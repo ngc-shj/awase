@@ -176,7 +176,7 @@ impl ImeOpenStrategy for MsImeDirectStrategy {
             //
             // 送信キーは KeySequencePolicy が SSOT（VK_IME_ON、MS-IME 冪等 ON キー）。
             let vk = ime_key_for(KeyMechanism::MsImeDirect, ImeOperation::Open);
-            log::debug!("[apply-ime] MS-IME direct: send {vk:#06X} (IME ON)");
+            log::info!("[apply-ime] MS-IME direct: send {vk:#06X} (IME ON)");
             // SAFETY: send_ime_mode_key は Win32 API を呼び出す unsafe fn。メインスレッドから呼ぶこと。
             if !unsafe { crate::ime::send_ime_mode_key(vk) } {
                 // Win キー押下中（デスクトップ切替等）で未送信。Applied 扱いにすると
@@ -191,7 +191,7 @@ impl ImeOpenStrategy for MsImeDirectStrategy {
             // VK_IME_OFF は MS-IME がネイティブに処理する冪等キー。
             // 既に DirectInput の場合は no-op のため conv チェック不要。
             let vk = ime_key_for(KeyMechanism::MsImeDirect, ImeOperation::Close);
-            log::debug!("[apply-ime] MS-IME direct: send {vk:#06X} (DirectInput, 冪等)");
+            log::info!("[apply-ime] MS-IME direct: send {vk:#06X} (DirectInput, 冪等)");
             // SAFETY: send_ime_mode_key は Win32 API を呼び出す unsafe fn。メインスレッドから呼ぶこと。
             if !unsafe { crate::ime::send_ime_mode_key(vk) } {
                 return ImeOpenOutcome::UnsafeToToggle;
@@ -349,6 +349,15 @@ fn romaji_pre_write(mechanism: WriteMechanism, open: bool, view: &ImeControlView
         view.observed.active_ime_kind.into(),
         view.belief_input_mode,
     ) {
+        // 診断用（BUG report 01M0VJEWSEZFFWAV0JFEVPB3D5 premortem追補）: ROMAN補完が
+        // 「発火条件を満たさずスキップされた」ことを可視化する。IME ON キー
+        // (VK_IME_ON) は ROMAN ビットに触れないため、ここがスキップされたまま
+        // open した場合、conv が半角英数のままIMEが開く経路になりうる。
+        log::info!(
+            "[imm-romaji] pre-write skipped (needs_romaji_pre_write=false): \
+             mechanism={mechanism:?} open={open} belief_input_mode={:?}",
+            view.belief_input_mode,
+        );
         return;
     }
     // BUG-34 横展開 Step0-c/レビュー: set_ime_romaji_mode_for_target_blocking は
@@ -367,16 +376,17 @@ fn romaji_pre_write(mechanism: WriteMechanism, open: bool, view: &ImeControlView
     //         Win32 API を呼ぶ unsafe fn。`ImeOpenStrategy::apply` の呼び出しチェーンは
     //         すべてメインスレッド（フックまたはメッセージループ）である。
     let Some(target) = (unsafe { crate::ime::ActuationTarget::capture_blocking(focus_gen) }) else {
-        log::debug!("[imm-romaji] capture 失敗（フォーカス無し）→ ROMAN 補完スキップ");
+        // 診断用（BUG report 01M0VJEWSEZFFWAV0JFEVPB3D5 premortem追補）: info に昇格。
+        log::info!("[imm-romaji] capture 失敗（フォーカス無し）→ ROMAN 補完スキップ (mechanism={mechanism:?} open={open})");
         return;
     };
     // SAFETY: 同上。
     let outcome = unsafe { crate::ime::set_ime_romaji_mode_for_target_blocking(target, focus_gen) };
-    if outcome != crate::ime::ActuationOutcome::Written {
-        // INV-14: `Aborted` を成功として扱わない。実機での競合頻度を事後に
-        // 測れるよう必ずログに残す（ADR-086 §6 段4）。
-        log::debug!("[imm-romaji] ROMAN 補完 {outcome:?} (mechanism={mechanism:?})");
-    }
+    // 診断用（BUG report 01M0VJEWSEZFFWAV0JFEVPB3D5 premortem追補）: 従来は
+    // `outcome != Written` のときだけ debug で残していた。「force-ON が送るキー列」
+    // を実機で追えるよう、成功時も含め常に info で1行残す（INV-14 の記録義務は
+    // 変えず、可視性のみ広げる）。
+    log::info!("[imm-romaji] ROMAN 補完 {outcome:?} (mechanism={mechanism:?} open={open})");
 }
 
 /// 同期 writer。`view` は呼び出し元が一度だけ構築したものを使い回す
@@ -431,6 +441,10 @@ pub(crate) struct ImeController;
 /// ——入口が発火したこと自体をログに残さないと、`would_have_blocked` の
 /// ゼロが「安全」なのか「未測定」なのか区別できない。
 pub(crate) fn log_shadow_warrant(chain: &str, order: &ActuationOrder) {
+    // 診断用に授権時も info で残す（BUG report 01M0VJEWSEZFFWAV0JFEVPB3D5 premortem
+    // 追補: would_have_blocked=true だけを info にしていたため、分母（授権が下りた
+    // 回数）が実機ログに一切残らず「N/N件ブロック」という数字が選択バイアスに
+    // なっていた。両分岐を info にし、実測での比率判定を可能にする）。
     if order.would_have_blocked() {
         log::info!(
             "[warrant-shadow] chain={chain} open={} origin={:?} would_have_blocked=true \
@@ -439,7 +453,7 @@ pub(crate) fn log_shadow_warrant(chain: &str, order: &ActuationOrder) {
             order.origin(),
         );
     } else {
-        log::debug!(
+        log::info!(
             "[warrant-shadow] chain={chain} open={} origin={:?} warranted",
             order.open(),
             order.origin(),

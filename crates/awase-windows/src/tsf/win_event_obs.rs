@@ -168,7 +168,15 @@ unsafe extern "system" fn observation_event_proc(
                     } else {
                         format!("{}ms ago", now_ms.saturating_sub(last_write_ms))
                     };
-                    log::info!("[gji-obs] candidate SHOW #{seq}: last_gji_write={write_ago}");
+                    // 診断用（BUG report 01M0VJEWSEZFFWAV0JFEVPB3D5 premortem追補）:
+                    // このフックは SetWinEventHook(idProcess=0, idThread=0) でシステム
+                    // 全体を対象にしており、フォーカス中プロセスとの照合が無い。イベント
+                    // hwnd の pid を出すことで「MS-IME セッション中の342件」が本当に
+                    // フォーカス外プロセス由来かを実機ログで確認できるようにする。
+                    let event_pid = crate::focus::classify::get_window_process_id(hwnd);
+                    log::info!(
+                        "[gji-obs] candidate SHOW #{seq}: last_gji_write={write_ago} event_pid={event_pid}"
+                    );
                 }
             } else if class == MSCTFIME_UI_CLASS {
                 log::debug!("[tsf-ime-ui] SHOW hwnd={:?}", hwnd.0);
@@ -191,7 +199,11 @@ unsafe extern "system" fn observation_event_proc(
                     } else {
                         format!("{}ms ago", now_ms.saturating_sub(last_write_ms))
                     };
-                    log::info!("[gji-obs] candidate HIDE: last_gji_write={write_ago}");
+                    // 診断用（BUG report 01M0VJEWSEZFFWAV0JFEVPB3D5 premortem追補、詳細は SHOW 側参照）。
+                    let event_pid = crate::focus::classify::get_window_process_id(hwnd);
+                    log::info!(
+                        "[gji-obs] candidate HIDE: last_gji_write={write_ago} event_pid={event_pid}"
+                    );
                 }
             } else if class == MSCTFIME_UI_CLASS {
                 log::debug!("[tsf-ime-ui] HIDE hwnd={:?}", hwnd.0);

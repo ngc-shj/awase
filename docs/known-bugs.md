@@ -10037,3 +10037,81 @@ BUG-35（epoch fencing・`consecutive` リセット条件の導入元）、BUG-3
 [bug-report-fetch skill](../.claude/skills/bug-report-fetch/SKILL.md)。
 本バグの恒久対策は次セッション以降、この診断ログの実機データが集まってから
 着手する。
+
+---
+
+## BUG-76: MS-IME × UWP/Windows Terminal 環境で Nicola エンジンが ON/OFF を繰り返す（原因未確定、診断ログ追加のみ）
+
+**症状:** タスクトレイ「不具合を報告」経由のレポート（report_id
+`01M0VJEWSEZFFWAV0JFEVPB3D5`, app_version 1.15.0, 2026-08-25）。MS-IME 利用中、
+Windows Terminal・UWP アプリ・Chrome を切り替えながら作業していると、実 IME が
+断続的に半角英数（`conv=0x00000010`）に落ち、awase の Nicola エンジンが
+`Inactive(NotRomajiInput)` へ落ちる。ユーザーはこれをかなキー（vk=0xF2 等）の
+手動連打で復旧するしかなく（該当16分間で34回）、「エンジンがオンオフを繰り返す」
+と体感される。
+
+**調査の経緯（Opus 2体 architect/premortem_reviewer による premortem 設計レビュー、
+3ラウンド）:** 詳細は
+[docs/bug-reports-triage.md](../bug-reports-triage.md) の該当行に経緯を全文
+記録済み。要点のみ:
+
+1. 当初「idle-conv-check が conv 値を誤読している」「同一UWPアプリ内の2つの
+   InputSite ハンドルが往復している」と診断したが、実際の app.log を読み直した
+   結果いずれも誤りだった。conv=0x0010 は実在（4経路の独立観測が一致）、
+   往復は Windows Terminal・別UWPアプリ・Chrome という**複数の別アプリ間**の
+   通常のフォーカス往復だった。
+2. 次に `issue_open_warrant()`（ADR-087 shadow モード）の強制化を主軸とする
+   修正案を検討したが、これも誤りだった。shadow ログの `would_have_blocked=true`
+   23件は全て `open=false`／`idle_conv_check_direct_input` 経路であり、
+   force-ON（`open=true` 側）とは無関係。加えてログ実装が「拒否時のみ info、
+   許可時は debug」だったため、分母が測定されておらず「23/23件」という数字
+   自体が選択バイアスだった。
+3. 最も整合的な未検証仮説: MS-IME 向け force-ON のキー列自体が「IME-ON かな」
+   ではなく「IME-ON 半角英数」に着地している（`docs/experiments.md` エントリ01
+   の `VK_DBE_ALPHANUMERIC` 誤解と同型パターン）。Kana→Eisu 化4回中3回で
+   「FocusChange → stale `ObservedEisu` キャッシュ復元 → force-ON → 直後に
+   実 conv=Eisu 化」という並びが確認されている（時間的相関のみ、因果は未証明）。
+
+**本コミットでの対応（挙動は一切変更していない、診断ログの追加のみ）:**
+
+- `ime_controller.rs::log_shadow_warrant`: 授権時（`warranted`）も `info!` で
+  記録するよう統一（従来は拒否時のみ `info!`、許可時は `debug!` で分母が
+  測定不能だった）。
+- `ime_controller.rs::romaji_pre_write`: ROMAN ビット補完（VK_IME_ON 直前に
+  `set_ime_romaji_mode_for_target_blocking` を呼ぶステップ、ADR-089 §6 Phase C
+  item 12）の 3 分岐（発火条件スキップ／capture 失敗／書き込み結果）を
+  すべて `info!` に統一。ここが上記仮説3の直接の検証ポイント: この補完が
+  スキップまたは失敗したまま `MsImeDirectStrategy::apply` が `VK_IME_ON`
+  （ROMAN ビットに触れない）を送ると、IME は半角英数のまま開く可能性がある。
+- `ime_controller.rs::MsImeDirectStrategy::apply`: 実際に送信する VK
+  （`VK_IME_ON`/`VK_IME_OFF`）のログを `debug!` → `info!` に格上げ。
+- `tsf/win_event_obs.rs::observation_event_proc`: GJI candidate SHOW/HIDE
+  ログにイベント hwnd の `event_pid` を追加。このフックは
+  `SetWinEventHook(idProcess=0, idThread=0)` でシステム全体を対象にしており
+  フォーカス中プロセスとの照合が無いため、MS-IME 環境で GJI 候補ウィンドウが
+  342回観測された謎（第3の未解明の汚染源、上記報告の調査で新規発見）の
+  裏取りに使う。
+
+**次のアクション:** 上記診断ログを含むビルドで実機再現し、新しいログで
+(a) 仮説3（force-ON が送る実際のキー列と ROMAN 補完の成否）、
+(b) warrant shadow の実際の許可/拒否比率、
+(c) GJI candidate SHOW/HIDE イベントの event_pid（フォーカス外プロセス由来か）
+の3点を確定させてから恒久対策を設計する。3ラウンド連続で「実データ確認後に
+前提が覆った」ため、診断データが揃うまで新しい修正コードは書かない方針。
+
+**テスト:** 挙動変更が無いため新規テストは追加していない。
+`cargo test -p awase-windows --lib` 431件 green（既存テストへの影響なし）、
+`cargo clippy -p awase-windows --lib --tests -- -D warnings`
+は変更ファイル（`ime_controller.rs`/`win_event_obs.rs`）に新規の指摘なし
+（既存の pedantic 指摘は変更前から別ファイルに存在、対象外）。
+
+**関連:** BUG-18（AppKind 往復・OffCold 残留、GJI限定で修正済み）、
+BUG-22（stale ObservedEisu キャッシュ復元、`cache_restore_eisu_guard` で
+修正済み・本件でも正しく動作していることを確認済み）、
+BUG-57（conv だけで英数判定する構造的欠陥の前例）、BUG-63（belief を
+actuation の根拠に使ってはいけない教訓）、BUG-68（focus 変更でクールダウンが
+リセットされる既知の限界）、BUG-69（`is_eligible_for_ime_force_on()` の
+`effective_open()` 依存、ADR-087 Phase 3 item15 未配線）、
+`docs/experiments.md` エントリ01（IME OFF キー選択の反転史、
+`VK_DBE_ALPHANUMERIC` 誤解の前例）、
+[docs/bug-reports-triage.md](../bug-reports-triage.md)。
