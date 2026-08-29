@@ -176,13 +176,38 @@ mod imp {
         }
     }
 
+    /// 注入ワーカーへ渡すイベント仕様。
+    ///
+    /// CGEvent の構築と post はワーカースレッドが行う（`CGEventSource` は
+    /// ワーカーが専有）。
+    enum Spec {
+        Key {
+            keycode: u16,
+            down: bool,
+            shift: bool,
+        },
+        /// Unicode 直接注入（keycode 0 + 文字列ペイロードの KeyDown）
+        CharDown(char),
+        /// `CharDown` に対応する KeyUp
+        CharUp,
+    }
+
+    /// 注入イベント間の待機。
+    ///
+    /// 間隔ゼロで連射すると**バースト先頭のキーストロークが失われる**
+    /// （`ku`→k・`ne`→n・`to`→t・`lyo`→l の欠落を実測。Session 化・実タイム
+    /// スタンプ・suppression 無効化でも解消せず）。CGEventPost 系ツールの
+    /// 既知の弱点で、espanso 等と同様にペーシングで回避する。
+    const INJECT_GAP: std::time::Duration = std::time::Duration::from_millis(2);
+
     /// CGEventPost によるキー出力。
     ///
-    /// 注入イベントはすべて `INJECT_MARKER` 付きで `HID` タップ位置に post する。
-    /// HID 位置に注入することで IME を含む通常の入力パイプラインを通る
-    /// （ローマ字キーストロークを IME に変換させるために必要）。
+    /// 注入イベントはすべて `INJECT_MARKER` 付きで、専用ワーカースレッドから
+    /// `INJECT_GAP` の間隔を空けて Session タップ位置に post する（tap
+    /// コールバックをブロックせずにペーシングするため）。キーストロークは
+    /// IME を含む通常の入力パイプラインを通る。
     pub struct Output {
-        source: CGEventSource,
+        tx: std::sync::mpsc::Sender<Spec>,
         /// `Char(かな)` をローマ字キーストロークへ逆引きするためのテーブル
         /// （Windows 版 VK モードの `send_char_as_vk` と同じ方針。macOS では
         /// Unicode 直接注入だと IME が未確定文字列を持たず漢字変換不能になる）。
@@ -203,50 +228,62 @@ mod imp {
         }
     }
 
-    impl Output {
-        /// イベントソースを作成する。
-        ///
-        /// # Errors
-        ///
-        /// `CGEventSource` の作成に失敗した場合。
-        pub fn new() -> anyhow::Result<Self> {
-            let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-                .map_err(|()| anyhow::anyhow!("Failed to create CGEventSource"))?;
-            // 合成イベント送出後、同ソース外のイベントを短時間抑制するレガシー動作
-            // （既定 ~250ms）を無効化する。高速打鍵と注入が交錯すると
-            // キーストロークが失われる古典的原因（で+あ+る → 「あ」消失を実測）。
-            #[allow(unsafe_code)] // CGEventSource の未バインド API 呼び出し
-            unsafe {
-                use foreign_types::ForeignType;
-                extern "C" {
-                    fn CGEventSourceSetLocalEventsSuppressionInterval(
-                        source: *mut core_graphics::sys::CGEventSource,
-                        seconds: f64,
-                    );
+    /// `Spec` から CGEvent を構築する（失敗時は警告して None）。
+    fn build_event(source: &CGEventSource, spec: &Spec) -> Option<CGEvent> {
+        match *spec {
+            Spec::Key {
+                keycode,
+                down,
+                shift,
+            } => {
+                let event = CGEvent::new_keyboard_event(source.clone(), keycode, down)
+                    .map_err(|()| {
+                        warn!("Failed to create keyboard event (keycode=0x{keycode:02X})");
+                    })
+                    .ok()?;
+                if shift {
+                    event.set_flags(CGEventFlags::CGEventFlagShift);
                 }
-                CGEventSourceSetLocalEventsSuppressionInterval(source.as_ptr(), 0.0);
+                Some(event)
             }
-            Ok(Self {
-                source,
-                kana: KanaTable::build(),
-                composing_hint: false,
-            })
+            Spec::CharDown(ch) => {
+                let event = CGEvent::new_keyboard_event(source.clone(), 0, true)
+                    .map_err(|()| warn!("Failed to create keyboard event for Char('{ch}')"))
+                    .ok()?;
+                event.set_string(&ch.to_string());
+                Some(event)
+            }
+            Spec::CharUp => CGEvent::new_keyboard_event(source.clone(), 0, false).ok(),
+        }
+    }
+
+    /// ワーカースレッド: `Spec` を受け取り、ペーシングしながら post する。
+    fn injection_worker(rx: &std::sync::mpsc::Receiver<Spec>) {
+        let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+            log::error!("injection worker: failed to create CGEventSource");
+            return;
+        };
+        // 合成イベント送出後、同ソース外のイベントを短時間抑制するレガシー動作
+        // （既定 ~250ms）を無効化する
+        #[allow(unsafe_code)] // CGEventSource の未バインド API 呼び出し
+        unsafe {
+            use foreign_types::ForeignType;
+            extern "C" {
+                fn CGEventSourceSetLocalEventsSuppressionInterval(
+                    source: *mut core_graphics::sys::CGEventSource,
+                    seconds: f64,
+                );
+            }
+            CGEventSourceSetLocalEventsSuppressionInterval(source.as_ptr(), 0.0);
         }
 
-        /// 確定・取消相当の操作を観測したときに App 側から呼ばれる。
-        pub const fn note_composition_break(&mut self) {
-            self.composing_hint = false;
-        }
-
-        /// 注入イベントに実時刻を付与して Session 層へ post する。
-        ///
-        /// - timestamp=0 のまま送ると、高速打鍵時の時刻整合処理で捨てられる
-        ///   余地がある
-        /// - `HID` 層への注入は物理入力と同じ合流点を通るため、連続入力中に
-        ///   キーストロークが失われた（`ne` 注入 → tap 再入まで確認できるのに
-        ///   ATOK には `e` しか届かず「え」になる事例を実測）。Session 層は
-        ///   この合流を避けられる
-        fn post_event(event: &CGEvent) {
+        while let Ok(spec) = rx.recv() {
+            let Some(event) = build_event(&source, &spec) else {
+                continue;
+            };
+            event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, INJECT_MARKER);
+            // timestamp=0 のまま送ると時刻整合処理で捨てられる余地があるため
+            // 実時刻を付与する。post 先は物理入力の合流点を避けて Session 層
             #[allow(unsafe_code)] // CGEvent の未バインド API 呼び出しに必要
             unsafe {
                 use foreign_types::ForeignType;
@@ -260,20 +297,41 @@ mod imp {
                 CGEventSetTimestamp(event.as_ptr(), mach_absolute_time());
             }
             event.post(CGEventTapLocation::Session);
+            std::thread::sleep(INJECT_GAP);
+        }
+    }
+
+    impl Output {
+        /// 注入ワーカースレッドを起動する。
+        ///
+        /// # Errors
+        ///
+        /// ワーカースレッドの spawn に失敗した場合。
+        pub fn new() -> anyhow::Result<Self> {
+            let (tx, rx) = std::sync::mpsc::channel::<Spec>();
+            std::thread::Builder::new()
+                .name("awase-inject".to_string())
+                .spawn(move || injection_worker(&rx))
+                .map_err(|e| anyhow::anyhow!("Failed to spawn injection worker: {e}"))?;
+            Ok(Self {
+                tx,
+                kana: KanaTable::build(),
+                composing_hint: false,
+            })
         }
 
-        /// 単一のキーイベントを post する。
+        /// 確定・取消相当の操作を観測したときに App 側から呼ばれる。
+        pub const fn note_composition_break(&mut self) {
+            self.composing_hint = false;
+        }
+
+        /// 単一のキーイベントをワーカー経由で post する。
         fn post_key(&self, keycode: u16, down: bool, shift: bool) {
-            let Ok(event) = CGEvent::new_keyboard_event(self.source.clone(), keycode, down)
-            else {
-                warn!("Failed to create keyboard event (keycode=0x{keycode:02X})");
-                return;
-            };
-            if shift {
-                event.set_flags(CGEventFlags::CGEventFlagShift);
-            }
-            event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, INJECT_MARKER);
-            Self::post_event(&event);
+            let _ = self.tx.send(Spec::Key {
+                keycode,
+                down,
+                shift,
+            });
         }
 
         /// キーを押して離す。
@@ -287,18 +345,8 @@ mod imp {
         /// キーコードに依存しないため任意のかな文字を出力できるが、
         /// IME のかな漢字変換は経由しない（Unicode 直接注入モード用）。
         fn post_char(&self, ch: char) {
-            let Ok(event) = CGEvent::new_keyboard_event(self.source.clone(), 0, true) else {
-                warn!("Failed to create keyboard event for Char('{ch}')");
-                return;
-            };
-            event.set_string(&ch.to_string());
-            event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, INJECT_MARKER);
-            Self::post_event(&event);
-            // 対応する KeyUp（文字列ペイロードなし）
-            if let Ok(up) = CGEvent::new_keyboard_event(self.source.clone(), 0, false) {
-                up.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, INJECT_MARKER);
-                Self::post_event(&up);
-            }
+            let _ = self.tx.send(Spec::CharDown(ch));
+            let _ = self.tx.send(Spec::CharUp);
         }
 
         /// ASCII 文字列をキーストロークとして送出する（IME に変換させる用途）。
