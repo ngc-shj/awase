@@ -218,8 +218,11 @@ mod imp {
         ) -> Result<()> {
             HANDLER.with(|h| *h.borrow_mut() = Some(handler));
 
+            // Session 層に張る。HID 層だと `post_from_tap` の挿入が HID→Session の
+            // 合流機構を通ることになり、高速打鍵時にストロークが失われる
+            // （き の欠落を実測）。Session 層 tap からの挿入は合流点の後に入る
             let tap = CGEventTap::new(
-                CGEventTapLocation::HID,
+                CGEventTapLocation::Session,
                 CGEventTapPlacement::HeadInsertEventTap,
                 CGEventTapOptions::Default,
                 vec![
