@@ -121,6 +121,128 @@ pub const fn ascii_to_keycode(ch: char) -> Option<(u16, bool)> {
 /// この値を見て自分の注入イベントを Engine に通さず素通しする。
 pub const INJECT_MARKER: i64 = 0x0A0A_5E00;
 
+/// 出力方式（config.toml の `macos_output_style`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputStyle {
+    /// ローマ字キーストロークを注入（IME はローマ字入力モード）
+    Romaji,
+    /// JIS かな配列のキーストロークを注入（IME はかな入力モード）。
+    /// 1 かな 1 打（濁点・半濁点は追い打ち）でイベント数が少なく、
+    /// 高速打鍵時の注入取りこぼしに強い（Lacaille と同方式）
+    Kana,
+}
+
+/// 濁点・半濁点を分解する（かな入力モード注入用。例: が → か + ゛）。
+const fn split_voicing(ch: char) -> (char, Option<char>) {
+    match ch {
+        'が' => ('か', Some('゛')),
+        'ぎ' => ('き', Some('゛')),
+        'ぐ' => ('く', Some('゛')),
+        'げ' => ('け', Some('゛')),
+        'ご' => ('こ', Some('゛')),
+        'ざ' => ('さ', Some('゛')),
+        'じ' => ('し', Some('゛')),
+        'ず' => ('す', Some('゛')),
+        'ぜ' => ('せ', Some('゛')),
+        'ぞ' => ('そ', Some('゛')),
+        'だ' => ('た', Some('゛')),
+        'ぢ' => ('ち', Some('゛')),
+        'づ' => ('つ', Some('゛')),
+        'で' => ('て', Some('゛')),
+        'ど' => ('と', Some('゛')),
+        'ば' => ('は', Some('゛')),
+        'び' => ('ひ', Some('゛')),
+        'ぶ' => ('ふ', Some('゛')),
+        'べ' => ('へ', Some('゛')),
+        'ぼ' => ('ほ', Some('゛')),
+        'ゔ' => ('う', Some('゛')),
+        'ぱ' => ('は', Some('゜')),
+        'ぴ' => ('ひ', Some('゜')),
+        'ぷ' => ('ふ', Some('゜')),
+        'ぺ' => ('へ', Some('゜')),
+        'ぽ' => ('ほ', Some('゜')),
+        _ => (ch, None),
+    }
+}
+
+/// JIS X 6002 かな配列: かな 1 文字 → (macOS keycode, Shift 要否)。
+///
+/// かな入力モードの IME はこのキーストロークを対応するかなとして受け取る。
+#[must_use]
+pub const fn jis_kana_keycode(ch: char) -> Option<(u16, bool)> {
+    let stroke = match ch {
+        // ── 数字段 ──
+        'ぬ' => (0x12, false), // 1
+        'ふ' => (0x13, false), // 2
+        'あ' => (0x14, false), // 3
+        'う' => (0x15, false), // 4
+        'え' => (0x17, false), // 5
+        'お' => (0x16, false), // 6
+        'や' => (0x1A, false), // 7
+        'ゆ' => (0x1C, false), // 8
+        'よ' => (0x19, false), // 9
+        'わ' => (0x1D, false), // 0
+        'ほ' => (0x1B, false), // -
+        'へ' => (0x18, false), // ^
+        'ー' => (0x5E, false), // ¥
+        'ぁ' => (0x14, true),
+        'ぅ' => (0x15, true),
+        'ぇ' => (0x17, true),
+        'ぉ' => (0x16, true),
+        'ゃ' => (0x1A, true),
+        'ゅ' => (0x1C, true),
+        'ょ' => (0x19, true),
+        'を' => (0x1D, true),
+        // ── Q 段 ──
+        'た' => (0x0C, false), // Q
+        'て' => (0x0D, false), // W
+        'い' => (0x0E, false), // E
+        'す' => (0x0F, false), // R
+        'か' => (0x11, false), // T
+        'ん' => (0x10, false), // Y
+        'な' => (0x20, false), // U
+        'に' => (0x22, false), // I
+        'ら' => (0x1F, false), // O
+        'せ' => (0x23, false), // P
+        '゛' => (0x21, false), // @
+        '゜' => (0x1E, false), // [
+        'ぃ' => (0x0E, true),
+        '「' => (0x1E, true),
+        // ── A 段 ──
+        'ち' => (0x00, false), // A
+        'と' => (0x01, false), // S
+        'し' => (0x02, false), // D
+        'は' => (0x03, false), // F
+        'き' => (0x05, false), // G
+        'く' => (0x04, false), // H
+        'ま' => (0x26, false), // J
+        'の' => (0x28, false), // K
+        'り' => (0x25, false), // L
+        'れ' => (0x29, false), // ;
+        'け' => (0x27, false), // :
+        'む' => (0x2A, false), // ]
+        '」' => (0x2A, true),
+        // ── Z 段 ──
+        'つ' => (0x06, false), // Z
+        'さ' => (0x07, false), // X
+        'そ' => (0x08, false), // C
+        'ひ' => (0x09, false), // V
+        'こ' => (0x0B, false), // B
+        'み' => (0x2D, false), // N
+        'も' => (0x2E, false), // M
+        'ね' => (0x2B, false), // ,
+        'る' => (0x2F, false), // .
+        'め' => (0x2C, false), // /
+        'ろ' => (0x5D, false), // ろ
+        'っ' => (0x06, true),
+        '、' => (0x2B, true),
+        '。' => (0x2F, true),
+        '・' => (0x2C, true),
+        _ => return None,
+    };
+    Some(stroke)
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
     use awase::kana_table::KanaTable;
@@ -129,7 +251,10 @@ mod imp {
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
     use log::warn;
 
-    use super::{ascii_to_keycode, special_key_to_keycode, INJECT_MARKER};
+    use super::{
+        ascii_to_keycode, jis_kana_keycode, special_key_to_keycode, split_voicing, OutputStyle,
+        INJECT_MARKER,
+    };
 
     /// kVK_Shift（Romaji/KeySequence の大文字送出用）
     const KEYCODE_SHIFT: u16 = 0x38;
@@ -208,6 +333,8 @@ mod imp {
     /// IME を含む通常の入力パイプラインを通る。
     pub struct Output {
         tx: std::sync::mpsc::Sender<Spec>,
+        /// 出力方式（romaji: ローマ字逆引き / kana: JIS かなストローク）
+        style: OutputStyle,
         /// `Char(かな)` をローマ字キーストロークへ逆引きするためのテーブル
         /// （Windows 版 VK モードの `send_char_as_vk` と同じ方針。macOS では
         /// Unicode 直接注入だと IME が未確定文字列を持たず漢字変換不能になる）。
@@ -307,17 +434,50 @@ mod imp {
         /// # Errors
         ///
         /// ワーカースレッドの spawn に失敗した場合。
-        pub fn new() -> anyhow::Result<Self> {
+        pub fn new(style: OutputStyle) -> anyhow::Result<Self> {
             let (tx, rx) = std::sync::mpsc::channel::<Spec>();
             std::thread::Builder::new()
                 .name("awase-inject".to_string())
                 .spawn(move || injection_worker(&rx))
                 .map_err(|e| anyhow::anyhow!("Failed to spawn injection worker: {e}"))?;
+            log::info!("Output style: {style:?}");
             Ok(Self {
                 tx,
+                style,
                 kana: KanaTable::build(),
                 composing_hint: false,
             })
+        }
+
+        /// かな 1 文字を JIS かな配列のキーストロークとして送出する。
+        ///
+        /// 濁点・半濁点は基底かな + ゛/゜ の追い打ち。対応表に無い文字なら
+        /// false を返す（呼び出し側が直接注入にフォールバック）。
+        fn send_kana_strokes(&mut self, ch: char) -> bool {
+            let (base, mark) = split_voicing(ch);
+            let Some((keycode, shift)) = jis_kana_keycode(base) else {
+                return false;
+            };
+            self.press_with_shift(keycode, shift);
+            if let Some(mark) = mark {
+                if let Some((mark_code, mark_shift)) = jis_kana_keycode(mark) {
+                    self.press_with_shift(mark_code, mark_shift);
+                }
+            }
+            log::debug!("Kana: injected '{ch}'");
+            self.composing_hint = true;
+            true
+        }
+
+        /// Shift ラッパー付きでキーを押して離す。
+        fn press_with_shift(&self, keycode: u16, shift: bool) {
+            if shift {
+                self.post_key(KEYCODE_SHIFT, true, false);
+            }
+            self.post_press_release(keycode, shift);
+            if shift {
+                self.post_key(KEYCODE_SHIFT, false, false);
+            }
         }
 
         /// 確定・取消相当の操作を観測したときに App 側から呼ばれる。
@@ -383,6 +543,16 @@ mod imp {
         ///    キーストローク表現があればそちらへフォールバック
         /// 5. それ以外は Unicode 直接注入
         fn send_char(&mut self, ch: char) {
+            if self.style == OutputStyle::Kana {
+                if self.send_kana_strokes(ch) {
+                    return;
+                }
+                // かなストロークで表現できない文字（数字・英字・記号）は直接注入。
+                // かな入力モードでは ASCII キーストロークがかなに化けるため
+                // ローマ字用のキーストロークフォールバックは使えない
+                self.post_char(ch);
+                return;
+            }
             if let Some(romaji) = self.kana.romaji_for_kana(ch) {
                 let romaji = romaji.to_owned();
                 self.send_ascii_sequence(&romaji, "Char");
@@ -417,7 +587,19 @@ mod imp {
                     KeyAction::Key(vk) => self.post_key(vk.0, true, false),
                     KeyAction::KeyUp(vk) => self.post_key(vk.0, false, false),
                     KeyAction::Char(ch) => self.send_char(*ch),
-                    KeyAction::Romaji(s) => self.send_ascii_sequence(s, "Romaji"),
+                    KeyAction::Romaji(s) => {
+                        // kana 方式では、ローマ字文字列もかなへ解決してストローク化する
+                        // （kana 未解決の .yab エントリが ASCII 注入でかなに化けるのを防ぐ）
+                        if self.style == OutputStyle::Kana {
+                            if let Some(kana) = self.kana.kana_for_romaji(s) {
+                                if self.send_kana_strokes(kana) {
+                                    continue;
+                                }
+                            }
+                            warn!("Romaji \"{s}\" has no kana-stroke mapping, falling back");
+                        }
+                        self.send_ascii_sequence(s, "Romaji");
+                    }
                     KeyAction::KeySequence(s) => self.send_ascii_sequence(s, "KeySequence"),
                     KeyAction::Suppress => {}
                 }
@@ -448,7 +630,7 @@ impl Output {
     /// # Errors
     ///
     /// スタブのため常に成功する。
-    pub fn new() -> anyhow::Result<Self> {
+    pub fn new(_style: OutputStyle) -> anyhow::Result<Self> {
         Ok(Self)
     }
 
@@ -483,5 +665,33 @@ mod tests {
         assert_eq!(ascii_to_keycode('['), Some((0x1E, false))); // JIS: [
         assert_eq!(ascii_to_keycode(']'), Some((0x2A, false))); // JIS: ]
         assert_eq!(ascii_to_keycode('?'), Some((0x2C, true))); // Shift+/
+    }
+
+    #[test]
+    fn jis_kana_strokes_cover_all_engine_kana() {
+        // NICOLA レイアウトが出力しうる全かな・記号が、かな入力モードの
+        // ストローク（基底かな + 濁点/半濁点）で表現できること
+        let all = "あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほ\
+                   まみむめもやゆよらりるれろわをんぁぃぅぇぉゃゅょっ\
+                   がぎぐげござじずぜぞだぢづでどばびぶべぼぱぴぷぺぽゔ\
+                   ー、。・「」゛゜";
+        for ch in all.chars() {
+            let (base, _mark) = split_voicing(ch);
+            assert!(
+                jis_kana_keycode(base).is_some(),
+                "missing JIS kana stroke for {ch:?} (base {base:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn jis_kana_keycode_spot_checks() {
+        assert_eq!(jis_kana_keycode('ね'), Some((0x2B, false))); // , キー
+        assert_eq!(jis_kana_keycode('く'), Some((0x04, false))); // H キー
+        assert_eq!(jis_kana_keycode('っ'), Some((0x06, true))); // Shift+Z
+        assert_eq!(jis_kana_keycode('を'), Some((0x1D, true))); // Shift+0
+        assert_eq!(split_voicing('が'), ('か', Some('゛')));
+        assert_eq!(split_voicing('ぱ'), ('は', Some('゜')));
+        assert_eq!(split_voicing('ね'), ('ね', None));
     }
 }

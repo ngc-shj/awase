@@ -201,7 +201,12 @@ fn main() -> Result<()> {
     // 7. Run platform event loop
     let poll_interval =
         std::time::Duration::from_millis(u64::from(config.general.ime_poll_interval_ms.max(100)));
-    run_event_loop(engine, &config.general.default_layout, poll_interval)
+    let output_style = if config.general.macos_output_style == "kana" {
+        awase_macos::output::OutputStyle::Kana
+    } else {
+        awase_macos::output::OutputStyle::Romaji
+    };
+    run_event_loop(engine, &config.general.default_layout, poll_interval, output_style)
 }
 
 #[cfg(target_os = "macos")]
@@ -209,6 +214,7 @@ fn run_event_loop(
     engine: Engine,
     layout_name: &str,
     poll_interval: std::time::Duration,
+    output_style: awase_macos::output::OutputStyle,
 ) -> Result<()> {
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -221,7 +227,7 @@ fn run_event_loop(
         );
     }
 
-    let output = awase_macos::output::Output::new()?;
+    let output = awase_macos::output::Output::new(output_style)?;
 
     // メニューバー常駐（NSApplication 初期化後に作ること）
     awase_macos::event_loop::init_nsapp();
@@ -240,6 +246,7 @@ fn run_event_loop(
     _engine: Engine,
     _layout_name: &str,
     _poll_interval: std::time::Duration,
+    _output_style: awase_macos::output::OutputStyle,
 ) -> Result<()> {
     log::warn!("awase-macos event loop is only available on macOS");
     Ok(())

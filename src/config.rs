@@ -130,6 +130,14 @@ pub struct GeneralConfig {
     pub auto_start: String,
     /// Linux 入力バックエンド ("evdev", "x11", "libinput")
     pub linux_input_backend: String,
+    /// macOS の出力方式（"romaji" または "kana"）。
+    ///
+    /// - "romaji"（既定）: ローマ字キーストロークを注入し IME に変換させる。
+    ///   IME 側の入力方式設定が不要
+    /// - "kana": JIS かな配列のキーストロークを注入する（IME をかな入力
+    ///   モードに設定して使う）。1 かな 1 打（濁点は追い打ち）でイベント数が
+    ///   少なく、高速打鍵時の注入取りこぼしに強い（Lacaille と同方式）
+    pub macos_output_style: String,
     /// evdev バックエンド: キーボードデバイスパス（None = 自動検出）
     pub linux_evdev_device: Option<String>,
     /// キーボードの物理レイアウトモデル（"jis" または "us"）。
@@ -360,6 +368,7 @@ impl Default for GeneralConfig {
             ime_poll_interval_ms: 500,
             auto_start: "enabled".to_string(),
             linux_input_backend: "evdev".to_string(),
+            macos_output_style: "romaji".to_string(),
             linux_evdev_device: None,
             keyboard_model: KeyboardModel::Jis,
             space_thumb_ignore_composing_guard: true,
@@ -926,6 +935,13 @@ impl AppConfig {
     }
 
     fn validate_linux_backend(g: &mut GeneralConfig, w: &mut Vec<String>) {
+        if !["romaji", "kana"].contains(&g.macos_output_style.as_str()) {
+            w.push(format!(
+                "macos_output_style \"{}\" は不正です。romaji/kana のいずれかを指定してください。romaji にリセットします",
+                g.macos_output_style
+            ));
+            g.macos_output_style = "romaji".to_string();
+        }
         if !["evdev", "x11", "libinput"].contains(&g.linux_input_backend.as_str()) {
             w.push(format!(
                 "linux_input_backend \"{}\" は不正です。evdev/x11/libinput のいずれかを指定してください。evdev にリセットします",
