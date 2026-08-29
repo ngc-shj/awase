@@ -591,6 +591,17 @@ mod app {
             }
 
             let decision = self.engine.on_input(raw, &ctx);
+            // 取りこぼし調査用: 物理イベントと判定の対応を RUST_LOG=debug で追える
+            log::debug!(
+                "phys 0x{keycode:02X} {:?} {:?} -> {}",
+                event_type,
+                key_classification,
+                match &decision {
+                    Decision::PassThrough => "pass",
+                    Decision::PassThroughWith { .. } => "pass+fx",
+                    Decision::Consume { .. } => "consume",
+                },
+            );
             let action = self.apply_decision(decision);
 
             // 物理の英数/かな キーが素通しで OS に届く場合（Engine 非活性時や

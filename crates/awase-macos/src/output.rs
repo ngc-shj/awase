@@ -281,6 +281,8 @@ mod imp {
                     warn!("{kind} char '{ch}' has no macOS keycode mapping, skipping");
                 }
             }
+            // 取りこぼし調査用（RUST_LOG=debug で注入内容を追跡できるように）
+            log::debug!("{kind}: injected \"{s}\"");
             self.composing_hint = true;
         }
 
@@ -319,6 +321,7 @@ mod imp {
             for action in actions {
                 match action {
                     KeyAction::SpecialKey(sk) => {
+                        log::debug!("SpecialKey: injected {sk:?}");
                         self.post_press_release(special_key_to_keycode(*sk), false);
                         // Enter/Escape は composition を確定・破棄する
                         if matches!(sk, SpecialKey::Enter | SpecialKey::Escape) {
