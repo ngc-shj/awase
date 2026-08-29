@@ -522,6 +522,9 @@ mod app {
             // （親指キー単独打鍵の再注入もここを通って OS の IME 切替に届く）
             if event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA) == INJECT_MARKER
             {
+                // 注入イベントが OS のイベントストリームに実在した証跡
+                // （CGEventPost 後の消失と IME 側での無視を切り分ける）
+                log::debug!("inj-tap 0x{keycode:02X} {etype:?}");
                 if matches!(etype, CGEventType::KeyDown) {
                     self.expect_ime_from_key(keycode);
                 }

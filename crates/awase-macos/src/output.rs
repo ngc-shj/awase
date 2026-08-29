@@ -212,6 +212,20 @@ mod imp {
         pub fn new() -> anyhow::Result<Self> {
             let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
                 .map_err(|()| anyhow::anyhow!("Failed to create CGEventSource"))?;
+            // 合成イベント送出後、同ソース外のイベントを短時間抑制するレガシー動作
+            // （既定 ~250ms）を無効化する。高速打鍵と注入が交錯すると
+            // キーストロークが失われる古典的原因（で+あ+る → 「あ」消失を実測）。
+            #[allow(unsafe_code)] // CGEventSource の未バインド API 呼び出し
+            unsafe {
+                use foreign_types::ForeignType;
+                extern "C" {
+                    fn CGEventSourceSetLocalEventsSuppressionInterval(
+                        source: *mut core_graphics::sys::CGEventSource,
+                        seconds: f64,
+                    );
+                }
+                CGEventSourceSetLocalEventsSuppressionInterval(source.as_ptr(), 0.0);
+            }
             Ok(Self {
                 source,
                 kana: KanaTable::build(),
