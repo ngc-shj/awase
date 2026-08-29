@@ -393,6 +393,14 @@ mod app {
             for effect in effects {
                 match effect {
                     Effect::Input(InputEffect::SendKeys(actions)) => {
+                        // 英数/かな の生 VK 送出は IME 切替を引き起こす。
+                        // Session 層への注入は自前 tap（HID）を通らないため、
+                        // ここで期待値を立てる（旧: tap 再入のマーカー経路で設定）
+                        for action in actions {
+                            if let awase::types::KeyAction::Key(vk) = action {
+                                self.expect_ime_from_key(vk.0);
+                            }
+                        }
                         // IME 切替中は旧入力ソースで解釈されてしまうため保留する
                         // （既に保留がある場合も順序維持のため追記する）
                         if self.ime.is_switch_pending() || !self.deferred_keys.is_empty() {
@@ -413,6 +421,9 @@ mod app {
                         }
                     }
                     Effect::Input(InputEffect::ReinjectKey(ev)) => {
+                        if matches!(ev.event_type, KeyEventType::KeyDown) {
+                            self.expect_ime_from_key(ev.vk_code.0);
+                        }
                         self.output.reinject(ev.vk_code, ev.event_type);
                     }
                     Effect::Timer(TimerEffect::Set { id, duration }) => {

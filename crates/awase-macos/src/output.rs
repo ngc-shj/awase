@@ -238,6 +238,30 @@ mod imp {
             self.composing_hint = false;
         }
 
+        /// 注入イベントに実時刻を付与して Session 層へ post する。
+        ///
+        /// - timestamp=0 のまま送ると、高速打鍵時の時刻整合処理で捨てられる
+        ///   余地がある
+        /// - `HID` 層への注入は物理入力と同じ合流点を通るため、連続入力中に
+        ///   キーストロークが失われた（`ne` 注入 → tap 再入まで確認できるのに
+        ///   ATOK には `e` しか届かず「え」になる事例を実測）。Session 層は
+        ///   この合流を避けられる
+        fn post_event(event: &CGEvent) {
+            #[allow(unsafe_code)] // CGEvent の未バインド API 呼び出しに必要
+            unsafe {
+                use foreign_types::ForeignType;
+                extern "C" {
+                    fn CGEventSetTimestamp(
+                        event: *mut core_graphics::sys::CGEvent,
+                        timestamp: u64,
+                    );
+                    fn mach_absolute_time() -> u64;
+                }
+                CGEventSetTimestamp(event.as_ptr(), mach_absolute_time());
+            }
+            event.post(CGEventTapLocation::Session);
+        }
+
         /// 単一のキーイベントを post する。
         fn post_key(&self, keycode: u16, down: bool, shift: bool) {
             let Ok(event) = CGEvent::new_keyboard_event(self.source.clone(), keycode, down)
@@ -249,7 +273,7 @@ mod imp {
                 event.set_flags(CGEventFlags::CGEventFlagShift);
             }
             event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, INJECT_MARKER);
-            event.post(CGEventTapLocation::HID);
+            Self::post_event(&event);
         }
 
         /// キーを押して離す。
@@ -269,11 +293,11 @@ mod imp {
             };
             event.set_string(&ch.to_string());
             event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, INJECT_MARKER);
-            event.post(CGEventTapLocation::HID);
+            Self::post_event(&event);
             // 対応する KeyUp（文字列ペイロードなし）
             if let Ok(up) = CGEvent::new_keyboard_event(self.source.clone(), 0, false) {
                 up.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, INJECT_MARKER);
-                up.post(CGEventTapLocation::HID);
+                Self::post_event(&up);
             }
         }
 
