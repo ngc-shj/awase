@@ -364,7 +364,7 @@ mod app {
 
     impl App {
         pub fn new(engine: Engine, output: Output, tray: SystemTray) -> Self {
-            Self {
+            let mut app = Self {
                 engine,
                 output,
                 timers: Timers::new(),
@@ -375,7 +375,13 @@ mod app {
                 right_thumb_down: None,
                 deferred_keys: Vec::new(),
                 deferred_focus_pid: None,
-            }
+            };
+            // トレイ表示を実際の activation 状態に合わせる。既定値のままだと
+            // 起動時に IME が OFF でも「あ」と出る（状態が変化しないため
+            // UiEffect が飛ばず、ポーリングでも補正されない）
+            let active = app.engine.compute_active(&app.make_ctx());
+            app.tray.set_enabled(active);
+            app
         }
 
         /// IME 切替待ちが解消していれば保留出力をフラッシュする。
