@@ -305,6 +305,11 @@ mod imp {
         source: CGEventSource,
         /// 出力方式（romaji: ローマ字逆引き / kana: JIS かなストローク）
         style: OutputStyle,
+        /// 出力文字 → IME に送るローマ字入力列（config の
+        /// `[macos_symbol_romaji]`）。IME のローマ字テーブルに登録した独自の
+        /// 入力列を使い、変換を経ずに正確な記号を未確定文字列へ入れる。
+        /// 直接注入と違い変換中でも飲まれない
+        symbol_romaji: std::collections::HashMap<char, String>,
         /// `Char(かな)` をローマ字キーストロークへ逆引きするためのテーブル
         /// （Windows 版 VK モードの `send_char_as_vk` と同じ方針。macOS では
         /// Unicode 直接注入だと IME が未確定文字列を持たず漢字変換不能になる）。
@@ -332,13 +337,20 @@ mod imp {
         /// # Errors
         ///
         /// ワーカースレッドの spawn に失敗した場合。
-        pub fn new(style: OutputStyle) -> anyhow::Result<Self> {
+        pub fn new(
+            style: OutputStyle,
+            symbol_romaji: std::collections::HashMap<char, String>,
+        ) -> anyhow::Result<Self> {
             let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
                 .map_err(|()| anyhow::anyhow!("Failed to create CGEventSource"))?;
-            log::info!("Output style: {style:?}");
+            log::info!(
+                "Output style: {style:?}, symbol_romaji entries: {}",
+                symbol_romaji.len()
+            );
             Ok(Self {
                 source,
                 style,
+                symbol_romaji,
                 kana: KanaTable::build(),
                 composing_hint: false,
             })
@@ -453,6 +465,13 @@ mod imp {
         ///    キーストローク表現があればそちらへフォールバック
         /// 5. それ以外は Unicode 直接注入
         fn send_char(&mut self, ch: char) {
+            // ユーザーが IME 側に登録した入力列があれば最優先で使う。
+            // 変換中でも未確定文字列に正確な文字が入る唯一の経路
+            if let Some(seq) = self.symbol_romaji.get(&ch) {
+                let seq = seq.clone();
+                self.send_ascii_sequence(&seq, "SymbolRomaji");
+                return;
+            }
             if self.style == OutputStyle::Kana {
                 if self.send_kana_strokes(ch) {
                     return;
@@ -542,7 +561,10 @@ impl Output {
     /// # Errors
     ///
     /// スタブのため常に成功する。
-    pub fn new(_style: OutputStyle) -> anyhow::Result<Self> {
+    pub fn new(
+        _style: OutputStyle,
+        _symbol_romaji: std::collections::HashMap<char, String>,
+    ) -> anyhow::Result<Self> {
         Ok(Self)
     }
 

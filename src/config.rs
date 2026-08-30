@@ -631,6 +631,21 @@ pub struct AppConfig {
     /// 物理キーの単純リマップルール一覧（`KeyRemapRule` doc 参照）
     #[serde(default)]
     pub key_remap: Vec<KeyRemapRule>,
+    /// macOS: 出力文字 → IME に送るローマ字入力列の対応表。
+    ///
+    /// IME のローマ字テーブル（ATOK のローマ字カスタマイザ等）に登録した
+    /// 独自の入力列を使い、**未確定文字列の中に正確な文字を入れる**ための
+    /// 設定。IME が既定で別の文字に変換してしまう記号（"/" → ・、
+    /// "[" → 「 等）を、変換を経ずに出したい場合に使う。
+    ///
+    /// ```toml
+    /// [macos_symbol_romaji]
+    /// "／" = "z/"   # ATOK 側に z/ → ／ を登録しておく
+    /// "［" = "z["
+    /// "］" = "z]"
+    /// ```
+    #[serde(default)]
+    pub macos_symbol_romaji: std::collections::HashMap<String, String>,
 }
 
 /// `AppConfig::load` の失敗を UI 側の扱い分けができる粒度に分類した結果
@@ -718,6 +733,8 @@ pub struct ValidatedConfig {
     pub post_bypass: Vec<PostBypassRule>,
     /// 物理キーの単純リマップルール一覧
     pub key_remap: Vec<KeyRemapRule>,
+    /// macOS: 出力文字 → IME に送るローマ字入力列（`AppConfig` の doc 参照）
+    pub macos_symbol_romaji: std::collections::HashMap<String, String>,
 }
 
 impl AppConfig {
@@ -1013,6 +1030,7 @@ impl AppConfig {
                 keymaps: self.keymaps,
                 post_bypass: self.post_bypass,
                 key_remap: self.key_remap,
+                macos_symbol_romaji: self.macos_symbol_romaji,
             },
             warnings,
         )

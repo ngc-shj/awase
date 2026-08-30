@@ -92,6 +92,24 @@ mod resolve_tests {
     }
 }
 
+/// config の `[macos_symbol_romaji]` を「出力 1 文字 → 入力列」へ変換する。
+/// キーが 1 文字でないエントリは警告して捨てる。
+fn parse_symbol_romaji(
+    table: &std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<char, String> {
+    table
+        .iter()
+        .filter_map(|(k, v)| {
+            let mut chars = k.chars();
+            let (Some(ch), None) = (chars.next(), chars.next()) else {
+                log::warn!("macos_symbol_romaji: key \"{k}\" must be a single character");
+                return None;
+            };
+            Some((ch, v.clone()))
+        })
+        .collect()
+}
+
 fn main() -> Result<()> {
     // 1. Initialize logging
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -206,7 +224,14 @@ fn main() -> Result<()> {
     } else {
         awase_macos::output::OutputStyle::Romaji
     };
-    run_event_loop(engine, &config.general.default_layout, poll_interval, output_style)
+    let symbol_romaji = parse_symbol_romaji(&config.macos_symbol_romaji);
+    run_event_loop(
+        engine,
+        &config.general.default_layout,
+        poll_interval,
+        output_style,
+        symbol_romaji,
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -215,6 +240,7 @@ fn run_event_loop(
     layout_name: &str,
     poll_interval: std::time::Duration,
     output_style: awase_macos::output::OutputStyle,
+    symbol_romaji: std::collections::HashMap<char, String>,
 ) -> Result<()> {
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -227,7 +253,7 @@ fn run_event_loop(
         );
     }
 
-    let output = awase_macos::output::Output::new(output_style)?;
+    let output = awase_macos::output::Output::new(output_style, symbol_romaji)?;
 
     // メニューバー常駐（NSApplication 初期化後に作ること）
     awase_macos::event_loop::init_nsapp();
@@ -247,6 +273,7 @@ fn run_event_loop(
     _layout_name: &str,
     _poll_interval: std::time::Duration,
     _output_style: awase_macos::output::OutputStyle,
+    _symbol_romaji: std::collections::HashMap<char, String>,
 ) -> Result<()> {
     log::warn!("awase-macos event loop is only available on macOS");
     Ok(())
