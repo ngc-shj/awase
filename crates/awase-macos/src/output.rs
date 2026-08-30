@@ -258,6 +258,8 @@ mod imp {
 
     /// kVK_Shift（Romaji/KeySequence の大文字送出用）
     const KEYCODE_SHIFT: u16 = 0x38;
+    /// kVK_Option（記号の変換回避ストローク用）
+    const KEYCODE_OPTION: u16 = 0x3A;
 
     /// かな記号（CJK 記号ブロック）→ IME が同等文字に変換するキーストローク。
     ///
@@ -278,13 +280,21 @@ mod imp {
         }
     }
 
-    /// IME のキーストローク変換がリテラルと**別の文字**になる全角記号。
+    /// IME の記号変換を回避して正確な文字を得るキーストローク。
     ///
-    /// 例: `/` は ・ に、`[` `]` は 「 」 に変換される（ATOK/MS-IME 既定）。
-    /// これらは非変換中なら Unicode 直接注入で正確に出し、変換中
-    /// （直接注入が IME に飲まれる）のみキーストロークにフォールバックする。
-    const fn ime_renders_differently(ch: char) -> bool {
-        matches!(ch, '／' | '［' | '］')
+    /// 日本語 IME は `/` を ・ に、`[` `]` を 「 」 に変換してしまうが、
+    /// **Option（⌥）修飾を付けると変換されず記号そのものが入力される**。
+    /// Unicode 直接注入と違い未確定文字列の中でも失われない（macOS の
+    /// 親指シフトエミュレータ Lacaille が同じ手法を採っている）。
+    ///
+    /// 戻り値は (keycode, shift 要否)。Option は常に付ける。
+    pub(super) const fn ime_literal_keystroke(ch: char) -> Option<(u16, bool)> {
+        match ch {
+            '／' => Some((0x2C, false)), // ⌥/
+            '［' => Some((0x1E, false)), // ⌥[ (JIS)
+            '］' => Some((0x2A, false)), // ⌥] (JIS)
+            _ => None,
+        }
     }
 
     /// 全角 ASCII（U+FF01〜U+FF5E）を対応する半角文字に変換する。
@@ -394,13 +404,25 @@ mod imp {
 
         /// 単一のキーイベントを post する（tap コールバック内で同期実行）。
         fn post_key(&self, keycode: u16, down: bool, shift: bool) {
+            self.post_key_with_flags(keycode, down, shift, false);
+        }
+
+        /// 修飾フラグ付きでキーイベントを post する。
+        fn post_key_with_flags(&self, keycode: u16, down: bool, shift: bool, option: bool) {
             let Ok(event) = CGEvent::new_keyboard_event(self.source.clone(), keycode, down)
             else {
                 warn!("Failed to create keyboard event (keycode=0x{keycode:02X})");
                 return;
             };
+            let mut flags = CGEventFlags::empty();
             if shift {
-                event.set_flags(CGEventFlags::CGEventFlagShift);
+                flags |= CGEventFlags::CGEventFlagShift;
+            }
+            if option {
+                flags |= CGEventFlags::CGEventFlagAlternate;
+            }
+            if !flags.is_empty() {
+                event.set_flags(flags);
             }
             event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, INJECT_MARKER);
             event.post(CGEventTapLocation::HID);
@@ -493,12 +515,28 @@ mod imp {
                 self.send_ascii_sequence(ascii, "Char");
                 return;
             }
-            let keystroke = fullwidth_to_ascii(ch).filter(|c| ascii_to_keycode(*c).is_some());
-            if let Some(ascii) = keystroke {
-                if !ime_renders_differently(ch) || self.composing_hint {
-                    self.send_ascii_sequence(&ascii.to_string(), "Char");
-                    return;
+            // IME が変換してしまう記号は Option 修飾ストロークで正確に出す。
+            // 修飾キーは実キーの押下/解放も送る（フラグを立てるだけだと
+            // 修飾が押しっぱなしと解釈され、以降の注入が ⌥+key となって
+            // IME に無視される。Shift 側と同じ扱いに揃える）
+            if let Some((keycode, shift)) = ime_literal_keystroke(ch) {
+                self.post_key(KEYCODE_OPTION, true, false);
+                if shift {
+                    self.post_key(KEYCODE_SHIFT, true, false);
                 }
+                self.post_key_with_flags(keycode, true, shift, true);
+                self.post_key_with_flags(keycode, false, shift, true);
+                if shift {
+                    self.post_key(KEYCODE_SHIFT, false, false);
+                }
+                self.post_key(KEYCODE_OPTION, false, false);
+                log::debug!("Char: injected '{ch}' via option-modified keystroke");
+                self.composing_hint = true;
+                return;
+            }
+            if let Some(ascii) = fullwidth_to_ascii(ch).filter(|c| ascii_to_keycode(*c).is_some()) {
+                self.send_ascii_sequence(&ascii.to_string(), "Char");
+                return;
             }
             self.post_char(ch);
         }
@@ -548,6 +586,12 @@ mod imp {
 
 #[cfg(target_os = "macos")]
 pub use imp::Output;
+
+/// テストから `imp` 内のマッピング関数を参照するための橋渡し。
+#[cfg(all(test, target_os = "macos"))]
+mod imp_test {
+    pub(super) use super::imp::ime_literal_keystroke as literal;
+}
 
 /// 非 macOS ビルド用スタブ（ワークスペース全体のクロスチェック用）。
 #[cfg(not(target_os = "macos"))]
@@ -616,6 +660,16 @@ mod tests {
                 "missing JIS kana stroke for {ch:?} (base {base:?})"
             );
         }
+    }
+
+    #[test]
+    fn ime_literal_symbols_use_jis_positions() {
+        use imp_test::literal;
+        // Lacaille と同じ ⌥ 付きストローク（[ ] は JIS 位置）
+        assert_eq!(literal('／'), Some((0x2C, false)));
+        assert_eq!(literal('［'), Some((0x1E, false)));
+        assert_eq!(literal('］'), Some((0x2A, false)));
+        assert_eq!(literal('あ'), None);
     }
 
     #[test]
