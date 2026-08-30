@@ -1,6 +1,7 @@
-;NICOLA配列（未定義キーをキートップ刻印どおりにした版）
+;NICOLA配列（JIS キーボード版）
 ;http://nicola.sunicom.co.jp/spec/kikaku.htm
 ;
+;NICOLA 規格が定義しない JIS 固有キーを、キートップの刻印どおりに割り当てた版。
 ;nicola.yab との違い:
 ;  - 後(Backspace) / 逃(Escape) を割り当てていた : ] キーを、刻印どおり ： ］ に
 ;  - 数字段の未割当キー ^ ¥ を刻印どおり ＾ ￥ に
