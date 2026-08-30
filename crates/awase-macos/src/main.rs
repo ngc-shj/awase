@@ -284,6 +284,15 @@ mod app {
     /// 保留キューの上限（DoS 耐性。通常の切替待ち 500ms で溜まるのは数打鍵）
     const DEFER_CAP: usize = 128;
 
+    /// IME 切替キー（英数/かな）の送出アクションかどうか。
+    const fn is_ime_switch_action(action: &awase::types::KeyAction) -> bool {
+        matches!(
+            action,
+            awase::types::KeyAction::Key(vk) | awase::types::KeyAction::KeyUp(vk)
+                if matches!(vk.0, KEYCODE_EISU | KEYCODE_KANA)
+        )
+    }
+
     /// 前面アプリの PID を返す（保留出力の誤送出防止用）。
     fn frontmost_pid() -> Option<i32> {
         let workspace = objc2_app_kit::NSWorkspace::sharedWorkspace();
@@ -400,13 +409,19 @@ mod app {
             for effect in effects {
                 match effect {
                     Effect::Input(InputEffect::SendKeys(actions)) => {
-                        // 英数/かな の生 VK 送出は IME 切替を引き起こす。
-                        // Session 層への注入は自前 tap（HID）を通らないため、
-                        // ここで期待値を立てる（旧: tap 再入のマーカー経路で設定）
-                        for action in actions {
-                            if let awase::types::KeyAction::Key(vk) = action {
-                                self.expect_ime_from_key(vk.0);
+                        // 英数/かな の生 VK 送出は IME 切替そのものの引き金なので、
+                        // 保留してはいけない。保留すると後続の物理切替キーに
+                        // 追い越されて順序が逆転し、IME が意図と逆の状態に落ちる
+                        // （英数→かな と続けて打つと 英数 の注入が後着し、直後の
+                        // 打鍵がリテラルで漏れる事例を実測）
+                        if actions.iter().any(is_ime_switch_action) {
+                            for action in actions {
+                                if let awase::types::KeyAction::Key(vk) = action {
+                                    self.expect_ime_from_key(vk.0);
+                                }
                             }
+                            self.output.send_keys(actions);
+                            continue;
                         }
                         // IME 切替中は旧入力ソースで解釈されてしまうため保留する
                         // （既に保留がある場合も順序維持のため追記する）
