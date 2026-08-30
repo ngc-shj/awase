@@ -513,8 +513,9 @@ mod app {
         }
     }
 
-    impl App {
-        fn on_cg_event_inner(&mut self, etype: CGEventType, event: &CGEvent) -> TapAction {
+
+    impl LoopHandler for App {
+        fn on_cg_event(&mut self, etype: CGEventType, event: &CGEvent) -> TapAction {
             // 切替待ちの保留出力があれば、後続イベント処理の前に順序を保って流す
             self.maybe_flush_deferred();
 
@@ -630,23 +631,6 @@ mod app {
             if action == TapAction::Pass && is_down {
                 self.expect_ime_from_key(keycode);
             }
-            action
-        }
-    }
-
-    impl LoopHandler for App {
-        fn on_cg_event(
-            &mut self,
-            proxy: core_graphics::event::CGEventTapProxy,
-            etype: CGEventType,
-            event: &CGEvent,
-        ) -> TapAction {
-            // コールバック中は tap 位置への直接挿入（post_from_tap）を使う。
-            // CGEventPost は物理入力との合流でストロークが失われることがある
-            // （Lacaille が安定しているのはこの経路のため）
-            self.output.set_tap_proxy(Some(proxy));
-            let action = self.on_cg_event_inner(etype, event);
-            self.output.set_tap_proxy(None);
             action
         }
 

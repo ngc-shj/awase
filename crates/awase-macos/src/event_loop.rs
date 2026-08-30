@@ -51,15 +51,7 @@ mod imp {
     /// 再入は起きない。
     pub trait LoopHandler {
         /// KeyDown / KeyUp / FlagsChanged イベント。
-        ///
-        /// `proxy` はこの tap の位置へイベントを直接挿入する
-        /// `CGEventTapPostEvent` 用（コールバック中のみ有効）。
-        fn on_cg_event(
-            &mut self,
-            proxy: core_graphics::event::CGEventTapProxy,
-            etype: CGEventType,
-            event: &CGEvent,
-        ) -> TapAction;
+        fn on_cg_event(&mut self, etype: CGEventType, event: &CGEvent) -> TapAction;
         /// `Timers::set` で設定したワンショットタイマーの発火。
         fn on_timer_fired(&mut self, id: usize);
         /// メニューバー操作（`dispatch_menu_action` 経由）。
@@ -218,11 +210,8 @@ mod imp {
         ) -> Result<()> {
             HANDLER.with(|h| *h.borrow_mut() = Some(handler));
 
-            // Session 層に張る。HID 層だと `post_from_tap` の挿入が HID→Session の
-            // 合流機構を通ることになり、高速打鍵時にストロークが失われる
-            // （き の欠落を実測）。Session 層 tap からの挿入は合流点の後に入る
             let tap = CGEventTap::new(
-                CGEventTapLocation::Session,
+                CGEventTapLocation::HID,
                 CGEventTapPlacement::HeadInsertEventTap,
                 CGEventTapOptions::Default,
                 vec![
@@ -235,8 +224,8 @@ mod imp {
                     CGEventType::RightMouseDown,
                     CGEventType::OtherMouseDown,
                 ],
-                |proxy, etype, event| {
-                    Self::tap_callback(proxy, etype, event);
+                |_proxy, etype, event| {
+                    Self::tap_callback(etype, event);
                     // None = （必要なら Null 化済みの）元イベントをそのまま返す
                     None
                 },
@@ -294,11 +283,7 @@ mod imp {
             Ok(())
         }
 
-        fn tap_callback(
-            proxy: core_graphics::event::CGEventTapProxy,
-            etype: CGEventType,
-            event: &CGEvent,
-        ) {
+        fn tap_callback(etype: CGEventType, event: &CGEvent) {
             // OS はタイムアウトや大量入力で tap を自動無効化することがある。
             // 検知したら再有効化する（イベント自体は触らない）。
             if matches!(
@@ -316,7 +301,7 @@ mod imp {
 
             let handler = HANDLER.with(|h| h.borrow().clone());
             let Some(handler) = handler else { return };
-            let action = handler.borrow_mut().on_cg_event(proxy, etype, event);
+            let action = handler.borrow_mut().on_cg_event(etype, event);
             if action == TapAction::Consume {
                 // core-graphics 0.24 の tap ラッパーは NULL 返却（=イベント破棄）を
                 // 表現できないため、型を Null に書き換えて無効化する。

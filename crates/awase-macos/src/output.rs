@@ -247,9 +247,7 @@ pub const fn jis_kana_keycode(ch: char) -> Option<(u16, bool)> {
 mod imp {
     use awase::kana_table::KanaTable;
     use awase::types::{KeyAction, KeyEventType, SpecialKey, VkCode};
-    use core_graphics::event::{
-        CGEvent, CGEventFlags, CGEventTapLocation, CGEventTapProxy, EventField,
-    };
+    use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, EventField};
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
     use log::warn;
 
@@ -303,48 +301,7 @@ mod imp {
         }
     }
 
-    /// 注入ワーカーへ渡すイベント仕様。
-    ///
-    /// CGEvent の構築と post はワーカースレッドが行う（`CGEventSource` は
-    /// ワーカーが専有）。
-    enum Spec {
-        Key {
-            keycode: u16,
-            down: bool,
-            shift: bool,
-        },
-        /// Unicode 直接注入（keycode 0 + 文字列ペイロードの KeyDown）
-        CharDown(char),
-        /// `CharDown` に対応する KeyUp
-        CharUp,
-    }
-
-    /// 注入イベント間の待機。
-    ///
-    /// 間隔ゼロで連射すると**バースト先頭のキーストロークが失われる**
-    /// （`ku`→k・`ne`→n・`to`→t・`lyo`→l の欠落を実測。Session 化・実タイム
-    /// スタンプ・suppression 無効化でも解消せず）。CGEventPost 系ツールの
-    /// 既知の弱点で、espanso 等と同様にペーシングで回避する。
-    const INJECT_GAP: std::time::Duration = std::time::Duration::from_millis(2);
-
-    /// CGEventPost によるキー出力。
-    ///
-    /// 注入イベントはすべて `INJECT_MARKER` 付きで、専用ワーカースレッドから
-    /// `INJECT_GAP` の間隔を空けて Session タップ位置に post する（tap
-    /// コールバックをブロックせずにペーシングするため）。キーストロークは
-    /// IME を含む通常の入力パイプラインを通る。
     pub struct Output {
-        tx: std::sync::mpsc::Sender<Spec>,
-        /// tap コールバック内でのみ Some になる `CGEventTapProxy`。
-        ///
-        /// Some の間は `CGEventTapPostEvent`（`post_from_tap`）で**自 tap の
-        /// 位置へ直接挿入**する。CGEventPost（HID/Session どちらでも）は物理
-        /// 入力との合流でストロークが失われることがある（同一環境の Lacaille
-        /// で問題が出ないのはこの経路を使っているため）。タイマー駆動など
-        /// コールバック外の出力のみワーカー経由の CGEventPost にフォール
-        /// バックする。
-        tap_proxy: std::cell::Cell<Option<CGEventTapProxy>>,
-        /// proxy 経由送出用のイベントソース（メイン thread 専有）
         source: CGEventSource,
         /// 出力方式（romaji: ローマ字逆引き / kana: JIS かなストローク）
         style: OutputStyle,
@@ -369,79 +326,6 @@ mod imp {
     }
 
     /// `Spec` から CGEvent を構築する（失敗時は警告して None）。
-    fn build_event(source: &CGEventSource, spec: &Spec) -> Option<CGEvent> {
-        match *spec {
-            Spec::Key {
-                keycode,
-                down,
-                shift,
-            } => {
-                let event = CGEvent::new_keyboard_event(source.clone(), keycode, down)
-                    .map_err(|()| {
-                        warn!("Failed to create keyboard event (keycode=0x{keycode:02X})");
-                    })
-                    .ok()?;
-                if shift {
-                    event.set_flags(CGEventFlags::CGEventFlagShift);
-                }
-                Some(event)
-            }
-            Spec::CharDown(ch) => {
-                let event = CGEvent::new_keyboard_event(source.clone(), 0, true)
-                    .map_err(|()| warn!("Failed to create keyboard event for Char('{ch}')"))
-                    .ok()?;
-                event.set_string(&ch.to_string());
-                Some(event)
-            }
-            Spec::CharUp => CGEvent::new_keyboard_event(source.clone(), 0, false).ok(),
-        }
-    }
-
-    /// 注入イベントへ実時刻を付与する（timestamp=0 のまま送ると
-    /// 時刻整合処理で捨てられる余地がある）。
-    fn stamp_now(event: &CGEvent) {
-        #[allow(unsafe_code)] // CGEvent の未バインド API 呼び出しに必要
-        unsafe {
-            use foreign_types::ForeignType;
-            extern "C" {
-                fn CGEventSetTimestamp(event: *mut core_graphics::sys::CGEvent, timestamp: u64);
-                fn mach_absolute_time() -> u64;
-            }
-            CGEventSetTimestamp(event.as_ptr(), mach_absolute_time());
-        }
-    }
-
-    /// ワーカースレッド: `Spec` を受け取り、ペーシングしながら post する。
-    fn injection_worker(rx: &std::sync::mpsc::Receiver<Spec>) {
-        let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
-            log::error!("injection worker: failed to create CGEventSource");
-            return;
-        };
-        // 合成イベント送出後、同ソース外のイベントを短時間抑制するレガシー動作
-        // （既定 ~250ms）を無効化する
-        #[allow(unsafe_code)] // CGEventSource の未バインド API 呼び出し
-        unsafe {
-            use foreign_types::ForeignType;
-            extern "C" {
-                fn CGEventSourceSetLocalEventsSuppressionInterval(
-                    source: *mut core_graphics::sys::CGEventSource,
-                    seconds: f64,
-                );
-            }
-            CGEventSourceSetLocalEventsSuppressionInterval(source.as_ptr(), 0.0);
-        }
-
-        while let Ok(spec) = rx.recv() {
-            let Some(event) = build_event(&source, &spec) else {
-                continue;
-            };
-            event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, INJECT_MARKER);
-            stamp_now(&event);
-            event.post(CGEventTapLocation::Session);
-            std::thread::sleep(INJECT_GAP);
-        }
-    }
-
     impl Output {
         /// 注入ワーカースレッドを起動する。
         ///
@@ -449,42 +333,15 @@ mod imp {
         ///
         /// ワーカースレッドの spawn に失敗した場合。
         pub fn new(style: OutputStyle) -> anyhow::Result<Self> {
-            let (tx, rx) = std::sync::mpsc::channel::<Spec>();
-            std::thread::Builder::new()
-                .name("awase-inject".to_string())
-                .spawn(move || injection_worker(&rx))
-                .map_err(|e| anyhow::anyhow!("Failed to spawn injection worker: {e}"))?;
             let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
                 .map_err(|()| anyhow::anyhow!("Failed to create CGEventSource"))?;
             log::info!("Output style: {style:?}");
             Ok(Self {
-                tx,
-                tap_proxy: std::cell::Cell::new(None),
                 source,
                 style,
                 kana: KanaTable::build(),
                 composing_hint: false,
             })
-        }
-
-        /// tap コールバックの入口/出口で App から呼ばれる。
-        pub fn set_tap_proxy(&self, proxy: Option<CGEventTapProxy>) {
-            self.tap_proxy.set(proxy);
-        }
-
-        /// `Spec` を送出する。tap コールバック中は自 tap の位置へ直接挿入し、
-        /// それ以外はワーカー経由の CGEventPost にフォールバックする。
-        fn dispatch(&self, spec: Spec) {
-            if let Some(proxy) = self.tap_proxy.get() {
-                if let Some(event) = build_event(&self.source, &spec) {
-                    event
-                        .set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, INJECT_MARKER);
-                    stamp_now(&event);
-                    event.post_from_tap(proxy);
-                }
-            } else {
-                let _ = self.tx.send(spec);
-            }
         }
 
         /// かな 1 文字を JIS かな配列のキーストロークとして送出する。
@@ -523,13 +380,18 @@ mod imp {
             self.composing_hint = false;
         }
 
-        /// 単一のキーイベントを送出する。
+        /// 単一のキーイベントを post する（tap コールバック内で同期実行）。
         fn post_key(&self, keycode: u16, down: bool, shift: bool) {
-            self.dispatch(Spec::Key {
-                keycode,
-                down,
-                shift,
-            });
+            let Ok(event) = CGEvent::new_keyboard_event(self.source.clone(), keycode, down)
+            else {
+                warn!("Failed to create keyboard event (keycode=0x{keycode:02X})");
+                return;
+            };
+            if shift {
+                event.set_flags(CGEventFlags::CGEventFlagShift);
+            }
+            event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, INJECT_MARKER);
+            event.post(CGEventTapLocation::HID);
         }
 
         /// キーを押して離す。
@@ -543,8 +405,18 @@ mod imp {
         /// キーコードに依存しないため任意のかな文字を出力できるが、
         /// IME のかな漢字変換は経由しない（Unicode 直接注入モード用）。
         fn post_char(&self, ch: char) {
-            self.dispatch(Spec::CharDown(ch));
-            self.dispatch(Spec::CharUp);
+            let Ok(event) = CGEvent::new_keyboard_event(self.source.clone(), 0, true) else {
+                warn!("Failed to create keyboard event for Char('{ch}')");
+                return;
+            };
+            event.set_string(&ch.to_string());
+            event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, INJECT_MARKER);
+            event.post(CGEventTapLocation::HID);
+            // 対応する KeyUp（文字列ペイロードなし）
+            if let Ok(up) = CGEvent::new_keyboard_event(self.source.clone(), 0, false) {
+                up.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, INJECT_MARKER);
+                up.post(CGEventTapLocation::HID);
+            }
         }
 
         /// ASCII 文字列をキーストロークとして送出する（IME に変換させる用途）。
