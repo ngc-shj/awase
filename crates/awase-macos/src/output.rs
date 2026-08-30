@@ -98,7 +98,7 @@ pub const fn ascii_to_keycode(ch: char) -> Option<(u16, bool)> {
         '@' => Some((0x21, false)), // kVK_ANSI_LeftBracket (JIS: @)
         ';' => Some((0x29, false)), // kVK_ANSI_Semicolon (JIS: ;)
         ':' => Some((0x27, false)), // kVK_ANSI_Quote (JIS: :)
-        '_' => Some((0x5D, true)),  // Shift+ろ (kVK_JIS_Underscore)
+        '_' => Some((0x5E, true)),  // Shift+ろ (kVK_JIS_Underscore = 0x5E)
         '"' => Some((0x13, true)),  // Shift+2 (JIS)
         '#' => Some((0x14, true)),  // Shift+3
         '$' => Some((0x15, true)),  // Shift+4
@@ -110,8 +110,8 @@ pub const fn ascii_to_keycode(ch: char) -> Option<(u16, bool)> {
         '*' => Some((0x27, true)),  // Shift+: (JIS)
         '<' => Some((0x2B, true)),  // Shift+,
         '>' => Some((0x2F, true)),  // Shift+.
-        '|' => Some((0x5E, true)),  // Shift+¥ (JIS)
-        '\\' => Some((0x5E, false)), // kVK_JIS_Yen（JIS では ¥、IME 経由で ￥/＼）
+        '|' => Some((0x5D, true)),  // Shift+¥ (kVK_JIS_Yen = 0x5D)
+        '\\' => Some((0x5D, false)), // kVK_JIS_Yen（JIS では ¥、IME 経由で ￥/＼）
         _ => None,
     }
 }
@@ -184,7 +184,7 @@ pub const fn jis_kana_keycode(ch: char) -> Option<(u16, bool)> {
         'わ' => (0x1D, false), // 0
         'ほ' => (0x1B, false), // -
         'へ' => (0x18, false), // ^
-        'ー' => (0x5E, false), // ¥
+        'ー' => (0x5D, false), // ¥ (kVK_JIS_Yen)
         'ぁ' => (0x14, true),
         'ぅ' => (0x15, true),
         'ぇ' => (0x17, true),
@@ -233,7 +233,7 @@ pub const fn jis_kana_keycode(ch: char) -> Option<(u16, bool)> {
         'ね' => (0x2B, false), // ,
         'る' => (0x2F, false), // .
         'め' => (0x2C, false), // /
-        'ろ' => (0x5D, false), // ろ
+        'ろ' => (0x5E, false), // ろ (kVK_JIS_Underscore)
         'っ' => (0x06, true),
         '、' => (0x2B, true),
         '。' => (0x2F, true),
@@ -457,10 +457,12 @@ mod imp {
                 if self.send_kana_strokes(ch) {
                     return;
                 }
-                // かなストロークで表現できない文字（数字・英字・記号）は直接注入。
-                // かな入力モードでは ASCII キーストロークがかなに化けるため
-                // ローマ字用のキーストロークフォールバックは使えない
-                self.post_char(ch);
+                // かなストロークで表現できない文字（数字段・小指シフト面の
+                // 英数記号）は直接注入する。かな入力モードでは ASCII
+                // キーストロークがかなに化けるため、ローマ字用のフォールバックは
+                // 使えない。全角リテラル（Ａ１？等）は半角にしてから注入する
+                // ——「Ｓｈｉｆｔ＋キーが全角で確定する」のを避けるため
+                self.post_char(fullwidth_to_ascii(ch).unwrap_or(ch));
                 return;
             }
             if let Some(romaji) = self.kana.romaji_for_kana(ch) {
@@ -592,6 +594,16 @@ mod tests {
                 "missing JIS kana stroke for {ch:?} (base {base:?})"
             );
         }
+    }
+
+    #[test]
+    fn jis_yen_and_underscore_keycodes_match_carbon() {
+        // kVK_JIS_Yen = 0x5D / kVK_JIS_Underscore = 0x5E（Events.h）。
+        // 実装当初これが逆で、長音記号（ー）が出力されなかった
+        assert_eq!(jis_kana_keycode('ー'), Some((0x5D, false)));
+        assert_eq!(jis_kana_keycode('ろ'), Some((0x5E, false)));
+        assert_eq!(ascii_to_keycode('\\'), Some((0x5D, false)));
+        assert_eq!(ascii_to_keycode('_'), Some((0x5E, true)));
     }
 
     #[test]

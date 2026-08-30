@@ -25,7 +25,7 @@ pub const fn keycode_to_pos(keycode: u16) -> Option<PhysicalPos> {
         0x1D => (0, 9),  // kVK_ANSI_0
         0x1B => (0, 10), // kVK_ANSI_Minus
         0x18 => (0, 11), // kVK_ANSI_Equal (JIS: ^)
-        0x5E => (0, 12), // kVK_JIS_Yen (¥)
+        0x5D => (0, 12), // kVK_JIS_Yen (¥)
 
         // Row 1: Q row
         0x0C => (1, 0),  // kVK_ANSI_Q
@@ -66,7 +66,7 @@ pub const fn keycode_to_pos(keycode: u16) -> Option<PhysicalPos> {
         0x2B => (3, 7),  // kVK_ANSI_Comma
         0x2F => (3, 8),  // kVK_ANSI_Period
         0x2C => (3, 9),  // kVK_ANSI_Slash
-        0x5D => (3, 10), // kVK_JIS_Underscore (_)
+        0x5E => (3, 10), // kVK_JIS_Underscore (_)
 
         _ => return None,
     };
