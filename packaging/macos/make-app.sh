@@ -17,12 +17,15 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp packaging/macos/Info.plist "$APP/Contents/Info.plist"
 cp target/release/awase "$APP/Contents/MacOS/awase"
 
-# Prefer a user-edited config.toml; fall back to the sample.
-if [[ -f config.toml ]]; then
-  cp config.toml "$APP/Contents/Resources/config.toml"
-else
-  cp config.sample.toml "$APP/Contents/Resources/config.toml"
-fi
+# Personal settings live in config.local.toml (gitignored) so the repo's
+# config.toml — which core tests read — stays pristine.
+for candidate in config.local.toml config.toml config.sample.toml; do
+  if [[ -f $candidate ]]; then
+    echo "Using $candidate"
+    cp "$candidate" "$APP/Contents/Resources/config.toml"
+    break
+  fi
+done
 cp -R layout "$APP/Contents/Resources/layout"
 
 # Sign the bundle. Ad-hoc ("-") works but its identity changes on every

@@ -26,3 +26,6 @@ mutants.out/
 services/report-worker/node_modules/
 services/report-worker/.wrangler/
 dist/
+
+# 個人設定（bundle には config.local.toml が優先して取り込まれる）
+config.local.toml
