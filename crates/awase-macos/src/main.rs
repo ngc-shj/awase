@@ -702,6 +702,10 @@ mod app {
                     // メニュー操作にも「現在のイベント」は無い
                     let _ = self.apply_decision(decision);
                 }
+                MenuAction::ToggleLoginItem => {
+                    let _ = awase_macos::login_item::toggle();
+                    self.tray.sync_login_item();
+                }
             }
         }
 

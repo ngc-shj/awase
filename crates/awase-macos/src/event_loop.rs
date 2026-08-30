@@ -42,6 +42,8 @@ mod imp {
     pub enum MenuAction {
         /// NICOLA エンジンの有効/無効を切り替える
         ToggleEngine,
+        /// ログイン時に起動するかを切り替える
+        ToggleLoginItem,
     }
 
     /// イベントループから駆動されるハンドラ。

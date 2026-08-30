@@ -6,6 +6,7 @@
 pub mod event_loop;
 pub mod hook;
 pub mod ime;
+pub mod login_item;
 pub mod output;
 pub mod scanmap;
 pub mod tray;

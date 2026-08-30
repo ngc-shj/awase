@@ -37,6 +37,11 @@ mod imp {
             fn toggle_engine(&self, _sender: Option<&AnyObject>) {
                 dispatch_menu_action(MenuAction::ToggleEngine);
             }
+
+            #[unsafe(method(toggleLoginItem:))]
+            fn toggle_login_item(&self, _sender: Option<&AnyObject>) {
+                dispatch_menu_action(MenuAction::ToggleLoginItem);
+            }
         }
     );
 
@@ -54,6 +59,7 @@ mod imp {
         status_item: Retained<NSStatusItem>,
         toggle_item: Retained<NSMenuItem>,
         layout_item: Retained<NSMenuItem>,
+        login_item: Retained<NSMenuItem>,
         /// NSMenuItem.target は弱参照のため、所有権を保持して生存させる
         _target: Retained<TrayTarget>,
         enabled: bool,
@@ -108,6 +114,18 @@ mod imp {
             layout_item.setEnabled(false);
             menu.addItem(&layout_item);
 
+            // ログイン時に起動（SMAppService。.app バンドル起動時のみ有効）
+            let login_item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    ns_string!("ログイン時に起動"),
+                    Some(sel!(toggleLoginItem:)),
+                    ns_string!(""),
+                )
+            };
+            unsafe { login_item.setTarget(Some(&target)) };
+            menu.addItem(&login_item);
+
             menu.addItem(&NSMenuItem::separatorItem(mtm));
 
             // 終了（NSApplication terminate:）
@@ -129,10 +147,12 @@ mod imp {
                 status_item,
                 toggle_item,
                 layout_item,
+                login_item,
                 _target: target,
                 enabled: true,
             };
             tray.sync_ui();
+            tray.sync_login_item();
             tray
         }
 
@@ -154,6 +174,20 @@ mod imp {
             } else {
                 NSControlStateValueOff
             });
+        }
+
+        /// ログイン項目メニューのチェック状態と有効/無効を実状態に合わせる。
+        pub fn sync_login_item(&self) {
+            use crate::login_item::LoginItemState;
+            let state = crate::login_item::state();
+            self.login_item.setState(if state == LoginItemState::Enabled {
+                NSControlStateValueOn
+            } else {
+                NSControlStateValueOff
+            });
+            // バンドル外実行（開発時）では登録できないのでグレーアウトする
+            self.login_item
+                .setEnabled(state != LoginItemState::Unavailable);
         }
 
         pub fn set_enabled(&mut self, enabled: bool) {
@@ -211,6 +245,8 @@ impl SystemTray {
     pub fn set_layout_name(&self, name: &str) {
         log::info!("Tray: layout = {name}");
     }
+
+    pub fn sync_login_item(&self) {}
 }
 
 #[cfg(not(target_os = "macos"))]
