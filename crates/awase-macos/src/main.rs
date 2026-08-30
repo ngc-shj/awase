@@ -525,12 +525,19 @@ mod app {
         /// 入力ソース切替は非同期のため、TIS 観測が追いつく前の打鍵が
         /// 旧状態で判定される（英字モード→かな→即 k で k が素通りする）
         /// のを防ぐ。
-        fn expect_ime_from_key(&self, keycode: u16) {
+        ///
+        /// 期待値を立てた直後に activation の再評価も走らせる。ポーリング
+        /// （既定 500ms）任せだと、切替後に打鍵を止めた場合にトレイ表示が
+        /// 最大 0.5 秒古いまま残るため。
+        fn expect_ime_from_key(&mut self, keycode: u16) {
             match keycode {
                 KEYCODE_EISU => self.ime.expect_ime_on(false),
                 KEYCODE_KANA => self.ime.expect_ime_on(true),
-                _ => {}
+                _ => return,
             }
+            let ctx = self.make_ctx();
+            let decision = self.engine.on_command(EngineCommand::RefreshState, &ctx);
+            let _ = self.apply_decision(decision);
         }
 
         /// FlagsChanged イベントから修飾キーの押下/解放を求める。
