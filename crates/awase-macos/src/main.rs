@@ -112,7 +112,11 @@ fn parse_symbol_romaji(
 
 fn main() -> Result<()> {
     // 1. Initialize logging
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // ms 精度: IME 切替の settle 窓（数十 ms）と打鍵の前後関係を読むには
+    // 既定の秒精度では足りない（BUG-101 の調査で判明）
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_millis()
+        .init();
 
     log::info!("awase-macos starting");
 
@@ -308,8 +312,14 @@ mod app {
     const FLUSH_TIMER_ID: usize = usize::MAX;
     /// フラッシュ再確認の間隔
     const FLUSH_RETRY: std::time::Duration = std::time::Duration::from_millis(20);
-    /// 保留キューの上限（DoS 耐性。通常の切替待ち 500ms で溜まるのは数打鍵）
+    /// 保留キューの上限（DoS 耐性。通常の切替待ちで溜まるのは数打鍵）
     const DEFER_CAP: usize = 128;
+    /// 観測されない切替を `TISSelectInputSource` で張り直す上限回数。
+    ///
+    /// 実測では張り直しは毎回 ~20ms で成功しているので 1 回で足りるが、
+    /// `EXPECTATION_GRACE` を実測最大 +59ms まで詰めた分、期限の空振りが
+    /// キュー破棄（＝入力消失）に直結しないよう 2 回まで許す（BUG-101）。
+    const MAX_SWITCH_REASSERTS: u8 = 2;
 
     /// IME 切替キー（英数/かな）の送出アクションかどうか。
     const fn is_ime_switch_action(action: &awase::types::KeyAction) -> bool {
@@ -360,6 +370,14 @@ mod app {
         /// 入力文字や Backspace が別アプリへ送出されてしまうため
         /// （2026-08-29 セキュリティレビュー第3回指摘1）。
         deferred_focus_pid: Option<i32>,
+        /// 保留を始めた時点で待っていた IME 状態。`is_switch_pending` は
+        /// 「切替が完了した」と「猶予切れで諦めた」を区別しないため、
+        /// フラッシュ直前に観測がこれと一致するかを確かめる（BUG-101）。
+        deferred_expect_on: Option<bool>,
+        /// 保留を始めた時刻（フラッシュまでの実待ち時間をログに残す）
+        deferred_since: Option<Instant>,
+        /// 観測されない切替を `TISSelectInputSource` で張り直した回数
+        deferred_switch_reasserts: u8,
     }
 
     impl App {
@@ -375,6 +393,9 @@ mod app {
                 right_thumb_down: None,
                 deferred_keys: Vec::new(),
                 deferred_focus_pid: None,
+                deferred_expect_on: None,
+                deferred_since: None,
+                deferred_switch_reasserts: 0,
             };
             // トレイ表示を実際の activation 状態に合わせる。既定値のままだと
             // 起動時に IME が OFF でも「あ」と出る（状態が変化しないため
@@ -393,8 +414,36 @@ mod app {
             if self.deferred_keys.is_empty() || self.ime.is_switch_pending() {
                 return;
             }
+            // 猶予切れで期待を諦めた場合も is_switch_pending は false になる。
+            // 観測が期待に届いていなければ IME は旧入力ソースのままで、ここで
+            // 送出するとローマ字がリテラルで漏れる（「きょう」→ "kilyou"）。
+            // 実測では物理「かな」キーを ATOK が取りこぼす（英数 切替の完了前に
+            // かな を打つと落ちる）ケースが主因で、`TISSelectInputSource` での
+            // 張り直しは ~20ms で必ず成功していた。上限まで張り直して待ち直し、
+            // それでも駄目なら破棄する
+            if let Some(expected) = self.deferred_expect_on {
+                if self.ime.is_ime_on() != Some(expected) {
+                    if self.deferred_switch_reasserts < MAX_SWITCH_REASSERTS
+                        && self.ime.set_ime_on(expected)
+                    {
+                        self.deferred_switch_reasserts += 1;
+                        log::warn!(
+                            "IME switch to open={expected} not observed; re-asserting it and \
+                             holding {} deferred key action(s)",
+                            self.deferred_keys.len()
+                        );
+                        self.timers.set(FLUSH_TIMER_ID, FLUSH_RETRY);
+                        return;
+                    }
+                    self.discard_deferred("IME switch to the expected state never took effect");
+                    return;
+                }
+            }
             let keys = std::mem::take(&mut self.deferred_keys);
             let expected_pid = self.deferred_focus_pid.take();
+            let held = self.deferred_since.take().map(|since| since.elapsed());
+            self.deferred_expect_on = None;
+            self.deferred_switch_reasserts = 0;
             let same_focus = matches!(
                 (expected_pid, frontmost_pid()),
                 (Some(expected), Some(current)) if expected == current
@@ -407,9 +456,12 @@ mod app {
                 );
                 return;
             }
+            // settle 定数の実測用（BUG-101）。保留開始から実際に送出するまでの
+            // 実待ち時間を残す
             log::debug!(
-                "Flushing {} deferred key action(s) after IME switch",
-                keys.len()
+                "Flushing {} deferred key action(s) {}ms after the switch was expected",
+                keys.len(),
+                held.unwrap_or_default().as_millis(),
             );
             self.output.send_keys(&keys);
         }
@@ -424,6 +476,9 @@ mod app {
                 self.deferred_keys.clear();
             }
             self.deferred_focus_pid = None;
+            self.deferred_expect_on = None;
+            self.deferred_since = None;
+            self.deferred_switch_reasserts = 0;
         }
 
         fn make_ctx(&self) -> InputContext {
@@ -464,6 +519,8 @@ mod app {
                         if self.ime.is_switch_pending() || !self.deferred_keys.is_empty() {
                             if self.deferred_keys.is_empty() {
                                 self.deferred_focus_pid = frontmost_pid();
+                                self.deferred_expect_on = self.ime.pending_open();
+                                self.deferred_since = Some(Instant::now());
                             }
                             if self.deferred_keys.len() + actions.len() > DEFER_CAP {
                                 log::warn!(
@@ -475,6 +532,15 @@ mod app {
                             }
                             self.timers.set(FLUSH_TIMER_ID, FLUSH_RETRY);
                         } else {
+                            // settle を実測で詰めるため、切替からの経過を残す
+                            // （消えた／化けた打鍵がここの何 ms かを突き合わせる）
+                            if let Some(since) = self.ime.since_switch_confirmed() {
+                                log::debug!(
+                                    "sending {} action(s) {}ms after the switch settled",
+                                    actions.len(),
+                                    since.as_millis(),
+                                );
+                            }
                             self.output.send_keys(actions);
                         }
                     }

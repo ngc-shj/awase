@@ -12060,3 +12060,106 @@ x86_64-pc-windows-msvc` によるコンパイル確認、および CI `windows-b
 
 **関連ファイル:** `crates/awase-windows/src/hook.rs`,
 `crates/awase-windows/src/state/key_remap.rs`。関連: ADR-110, BUG-48, BUG-78。
+
+## BUG-101: macOS で IME OFF→ON 直後の入力がまれにローマ字リテラルになる（「今日」→ `kilyou`）
+
+**採番根拠:** `docs/known-bugs.md`（本ブランチ `macos-port` と `origin/develop`
+の両方）を `BUG-[0-9]+` で走査し、作業時点の最大番号が BUG-100 であることを
+確認した上で BUG-101 とした。
+
+**症状:** macOS 版（`macos_output_style = "romaji"`、ATOK）で IME を OFF→ON に
+切り替えた直後に打鍵すると、**まれに** かな漢字変換されず注入したローマ字が
+そのまま出る。「今日」（きょう）なら `ki` + `lyo` + `u` が連結して `kilyou` に
+なる。3 文字ぶんまとめて化けるのが典型で、部分的に化けることもありうる。
+
+**再現条件:** IME を英数（`…Roman` / `…Eiji`）にしてから かな へ切り替え、
+切替の直後に速く打鍵する。切替から最初の打鍵までの間隔が短いほど当たりやすい。
+
+**真因:** 切替直後の出力保留（`crates/awase-macos/src/main.rs` の
+`deferred_keys` / `maybe_flush_deferred`）が `ImeDetector::is_switch_pending()`
+だけを条件にしており、そこに 2 つの穴があった。
+
+1. **観測 = アプリ側の準備完了ではない。** `is_ime_on()` は
+   `TISCopyCurrentKeyboardInputSource` が新しい入力ソースを返した瞬間に期待値を
+   解除していた。TIS はプロセス横断のグローバル状態で、フォアグラウンドアプリの
+   テキスト入力コンテキストが新入力ソースへ差し替わるより先に切替済みを報告する。
+   この隙間に保留を解いて注入すると、ローマ字が旧入力ソース（英数）で解釈されて
+   リテラル化する。窓が数十 ms のため「まれに」だが、速く打つほど当たる。
+2. **猶予切れで fail-open していた。** `EXPECTATION_GRACE`（500ms）を超えると、
+   切替が観測できていなくても期待値が解除される。`is_switch_pending()` は
+   「切替が完了した」と「諦めた」を区別しないため、IME が OFF のままと分かって
+   いる状態で保留キューを送出していた。溜まった打鍵が一括でリテラル化する。
+
+**修正:** `crates/awase-macos/src/ime.rs`
+
+- 切替期待を `SwitchExpectation`（`expected` / `started` / `confirmed`）に
+  切り出し、`resolve()` を TIS 観測から独立した純粋関数にした。観測が期待と
+  一致しても即解除せず、`OBSERVATION_SETTLE` の間は `Settling` を返して保留を
+  継続する（穴1）。猶予切れは `Clear` を返すが期待値へは倒さず生の観測を返す
+  ので、呼び出し側が失敗を検出できる（穴2）。
+- `pending_open()` を追加。
+
+`crates/awase-macos/src/main.rs`
+
+- 保留開始時の期待状態を `deferred_expect_on` に記録し、フラッシュ直前に
+  `is_ime_on()` がそれと一致するかを確認する。一致しなければ
+  `TISSelectInputSource` で切替を **1 回だけ** 張り直して待ち直し
+  （`deferred_switch_reasserted`）、それでも駄目ならキューを破棄する。
+  リテラルを撒くより破棄の方が害が小さい（フォーカス変更時の既存方針と同じ）。
+
+**実測（2026-09-02、ATOK atok36、英数⇄かな 往復 計 102 回、`RUST_LOG=debug`）:**
+「かな」キー送出から TIS が新入力ソースを報告するまで p50 ~60ms / p90 ~160ms /
+**max 208ms**（期待を立てた時点で既に一致していた 0ms のケースを除く）。2 回の
+計測で max は 191ms → 208ms と伸びており、分布に裾がある。OFF 側は max 122ms。
+これを根拠に `EXPECTATION_GRACE` を 500ms → **300ms**（実測最大 208ms +
+マージン 92ms）へ短縮した。
+
+途中 250ms でも計測している（実測最大 191ms + マージン 59ms のつもりだった）。
+250ms でも誤爆（正当に遅い切替を失敗と誤判定）は観測されなかったが、その計測で
+max が 208ms まで伸びてマージンが 42ms に縮んだため 300ms を採った。
+切替失敗時の停止は 500ms 版が実測 390/483/543/551ms、250ms 版が 328ms、
+300ms 版は ~380ms が上限の見込み。
+
+同じ計測で判明した重要な事実として、**500ms 超過したケースは「遅い切替」では
+なく「切替そのものの取りこぼし」だった**。物理「かな」キーが ATOK に届いても
+入力ソースが変わらず、直後の `TISSelectInputSource` による張り直しは 4 回とも
+~20ms で成功している。直前の 英数 切替（実測 99ms）が完了する前に かな を
+打つと ATOK が落とすものと見られる。off→on を速く往復する使い方で出るため、
+元の報告「まれに」と符合する。したがって `EXPECTATION_GRACE` は待ち時間である
+と同時に**失敗検出の期限**であり、長すぎると張り直しが遅れて体感 0.5 秒の停止に
+なる（実測でフラッシュが 390 / 483 / 543 / 551ms までずれた）。値を上げる方向へ
+動かす場合はこの副作用を必ず併せて見ること。
+
+`MAX_SWITCH_REASSERTS = 2`: 実測では張り直しは 1 回で足りているが、
+`EXPECTATION_GRACE` を実測最大 +59ms まで詰めた分、期限の空振りがキュー破棄
+（＝入力消失）に直結しないよう 2 回まで許す。
+
+**`OBSERVATION_SETTLE = 50ms` は直接の実測ではない。** TIS 観測の後にアプリ側の
+入力コンテキストがいつ繋がるかを問い合わせる API が無く、「リテラルが出なく
+なったか」でしか検証できないため。2026-09-02 の計測（英数⇄かな 往復 計 102 回、
+ATOK atok36）で **リテラル出力ゼロ** を確認しており、間接的な裏付けはある。
+再発したらまずこの値を疑うこと。実測用に `RUST_LOG=debug` で 2 本のログを出す:
+
+- `IME switch observed: open=… after Nms, holding output Mms for settle`
+  — 切替キー送出から TIS が新入力ソースを報告するまでの実時間
+- `Flushing N deferred key action(s) Mms after the switch was expected`
+  — 保留開始から実際に送出するまでの実待ち時間
+
+再発する場合はこの 2 本の ms を添えて値を見直すこと。同じ「待ちが足りないから
+増やす」の盲目的エスカレーションにしないため、値を上げる前に「保留の起点
+（`expect_ime_on` を張る位置）がずれていないか」を先に疑う。
+
+**テスト:** `crates/awase-macos/src/ime.rs` の `imp::tests` に
+`expectation_keeps_holding_output_through_the_settle_window`（本バグの回帰）、
+`expectation_clears_once_the_settle_window_elapses`、
+`settle_window_starts_at_the_observation_not_the_expectation`、
+`expectation_gives_up_after_the_grace_without_any_observation` を追加。
+`resolve()` を「観測が一致した瞬間に `Clear`」へ戻す変異で 3 本が落ちることを
+確認済み。`main.rs` 側のフラッシュ判定は `CGEventTap`／`NSWorkspace` を伴うため
+ユニットテストできず、本エントリと実機確認に委ねる。
+
+**修正履歴:** `macos-port` ブランチで実装（本エントリ記録と同一コミット）。
+
+**関連ファイル:** `crates/awase-macos/src/ime.rs`,
+`crates/awase-macos/src/main.rs`。
+

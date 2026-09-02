@@ -21,6 +21,7 @@ mod imp {
     use core_foundation::string::{CFString, CFStringRef};
     use std::ffi::c_void;
     use std::ptr;
+    use std::time::{Duration, Instant};
 
     #[link(name = "Carbon", kind = "framework")]
     extern "C" {
@@ -123,11 +124,112 @@ mod imp {
     }
 
     /// IME 切替キー送出後、TIS 観測が追いつくまで期待値を優先する猶予時間。
+    /// これを過ぎても観測が一致しなければ「切替は失敗した」と見なす。
     ///
     /// 入力ソースの切替は非同期で数十〜数百 ms かかるため、英数/かな 直後の
     /// 打鍵は観測ベースだと旧状態で判定されて素通り/誤変換する
     /// （英字モード→かな→即 k で「き」でなく k が出る問題）。
-    const EXPECTATION_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+    ///
+    /// 実測（2026-09-02、ATOK atok36、英数⇄かな 往復 102 回、BUG-101）:
+    /// 「かな」キー送出から TIS が新入力ソースを報告するまで p50 ~60ms /
+    /// p90 ~160ms / **max 208ms**（2 回の計測で max 191ms → 208ms と伸びた）。
+    /// OFF 側は max 122ms。実測最大 208ms + マージン 92ms = 300ms とする。
+    ///
+    /// これは失敗検出の期限でもあるため、長すぎると害がある: 物理「かな」キー
+    /// を ATOK が取りこぼした場合、この時間だけ出力が止まってから張り直しが
+    /// 走る（500ms 版では体感 0.5 秒の停止、250ms 版では実測 328ms）。
+    /// 逆に短すぎると、正当に遅いだけの切替を失敗と誤判定して、その間の打鍵が
+    /// 生キーで素通しされる。250ms でも実測上の誤爆は無かったが、max との
+    /// マージンが 42ms しか無かったため 300ms を採る。
+    const EXPECTATION_GRACE: Duration = Duration::from_millis(300);
+
+    /// TIS が切替済みを報告してから、注入を再開してよいと見なすまでの猶予。
+    ///
+    /// `TISCopyCurrentKeyboardInputSource` はプロセス横断のグローバル状態で、
+    /// フォアグラウンドアプリのテキスト入力コンテキストが新しい入力ソースへ
+    /// 差し替わるより **先に** 切替済みを報告する。観測と同時に注入を再開すると
+    /// この隙間でローマ字が旧入力ソース（英数）にリテラル解釈され、「きょう」が
+    /// `kilyou` として出る。観測を確認しても settle 分は保留を続ける。
+    ///
+    /// この隙間の長さは外から観測できない（アプリの入力コンテキストがいつ
+    /// 新 IME に繋がったかを問い合わせる API が無い）ため、値は症状の有無で
+    /// しか検証できない。**足りないときの症状は 2 種類ある**:
+    ///
+    /// - 全く足りない（切替直後に注入）: 旧入力ソースが解釈してローマ字が
+    ///   リテラルで出る（「きょう」→ `kilyou`）
+    /// - 少し足りない: 新入力ソースはアクティブだがコンポジションコンテキストが
+    ///   未接続で、キーストロークがどこにも入らず**消える**（VS Code で実測）
+    ///
+    /// 後者は「出力が化ける」より気づきにくいので、値を詰めるときは
+    /// リテラルが消えたことだけを根拠にしないこと。
+    ///
+    /// `AWASE_MACOS_SETTLE_MS` で上書きできる（この値を実機で詰めるための
+    /// 診断用。BUG-101）。
+    const OBSERVATION_SETTLE: Duration = Duration::from_millis(50);
+
+    /// 実効 settle 値。`AWASE_MACOS_SETTLE_MS` があればそれを使う。
+    fn observation_settle() -> Duration {
+        static SETTLE: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+        *SETTLE.get_or_init(|| {
+            let Some(ms) = std::env::var("AWASE_MACOS_SETTLE_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+            else {
+                return OBSERVATION_SETTLE;
+            };
+            log::info!("OBSERVATION_SETTLE overridden to {ms}ms (AWASE_MACOS_SETTLE_MS)");
+            Duration::from_millis(ms)
+        })
+    }
+
+    /// 切替期待の状態機械。TIS 観測から切り離した純粋部分（テスト対象）。
+    #[derive(Debug, Clone, Copy)]
+    struct SwitchExpectation {
+        /// 切替キー/`TISSelectInputSource` の直後に立てた期待状態
+        expected: bool,
+        /// 期待を立てた時刻（`EXPECTATION_GRACE` の起点）
+        started: Instant,
+        /// 観測が初めて期待と一致した時刻（`OBSERVATION_SETTLE` の起点）
+        confirmed: Option<Instant>,
+    }
+
+    /// `SwitchExpectation::resolve` の結果。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Expectation {
+        /// 観測はまだ追いついていない。期待値を `is_ime_on` の答えとして使う
+        Hold(bool),
+        /// 観測が追いついた。settle 待ちのため保留（`is_switch_pending`）は続ける
+        Settling,
+        /// 期待を解除する（settle 完了、または観測されないまま猶予切れ）
+        Clear,
+    }
+
+    impl SwitchExpectation {
+        const fn new(expected: bool, now: Instant) -> Self {
+            Self {
+                expected,
+                started: now,
+                confirmed: None,
+            }
+        }
+
+        fn resolve(&mut self, observed: Option<bool>, now: Instant) -> Expectation {
+            if observed == Some(self.expected) {
+                let confirmed = *self.confirmed.get_or_insert(now);
+                if now.duration_since(confirmed) >= observation_settle() {
+                    Expectation::Clear
+                } else {
+                    Expectation::Settling
+                }
+            } else if now.duration_since(self.started) > EXPECTATION_GRACE {
+                // 観測されないまま猶予切れ。呼び出し側は「切替に失敗した」と
+                // 見なせるよう、期待値ではなく生の観測へ戻す
+                Expectation::Clear
+            } else {
+                Expectation::Hold(self.expected)
+            }
+        }
+    }
 
     /// macOS IME 検出。
     ///
@@ -145,8 +247,12 @@ mod imp {
         /// 英数モードで起動して ON する場合の復元先の確定に使う —
         /// 2026-08-29 セキュリティレビュー第2回指摘）
         last_japanese_prefix: std::cell::RefCell<Option<String>>,
-        /// IME 切替キー送出後の期待状態（観測が追いつくか猶予超過で解除）
-        pending: std::cell::RefCell<Option<(bool, std::time::Instant)>>,
+        /// IME 切替キー送出後の期待状態（settle 完了か猶予超過で解除）
+        pending: std::cell::RefCell<Option<SwitchExpectation>>,
+        /// 直近の切替が観測で確認された時刻。`pending` は settle 完了で消えるので
+        /// 別に持つ — 「切替の何 ms 後に注入したか」をログに残し、
+        /// `OBSERVATION_SETTLE` を実測で詰めるために使う（BUG-101）。
+        last_confirmed_at: std::cell::Cell<Option<Instant>>,
     }
 
     impl ImeDetector {
@@ -157,6 +263,7 @@ mod imp {
                 last_japanese_id: std::cell::RefCell::new(None),
                 last_japanese_prefix: std::cell::RefCell::new(None),
                 pending: std::cell::RefCell::new(None),
+                last_confirmed_at: std::cell::Cell::new(None),
             };
             // 起動時点の入力ソースを観測しておく（最初の打鍵前に
             // set_ime_on(true) が呼ばれても復元先が分かるように）
@@ -166,10 +273,10 @@ mod imp {
 
         /// IME 切替キー（英数/かな）が OS に届いた直後に呼び、期待状態を立てる。
         pub fn expect_ime_on(&self, open: bool) {
-            *self.pending.borrow_mut() = Some((open, std::time::Instant::now()));
+            *self.pending.borrow_mut() = Some(SwitchExpectation::new(open, Instant::now()));
         }
 
-        /// IME 切替がまだ観測で確認できていない（切替中）かどうか。
+        /// IME 切替がまだ落ち着いていない（切替中 or settle 待ち）かどうか。
         ///
         /// この間に注入したキーストロークは旧入力ソースで解釈されて
         /// リテラルの "wo" 等になるため、呼び出し側は送出を遅延させる。
@@ -180,6 +287,24 @@ mod imp {
             self.pending.borrow().is_some()
         }
 
+        /// 保留中の切替期待の目標状態（`is_switch_pending` が true の間だけ Some）。
+        ///
+        /// 観測は進めない — 呼び出し側は直前に `is_switch_pending` を呼んでいる
+        /// 前提で、保留を始めた時点の期待を記録するために使う。
+        #[must_use]
+        pub fn pending_open(&self) -> Option<bool> {
+            self.pending.borrow().as_ref().map(|exp| exp.expected)
+        }
+
+        /// 直近の切替が観測で確認されてからの経過時間（BUG-101 の実測用）。
+        ///
+        /// 「切替の N ms 後に注入した打鍵が消えた／化けた」を突き合わせて
+        /// `OBSERVATION_SETTLE` を詰めるために使う。
+        #[must_use]
+        pub fn since_switch_confirmed(&self) -> Option<Duration> {
+            self.last_confirmed_at.get().map(|at| at.elapsed())
+        }
+
         /// 現在の IME 状態を問い合わせる
         /// - Some(true): IME ON (ひらがな・カタカナモード等)
         /// - Some(false): IME OFF (英数モード・IME なしレイアウト)
@@ -188,16 +313,41 @@ mod imp {
         pub fn is_ime_on(&self) -> Option<bool> {
             let observed = self.observe_ime_on();
 
-            // 期待値の適用: 観測が一致したら解除、猶予内の不一致は期待値優先
             let mut pending = self.pending.borrow_mut();
-            if let Some((expected, at)) = *pending {
-                if observed == Some(expected) || at.elapsed() > EXPECTATION_GRACE {
-                    *pending = None;
-                } else {
-                    return Some(expected);
+            let Some(exp) = pending.as_mut() else {
+                return observed;
+            };
+            let was_confirmed = exp.confirmed.is_some();
+            let outcome = exp.resolve(observed, Instant::now());
+            let expected = exp.expected;
+            if !was_confirmed {
+                if let Some(confirmed) = exp.confirmed {
+                    self.last_confirmed_at.set(Some(confirmed));
+                    // settle 定数の実測用（BUG-101）。切替キー送出から TIS が
+                    // 新入力ソースを報告するまでの実時間を残す
+                    log::debug!(
+                        "IME switch observed: open={expected} after {}ms, \
+                         holding output {}ms for settle",
+                        confirmed.duration_since(exp.started).as_millis(),
+                        observation_settle().as_millis(),
+                    );
                 }
             }
-            observed
+            match outcome {
+                Expectation::Hold(expected) => Some(expected),
+                Expectation::Settling => observed,
+                Expectation::Clear => {
+                    if observed != Some(expected) {
+                        log::warn!(
+                            "IME switch to open={expected} not observed within {}ms; \
+                             injected output would be read by the old input source",
+                            EXPECTATION_GRACE.as_millis(),
+                        );
+                    }
+                    *pending = None;
+                    observed
+                }
+            }
         }
 
         /// TIS 観測のみで IME 状態を判定する（期待値を適用しない）。
@@ -236,8 +386,8 @@ mod imp {
         /// からの切替中にここが false だと期待値ブリッジが無効化される。
         #[must_use]
         pub fn is_japanese_layout(&self) -> bool {
-            if let Some((true, at)) = *self.pending.borrow() {
-                if at.elapsed() <= EXPECTATION_GRACE {
+            if let Some(exp) = *self.pending.borrow() {
+                if exp.expected && exp.started.elapsed() <= EXPECTATION_GRACE {
                     return true;
                 }
             }
@@ -362,6 +512,68 @@ mod imp {
             ));
         }
 
+        const MS: Duration = Duration::from_millis(1);
+
+        /// 期待を立てた時刻から `after` 経過した時点で resolve する。
+        fn at(exp: &mut SwitchExpectation, observed: Option<bool>, after: Duration) -> Expectation {
+            exp.resolve(observed, exp.started + after)
+        }
+
+        #[test]
+        fn expectation_holds_until_the_observation_catches_up() {
+            let mut exp = SwitchExpectation::new(true, Instant::now());
+            assert_eq!(at(&mut exp, Some(false), 10 * MS), Expectation::Hold(true));
+            assert_eq!(at(&mut exp, None, 30 * MS), Expectation::Hold(true));
+        }
+
+        /// BUG-101 の回帰: TIS が切替済みを報告した瞬間に保留を解いてはならない。
+        /// ここが `Clear` に戻ると、アプリの入力コンテキストが新入力ソースへ
+        /// 繋がる前にローマ字が流れ、「きょう」が `kilyou` になる。
+        #[test]
+        fn expectation_keeps_holding_output_through_the_settle_window() {
+            let mut exp = SwitchExpectation::new(true, Instant::now());
+            assert_eq!(at(&mut exp, Some(true), 40 * MS), Expectation::Settling);
+            let almost = (40 * MS + observation_settle()).saturating_sub(MS);
+            assert_eq!(at(&mut exp, Some(true), almost), Expectation::Settling);
+        }
+
+        #[test]
+        fn expectation_clears_once_the_settle_window_elapses() {
+            let mut exp = SwitchExpectation::new(true, Instant::now());
+            assert_eq!(at(&mut exp, Some(true), 40 * MS), Expectation::Settling);
+            let settled = 40 * MS + observation_settle();
+            assert_eq!(at(&mut exp, Some(true), settled), Expectation::Clear);
+        }
+
+        /// settle の起点は「期待を立てた時刻」ではなく「観測が一致した時刻」。
+        /// 起点を取り違えると、観測が遅れたケースで settle が丸ごと消える。
+        #[test]
+        fn settle_window_starts_at_the_observation_not_the_expectation() {
+            let mut exp = SwitchExpectation::new(true, Instant::now());
+            let late = EXPECTATION_GRACE.saturating_sub(10 * MS);
+            assert_eq!(at(&mut exp, Some(true), late), Expectation::Settling);
+            assert_eq!(
+                at(
+                    &mut exp,
+                    Some(true),
+                    (late + observation_settle()).saturating_sub(MS)
+                ),
+                Expectation::Settling,
+            );
+        }
+
+        /// 猶予切れは「切替が終わった」ではなく「諦めた」。呼び出し側が
+        /// 観測と期待の不一致で失敗を検出できるよう、期待値へ倒さず解除する。
+        #[test]
+        fn expectation_gives_up_after_the_grace_without_any_observation() {
+            let mut exp = SwitchExpectation::new(true, Instant::now());
+            assert_eq!(
+                at(&mut exp, Some(false), EXPECTATION_GRACE + MS),
+                Expectation::Clear
+            );
+            assert!(exp.confirmed.is_none());
+        }
+
         #[test]
         fn family_prefix_is_mode_invariant() {
             assert_eq!(
@@ -410,6 +622,16 @@ impl ImeDetector {
     #[must_use]
     pub fn is_switch_pending(&self) -> bool {
         false
+    }
+
+    #[must_use]
+    pub fn pending_open(&self) -> Option<bool> {
+        None
+    }
+
+    #[must_use]
+    pub fn since_switch_confirmed(&self) -> Option<std::time::Duration> {
+        None
     }
 }
 
