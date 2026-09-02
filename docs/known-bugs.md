@@ -12163,3 +12163,74 @@ ATOK atok36）で **リテラル出力ゼロ** を確認しており、間接的
 **関連ファイル:** `crates/awase-macos/src/ime.rs`,
 `crates/awase-macos/src/main.rs`。
 
+
+## BUG-102: macOS で切替キーが効かなかったとき、打鍵前だと張り直しが走らず生キーが漏れる
+
+**採番根拠:** BUG-101 の計測中に判明した別症状。作業時点の最大番号が BUG-101
+（同一ブランチ `macos-port`）であることを確認し BUG-102 とした。
+
+**症状:** 「かな」キーを押したのに IME が ON にならず、その後の打鍵が NICOLA を
+経ずに生の QWERTY で出力される（「き」の位置を打つと `k` が出る）。IME が実際に
+OFF なので出力自体は状態と整合しているが、**その OFF はユーザーの意図ではない**。
+実測ログ（2026-09-02 12:48:07）:
+
+```
+phys 0x68 KeyDown RightThumb -> pass                     ← 「かな」を押した
+Engine activated (ime=true, japanese=true)               ← 期待値ブリッジで ON 扱い
+WARN IME switch to open=true not observed within 250ms
+Engine deactivated (ime=false, japanese=false, reason=Inactive(NotJapaneseIme))
+phys 0x28 KeyDown Char -> pass                           ← 生 k
+```
+
+**真因:** 失敗の検出と回復が別の場所にあった。検出は `ime.rs::is_ime_on`
+（猶予切れの WARN）、回復（`TISSelectInputSource` での張り直し）は
+`main.rs::maybe_flush_deferred` の中。後者は先頭で `deferred_keys.is_empty()` なら
+return するため、**猶予切れまでに打鍵していないと検出だけして回復しない**。
+逆に猶予内に打鍵していれば期待値ブリッジで consume → 保留 → 張り直しに載るので
+救われる（BUG-101 の修正で確認済み）。つまり発生条件は「切替の取りこぼし ×
+猶予内に打鍵しなかった」の重なりで、計測では ~40 往復に 1 回の取りこぼしのうち
+さらに一部。
+
+**前提の訂正（BUG-101 の調査中に判明）:** この環境の 英数/かな キーは ATOK の
+内部モードではなく **入力ソースそのもの** を切り替えている。診断ログ
+（`observe_ime_on` の "input source: A -> B"）で観測された遷移は 2 種類だけ:
+
+```
+39 input source: com.apple.keylayout.ABC -> com.justsystems.inputmethod.atok36.Japanese
+38 input source: com.justsystems.inputmethod.atok36.Japanese -> com.apple.keylayout.ABC
+```
+
+**ATOK の Roman / Eiji モードは入力ソースとして存在しない。** 切替が 46〜208ms と
+重いのも、往復を速くすると取りこぼすのも、フル入力ソース切替だからで説明が付く。
+また ABC へ動かしている主体が 英数 キー自身だと確定したため、awase が
+`TISSelectInputSource` で ATOK へ戻すのは第三者との綱引きにならない
+（`ImeEffect::SetOpen` の `ActivationSync` が警告している競合とは状況が異なる）。
+この事実が判明するまで修正を保留していた。
+
+**修正:** `crates/awase-macos/src/ime.rs` に `failed_switch: Cell<Option<bool>>` を
+追加し、猶予切れ時（観測が期待と不一致）に目標状態を立てる。`take_failed_switch`
+で一度だけ取り出せる。`crates/awase-macos/src/main.rs` に `recover_failed_switch`
+を追加し、`on_cg_event` の先頭（`maybe_flush_deferred` の直後、打鍵の判定より前）と
+`on_poll` から呼ぶ。保留キューがある場合は `maybe_flush_deferred` 側に任せる。
+
+打鍵の判定より **前** に呼ぶのが要点で、そこで期待を張り直しておけば、引き金に
+なった打鍵自体も `ime_on=true` として consume され保留に載る。1 打鍵も漏れない。
+
+回数制限は `MAX_SWITCH_REASSERTS`（2）を共用し、`switch_recoveries` は
+`expect_ime_from_key`（＝新しい切替キーを観測したとき）で 0 に戻す。ユーザーの
+1 回の切替操作あたり最大 2 回まで。これが無いと、張り直しも失敗し続ける環境で
+`EXPECTATION_GRACE` ごとに永久に張り直す。
+
+**残るリスク:** ユーザーが「かな」を押した直後 `EXPECTATION_GRACE`（300ms）以内に
+入力ソースメニュー等で意図的に別の入力ソースへ移った場合、awase が引き戻す。
+窓が狭く実用上は無視できると判断した。再発報告があればここを疑うこと。
+
+**テスト:** 回復経路は `CGEventTap`／`TISSelectInputSource` を伴うためユニット
+テストできない。猶予切れが期待値へ倒れず生の観測を返すこと（＝呼び出し側が失敗を
+検出できること）は `expectation_gives_up_after_the_grace_without_any_observation`
+で固定済み。実機での確認は本エントリに委ねる。
+
+**修正履歴:** `macos-port` ブランチで実装（BUG-101 と同一の作業）。
+
+**関連ファイル:** `crates/awase-macos/src/ime.rs`,
+`crates/awase-macos/src/main.rs`。関連: BUG-101。

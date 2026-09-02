@@ -378,6 +378,9 @@ mod app {
         deferred_since: Option<Instant>,
         /// 観測されない切替を `TISSelectInputSource` で張り直した回数
         deferred_switch_reasserts: u8,
+        /// 保留キューが空のまま失敗した切替を張り直した回数（BUG-102）。
+        /// 切替キーを新たに観測するたびに 0 に戻す
+        switch_recoveries: u8,
     }
 
     impl App {
@@ -396,6 +399,7 @@ mod app {
                 deferred_expect_on: None,
                 deferred_since: None,
                 deferred_switch_reasserts: 0,
+                switch_recoveries: 0,
             };
             // トレイ表示を実際の activation 状態に合わせる。既定値のままだと
             // 起動時に IME が OFF でも「あ」と出る（状態が変化しないため
@@ -464,6 +468,30 @@ mod app {
                 held.unwrap_or_default().as_millis(),
             );
             self.output.send_keys(&keys);
+        }
+
+        /// 観測されないまま猶予切れした切替を張り直す（BUG-102）。
+        ///
+        /// 保留キューがあるときは `maybe_flush_deferred` が回数制限付きで面倒を
+        /// 見るので、ここは「切替キーが効かなかったが、まだ何も打鍵していない」
+        /// 経路だけを拾う。放置すると engine が非活性のまま次の打鍵が生キーで
+        /// 素通しされる（実測: 「かな」が効かず生 `k` が出た）。
+        ///
+        /// 打鍵イベントの処理より先に呼ぶこと。ここで期待を張り直しておけば、
+        /// その打鍵自体も `ime_on=true` として consume され保留に載る。
+        fn recover_failed_switch(&mut self) {
+            // 猶予切れの判定を進めてから失敗を取り出す
+            let _ = self.ime.is_ime_on();
+            let Some(expected) = self.ime.take_failed_switch() else {
+                return;
+            };
+            if !self.deferred_keys.is_empty() || self.switch_recoveries >= MAX_SWITCH_REASSERTS {
+                return;
+            }
+            if self.ime.set_ime_on(expected) {
+                self.switch_recoveries += 1;
+                log::warn!("IME switch to open={expected} not observed; re-asserting it");
+            }
         }
 
         /// 保留出力を破棄する（クリック等でフォーカス・キャレットが動いた場合）。
@@ -608,6 +636,8 @@ mod app {
                 KEYCODE_KANA => self.ime.expect_ime_on(true),
                 _ => return,
             }
+            // 新しい切替キーを観測したので、張り直しの回数制限を仕切り直す
+            self.switch_recoveries = 0;
             let ctx = self.make_ctx();
             let decision = self.engine.on_command(EngineCommand::RefreshState, &ctx);
             let _ = self.apply_decision(decision);
@@ -639,6 +669,8 @@ mod app {
         fn on_cg_event(&mut self, etype: CGEventType, event: &CGEvent) -> TapAction {
             // 切替待ちの保留出力があれば、後続イベント処理の前に順序を保って流す
             self.maybe_flush_deferred();
+            // 効かなかった切替キーの張り直しも、この打鍵を判定する前に済ませる
+            self.recover_failed_switch();
 
             // クリックは IME の未確定文字列を確定させる（composing ヒントの
             // 主要なクリア漏れだった。Enter を打たない確定スタイルへの対応）。
@@ -789,6 +821,8 @@ mod app {
 
         fn on_poll(&mut self) {
             self.maybe_flush_deferred();
+            // 打鍵が来なくても IME が戻るように、ポーリングでも張り直す
+            self.recover_failed_switch();
             // activation 遷移の検知はキーイベント経由でしか起きないため、
             // IME 切替後に打鍵が無いとトレイ表示が古いまま残る。RefreshState で
             // 遷移チェックだけを走らせ、UiEffect でトレイを追随させる。

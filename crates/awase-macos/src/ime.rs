@@ -249,6 +249,14 @@ mod imp {
         last_japanese_prefix: std::cell::RefCell<Option<String>>,
         /// IME 切替キー送出後の期待状態（settle 完了か猶予超過で解除）
         pending: std::cell::RefCell<Option<SwitchExpectation>>,
+        /// 直近に観測した入力ソース ID（種別を問わない）。遷移をログへ残す
+        /// ためだけに持つ — `last_japanese_id` はかなモードの ID しか記録
+        /// しないため、ATOK Roman → ABC keylayout のような日本語 IM の外へ
+        /// 出る遷移が誰の直後に起きたのか追えなかった（BUG-101 の追跡課題）。
+        last_observed_id: std::cell::RefCell<Option<String>>,
+        /// 観測されないまま猶予切れした切替の目標状態。呼び出し側が
+        /// `take_failed_switch` で一度だけ受け取り、張り直しに使う（BUG-102）。
+        failed_switch: std::cell::Cell<Option<bool>>,
         /// 直近の切替が観測で確認された時刻。`pending` は settle 完了で消えるので
         /// 別に持つ — 「切替の何 ms 後に注入したか」をログに残し、
         /// `OBSERVATION_SETTLE` を実測で詰めるために使う（BUG-101）。
@@ -263,6 +271,8 @@ mod imp {
                 last_japanese_id: std::cell::RefCell::new(None),
                 last_japanese_prefix: std::cell::RefCell::new(None),
                 pending: std::cell::RefCell::new(None),
+                last_observed_id: std::cell::RefCell::new(None),
+                failed_switch: std::cell::Cell::new(None),
                 last_confirmed_at: std::cell::Cell::new(None),
             };
             // 起動時点の入力ソースを観測しておく（最初の打鍵前に
@@ -294,6 +304,15 @@ mod imp {
         #[must_use]
         pub fn pending_open(&self) -> Option<bool> {
             self.pending.borrow().as_ref().map(|exp| exp.expected)
+        }
+
+        /// 観測されないまま猶予切れした切替を一度だけ受け取る（BUG-102）。
+        ///
+        /// 切替キーが IME に届かなかったということなので、呼び出し側は
+        /// `set_ime_on` で張り直す。判定を進めるため、先に `is_ime_on` を
+        /// 呼んでから取り出すこと。
+        pub fn take_failed_switch(&self) -> Option<bool> {
+            self.failed_switch.take()
         }
 
         /// 直近の切替が観測で確認されてからの経過時間（BUG-101 の実測用）。
@@ -343,6 +362,7 @@ mod imp {
                              injected output would be read by the old input source",
                             EXPECTATION_GRACE.as_millis(),
                         );
+                        self.failed_switch.set(Some(expected));
                     }
                     *pending = None;
                     observed
@@ -353,6 +373,16 @@ mod imp {
         /// TIS 観測のみで IME 状態を判定する（期待値を適用しない）。
         fn observe_ime_on(&self) -> Option<bool> {
             let id = current_input_source_id()?;
+            {
+                let mut last = self.last_observed_id.borrow_mut();
+                if last.as_deref() != Some(id.as_str()) {
+                    log::debug!(
+                        "input source: {} -> {id}",
+                        last.as_deref().unwrap_or("(unknown)")
+                    );
+                    *last = Some(id.clone());
+                }
+            }
             if is_japanese_im(&id) {
                 // ユーザーが実際に使っている日本語 IM を記憶する
                 // （ATOK / Google 日本語入力 / 日本語IM の区別を保つため。
@@ -626,6 +656,10 @@ impl ImeDetector {
 
     #[must_use]
     pub fn pending_open(&self) -> Option<bool> {
+        None
+    }
+
+    pub fn take_failed_switch(&self) -> Option<bool> {
         None
     }
 
