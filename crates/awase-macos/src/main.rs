@@ -78,6 +78,16 @@ fn resolve_bundled_resource(resources: &Path, path: &str) -> Result<PathBuf> {
         // 存在しないリソースは呼び出し側が既定値へ倒す。ただし、直前の
         // ディレクトリも canonicalize し、未作成ファイルに向かう symlink での脱出を防ぐ。
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // `canonicalize` が NotFound かつ `symlink_metadata` が成功する組み合わせは
+            // dangling symlink（リンク自体は在るがリンク先が無い）に限られる。今は
+            // 解決できないが、外部プロセスが後からリンク先を作れば Resources 外を
+            // 読める（`exists()` / 読み込みとの競合）ため、ここで拒否する。
+            if std::fs::symlink_metadata(&candidate).is_ok() {
+                bail!(
+                    "bundled resource is a dangling symlink: {}",
+                    candidate.display()
+                );
+            }
             let parent = candidate.parent().unwrap_or(resources);
             let canonical_parent = parent.canonicalize().with_context(|| {
                 format!(
@@ -187,6 +197,28 @@ mod resolve_tests {
             resolved,
             resources.join("layout/nicola.yab").canonicalize().unwrap()
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// 最終要素そのものが dangling symlink のケース。`canonicalize` は NotFound を
+    /// 返すため親ディレクトリ検査だけでは通ってしまうが、外部プロセスがあとから
+    /// リンク先を作れば Resources 外を読める。
+    #[cfg(unix)]
+    #[test]
+    fn bundled_resource_rejects_dangling_symlink_as_the_final_component() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_temp_dir("dangling_leaf");
+        let resources = root.join("Contents/Resources");
+        fs::create_dir_all(resources.join("layout")).unwrap();
+        // リンク先はまだ存在しない（＝canonicalize は NotFound）
+        symlink(
+            root.join("not-created-yet.yab"),
+            resources.join("layout/default.yab"),
+        )
+        .unwrap();
+
+        assert!(resolve_bundled_resource(&resources, "layout/default.yab").is_err());
         let _ = fs::remove_dir_all(root);
     }
 
