@@ -407,7 +407,10 @@ mod app {
                 );
                 return;
             }
-            log::debug!("Flushing {} deferred key action(s) after IME switch", keys.len());
+            log::debug!(
+                "Flushing {} deferred key action(s) after IME switch",
+                keys.len()
+            );
             self.output.send_keys(&keys);
         }
 
@@ -491,9 +494,7 @@ mod app {
                             if self.ime.set_ime_on(*open) {
                                 log::debug!("IME set_open({open}) via TISSelectInputSource");
                             } else {
-                                log::warn!(
-                                    "IME set_open({open}) failed: no matching input source"
-                                );
+                                log::warn!("IME set_open({open}) failed: no matching input source");
                             }
                         }
                         // ActivationSync は activation 遷移の echo（SetOpenOrigin の doc
@@ -568,7 +569,6 @@ mod app {
         }
     }
 
-
     impl LoopHandler for App {
         fn on_cg_event(&mut self, etype: CGEventType, event: &CGEvent) -> TapAction {
             // 切替待ちの保留出力があれば、後続イベント処理の前に順序を保って流す
@@ -594,8 +594,7 @@ mod app {
 
             // 自分自身の注入イベントは Engine に通さず素通しする
             // （親指キー単独打鍵の再注入もここを通って OS の IME 切替に届く）
-            if event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA) == INJECT_MARKER
-            {
+            if event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA) == INJECT_MARKER {
                 // 注入イベントが OS のイベントストリームに実在した証跡
                 // （CGEventPost 後の消失と IME 側での無視を切り分ける）
                 log::debug!("inj-tap 0x{keycode:02X} {etype:?}");

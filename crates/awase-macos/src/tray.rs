@@ -81,8 +81,8 @@ mod imp {
         /// メイン thread 以外から呼ばれた場合。
         #[must_use]
         pub fn new() -> Self {
-            let mtm = MainThreadMarker::new()
-                .expect("SystemTray must be created on the main thread");
+            let mtm =
+                MainThreadMarker::new().expect("SystemTray must be created on the main thread");
 
             let status_bar = NSStatusBar::systemStatusBar();
             let status_item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
@@ -164,8 +164,7 @@ mod imp {
                 TITLE_DISABLED
             };
             // 生成時に MainThreadOnly を確認済み（new() 参照）
-            let mtm = MainThreadMarker::new()
-                .expect("SystemTray must be used on the main thread");
+            let mtm = MainThreadMarker::new().expect("SystemTray must be used on the main thread");
             if let Some(button) = self.status_item.button(mtm) {
                 button.setTitle(&NSString::from_str(title));
             }
@@ -180,11 +179,12 @@ mod imp {
         pub fn sync_login_item(&self) {
             use crate::login_item::LoginItemState;
             let state = crate::login_item::state();
-            self.login_item.setState(if state == LoginItemState::Enabled {
-                NSControlStateValueOn
-            } else {
-                NSControlStateValueOff
-            });
+            self.login_item
+                .setState(if state == LoginItemState::Enabled {
+                    NSControlStateValueOn
+                } else {
+                    NSControlStateValueOff
+                });
             // バンドル外実行（開発時）では登録できないのでグレーアウトする
             self.login_item
                 .setEnabled(state != LoginItemState::Unavailable);

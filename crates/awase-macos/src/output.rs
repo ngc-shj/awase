@@ -89,28 +89,28 @@ pub const fn ascii_to_keycode(ch: char) -> Option<(u16, bool)> {
         ']' => Some((0x2A, false)), // kVK_ANSI_Backslash (JIS: ])
         '{' => Some((0x1E, true)),
         '}' => Some((0x2A, true)),
-        '(' => Some((0x1C, true)), // Shift+8
-        ')' => Some((0x19, true)), // Shift+9
-        '?' => Some((0x2C, true)), // Shift+/
-        '!' => Some((0x12, true)), // Shift+1
-        '^' => Some((0x18, false)), // kVK_ANSI_Equal (JIS: ^)
-        '~' => Some((0x18, true)),  // Shift+^
-        '@' => Some((0x21, false)), // kVK_ANSI_LeftBracket (JIS: @)
-        ';' => Some((0x29, false)), // kVK_ANSI_Semicolon (JIS: ;)
-        ':' => Some((0x27, false)), // kVK_ANSI_Quote (JIS: :)
-        '_' => Some((0x5E, true)),  // Shift+ろ (kVK_JIS_Underscore = 0x5E)
-        '"' => Some((0x13, true)),  // Shift+2 (JIS)
-        '#' => Some((0x14, true)),  // Shift+3
-        '$' => Some((0x15, true)),  // Shift+4
-        '%' => Some((0x17, true)),  // Shift+5
-        '&' => Some((0x16, true)),  // Shift+6
-        '\'' => Some((0x1A, true)), // Shift+7 (JIS)
-        '=' => Some((0x1B, true)),  // Shift+- (JIS)
-        '+' => Some((0x29, true)),  // Shift+; (JIS)
-        '*' => Some((0x27, true)),  // Shift+: (JIS)
-        '<' => Some((0x2B, true)),  // Shift+,
-        '>' => Some((0x2F, true)),  // Shift+.
-        '|' => Some((0x5D, true)),  // Shift+¥ (kVK_JIS_Yen = 0x5D)
+        '(' => Some((0x1C, true)),   // Shift+8
+        ')' => Some((0x19, true)),   // Shift+9
+        '?' => Some((0x2C, true)),   // Shift+/
+        '!' => Some((0x12, true)),   // Shift+1
+        '^' => Some((0x18, false)),  // kVK_ANSI_Equal (JIS: ^)
+        '~' => Some((0x18, true)),   // Shift+^
+        '@' => Some((0x21, false)),  // kVK_ANSI_LeftBracket (JIS: @)
+        ';' => Some((0x29, false)),  // kVK_ANSI_Semicolon (JIS: ;)
+        ':' => Some((0x27, false)),  // kVK_ANSI_Quote (JIS: :)
+        '_' => Some((0x5E, true)),   // Shift+ろ (kVK_JIS_Underscore = 0x5E)
+        '"' => Some((0x13, true)),   // Shift+2 (JIS)
+        '#' => Some((0x14, true)),   // Shift+3
+        '$' => Some((0x15, true)),   // Shift+4
+        '%' => Some((0x17, true)),   // Shift+5
+        '&' => Some((0x16, true)),   // Shift+6
+        '\'' => Some((0x1A, true)),  // Shift+7 (JIS)
+        '=' => Some((0x1B, true)),   // Shift+- (JIS)
+        '+' => Some((0x29, true)),   // Shift+; (JIS)
+        '*' => Some((0x27, true)),   // Shift+: (JIS)
+        '<' => Some((0x2B, true)),   // Shift+,
+        '>' => Some((0x2F, true)),   // Shift+.
+        '|' => Some((0x5D, true)),   // Shift+¥ (kVK_JIS_Yen = 0x5D)
         '\\' => Some((0x5D, false)), // kVK_JIS_Yen（JIS では ¥、IME 経由で ￥/＼）
         _ => None,
     }
@@ -411,8 +411,7 @@ mod imp {
 
         /// 修飾フラグ付きでキーイベントを post する。
         fn post_key_with_flags(&self, keycode: u16, down: bool, shift: bool, option: bool) {
-            let Ok(event) = CGEvent::new_keyboard_event(self.source.clone(), keycode, down)
-            else {
+            let Ok(event) = CGEvent::new_keyboard_event(self.source.clone(), keycode, down) else {
                 warn!("Failed to create keyboard event (keycode=0x{keycode:02X})");
                 return;
             };

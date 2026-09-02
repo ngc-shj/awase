@@ -319,7 +319,9 @@ mod imp {
             assert!(is_japanese_kana_mode(
                 "com.apple.inputmethod.Kotoeri.RomajiTyping.Japanese"
             ));
-            assert!(is_japanese_kana_mode("com.google.inputmethod.Japanese.base"));
+            assert!(is_japanese_kana_mode(
+                "com.google.inputmethod.Japanese.base"
+            ));
             assert!(is_japanese_kana_mode(
                 "com.justsystems.inputmethod.atok34.Japanese"
             ));
@@ -354,7 +356,10 @@ mod imp {
             assert!(in_family("com.google.inputmethod.Japanese", prefix));
             assert!(in_family("com.google.inputmethod.Japanese.Roman", prefix));
             // 兄弟 ID（prefix + 追加文字）はセグメント境界で拒否する
-            assert!(!in_family("com.google.inputmethod.JapaneseEvil.base", prefix));
+            assert!(!in_family(
+                "com.google.inputmethod.JapaneseEvil.base",
+                prefix
+            ));
         }
 
         #[test]

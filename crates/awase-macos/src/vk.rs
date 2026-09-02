@@ -51,7 +51,9 @@ pub fn key_name_to_keycode(name: &str) -> Option<VkCode> {
         // ── 日本語入力制御キー ──
         // macOS では英数/かなキーが IME 切替を担う
         // kVK_JIS_Eisu (英数): デフォルト設定の「無変換」を含む Windows 系名称も受ける
-        "Nonconvert" | "VK_NONCONVERT" | "VK_MUHENKAN" | "無変換" | "英数" => Some(VkCode(0x66)),
+        "Nonconvert" | "VK_NONCONVERT" | "VK_MUHENKAN" | "無変換" | "英数" => {
+            Some(VkCode(0x66))
+        }
         // kVK_JIS_Kana (かな)
         "Convert" | "VK_CONVERT" | "Kana" | "VK_KANA" | "変換" | "かな" => Some(VkCode(0x68)),
         // "Kanji"/"ImeOn"/"ImeOff" は macOS に直接対応なし → 末尾のワイルドカードで None

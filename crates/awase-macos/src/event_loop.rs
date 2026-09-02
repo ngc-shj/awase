@@ -20,8 +20,7 @@ mod imp {
     use core_foundation::date::CFDate;
     use core_foundation::mach_port::CFMachPortRef;
     use core_foundation::runloop::{
-        kCFRunLoopCommonModes, CFRunLoop, CFRunLoopTimer, CFRunLoopTimerContext,
-        CFRunLoopTimerRef,
+        kCFRunLoopCommonModes, CFRunLoop, CFRunLoopTimer, CFRunLoopTimerContext, CFRunLoopTimerRef,
     };
     use core_graphics::event::{
         CGEvent, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,

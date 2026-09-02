@@ -55,7 +55,11 @@ mod imp {
                 let new_state = state();
                 log::info!(
                     "Login item {}: {new_state:?}",
-                    if enabled { "unregistered" } else { "registered" }
+                    if enabled {
+                        "unregistered"
+                    } else {
+                        "registered"
+                    }
                 );
                 new_state
             }
