@@ -49,7 +49,8 @@ NICOLA 同時打鍵判定（コアエンジンは Windows 版と共通）の結�
 
 ```sh
 ./packaging/macos/make-app.sh     # dist/Awase.app をビルド
-./packaging/macos/install-app.sh  # /Applications へインストール
+./packaging/macos/install-app.sh  # /Applications（書き込めなければ ~/Applications）へ
+./packaging/macos/install-app.sh ~/Applications  # インストール先を明示する場合
 ```
 
 初回起動時にアクセシビリティ権限の許可が必要です。ビルド・権限・ログイン時

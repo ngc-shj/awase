@@ -50,7 +50,8 @@ supported via input-source-id detection. Thumb keys default to 英数 (left) /
 
 ```sh
 ./packaging/macos/make-app.sh     # build dist/Awase.app
-./packaging/macos/install-app.sh  # install to /Applications
+./packaging/macos/install-app.sh  # install to /Applications (or ~/Applications)
+./packaging/macos/install-app.sh ~/Applications  # or name the destination
 ```
 
 The first launch prompts for Accessibility permission. See

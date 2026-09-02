@@ -7,7 +7,21 @@
 ./packaging/macos/install-app.sh
 ```
 
-Do not `cp -R` over an existing `/Applications/Awase.app`: cp merges old and
+`install-app.sh` installs to `/Applications` when that directory is writable
+(admin accounts have group write on it, so no `sudo` is involved) and to
+`~/Applications` otherwise — a standard account without admin rights can
+install without help. Override with an argument or `AWASE_INSTALL_DIR`:
+
+```sh
+./packaging/macos/install-app.sh ~/Applications
+AWASE_INSTALL_DIR=~/Applications ./packaging/macos/install-app.sh
+```
+
+The Accessibility grant follows the bundle's signature and bundle ID, not its
+directory, so a `~/Applications` install behaves the same. The paths below
+spell out `/Applications`; substitute your destination if you moved it.
+
+Do not `cp -R` over an existing `Awase.app`: cp merges old and
 new bundle contents, which breaks the code signature, and the stale TCC entry
 makes the Accessibility toggle in System Settings a no-op. The install script
 quits the running instance, replaces the bundle wholesale, and runs
@@ -52,7 +66,9 @@ Pick **one** of the following:
 
   ```sh
   mkdir -p ~/Library/Logs/Awase && chmod 700 ~/Library/Logs/Awase
-  sed "s|USERNAME|$USER|g" packaging/macos/com.github.cuzic.awase.plist \
+  APP_DIR=/Applications  # or ~/Applications, wherever install-app.sh put it
+  sed -e "s|USERNAME|$USER|g" -e "s|/Applications/Awase.app|$APP_DIR/Awase.app|g" \
+    packaging/macos/com.github.cuzic.awase.plist \
     > ~/Library/LaunchAgents/com.github.cuzic.awase.plist
   launchctl load ~/Library/LaunchAgents/com.github.cuzic.awase.plist
   ```
