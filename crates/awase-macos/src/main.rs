@@ -454,6 +454,52 @@ mod app {
     /// キュー破棄（＝入力消失）に直結しないよう 2 回まで許す（BUG-101）。
     const MAX_SWITCH_REASSERTS: u8 = 2;
 
+    /// 保留出力がある間の外部パススルーキーが、入力コンテキストを失効させるか。
+    ///
+    /// PID が同じでも Tab / Cmd+L 等でフォーカス先の control は変わりうるため、
+    /// そのまま送ると保留文字が別の入力欄へ入る。一方で **パススルー全部を対象に
+    /// すると害の方が大きい**: Backspace や矢印はフォーカスを移さないので破棄の
+    /// 利得が無く、保留中の文字を捨てたうえで Backspace を通すと「その前の文字」
+    /// が消える。対象はフォーカスを動かしうるものだけに絞る —
+    /// 既存の composition 切れ目（Enter / keypad Enter / Escape / Tab、
+    /// `on_cg_event` の `note_composition_break` と同じ集合）と、修飾キー同時押し
+    /// （Cmd+L 等のショートカット）。Shift は単独でフォーカスを動かさないので除く
+    /// （Shift+Tab は Tab 側で捕まる）。
+    ///
+    /// awase 自身の注入イベントはこの判定より前に return するため対象外。
+    const fn passthrough_invalidates_deferred(
+        action: TapAction,
+        has_deferred: bool,
+        keycode: u16,
+        event_type: KeyEventType,
+        modifiers: ModifierState,
+    ) -> bool {
+        if !has_deferred
+            || !matches!(action, TapAction::Pass)
+            || !matches!(event_type, KeyEventType::KeyDown)
+        {
+            return false;
+        }
+        matches!(keycode, 0x24 | 0x4C | 0x35 | 0x30) || modifiers.is_os_modifier_held()
+    }
+
+    /// decision の effect を実行する前のキュー状態で、実行後の破棄要否を決める。
+    ///
+    /// `apply` が `SendKeys` を新たに保留しても、その出力を「以前から保留されていた
+    /// 入力」と誤認して同じイベント内で破棄しない。
+    fn apply_with_deferred_snapshot(
+        had_deferred: bool,
+        keycode: u16,
+        event_type: KeyEventType,
+        modifiers: ModifierState,
+        apply: impl FnOnce() -> TapAction,
+    ) -> (TapAction, bool) {
+        let action = apply();
+        let invalidates =
+            passthrough_invalidates_deferred(action, had_deferred, keycode, event_type, modifiers);
+        (action, invalidates)
+    }
+
     /// IME 切替キー（英数/かな）の送出アクションかどうか。
     const fn is_ime_switch_action(action: &awase::types::KeyAction) -> bool {
         matches!(
@@ -938,7 +984,23 @@ mod app {
             log::debug!(
                 "phys 0x{keycode:02X} {event_type:?} {key_classification:?} -> {decision_name}"
             );
-            let action = self.apply_decision(decision);
+            // このキー自身の出力が保留に積まれる前の状態を見る。`apply_decision` の
+            // 後に読むと、`PassThroughWith` で吐かれた SendKeys が保留に入った直後に
+            // 自分で破棄してしまう（activation 遷移フラッシュや bypass 経由の
+            // `flush_pending` がこの形で SendKeys を返す）
+            let had_deferred = !self.deferred_keys.is_empty();
+            let modifiers = self.modifiers;
+            let (action, invalidates_deferred) =
+                apply_with_deferred_snapshot(had_deferred, keycode, event_type, modifiers, || {
+                    self.apply_decision(decision)
+                });
+
+            // 保留開始時と同じ PID でも、Tab / Cmd+L 等のパススルー操作で focused
+            // control は変わりうる。新しい control へ保留文字を誤注入しないよう、
+            // 外部イベントを通す時点で入力コンテキストを失効させる。
+            if invalidates_deferred {
+                self.discard_deferred("external passthrough key during IME switch");
+            }
 
             // 物理の英数/かな キーが素通しで OS に届く場合（Engine 非活性時や
             // 親指キー以外に設定されている場合）も IME 切替の期待を立てる
@@ -991,6 +1053,133 @@ mod app {
             let ctx = self.make_ctx();
             let decision = self.engine.on_command(EngineCommand::RefreshState, &ctx);
             let _ = self.apply_decision(decision);
+        }
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::{
+            apply_with_deferred_snapshot, passthrough_invalidates_deferred, KeyEventType,
+            ModifierState, TapAction,
+        };
+
+        const TAB: u16 = 0x30;
+        const ENTER: u16 = 0x24;
+        const KEYPAD_ENTER: u16 = 0x4C;
+        const ESCAPE: u16 = 0x35;
+        const BACKSPACE: u16 = 0x33;
+        const LEFT_ARROW: u16 = 0x7B;
+        const L: u16 = 0x25;
+
+        fn invalidates(keycode: u16, modifiers: ModifierState) -> bool {
+            passthrough_invalidates_deferred(
+                TapAction::Pass,
+                true,
+                keycode,
+                KeyEventType::KeyDown,
+                modifiers,
+            )
+        }
+
+        #[test]
+        fn focus_moving_keys_invalidate_the_deferred_queue() {
+            assert!(invalidates(TAB, ModifierState::default()));
+            assert!(invalidates(ENTER, ModifierState::default()));
+            assert!(invalidates(KEYPAD_ENTER, ModifierState::default()));
+            assert!(invalidates(ESCAPE, ModifierState::default()));
+            // Cmd+L 等のショートカットはフォーカスを別 control へ飛ばす
+            assert!(invalidates(
+                L,
+                ModifierState {
+                    win: true,
+                    ..ModifierState::default()
+                }
+            ));
+            assert!(invalidates(
+                L,
+                ModifierState {
+                    ctrl: true,
+                    ..ModifierState::default()
+                }
+            ));
+            assert!(invalidates(
+                L,
+                ModifierState {
+                    alt: true,
+                    ..ModifierState::default()
+                }
+            ));
+        }
+
+        /// フォーカスを移さない編集キーで破棄すると、保留中の文字が消えたうえで
+        /// Backspace が「その前の文字」を消す。利得が無く実害だけがある。
+        #[test]
+        fn plain_editing_keys_keep_the_deferred_queue() {
+            assert!(!invalidates(BACKSPACE, ModifierState::default()));
+            assert!(!invalidates(LEFT_ARROW, ModifierState::default()));
+            // Shift 単独はフォーカスを動かさない（Shift+Tab は Tab 側で捕まる）
+            assert!(!invalidates(
+                BACKSPACE,
+                ModifierState {
+                    shift: true,
+                    ..ModifierState::default()
+                }
+            ));
+        }
+
+        #[test]
+        fn consumed_keys_and_an_empty_queue_never_invalidate() {
+            assert!(!passthrough_invalidates_deferred(
+                TapAction::Pass,
+                false,
+                TAB,
+                KeyEventType::KeyDown,
+                ModifierState::default()
+            ));
+            assert!(!passthrough_invalidates_deferred(
+                TapAction::Consume,
+                true,
+                TAB,
+                KeyEventType::KeyDown,
+                ModifierState::default()
+            ));
+        }
+
+        #[test]
+        fn key_up_never_invalidates_the_deferred_queue() {
+            assert!(!passthrough_invalidates_deferred(
+                TapAction::Pass,
+                true,
+                TAB,
+                KeyEventType::KeyUp,
+                ModifierState {
+                    win: true,
+                    ..ModifierState::default()
+                }
+            ));
+        }
+
+        #[test]
+        fn output_deferred_by_the_current_decision_is_not_self_discarded() {
+            let mut deferred = Vec::new();
+            let had_deferred = !deferred.is_empty();
+            let (action, invalidates) = apply_with_deferred_snapshot(
+                had_deferred,
+                L,
+                KeyEventType::KeyDown,
+                ModifierState {
+                    ctrl: true,
+                    ..ModifierState::default()
+                },
+                || {
+                    // PassThroughWith の effect が SendKeys を保留する状況を模擬する。
+                    deferred.push("ki");
+                    TapAction::Pass
+                },
+            );
+
+            assert_eq!(action, TapAction::Pass);
+            assert_eq!(deferred, ["ki"]);
+            assert!(!invalidates);
         }
     }
 }
