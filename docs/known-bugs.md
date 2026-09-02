@@ -12234,3 +12234,76 @@ return するため、**猶予切れまでに打鍵していないと検出だ�
 
 **関連ファイル:** `crates/awase-macos/src/ime.rs`,
 `crates/awase-macos/src/main.rs`。関連: BUG-101。
+
+## BUG-103: macOS で 英数 の直後に かな を押すと、かな の KeyDown が NICOLA に食われて IME が ON にならない
+
+**採番根拠:** BUG-101 の実機計測中に判明。作業時点の最大番号が BUG-102
+（同一ブランチ `macos-port`）であることを確認し BUG-103 とした。
+
+**症状:** IME を OFF にしてすぐ ON に戻すと、「かな」を押したのに IME が ON に
+ならず、続く打鍵が NICOLA を経ずに生の QWERTY で出る（き の位置を打つと `k`）。
+報告者の言葉では「ON を押したのに k」。BUG-101（`kilyou` のリテラル化）や
+BUG-102（切替の取りこぼし）とは別の経路で、**そもそも「かな」キーが OS に
+届いていない**。
+
+**実測（2026-09-02、`RUST_LOG=debug`、ms 精度）:**
+
+```
+phys 0x68 (かな) KeyDown consume : 31 回
+inj-tap 0x68 KeyDown             :  1 回   ← ほぼ再注入されていない
+phys 0x66 (英数) KeyDown consume : 59 回
+inj-tap 0x66 KeyDown             : 53 回   ← こちらは再注入されている
+```
+
+左右で再注入率が極端に非対称。右親指は NICOLA のシフトとして正当に consume
+される場合が多いので 31 回すべてが失敗ではないが、英数→かな が連続したペアの
+うち consume されたものは **55 / 56 / 56 / 73 / 84 / 88 / 88 / 91 ms** に集中して
+おり、`config.local.toml` の `simultaneous_threshold_ms = 100` の内側に収まる。
+
+**真因（13:53:31 の実ログ）:**
+
+```
+.249 phys 0x66 KeyDown LeftThumb  -> consume     英数を押す（単打かコードか判定待ち）
+.340 phys 0x68 KeyDown RightThumb -> consume     91ms 後に かな → これも consume
+.340 flush_pending(ImeOff): flushed 0 action(s)  ← 保留中の右親指がここで捨てられる
+.340 Engine deactivated (reason=Inactive(ImeOff))
+.345 inj-tap 0x66 KeyDown                        英数 だけ再注入される
+.394 input source: atok36.Japanese -> keylayout.ABC
+.453 phys 0x28 KeyDown Char -> pass              生 k
+.513 phys 0x68 KeyUp RightThumb -> pass          KeyUp だけ素通し（KeyDown は消えたまま）
+```
+
+1. 英数 を押す → 親指キーなので engine が consume（判定保留）
+2. 閾値内に かな → 両親指が下りた状態で、これも consume
+3. 英数 が単打と確定 → 再注入 → `expect_ime_from_key(0x66)` で `ime_on=false`
+4. engine が非活性化し、`flush_pending` が保留中の右親指を捨てる
+5. かな の KeyDown は永久に失われる。KeyUp だけ後から素通ししても IME は
+   切り替わらない
+
+**なぜ BUG-102 の張り直しで救われないか:** かな が consume された時点で
+`expect_ime_on(true)` が立たない。awase は「ユーザーが ON を押した」ことを
+知らないので、検出すべき失敗が存在しない。BUG-102 は「切替キーは OS に届いたが
+効かなかった」を救う仕組みで、本件は「切替キーが OS に届いていない」。
+
+**位置づけ:** macOS 固有の構造的な衝突。macOS では親指キーがそのまま IME 切替
+キー（英数/かな）を兼ねるため、NICOLA の同時打鍵判定に吸われた親指キーは
+IME 切替の機会も一緒に失う。Windows/Linux では親指キーと IME 切替キーが同一で
+ないため表面化しない。
+
+**当座の回避策:** 英数 と かな の間を `simultaneous_threshold_ms`（既定 100ms）
+より広く空ける。
+
+**修正方針（未着手）:** engine 非活性化時に `flush_pending` が捨てている保留中の
+親指キーを、IME 切替キーとして再注入する経路が要る。修正箇所は `awase` コアの
+`flush_pending` か、macOS 側の親指ハンドリング。BUG-101/102 が触った IME 観測層
+（期待値・settle・張り直し）とはコード経路が重ならないため、混ぜずに別途直す。
+なお BUG-101/102 の変更が非活性化のタイミングを動かした可能性は否定できて
+いない（機構自体は `463ce313` 以前から存在する）。
+
+**テスト:** 未着手。修正時に `flush_pending` の親指キー保持を `awase` コアの
+ユニットテストで固定できる見込み（プラットフォーム非依存の FSM 部分のため）。
+
+**修正履歴:** 未修正。本エントリは BUG-101/102 の実機検証中に得た証拠の記録。
+
+**関連ファイル:** `crates/awase-macos/src/main.rs`, `src/engine/nicola_fsm.rs`。
+関連: BUG-101, BUG-102。
