@@ -256,6 +256,10 @@ mod imp {
         INJECT_MARKER,
     };
 
+    fn key_content_enabled() -> bool {
+        crate::diagnostics::key_content_enabled()
+    }
+
     /// kVK_Shift（Romaji/KeySequence の大文字送出用）
     const KEYCODE_SHIFT: u16 = 0x38;
     /// kVK_Option（記号の変換回避ストローク用）
@@ -383,7 +387,11 @@ mod imp {
                     self.press_with_shift(mark_code, mark_shift);
                 }
             }
-            log::debug!("Kana: injected '{ch}'");
+            if key_content_enabled() {
+                log::debug!("Kana: injected '{ch}'");
+            } else {
+                log::debug!("Kana: injected 1 character");
+            }
             self.composing_hint = true;
             true
         }
@@ -412,7 +420,11 @@ mod imp {
         /// 修飾フラグ付きでキーイベントを post する。
         fn post_key_with_flags(&self, keycode: u16, down: bool, shift: bool, option: bool) {
             let Ok(event) = CGEvent::new_keyboard_event(self.source.clone(), keycode, down) else {
-                warn!("Failed to create keyboard event (keycode=0x{keycode:02X})");
+                if key_content_enabled() {
+                    warn!("Failed to create keyboard event (keycode=0x{keycode:02X})");
+                } else {
+                    warn!("Failed to create keyboard event");
+                }
                 return;
             };
             let mut flags = CGEventFlags::empty();
@@ -441,7 +453,11 @@ mod imp {
         /// IME のかな漢字変換は経由しない（Unicode 直接注入モード用）。
         fn post_char(&self, ch: char) {
             let Ok(event) = CGEvent::new_keyboard_event(self.source.clone(), 0, true) else {
-                warn!("Failed to create keyboard event for Char('{ch}')");
+                if key_content_enabled() {
+                    warn!("Failed to create keyboard event for Char('{ch}')");
+                } else {
+                    warn!("Failed to create keyboard event for a character");
+                }
                 return;
             };
             event.set_string(&ch.to_string());
@@ -468,12 +484,18 @@ mod imp {
                     if needs_shift {
                         self.post_key(KEYCODE_SHIFT, false, false);
                     }
-                } else {
+                } else if key_content_enabled() {
                     warn!("{kind} char '{ch}' has no macOS keycode mapping, skipping");
+                } else {
+                    warn!("{kind} contains a character with no macOS keycode mapping, skipping");
                 }
             }
-            // 取りこぼし調査用（RUST_LOG=debug で注入内容を追跡できるように）
-            log::debug!("{kind}: injected \"{s}\"");
+            // 通常の debug は構造だけを残す。内容は追加オプトイン時のみ。
+            if key_content_enabled() {
+                log::debug!("{kind}: injected \"{s}\"");
+            } else {
+                log::debug!("{kind}: injected {} character(s)", s.chars().count());
+            }
             self.composing_hint = true;
         }
 
@@ -531,7 +553,11 @@ mod imp {
                     self.post_key(KEYCODE_SHIFT, false, false);
                 }
                 self.post_key(KEYCODE_OPTION, false, false);
-                log::debug!("Char: injected '{ch}' via option-modified keystroke");
+                if key_content_enabled() {
+                    log::debug!("Char: injected '{ch}' via option-modified keystroke");
+                } else {
+                    log::debug!("Char: injected 1 character via option-modified keystroke");
+                }
                 self.composing_hint = true;
                 return;
             }
@@ -566,7 +592,11 @@ mod imp {
                                     continue;
                                 }
                             }
-                            warn!("Romaji \"{s}\" has no kana-stroke mapping, falling back");
+                            if key_content_enabled() {
+                                warn!("Romaji \"{s}\" has no kana-stroke mapping, falling back");
+                            } else {
+                                warn!("Romaji sequence has no kana-stroke mapping, falling back");
+                            }
                         }
                         self.send_ascii_sequence(s, "Romaji");
                     }
@@ -615,12 +645,20 @@ impl Output {
 
     pub fn send_keys(&mut self, actions: &[awase::types::KeyAction]) {
         for action in actions {
-            log::trace!("macOS output stub: {action:?}");
+            if crate::diagnostics::key_content_enabled() {
+                log::trace!("macOS output stub: {action:?}");
+            } else {
+                log::trace!("macOS output stub: action");
+            }
         }
     }
 
     pub fn reinject(&mut self, vk: awase::types::VkCode, event_type: awase::types::KeyEventType) {
-        log::trace!("macOS output stub: reinject 0x{:02X} {event_type:?}", vk.0);
+        if crate::diagnostics::key_content_enabled() {
+            log::trace!("macOS output stub: reinject 0x{:02X} {event_type:?}", vk.0);
+        } else {
+            log::trace!("macOS output stub: reinject {event_type:?}");
+        }
     }
 
     pub fn note_composition_break(&mut self) {}

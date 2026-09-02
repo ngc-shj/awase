@@ -238,6 +238,16 @@ fn parse_symbol_romaji(
         .collect()
 }
 
+fn warn_if_key_content_logging_enabled() {
+    if awase_macos::diagnostics::key_content_enabled() {
+        log::warn!(
+            "{}=1: diagnostic logs may contain physical key codes and typed text; \
+             do not share them without review",
+            awase_macos::diagnostics::KEY_CONTENT_ENV
+        );
+    }
+}
+
 fn main() -> Result<()> {
     // 1. Initialize logging
     // ms 精度: IME 切替の settle 窓（数十 ms）と打鍵の前後関係を読むには
@@ -245,6 +255,8 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_millis()
         .init();
+
+    warn_if_key_content_logging_enabled();
 
     log::info!("awase-macos starting");
 
@@ -739,9 +751,16 @@ mod app {
                             // 後に着地して IME が意図と逆の OFF に落ちた）。
                             // 後から押された方をユーザーの最終意図とみなして捨てる
                             if self.is_superseded_switch(actions) {
-                                log::debug!(
-                                    "Dropping superseded IME switch action(s): {actions:?}"
-                                );
+                                if awase_macos::diagnostics::key_content_enabled() {
+                                    log::debug!(
+                                        "Dropping superseded IME switch action(s): {actions:?}"
+                                    );
+                                } else {
+                                    log::debug!(
+                                        "Dropping {} superseded IME switch action(s)",
+                                        actions.len()
+                                    );
+                                }
                                 continue;
                             }
                             for action in actions {
@@ -905,7 +924,11 @@ mod app {
             if event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA) == INJECT_MARKER {
                 // 注入イベントが OS のイベントストリームに実在した証跡
                 // （CGEventPost 後の消失と IME 側での無視を切り分ける）
-                log::debug!("inj-tap 0x{keycode:02X} {etype:?}");
+                if awase_macos::diagnostics::key_content_enabled() {
+                    log::debug!("inj-tap 0x{keycode:02X} {etype:?}");
+                } else {
+                    log::debug!("inj-tap {etype:?}");
+                }
                 if matches!(etype, CGEventType::KeyDown) {
                     self.expect_ime_from_key(keycode);
                 }
@@ -981,9 +1004,13 @@ mod app {
                 Decision::PassThroughWith { .. } => "pass+fx",
                 Decision::Consume { .. } => "consume",
             };
-            log::debug!(
-                "phys 0x{keycode:02X} {event_type:?} {key_classification:?} -> {decision_name}"
-            );
+            if awase_macos::diagnostics::key_content_enabled() {
+                log::debug!(
+                    "phys 0x{keycode:02X} {event_type:?} {key_classification:?} -> {decision_name}"
+                );
+            } else {
+                log::debug!("phys {event_type:?} {key_classification:?} -> {decision_name}");
+            }
             // このキー自身の出力が保留に積まれる前の状態を見る。`apply_decision` の
             // 後に読むと、`PassThroughWith` で吐かれた SendKeys が保留に入った直後に
             // 自分で破棄してしまう（activation 遷移フラッシュや bypass 経由の
@@ -1055,6 +1082,7 @@ mod app {
             let _ = self.apply_decision(decision);
         }
     }
+
     #[cfg(test)]
     mod tests {
         use super::{

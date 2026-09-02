@@ -83,6 +83,21 @@ difference is hard to perceive (wait's worst-case delay is the
 simultaneity threshold, ~100 ms); pick with `confirm_mode` in config.toml.
 `two_phase` and the adaptive modes are untested on macOS.
 
+## Diagnostic logging
+
+`RUST_LOG=debug` logs state transitions, key classifications, action counts, and
+timing without recording physical key codes or injected text. When diagnosing a
+problem that requires the exact input/output correspondence, add the separate
+explicit opt-in:
+
+```sh
+RUST_LOG=debug AWASE_LOG_KEY_CONTENT=1 /Applications/Awase.app/Contents/MacOS/awase
+```
+
+The app emits a warning at startup when this flag is enabled. These logs can
+contain reconstructable typed text; review and redact them before sharing, and
+unset the flag after the diagnostic session.
+
 ## Notes
 
 - A bundled build fails to start if `Contents/Resources` is missing, or if the

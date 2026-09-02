@@ -3,6 +3,7 @@
 //! CGEventTap によるキーボードフック、CGEventPost による出力、
 //! TIS による IME 制御など、macOS API 依存コードを集約する。
 
+pub mod diagnostics;
 pub mod event_loop;
 pub mod hook;
 pub mod ime;
