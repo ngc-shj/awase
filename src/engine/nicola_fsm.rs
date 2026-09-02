@@ -123,6 +123,23 @@ pub struct NicolaFsm {
     /// 呼び忘れ時にこの誤出力が起こるため、意図的に安全側の `false` を既定にしている。
     thumb_shift_faces_enabled: bool,
 
+    /// 親指キーが IME 切替キー（macOS の 英数/かな）そのものかどうか。
+    ///
+    /// true のとき、`flush_pending` は `ComposingHint::Unknown` でも保留中の
+    /// 親指キーを生キーで送出する。既定の `Unknown` は「保留キーが入力された
+    /// ウィンドウと今のウィンドウが同じ保証が無いので抑制する」ための安全側の
+    /// 挙動だが、親指キーが IME 切替キーを兼ねる構成ではこれが**ユーザーの
+    /// 切替操作そのものを消す**（BUG-103: 英数 の直後に かな を押すと、かな が
+    /// 同時打鍵判定に consume され、非活性化フラッシュで捨てられて IME が ON に
+    /// ならない）。切替キーは文字を生まないため、抑制の本来の目的である
+    /// 「別ウィンドウへの生 `VK_SPACE` 誤注入」のような実害が無い。
+    ///
+    /// **Platform 層は、親指キーが実際に IME 切替キーのときだけ true を渡すこと**
+    /// （`crates/awase-macos/src/main.rs` 参照）。親指に Space 等の文字キーを
+    /// 割り当てた構成で true にすると、抑制が意図している誤注入が起きる。
+    /// 既定は `false`（従来どおり抑制）で、呼び忘れても実害が出ない側に倒す。
+    thumb_keys_are_ime_switch: bool,
+
     /// ソロ確定の連続回数を追跡する汎用カウンター（親指キーに割り当てた
     /// `engine_off_solo_repeat_vk` 用、`PendingThumb` 経由でのみ更新される）。
     solo_counter: ConsecutiveSoloCounter,
@@ -272,6 +289,9 @@ impl NicolaFsm {
             // set_thumb_shift_faces_enabled() で実際の値を設定する（フィールドの
             // doc コメント参照）。
             thumb_shift_faces_enabled: false,
+            // 既定は無効（安全側）。Platform 層が親指キー＝IME 切替キーのときだけ
+            // set_thumb_keys_are_ime_switch() で true にする（フィールドの doc 参照）
+            thumb_keys_are_ime_switch: false,
             solo_counter: ConsecutiveSoloCounter::new(SOLO_OFF_TIMEOUT_US),
             engine_off_extra_solo_counter: ConsecutiveSoloCounter::new(SOLO_OFF_TIMEOUT_US),
             engine_off_extra_key_suppressed: None,
@@ -375,6 +395,20 @@ impl NicolaFsm {
                         thumb.modifier_key,
                         c,
                     ),
+                    // 親指キーが IME 切替キーそのものの構成では、抑制すると
+                    // ユーザーの切替操作が消える（BUG-103）。切替キーは文字を
+                    // 生まないので、抑制が防いでいる誤注入の実害が無い
+                    ComposingHint::Unknown if self.thumb_keys_are_ime_switch => {
+                        let action = KeyAction::Key(thumb.vk_code);
+                        let output = OutputUpdate::record(thumb.scan_code, &action, None);
+                        (
+                            ResolvedAction {
+                                actions: smallvec![action],
+                                output,
+                            },
+                            None,
+                        )
+                    }
                     ComposingHint::Unknown => (
                         ResolvedAction {
                             actions: SmallVec::new(),
@@ -598,6 +632,11 @@ impl NicolaFsm {
     /// Shift レベルが立つため、Platform 層は false を渡すこと。
     pub const fn set_thumb_shift_faces_enabled(&mut self, enabled: bool) {
         self.thumb_shift_faces_enabled = enabled;
+    }
+
+    /// 親指キーが IME 切替キーそのものかどうかを設定する（フィールドの doc 参照）。
+    pub const fn set_thumb_keys_are_ime_switch(&mut self, yes: bool) {
+        self.thumb_keys_are_ime_switch = yes;
     }
 
     /// ソロ連打によるエンジン OFF 要求を取り出す（1ショット）。

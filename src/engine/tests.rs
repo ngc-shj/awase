@@ -5259,6 +5259,65 @@ mod engine_integration_tests {
         }
     }
 
+    /// BUG-103: 親指キーが IME 切替キーを兼ねる構成（macOS の 英数/かな）で、
+    /// 親指を押したまま engine が非活性化しても切替キーが消えないこと。
+    ///
+    /// これが落ちると「ON を押したのに IME が ON にならず、次の打鍵が生キーで
+    /// 出る」に戻る。実機では 英数 の直後（`simultaneous_threshold_ms` の内側）に
+    /// かな を押すと、かな が同時打鍵判定に consume され、非活性化フラッシュの
+    /// `ComposingHint::Unknown` で捨てられていた。
+    #[test]
+    fn deactivation_keeps_a_held_thumb_key_when_it_is_the_ime_switch() {
+        let mut engine = make_test_engine();
+        engine.set_thumb_keys_are_ime_switch(true);
+
+        let d1 = engine.on_input(Ev::down(VK_NONCONVERT).at(0).build(), &ime_on_ctx());
+        assert!(d1.is_consumed(), "thumb key is consumed while pending");
+
+        // 親指を押したまま ime_on が落ちる（macOS では 英数 再注入の期待値で起きる）
+        let ctx_off = InputContext {
+            left_thumb_down: Some(0),
+            ..ime_off_ctx()
+        };
+        let d2 = engine.on_command(EngineCommand::RefreshState, &ctx_off);
+
+        assert!(
+            has_effect(&d2, |e| matches!(
+                e,
+                Effect::Input(InputEffect::SendKeys(actions))
+                    if actions.iter().any(|a| matches!(a, KeyAction::Key(vk) if vk == &VK_NONCONVERT))
+            )),
+            "the held switch key must survive deactivation, got {:?}",
+            effects_of(&d2)
+        );
+    }
+
+    /// 既定（親指キーが IME 切替キーではない = Windows/Linux）では従来どおり
+    /// 抑制する。ここが緩むと、フォーカス変更に伴う非活性化で保留中の親指キーが
+    /// 別ウィンドウへ生送出される（`ComposingHint::Unknown` が防いでいる事故）。
+    #[test]
+    fn deactivation_still_suppresses_a_held_thumb_key_by_default() {
+        let mut engine = make_test_engine();
+
+        let d1 = engine.on_input(Ev::down(VK_NONCONVERT).at(0).build(), &ime_on_ctx());
+        assert!(d1.is_consumed());
+
+        let ctx_off = InputContext {
+            left_thumb_down: Some(0),
+            ..ime_off_ctx()
+        };
+        let d2 = engine.on_command(EngineCommand::RefreshState, &ctx_off);
+
+        assert!(
+            !has_effect(&d2, |e| matches!(
+                e,
+                Effect::Input(InputEffect::SendKeys(_))
+            )),
+            "default config must not emit the held thumb key, got {:?}",
+            effects_of(&d2)
+        );
+    }
+
     fn ime_on_composing_ctx() -> InputContext {
         InputContext {
             composing: true,

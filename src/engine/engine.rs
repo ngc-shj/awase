@@ -195,6 +195,12 @@ impl Engine {
         self.adapter.set_thumb_shift_faces_enabled(enabled);
     }
 
+    /// 親指キーが IME 切替キーそのものかを設定する
+    /// （`NicolaFsm::thumb_keys_are_ime_switch` の doc 参照）。
+    pub const fn set_thumb_keys_are_ime_switch(&mut self, yes: bool) {
+        self.adapter.set_thumb_keys_are_ime_switch(yes);
+    }
+
     /// InputContext から実効状態を `ActivationState` で返す。
     ///
     /// 判定順: user_enabled → is_japanese_ime → ime_on → is_romaji

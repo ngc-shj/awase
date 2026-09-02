@@ -141,6 +141,10 @@ impl FsmAdapter {
         self.fsm.set_thumb_shift_faces_enabled(enabled);
     }
 
+    pub(super) const fn set_thumb_keys_are_ime_switch(&mut self, yes: bool) {
+        self.fsm.set_thumb_keys_are_ime_switch(yes);
+    }
+
     /// ソロ連打によるエンジン OFF 要求を取り出す（1ショット）。
     pub(super) fn take_engine_off_requested(&mut self) -> bool {
         self.fsm.take_engine_off_requested()

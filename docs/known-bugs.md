@@ -12293,17 +12293,43 @@ IME 切替の機会も一緒に失う。Windows/Linux では親指キーと IME 
 **当座の回避策:** 英数 と かな の間を `simultaneous_threshold_ms`（既定 100ms）
 より広く空ける。
 
-**修正方針（未着手）:** engine 非活性化時に `flush_pending` が捨てている保留中の
-親指キーを、IME 切替キーとして再注入する経路が要る。修正箇所は `awase` コアの
-`flush_pending` か、macOS 側の親指ハンドリング。BUG-101/102 が触った IME 観測層
-（期待値・settle・張り直し）とはコード経路が重ならないため、混ぜずに別途直す。
-なお BUG-101/102 の変更が非活性化のタイミングを動かした可能性は否定できて
-いない（機構自体は `463ce313` 以前から存在する）。
+**修正:** `src/engine/nicola_fsm.rs` に `thumb_keys_are_ime_switch`（既定
+`false`）を追加し、true のときだけ `flush_pending` が `ComposingHint::Unknown` でも
+保留中の親指キーを生キーで送出する。`ComposingHint::Unknown` 自体は変えていない
+——あれは「保留キーが入力されたウィンドウと今のウィンドウが同じ保証が無いので
+生 `VK_SPACE` 等を別ウィンドウへ誤注入しない」ための安全策で、focus 遷移バグを
+繰り返してきた経緯がある。切替キーは文字を生まないため、抑制が防いでいる実害が
+この構成に限って存在しない、というのが例外の根拠。
 
-**テスト:** 未着手。修正時に `flush_pending` の親指キー保持を `awase` コアの
-ユニットテストで固定できる見込み（プラットフォーム非依存の FSM 部分のため）。
+`crates/awase-macos/src/main.rs` は、親指キーが**実際に 英数/かな のときだけ**
+true を渡す。Space 等の文字キーを親指に割り当てた構成では false のままなので、
+抑制が本来の目的どおり効く。既定 false のため Windows/Linux は挙動不変。
 
-**修正履歴:** 未修正。本エントリは BUG-101/102 の実機検証中に得た証拠の記録。
+**追補（順序の逆転）:** 上記だけでは不十分だった。保留から遅れて出てきた
+`英数` が、その間に押された `かな` に**追い越されて後着**し、IME が意図と逆の
+OFF に落ちた（実測 14:14:20: `inj-tap 0x68` → `inj-tap 0x66` → `ABC` → 生 `k`）。
+これは `run_effects` の既存コメントが名指ししていた現象そのもの（「英数→かな と
+続けて打つと 英数 の注入が後着し」）。`is_superseded_switch` を追加し、**両親指が
+押されている間は押下時刻の新しい方をユーザーの最終意図とみなして、古い方の切替
+キーを捨てる**ようにした。判定には既存の `left_thumb_down` / `right_thumb_down`
+を使うだけで新しい状態は増やしていない。片方だけ押下なら追い越しは起こり得ない
+ので、通常の単打・親指シフト経路には影響しない。
 
-**関連ファイル:** `crates/awase-macos/src/main.rs`, `src/engine/nicola_fsm.rs`。
+**実機検証（2026-09-02、ATOK atok36、VS Code）:** 英数→かな の高速往復で、
+かな を押した後の生キー漏れ **0 件**（生キー素通し 26 件はすべて Ctrl+H 等の
+修飾キーバイパス中で正当）。順序ガードの発火は 英数 47 回・かな 7 回で左右対称。
+`flush_pending(ImeOff)` は修正前 flushed 0 → 修正後 flushed 1、かな の再注入は
+31 回中 1 回 → 29 回中 14 回に改善。
+
+**テスト:** `src/engine/tests.rs` に 2 本追加。
+`deactivation_keeps_a_held_thumb_key_when_it_is_the_ime_switch`（本バグの回帰）と
+`deactivation_still_suppresses_a_held_thumb_key_by_default`（既定の抑制が緩んで
+いないこと）。後者が無いと「安全側の抑制を全体的に緩めた」変更と区別が付かない。
+`is_superseded_switch` は `CGEventTap` を伴うためユニットテストできず、上記の
+実機検証に委ねる。
+
+**修正履歴:** `macos-port` ブランチで実装（本エントリ更新と同一コミット）。
+
+**関連ファイル:** `src/engine/nicola_fsm.rs`, `src/engine/engine.rs`,
+`src/engine/fsm_adapter.rs`, `crates/awase-macos/src/main.rs`。
 関連: BUG-101, BUG-102。

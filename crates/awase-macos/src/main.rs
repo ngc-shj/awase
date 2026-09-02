@@ -9,6 +9,11 @@ use awase::yab::YabLayout;
 
 use awase_macos::vk::key_name_to_keycode;
 
+/// kVK_JIS_Eisu（英数）— macOS 標準の IME OFF キー
+const KEYCODE_EISU: u16 = 0x66;
+/// kVK_JIS_Kana（かな）— macOS 標準の IME ON キー
+const KEYCODE_KANA: u16 = 0x68;
+
 /// 実行ファイルが .app バンドル内（`…/<名前>.app/Contents/MacOS/<exe>`）に
 /// あれば `Contents/Resources` を返す。
 ///
@@ -194,6 +199,14 @@ fn main() -> Result<()> {
         awase_macos::hook::classify_modifier(left_thumb.0) != Some(ModifierKey::Shift)
             && awase_macos::hook::classify_modifier(right_thumb.0) != Some(ModifierKey::Shift),
     );
+    // 親指キーが 英数/かな（kVK_JIS_Eisu / kVK_JIS_Kana）そのものなら、非活性化
+    // フラッシュで捨てずに送出させる。macOS では親指キーが IME 切替キーを兼ねる
+    // ため、捨てるとユーザーの切替操作が消える（BUG-103）。Space 等の文字キーを
+    // 割り当てた構成では false のままにする — 生キー送出の誤注入を防ぐ抑制が
+    // 本来の目的どおり効くべきなので（`thumb_keys_are_ime_switch` の doc 参照）
+    let is_switch_key = |kc: u16| matches!(kc, KEYCODE_EISU | KEYCODE_KANA);
+    fsm.set_thumb_keys_are_ime_switch(is_switch_key(left_thumb.0) && is_switch_key(right_thumb.0));
+
     // [keys] のコンボ設定を macOS keycode に解決して Engine に渡す
     let parse_combos = |keys: &[String], label: &str| {
         let parsed: Vec<_> = keys
@@ -302,10 +315,7 @@ mod app {
     use awase_macos::output::{Output, INJECT_MARKER};
     use awase_macos::tray::SystemTray;
 
-    /// kVK_JIS_Eisu（英数）— macOS 標準の IME OFF キー
-    const KEYCODE_EISU: u16 = 0x66;
-    /// kVK_JIS_Kana（かな）— macOS 標準の IME ON キー
-    const KEYCODE_KANA: u16 = 0x68;
+    use super::{KEYCODE_EISU, KEYCODE_KANA};
 
     /// IME 切替待ちの出力フラッシュ用タイマー ID。
     /// Engine の TimerEffect ID（小さい連番）と衝突しない値を使う。
@@ -470,6 +480,26 @@ mod app {
             self.output.send_keys(&keys);
         }
 
+        /// この切替アクションが、より後に押された反対側の親指キーに
+        /// 追い越されているか（BUG-103 追補）。
+        ///
+        /// 両親指が押されている間だけ判定する。押下時刻の新しい方がユーザーの
+        /// 最終意図なので、古い方の切替キーを送ると結果が逆になる。
+        fn is_superseded_switch(&self, actions: &[awase::types::KeyAction]) -> bool {
+            let (Some(left_at), Some(right_at)) = (self.left_thumb_down, self.right_thumb_down)
+            else {
+                return false;
+            };
+            actions.iter().any(|action| match action {
+                awase::types::KeyAction::Key(vk) => match vk.0 {
+                    KEYCODE_EISU => right_at > left_at,
+                    KEYCODE_KANA => left_at > right_at,
+                    _ => false,
+                },
+                _ => false,
+            })
+        }
+
         /// 観測されないまま猶予切れした切替を張り直す（BUG-102）。
         ///
         /// 保留キューがあるときは `maybe_flush_deferred` が回数制限付きで面倒を
@@ -534,6 +564,17 @@ mod app {
                         // （英数→かな と続けて打つと 英数 の注入が後着し、直後の
                         // 打鍵がリテラルで漏れる事例を実測）
                         if actions.iter().any(is_ime_switch_action) {
+                            // 保留から遅れて出てきた切替キーは、その間に押された
+                            // 反対側の親指に追い越される（BUG-103 追補: 英数 →
+                            // 42ms 後に かな と打つと、flush された 英数 が かな の
+                            // 後に着地して IME が意図と逆の OFF に落ちた）。
+                            // 後から押された方をユーザーの最終意図とみなして捨てる
+                            if self.is_superseded_switch(actions) {
+                                log::debug!(
+                                    "Dropping superseded IME switch action(s): {actions:?}"
+                                );
+                                continue;
+                            }
                             for action in actions {
                                 if let awase::types::KeyAction::Key(vk) = action {
                                     self.expect_ime_from_key(vk.0);
