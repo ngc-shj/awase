@@ -85,6 +85,9 @@ simultaneity threshold, ~100 ms); pick with `confirm_mode` in config.toml.
 
 ## Notes
 
+- A bundled build fails to start if `Contents/Resources` is missing, or if the
+  configured layout path is absolute, contains `..`, or resolves outside that
+  directory. This is an intentional fail-closed behavior.
 - Quit from the menu bar icon (awase を終了) or `launchctl unload`.
 - Thumb keys default to 英数 (left) / かな (right); the IME must be in
   romaji-input hiragana mode for kana-kanji conversion to work.

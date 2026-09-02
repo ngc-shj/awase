@@ -1,5 +1,5 @@
-use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
+use anyhow::{bail, Context, Result};
+use std::path::{Component, Path, PathBuf};
 
 use awase::config::AppConfig;
 use awase::engine::{Engine, NicolaFsm, SpecialKeyCombos};
@@ -35,6 +35,74 @@ fn bundle_resources_dir(exe: &Path) -> Option<PathBuf> {
         .then(|| contents.join("Resources"))
 }
 
+/// バンドル内のリソースを解決し、`Contents/Resources` の外への脱出を拒否する。
+fn resolve_bundled_resource(resources: &Path, path: &str) -> Result<PathBuf> {
+    let raw = Path::new(path);
+    if raw.is_absolute()
+        || raw.components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        bail!("bundled resource path must stay relative: {path:?}");
+    }
+
+    let resources_meta = std::fs::symlink_metadata(resources).with_context(|| {
+        format!(
+            "Failed to inspect bundle resources at {}",
+            resources.display()
+        )
+    })?;
+    if resources_meta.file_type().is_symlink() || !resources_meta.is_dir() {
+        bail!(
+            "bundle Resources must be a real directory, not a symlink: {}",
+            resources.display()
+        );
+    }
+    let canonical_root = resources.canonicalize().with_context(|| {
+        format!(
+            "Failed to canonicalize bundle resources at {}",
+            resources.display()
+        )
+    })?;
+    let candidate = resources.join(raw);
+    match candidate.canonicalize() {
+        Ok(canonical) if canonical.starts_with(&canonical_root) => Ok(canonical),
+        Ok(canonical) => bail!(
+            "bundled resource escapes Contents/Resources: {} -> {}",
+            candidate.display(),
+            canonical.display()
+        ),
+        // 存在しないリソースは呼び出し側が既定値へ倒す。ただし、直前の
+        // ディレクトリも canonicalize し、未作成ファイルに向かう symlink での脱出を防ぐ。
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let parent = candidate.parent().unwrap_or(resources);
+            let canonical_parent = parent.canonicalize().with_context(|| {
+                format!(
+                    "Failed to canonicalize bundled resource parent {}",
+                    parent.display()
+                )
+            })?;
+            if !canonical_parent.starts_with(&canonical_root) {
+                bail!(
+                    "bundled resource parent escapes Contents/Resources: {} -> {}",
+                    parent.display(),
+                    canonical_parent.display()
+                );
+            }
+            Ok(candidate)
+        }
+        Err(e) => Err(e).with_context(|| {
+            format!(
+                "Failed to canonicalize bundled resource {}",
+                candidate.display()
+            )
+        }),
+    }
+}
+
 /// リソース（config.toml / layout）を解決する。
 ///
 /// .app バンドル内から実行されている場合は署名対象の `Contents/Resources` に
@@ -48,35 +116,46 @@ fn bundle_resources_dir(exe: &Path) -> Option<PathBuf> {
 /// - リリースビルド: exe 隣接のみ（fail closed）。共通解決器はパス中の任意の
 ///   `target` ディレクトリをワークスペースとみなすため、偽の `target/release/`
 ///   配下に置かれたバイナリに外部設定を読ませられる。`current_exe()` 取得
-///   不能時も CWD には落とさず、存在しないパスを返して既定値動作にする
-fn resolve_resource(path: &str) -> PathBuf {
+///   不能時も CWD には落とさず、存在しないパスを返して既定値動作にする。
+fn resolve_resource(path: &str) -> Result<PathBuf> {
     let raw = Path::new(path);
-    if raw.is_absolute() {
-        return raw.to_path_buf();
-    }
     let exe = std::env::current_exe().ok();
     if let Some(resources) = exe.as_deref().and_then(bundle_resources_dir) {
-        return resources.join(path);
+        return resolve_bundled_resource(&resources, path);
+    }
+    if raw.is_absolute() {
+        return Ok(raw.to_path_buf());
     }
     #[cfg(debug_assertions)]
     {
-        awase::paths::resolve_relative_to_exe(path)
+        Ok(awase::paths::resolve_relative_to_exe(path))
     }
     #[cfg(not(debug_assertions))]
     {
-        exe.as_deref().and_then(Path::parent).map_or_else(
+        Ok(exe.as_deref().and_then(Path::parent).map_or_else(
             // /var/empty は root 所有の空ディレクトリ（macOS 標準）。
             // 「確実に存在しない相対リソース」の錨として使い、呼び出し側の
             // 既定値（デフォルト設定・空レイアウト警告）へ倒す
             || Path::new("/var/empty").join(path),
             |dir| dir.join(path),
-        )
+        ))
     }
 }
 
 #[cfg(test)]
 mod resolve_tests {
     use super::*;
+    use std::fs;
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "awase_macos_resource_{name}_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     #[test]
     fn bundle_detection_is_structural_and_case_insensitive() {
@@ -94,6 +173,50 @@ mod resolve_tests {
         assert_eq!(dir("/usr/local/bin/awase"), None);
         assert_eq!(dir("/tmp/Awase.app/MacOS/awase"), None);
         assert_eq!(dir("/tmp/NotBundle/Contents/MacOS/awase"), None);
+    }
+
+    #[test]
+    fn bundled_resource_accepts_existing_file_inside_resources() {
+        let root = unique_temp_dir("inside");
+        let resources = root.join("Contents/Resources");
+        fs::create_dir_all(resources.join("layout")).unwrap();
+        fs::write(resources.join("layout/nicola.yab"), "").unwrap();
+
+        let resolved = resolve_bundled_resource(&resources, "layout/nicola.yab").unwrap();
+        assert_eq!(
+            resolved,
+            resources.join("layout/nicola.yab").canonicalize().unwrap()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bundled_resource_rejects_absolute_path_and_parent_traversal() {
+        let root = unique_temp_dir("lexical_escape");
+        let resources = root.join("Contents/Resources");
+        fs::create_dir_all(&resources).unwrap();
+
+        assert!(resolve_bundled_resource(&resources, "/tmp/evil.yab").is_err());
+        assert!(resolve_bundled_resource(&resources, "layout/../../evil.yab").is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundled_resource_rejects_outward_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_temp_dir("symlink_escape");
+        let resources = root.join("Contents/Resources");
+        let outside = root.join("outside");
+        fs::create_dir_all(&resources).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("evil.yab"), "").unwrap();
+        symlink(&outside, resources.join("layout")).unwrap();
+
+        assert!(resolve_bundled_resource(&resources, "layout/evil.yab").is_err());
+        assert!(resolve_bundled_resource(&resources, "layout/not-created.yab").is_err());
+        let _ = fs::remove_dir_all(root);
     }
 }
 
@@ -126,7 +249,7 @@ fn main() -> Result<()> {
     log::info!("awase-macos starting");
 
     // 2. Load config
-    let config_path = resolve_resource("config.toml");
+    let config_path = resolve_resource("config.toml")?;
     let config = if config_path.exists() {
         log::info!("Loading config from: {}", config_path.display());
         AppConfig::load(&config_path)?
@@ -158,7 +281,7 @@ fn main() -> Result<()> {
     let keyboard_model = KeyboardModel::Jis;
 
     let layout_rel = Path::new(&config.general.layouts_dir).join(&config.general.default_layout);
-    let layout_path = resolve_resource(&layout_rel.to_string_lossy());
+    let layout_path = resolve_resource(&layout_rel.to_string_lossy())?;
     let mut layout = if layout_path.exists() {
         let content = std::fs::read_to_string(&layout_path)?;
         YabLayout::parse(&content, keyboard_model)?.resolve_kana()
@@ -807,15 +930,13 @@ mod app {
 
             let decision = self.engine.on_input(raw, &ctx);
             // 取りこぼし調査用: 物理イベントと判定の対応を RUST_LOG=debug で追える
+            let decision_name = match &decision {
+                Decision::PassThrough => "pass",
+                Decision::PassThroughWith { .. } => "pass+fx",
+                Decision::Consume { .. } => "consume",
+            };
             log::debug!(
-                "phys 0x{keycode:02X} {:?} {:?} -> {}",
-                event_type,
-                key_classification,
-                match &decision {
-                    Decision::PassThrough => "pass",
-                    Decision::PassThroughWith { .. } => "pass+fx",
-                    Decision::Consume { .. } => "consume",
-                },
+                "phys 0x{keycode:02X} {event_type:?} {key_classification:?} -> {decision_name}"
             );
             let action = self.apply_decision(decision);
 
