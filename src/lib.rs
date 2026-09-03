@@ -1,4 +1,5 @@
 pub mod config;
+pub mod diagnostics;
 pub mod engine;
 pub mod fs_atomic;
 pub mod gate;

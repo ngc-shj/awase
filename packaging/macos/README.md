@@ -98,6 +98,10 @@ The app emits a warning at startup when this flag is enabled. These logs can
 contain reconstructable typed text; review and redact them before sharing, and
 unset the flag after the diagnostic session.
 
+The gate covers the shared engine crate and the macOS layer. It does not cover
+`crates/awase-windows/`, which has many ungated VK logs of its own — the
+guarantee here is about the macOS build only.
+
 ## Notes
 
 - A bundled build fails to start if `Contents/Resources` is missing, or if the

@@ -1040,8 +1040,8 @@ impl SpecialKeyCombos {
                 .any(|k| matches_key_combo(*k, event, modifiers))
             {
                 log::debug!(
-                    "[special-key] IME ON match: vk={:#06X} ctrl={} shift={} alt={} extra_info={:#x}",
-                    event.vk_code,
+                    "[special-key] IME ON match: vk={} ctrl={} shift={} alt={} extra_info={:#x}",
+                    crate::diagnostics::MaskedVk(event.vk_code.0),
                     modifiers.ctrl,
                     modifiers.shift,
                     modifiers.alt,
@@ -1055,8 +1055,8 @@ impl SpecialKeyCombos {
                 .any(|k| matches_key_combo(*k, event, modifiers))
             {
                 log::debug!(
-                    "[special-key] IME OFF match: vk={:#06X} ctrl={} shift={} alt={} extra_info={:#x}",
-                    event.vk_code,
+                    "[special-key] IME OFF match: vk={} ctrl={} shift={} alt={} extra_info={:#x}",
+                    crate::diagnostics::MaskedVk(event.vk_code.0),
                     modifiers.ctrl,
                     modifiers.shift,
                     modifiers.alt,
@@ -1072,8 +1072,8 @@ impl SpecialKeyCombos {
                 .any(|k| matches_key_combo(*k, event, modifiers))
             {
                 log::debug!(
-                    "[special-key] IME Toggle match: vk={:#06X} ctrl={} shift={} alt={} extra_info={:#x}",
-                    event.vk_code,
+                    "[special-key] IME Toggle match: vk={} ctrl={} shift={} alt={} extra_info={:#x}",
+                    crate::diagnostics::MaskedVk(event.vk_code.0),
                     modifiers.ctrl,
                     modifiers.shift,
                     modifiers.alt,

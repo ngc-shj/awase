@@ -369,23 +369,59 @@ impl EngineState {
     }
 
     /// 診断用: 状態を短い文字列で返す（[engine-input] ログ等で使用）。
+    ///
+    /// VK は打鍵内容そのものなので、既定では出さず構造だけを返す。
+    /// `AWASE_LOG_KEY_CONTENT=1` のときだけ VK 付きの詳細ラベルになる
+    /// （`crate::diagnostics` の doc 参照）。
     #[must_use]
     pub fn debug_label(&self) -> String {
+        self.debug_label_with(crate::diagnostics::key_content_enabled())
+    }
+
+    /// `debug_label` の中核（オプトイン判定を引数で受ける純粋部分）。
+    #[must_use]
+    pub fn debug_label_with(&self, detailed: bool) -> String {
         match self {
             Self::Idle => "Idle".to_string(),
-            Self::PendingChar(k) => format!("PendingChar(vk=0x{:02X})", k.vk_code.0),
+            Self::PendingChar(k) => {
+                if detailed {
+                    format!("PendingChar(vk=0x{:02X})", k.vk_code.0)
+                } else {
+                    "PendingChar".to_string()
+                }
+            }
             Self::PendingThumb(t) => {
-                format!("PendingThumb(vk=0x{:02X},left={})", t.vk_code.0, t.is_left)
+                if detailed {
+                    format!("PendingThumb(vk=0x{:02X},left={})", t.vk_code.0, t.is_left)
+                } else {
+                    format!("PendingThumb(left={})", t.is_left)
+                }
             }
             Self::PendingCharThumb {
                 char_key,
                 thumb,
                 char1_released_at,
-            } => format!(
-                "PendingCharThumb(char=0x{:02X},thumb=0x{:02X},left={},released_at={:?})",
-                char_key.vk_code.0, thumb.vk_code.0, thumb.is_left, char1_released_at
-            ),
-            Self::SpeculativeChar(k) => format!("SpeculativeChar(vk=0x{:02X})", k.vk_code.0),
+            } => {
+                if detailed {
+                    format!(
+                        "PendingCharThumb(char=0x{:02X},thumb=0x{:02X},left={},released_at={:?})",
+                        char_key.vk_code.0, thumb.vk_code.0, thumb.is_left, char1_released_at
+                    )
+                } else {
+                    format!(
+                        "PendingCharThumb(left={},released={})",
+                        thumb.is_left,
+                        char1_released_at.is_some()
+                    )
+                }
+            }
+            Self::SpeculativeChar(k) => {
+                if detailed {
+                    format!("SpeculativeChar(vk=0x{:02X})", k.vk_code.0)
+                } else {
+                    "SpeculativeChar".to_string()
+                }
+            }
         }
     }
 
@@ -1399,5 +1435,42 @@ mod tests {
             remaining,
         };
         assert!(matches!(pa, ParseAction::ReduceAndContinue { .. }));
+    }
+}
+
+#[cfg(test)]
+mod debug_label_tests {
+    use super::*;
+    use crate::types::{ScanCode, VkCode};
+
+    fn pending_char() -> EngineState {
+        EngineState::PendingChar(PendingKey {
+            scan_code: ScanCode(0x25),
+            vk_code: VkCode(0x28),
+            pos: None,
+            timestamp: 0,
+        })
+    }
+
+    /// 既定では VK を出さない。ここが漏れると `RUST_LOG=debug` だけで
+    /// 打鍵内容が復元できてしまう（VK の列は本質的にキーログ）。
+    #[test]
+    fn a_state_label_hides_the_vk_without_the_opt_in() {
+        let label = pending_char().debug_label_with(false);
+        assert_eq!(label, "PendingChar");
+        assert!(!label.contains("vk"), "no vk in the default label: {label}");
+        assert!(
+            !label.contains("28"),
+            "no key code in the default label: {label}"
+        );
+    }
+
+    /// オプトイン時は従来どおり VK 付きの詳細ラベル。
+    #[test]
+    fn a_state_label_shows_the_vk_with_the_opt_in() {
+        assert_eq!(
+            pending_char().debug_label_with(true),
+            "PendingChar(vk=0x28)"
+        );
     }
 }

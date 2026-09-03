@@ -1044,9 +1044,9 @@ impl NicolaFsm {
                 // Flush the pending char first so it reaches IME before the passthrough key.
                 let pending = self.state.expect_pending_char();
                 log::debug!(
-                    "[passthrough-flush] pending=PendingChar(vk={:#04x}) → flush, then reprocess passthrough_vk={:#04x} ts={}us",
-                    pending.vk_code.0,
-                    ev.vk_code.0,
+                    "[passthrough-flush] pending=PendingChar(vk={}) → flush, then reprocess passthrough_vk={} ts={}us",
+                    crate::diagnostics::MaskedVk(pending.vk_code.0),
+                    crate::diagnostics::MaskedVk(ev.vk_code.0),
                     ev.timestamp,
                 );
                 self.go_idle();
@@ -1066,9 +1066,9 @@ impl NicolaFsm {
                 // Flush the pending thumb first so it reaches IME before the passthrough key.
                 let thumb = self.state.expect_pending_thumb();
                 log::debug!(
-                    "[passthrough-flush] pending=PendingThumb(vk={:#04x}) → flush, then reprocess passthrough_vk={:#04x} ts={}us",
-                    thumb.vk_code.0,
-                    ev.vk_code.0,
+                    "[passthrough-flush] pending=PendingThumb(vk={}) → flush, then reprocess passthrough_vk={} ts={}us",
+                    crate::diagnostics::MaskedVk(thumb.vk_code.0),
+                    crate::diagnostics::MaskedVk(ev.vk_code.0),
                     ev.timestamp,
                 );
                 self.go_idle();
@@ -1825,8 +1825,8 @@ impl NicolaFsm {
             | EngineState::PendingCharThumb { .. }
             | EngineState::SpeculativeChar(_) => {
                 log::error!(
-                    "unexpected state in handle_key_up_pending: {:?}",
-                    self.state
+                    "unexpected state in handle_key_up_pending: {}",
+                    self.state.debug_label()
                 );
                 (
                     ResolvedAction {
@@ -1985,7 +1985,10 @@ impl NicolaFsm {
             }
             // Other states shouldn't have TIMER_SPECULATIVE active
             other => {
-                log::warn!("TIMER_SPECULATIVE fired in unexpected state: {other:?}");
+                log::warn!(
+                    "TIMER_SPECULATIVE fired in unexpected state: {}",
+                    other.debug_label()
+                );
                 Response::pass_through().with_kill_timer(TIMER_SPECULATIVE)
             }
         }
@@ -2138,8 +2141,8 @@ impl NicolaFsm {
             return Response::pass_through();
         }
         log::debug!(
-            "handle_bypass: vk=0x{:02X} reason={:?} state={}",
-            ev.vk_code.0,
+            "handle_bypass: vk={} reason={:?} state={}",
+            crate::diagnostics::MaskedVk(ev.vk_code.0),
             reason,
             self.state.debug_label(),
         );
