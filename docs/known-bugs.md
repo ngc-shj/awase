@@ -12453,3 +12453,42 @@ engine が活性のまま 英数 が押下中になり、後続の文字が左�
 
 **関連ファイル:** `crates/awase-macos/src/main.rs`。関連: BUG-103, BUG-106。
 
+
+## BUG-106: 非活性中に素通しした KeyDown の KeyUp が、活性化後に解釈される
+
+**症状:** BUG-105 と同じ打鍵で、KeyDown を一度も処理していないキーから出力が出る。
+
+**実測（同 15:37:05）:**
+
+```
+05.341 phys 0x28 KeyDown Char -> pass      ← engine 非活性、素通し
+05.345 かな で engine 活性化
+05.563 phys 0x28 KeyUp Char -> consume     ← 活性なので consume され
+05.563 sending 1 action(s) 164ms after settled  ← 出力が発生
+```
+
+**真因:** `src/engine/key_lifecycle.rs` のモジュール doc は
+「KeyDown を PassThrough した場合、対応する KeyUp も PassThrough すべき。
+**この不変条件を保証する**」と宣言しているが、`engine.rs::on_input` の Phase 0 は
+片方向しか実装していなかった。`on_key_up` が false（＝ KeyDown は PassThrough）の
+とき `pass_through` せず Phase 1/2/3 へ落ち、FSM が KeyUp を解釈していた。
+活性化境界をまたいだときだけ顕在化するため「まれに」に合致する。
+
+**修正:** `KeyUpDisposition`（`Consume` / `PassThrough` / `Unknown`）を導入し、
+`on_key_down_passed_while_inactive` で「engine 非活性中に素通しした KeyDown」だけを
+記録する。その KeyUp は `pass_through` を返す。**活性中に素通しされたキー
+（Backspace 等）は `Unknown` のまま従来どおり FSM へ渡す** — 一律に
+PassThrough へ倒すと FSM の KeyUp 処理を広範に変えることになり、
+Windows/Linux 共通コードでの退行リスクが高いため、影響範囲を活性化境界に絞った。
+
+**テスト:** `key_down_passed_while_inactive_makes_key_up_pass_through` と
+`passed_while_inactive_is_not_doubled_by_auto_repeat`。変異検査で 2 本とも落ちる
+ことを確認済み。**Engine レベルの回帰テストは書けなかった** — 実機では FSM に
+投機出力が保留された状態で KeyUp が出力を生んだが、その状態を合成したテストでは
+修正の有無で結果が変わらず、判別できないテストになったため削除した。engine の
+配線が正しいことの根拠は上記の実機ログに委ねる。
+
+**修正履歴:** `macos-port` ブランチで実装（本エントリ記録と同一コミット）。
+
+**関連ファイル:** `src/engine/key_lifecycle.rs`, `src/engine/engine.rs`。
+関連: BUG-105。

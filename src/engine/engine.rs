@@ -23,7 +23,7 @@ use super::decision::{
 use super::fsm_adapter::FsmAdapter;
 use super::fsm_types::{ComposingHint, ModeKeyConfig, ModifierState, TextKeyConfig};
 use super::input_tracker::PhysicalKeyState;
-use super::key_lifecycle::KeyLifecycle;
+use super::key_lifecycle::{KeyLifecycle, KeyUpDisposition};
 use super::nicola_fsm::NicolaFsm;
 
 /// 特殊キーコンボのマッチ結果
@@ -351,8 +351,14 @@ impl Engine {
     pub fn on_input(&mut self, event: RawKeyEvent, ctx: &InputContext) -> Decision {
         // Phase 0: KeyUp 自動追跡
         let is_key_down = matches!(event.event_type, KeyEventType::KeyDown);
-        if !is_key_down && self.lifecycle.on_key_up(event.vk_code) {
-            return Decision::consumed();
+        if !is_key_down {
+            match self.lifecycle.on_key_up(event.vk_code) {
+                KeyUpDisposition::Consume => return Decision::consumed(),
+                // 非活性中に素通しした KeyDown の相方。活性化後に届いても
+                // FSM に解釈させない（`passed_while_inactive` の doc 参照）
+                KeyUpDisposition::PassThrough => return Decision::pass_through(),
+                KeyUpDisposition::Unknown => {}
+            }
         }
 
         // Phase 1: Special keys (engine toggle + IME control)
@@ -368,6 +374,10 @@ impl Engine {
         // Phase 2: Active state check + transition detection
         let transition_effects = self.check_active_transition(ctx);
         if !self.compute_active(ctx) {
+            if is_key_down {
+                self.lifecycle
+                    .on_key_down_passed_while_inactive(event.vk_code);
+            }
             if transition_effects.is_empty() {
                 return Decision::pass_through();
             }
