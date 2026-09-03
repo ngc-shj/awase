@@ -62,6 +62,12 @@ impl KeyLifecycle {
     /// KeyDown が Consume された場合に呼ぶ。対応する KeyUp も Consume すべきことを記録。
     pub fn on_key_down_consumed(&mut self, event: &RawKeyEvent) {
         let vk = event.vk_code;
+        // 非活性中に PassThrough した記録が残っていたら破棄する。押したまま
+        // Engine が活性化し、auto-repeat の KeyDown が Consume されるケースで、
+        // 同じキーが両方のリストに載る。`on_key_up` は `active_keys` を先に見るため
+        // PassThrough 側が残留し、後続の無関係な KeyUp を誤って素通しさせる。
+        // 1 つのキーの disposition は常に 1 つで、**最後の KeyDown の扱いが勝つ**
+        self.passed_while_inactive.retain(|held| *held != vk);
         // 同じキーの重複登録を防ぐ（キーリピートの場合）
         if !self.active_keys.iter().any(|k| k.vk_code == vk) {
             self.active_keys.push(ActiveKey {
@@ -75,6 +81,11 @@ impl KeyLifecycle {
     /// 対応する KeyUp も PassThrough すべきことを記録する
     /// （`passed_while_inactive` の doc 参照）。
     pub fn on_key_down_passed_while_inactive(&mut self, vk_code: VkCode) {
+        // 逆向きも同様に掃除する（Consume 済みのキーが押されたまま Engine が
+        // 非活性化し、auto-repeat が素通しされるケース）
+        if let Some(pos) = self.active_keys.iter().position(|k| k.vk_code == vk_code) {
+            self.active_keys.remove(pos);
+        }
         if !self.passed_while_inactive.contains(&vk_code) {
             self.passed_while_inactive.push(vk_code);
         }
@@ -169,6 +180,35 @@ mod tests {
         lc.on_key_down_passed_while_inactive(VkCode(0x41));
         assert_eq!(lc.on_key_up(VkCode(0x41)), KeyUpDisposition::PassThrough);
         // 一度きり。次の同じキーは通常処理へ戻す
+        assert_eq!(lc.on_key_up(VkCode(0x41)), KeyUpDisposition::Unknown);
+    }
+
+    /// 押したまま Engine が活性化し、auto-repeat の KeyDown が Consume される
+    /// ケース。同じキーが両方のリストに載ると `on_key_up` は `active_keys` を
+    /// 先に見るので PassThrough 側が残留し、後続の無関係な KeyUp を誤って
+    /// 素通しさせる。最後の KeyDown の扱いが勝つべき。
+    #[test]
+    fn a_repeat_consumed_after_activation_replaces_the_pass_through_record() {
+        let mut lc = KeyLifecycle::new();
+        lc.on_key_down_passed_while_inactive(VkCode(0x41));
+        // 活性化後の auto-repeat が Consume される
+        lc.on_key_down_consumed(&make_event(VkCode(0x41), KeyEventType::KeyDown));
+
+        assert_eq!(lc.on_key_up(VkCode(0x41)), KeyUpDisposition::Consume);
+        // PassThrough 側が残っていないこと
+        assert_eq!(lc.on_key_up(VkCode(0x41)), KeyUpDisposition::Unknown);
+    }
+
+    /// 逆向き: Consume 済みのキーが押されたまま非活性化し、auto-repeat が
+    /// 素通しされるケース。
+    #[test]
+    fn a_repeat_passed_after_deactivation_replaces_the_consume_record() {
+        let mut lc = KeyLifecycle::new();
+        lc.on_key_down_consumed(&make_event(VkCode(0x41), KeyEventType::KeyDown));
+        lc.on_key_down_passed_while_inactive(VkCode(0x41));
+
+        assert_eq!(lc.active_count(), 0, "the consume record must be dropped");
+        assert_eq!(lc.on_key_up(VkCode(0x41)), KeyUpDisposition::PassThrough);
         assert_eq!(lc.on_key_up(VkCode(0x41)), KeyUpDisposition::Unknown);
     }
 

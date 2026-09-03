@@ -12481,9 +12481,20 @@ engine が活性のまま 英数 が押下中になり、後続の文字が左�
 PassThrough へ倒すと FSM の KeyUp 処理を広範に変えることになり、
 Windows/Linux 共通コードでの退行リスクが高いため、影響範囲を活性化境界に絞った。
 
-**テスト:** `key_down_passed_while_inactive_makes_key_up_pass_through` と
-`passed_while_inactive_is_not_doubled_by_auto_repeat`。変異検査で 2 本とも落ちる
-ことを確認済み。**Engine レベルの回帰テストは書けなかった** — 実機では FSM に
+**追補（活性化をまたぐ auto-repeat）:** 初版は、同じキーが両方のリストに載る
+経路を塞いでいなかった。`k` を押したまま Engine が活性化すると、auto-repeat の
+KeyDown は FSM に Consume され `active_keys` にも載る。`on_key_up` は
+`active_keys` を先に見るため `passed_while_inactive` 側が残留し、後続の無関係な
+KeyUp を誤って素通しさせる。`on_key_down_consumed` / `on_key_down_passed_while_inactive`
+の双方で相手側の記録を破棄し、**1 つのキーの disposition は常に 1 つ・最後の
+KeyDown の扱いが勝つ**ようにした（逆向き＝ Consume 済みのキーを押したまま
+非活性化して auto-repeat が素通しされるケースも同様）。
+
+**テスト:** `key_down_passed_while_inactive_makes_key_up_pass_through`、
+`passed_while_inactive_is_not_doubled_by_auto_repeat`、
+`a_repeat_consumed_after_activation_replaces_the_pass_through_record`、
+`a_repeat_passed_after_deactivation_replaces_the_consume_record`。変異検査で、
+2 方向の掃除をそれぞれ外すと対応する 1 本だけが落ちることを確認済み。**Engine レベルの回帰テストは書けなかった** — 実機では FSM に
 投機出力が保留された状態で KeyUp が出力を生んだが、その状態を合成したテストでは
 修正の有無で結果が変わらず、判別できないテストになったため削除した。engine の
 配線が正しいことの根拠は上記の実機ログに委ねる。
