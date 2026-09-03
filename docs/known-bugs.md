@@ -12397,3 +12397,59 @@ ABC・HalfWidthEiji が等しく `Some(false)`、かなモードが `Some(true)`
 **修正履歴:** `macos-port` ブランチで実装（本エントリ記録と同一コミット）。
 
 **関連ファイル:** `crates/awase-macos/src/ime.rs`。関連: BUG-101, BUG-102。
+
+## BUG-105: IME 切替に使った親指打鍵が、そのまま親指シフトとしても数えられる
+
+**症状:** 英数 → かな と切り替えて「きょう」を打つと `ゔ` `い` 等になる。
+かな を押してから離すまでの間に打った文字が、親指シフト面で解決されている。
+
+**実測（2026-09-03 15:37:05、`RUST_LOG=debug AWASE_LOG_KEY_CONTENT=1`）:**
+
+```
+05.341 phys 0x28 KeyDown Char -> pass      ← 生 k（IME はまだ ABC）
+05.345 phys 0x68 (かな) KeyDown -> pass     ← 4ms 後。IME ON へ
+05.398 phys 0x00 KeyDown Char -> consume    ← かな 押下中 → 親指シフト面
+05.471 phys 0x25 KeyDown Char -> consume    ← 同じ
+05.612 phys 0x68 KeyUp                      ← 267ms 押しっぱなし
+```
+
+**真因:** macOS では親指キーが IME 切替キー（英数/かな）を兼ねる。その押下は
+「IME を切り替える」役割を果たして OS へ渡っているのに、`main.rs` の
+`left_thumb_down`/`right_thumb_down` は **engine の活性状態に関係なく毎イベント
+更新される**ため、同じ押下が親指シフトとしても数えられる（二重計上）。
+Windows/Linux では親指キーと IME 切替キーが別なので起きない。
+
+**利用者の意図の確認:** 「切替ですね」— 267ms の押下は IME を切り替えるための
+タップであって、親指シフトの意図的な保持ではなかった。したがって切替に使った
+押下はシフト役を持たないのが正しい、と判断した。
+
+**修正:** 親指の押下状態を `ThumbHold`（`down_at` + `spent_on_switch`）へ切り出し、
+切替に消費した押下は `held_at()` が `None` を返すようにした。`down_at` は残す —
+切替の追い越し判定（`is_superseded_switch`、BUG-103 追補）は**物理的な押下順**を
+見るため。KeyUp で消費フラグを解除し、次の押下は通常の親指シフトに戻す。
+
+消費の検出経路は方向で異なり、両方に入れる必要があった:
+
+| 方向 | 物理キー | engine | 決定 | 消費点 |
+| --- | --- | --- | --- | --- |
+| ON | かな | 非活性（IME OFF） | `Pass` で素通し | `on_cg_event` 末尾 |
+| OFF | 英数 | 活性（IME ON） | `Consume` → 単独打鍵と確定 → 送出 | `run_effects` の切替送出／`ReinjectKey` |
+
+OFF 方向を入れないと、OFF 切替が失敗して期待値ブリッジが `ime_on=true` を保つ間、
+engine が活性のまま 英数 が押下中になり、後続の文字が左親指シフト面で解決される。
+
+**残る仕様:** かな より **前** に打鍵した文字（上記の `0x28`）は、その時点で IME が
+本当に OFF なので生キーが出る。これは正しい挙動で、直せない — tap コールバックは
+同期で判定を返す必要があり、4ms 後に かな が来ることを知る手段が無い。
+
+**テスト:** `crates/awase-macos/src/main.rs` の `app::tests` に
+`a_thumb_press_spent_on_a_switch_stops_counting_as_a_shift`、
+`releasing_a_spent_thumb_restores_its_shift_role`、
+`auto_repeat_keeps_the_first_press_timestamp`。変異検査で前 2 本がそれぞれ単独で
+落ちることを確認済み。後者が無いと、一度切替に使った親指が二度とシフトとして
+使えなくなる。
+
+**修正履歴:** `macos-port` ブランチで実装（本エントリ記録と同一コミット）。
+
+**関連ファイル:** `crates/awase-macos/src/main.rs`。関連: BUG-103, BUG-106。
+

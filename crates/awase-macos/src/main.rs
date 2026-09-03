@@ -498,6 +498,56 @@ mod app {
     /// キュー破棄（＝入力消失）に直結しないよう 2 回まで許す（BUG-101）。
     const MAX_SWITCH_REASSERTS: u8 = 2;
 
+    /// 親指キー 1 本の押下状態。
+    ///
+    /// macOS では親指キーが IME 切替キー（英数/かな）を兼ねるため、「切替として
+    /// 消費された押下」と「親指シフトとしての押下」を区別する必要がある。前者を
+    /// 押下として数えると、切替直後の文字が意図せず親指シフト面で解決される
+    /// （BUG-105: 英数 → かな と押して「きょう」を打つと、かな 押下中の 2 文字が
+    /// シフト面になり `ゔ` `い` が出た）。その押下は既に「IME を切り替える」役割を
+    /// 果たして OS へ渡っており、同じ押下をシフトにも数えるのは二重計上。
+    ///
+    /// 消費の検出経路は ON/OFF で異なる（どちらも `spend_thumb_on_switch` 経由）:
+    /// - ON（かな）: IME OFF 中なので engine 非活性 → `Pass` で素通し
+    /// - OFF（英数）: IME ON 中なので engine 活性 → `Consume` され、単独打鍵と
+    ///   確定してから `SendKeys`/`ReinjectKey` で切替キーとして送出される
+    #[derive(Debug, Default, Clone, Copy)]
+    struct ThumbHold {
+        /// 物理的に押された時刻（auto-repeat では最初の値を保つ）
+        down_at: Option<Timestamp>,
+        /// この押下を IME 切替として使い切ったか
+        spent_on_switch: bool,
+    }
+
+    impl ThumbHold {
+        /// 親指シフトとして数えるべき押下時刻（切替に消費済みなら `None`）。
+        const fn held_at(self) -> Option<Timestamp> {
+            if self.spent_on_switch {
+                None
+            } else {
+                self.down_at
+            }
+        }
+
+        /// 物理イベントを取り込む。
+        ///
+        /// auto-repeat KeyDown では最初のタイムスタンプを上書きしない
+        /// （Linux/Windows 実装と同じセマンティクス。上書きすると
+        /// `left_thumb_consumed` との比較で「消費済み」が剥がれる）。
+        fn track(&mut self, is_down: bool, timestamp: Timestamp) {
+            if is_down {
+                self.down_at = self.down_at.or(Some(timestamp));
+            } else {
+                // 離したら消費フラグも解除し、次の押下は通常の親指シフトに戻す
+                *self = Self::default();
+            }
+        }
+
+        const fn spend_on_switch(&mut self) {
+            self.spent_on_switch = true;
+        }
+    }
+
     /// この外部パススルーキーがフォーカスを動かしうるか（＝保留出力の宛先が
     /// 変わりうるか）。
     ///
@@ -573,8 +623,8 @@ mod app {
         ime: ImeDetector,
         tray: SystemTray,
         modifiers: ModifierState,
-        left_thumb_down: Option<Timestamp>,
-        right_thumb_down: Option<Timestamp>,
+        left_thumb: ThumbHold,
+        right_thumb: ThumbHold,
         /// IME 切替が観測確認されるまで保留する出力アクション。
         ///
         /// 期待値ブリッジで Engine は切替直後の打鍵も変換するが、注入した
@@ -609,8 +659,8 @@ mod app {
                 ime: ImeDetector::new(),
                 tray,
                 modifiers: ModifierState::default(),
-                left_thumb_down: None,
-                right_thumb_down: None,
+                left_thumb: ThumbHold::default(),
+                right_thumb: ThumbHold::default(),
                 deferred_keys: Vec::new(),
                 deferred_focus_pid: None,
                 deferred_expect_on: None,
@@ -693,7 +743,8 @@ mod app {
         /// 両親指が押されている間だけ判定する。押下時刻の新しい方がユーザーの
         /// 最終意図なので、古い方の切替キーを送ると結果が逆になる。
         fn is_superseded_switch(&self, actions: &[awase::types::KeyAction]) -> bool {
-            let (Some(left_at), Some(right_at)) = (self.left_thumb_down, self.right_thumb_down)
+            let (Some(left_at), Some(right_at)) =
+                (self.left_thumb.down_at, self.right_thumb.down_at)
             else {
                 return false;
             };
@@ -756,8 +807,8 @@ mod app {
                 is_japanese_ime: self.ime.is_japanese_layout(),
                 composing: false, // macOS では composition 検出未実装
                 modifiers: self.modifiers,
-                left_thumb_down: self.left_thumb_down,
-                right_thumb_down: self.right_thumb_down,
+                left_thumb_down: self.left_thumb.held_at(),
+                right_thumb_down: self.right_thumb.held_at(),
             }
         }
 
@@ -792,6 +843,8 @@ mod app {
                             for action in actions {
                                 if let awase::types::KeyAction::Key(vk) = action {
                                     self.expect_ime_from_key(vk.0);
+                                    // OFF 方向はここが消費点（`ThumbHold` の doc 参照）
+                                    self.spend_thumb_on_switch(vk.0);
                                 }
                             }
                             self.output.send_keys(actions);
@@ -830,6 +883,7 @@ mod app {
                     Effect::Input(InputEffect::ReinjectKey(ev)) => {
                         if matches!(ev.event_type, KeyEventType::KeyDown) {
                             self.expect_ime_from_key(ev.vk_code.0);
+                            self.spend_thumb_on_switch(ev.vk_code.0);
                         }
                         self.output.reinject(ev.vk_code, ev.event_type);
                     }
@@ -896,6 +950,33 @@ mod app {
             let ctx = self.make_ctx();
             let decision = self.engine.on_command(EngineCommand::RefreshState, &ctx);
             let _ = self.apply_decision(decision);
+        }
+
+        /// 親指キーの押下状態を更新する（`ThumbHold::track`）。
+        fn track_thumb_hold(
+            &mut self,
+            key_classification: KeyClassification,
+            is_down: bool,
+            timestamp: Timestamp,
+        ) {
+            match key_classification {
+                KeyClassification::LeftThumb => self.left_thumb.track(is_down, timestamp),
+                KeyClassification::RightThumb => self.right_thumb.track(is_down, timestamp),
+                KeyClassification::Char | KeyClassification::Passthrough => {}
+            }
+        }
+
+        /// この keycode の親指打鍵を IME 切替として使い切ったものとして記録する
+        /// （`ThumbHold` の doc 参照）。ON/OFF 両方の経路から呼ぶ。
+        fn spend_thumb_on_switch(&mut self, keycode: u16) {
+            if !matches!(keycode, KEYCODE_EISU | KEYCODE_KANA) {
+                return;
+            }
+            match hook::classify_key(keycode).0 {
+                KeyClassification::LeftThumb => self.left_thumb.spend_on_switch(),
+                KeyClassification::RightThumb => self.right_thumb.spend_on_switch(),
+                KeyClassification::Char | KeyClassification::Passthrough => {}
+            }
         }
 
         /// FlagsChanged イベントから修飾キーの押下/解放を求める。
@@ -996,26 +1077,7 @@ mod app {
 
             self.modifiers.update(&raw);
 
-            // auto-repeat KeyDown では最初のタイムスタンプを上書きしない
-            // （Linux/Windows 実装と同じセマンティクス。上書きすると
-            // `left_thumb_consumed` との比較で「消費済み」が剥がれる）。
-            match key_classification {
-                KeyClassification::LeftThumb => {
-                    self.left_thumb_down = if is_down {
-                        self.left_thumb_down.or(Some(raw.timestamp))
-                    } else {
-                        None
-                    };
-                }
-                KeyClassification::RightThumb => {
-                    self.right_thumb_down = if is_down {
-                        self.right_thumb_down.or(Some(raw.timestamp))
-                    } else {
-                        None
-                    };
-                }
-                KeyClassification::Char | KeyClassification::Passthrough => {}
-            }
+            self.track_thumb_hold(key_classification, is_down, raw.timestamp);
 
             let ctx = self.make_ctx();
 
@@ -1057,6 +1119,7 @@ mod app {
             // 親指キー以外に設定されている場合）も IME 切替の期待を立てる
             if action == TapAction::Pass && is_down {
                 self.expect_ime_from_key(keycode);
+                self.spend_thumb_on_switch(keycode);
             }
             action
         }
@@ -1109,7 +1172,45 @@ mod app {
 
     #[cfg(test)]
     mod tests {
-        use super::{passthrough_moves_focus, KeyEventType, ModifierState, TapAction};
+        use super::{passthrough_moves_focus, KeyEventType, ModifierState, TapAction, ThumbHold};
+
+        /// BUG-105: IME 切替として使い切った親指打鍵は、離すまで親指シフトとして
+        /// 数えない。数えると切替直後の文字がシフト面で解決される
+        /// （英数 → かな と押して「きょう」を打つと `ゔ` `い` になった）。
+        #[test]
+        fn a_thumb_press_spent_on_a_switch_stops_counting_as_a_shift() {
+            let mut thumb = ThumbHold::default();
+            thumb.track(true, 100);
+            assert_eq!(thumb.held_at(), Some(100), "a plain press is a thumb shift");
+
+            thumb.spend_on_switch();
+            assert_eq!(thumb.held_at(), None, "spent on a switch → not a shift");
+            // 物理的にはまだ押されているので、切替の追い越し判定用に時刻は残す
+            assert_eq!(thumb.down_at, Some(100));
+        }
+
+        /// 離せば消費フラグは解除され、次の押下は通常の親指シフトに戻る。
+        /// ここが残ると、一度切替に使った親指がシフトとして二度と使えなくなる。
+        #[test]
+        fn releasing_a_spent_thumb_restores_its_shift_role() {
+            let mut thumb = ThumbHold::default();
+            thumb.track(true, 100);
+            thumb.spend_on_switch();
+            thumb.track(false, 200);
+
+            thumb.track(true, 300);
+            assert_eq!(thumb.held_at(), Some(300));
+        }
+
+        /// auto-repeat KeyDown で最初のタイムスタンプを上書きしない
+        /// （上書きすると `left_thumb_consumed` との比較で「消費済み」が剥がれる）。
+        #[test]
+        fn auto_repeat_keeps_the_first_press_timestamp() {
+            let mut thumb = ThumbHold::default();
+            thumb.track(true, 100);
+            thumb.track(true, 150);
+            assert_eq!(thumb.held_at(), Some(100));
+        }
 
         const TAB: u16 = 0x30;
         const ENTER: u16 = 0x24;
