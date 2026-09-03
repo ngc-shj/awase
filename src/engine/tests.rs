@@ -5259,6 +5259,40 @@ mod engine_integration_tests {
         }
     }
 
+    /// BUG-106 追補: 非活性中に素通しした押下は、活性化後の auto-repeat でも
+    /// FSM に入らない。
+    ///
+    /// auto-repeat は新しい物理押下ではないので、途中で Consume に変えると
+    /// 「最初は生キー、リピートは変換」という混在が起き、OS へ渡した KeyDown に
+    /// 対応する KeyUp も渡らなくなる。
+    #[test]
+    fn an_auto_repeat_keeps_the_pass_through_disposition_of_its_press() {
+        let mut engine = make_test_engine();
+
+        // IME OFF（非活性）中の KeyDown は素通し
+        let down = engine.on_input(Ev::down(VK_A).at(0).build(), &ime_off_ctx());
+        assert!(
+            !down.is_consumed(),
+            "an inactive engine passes the key down"
+        );
+
+        // 押したまま IME が ON になり活性化。auto-repeat が届く
+        let repeat = engine.on_input(Ev::down(VK_A).at(30).build(), &ime_on_ctx());
+        assert!(
+            !repeat.is_consumed(),
+            "a repeat of a passed press must not be consumed, got {:?}",
+            effects_of(&repeat)
+        );
+        assert!(
+            !has_effect(&repeat, |e| matches!(
+                e,
+                Effect::Input(InputEffect::SendKeys(_))
+            )),
+            "and must not produce output, got {:?}",
+            effects_of(&repeat)
+        );
+    }
+
     /// BUG-103: 親指キーが IME 切替キーを兼ねる構成（macOS の 英数/かな）で、
     /// 親指を押したまま engine が非活性化しても切替キーが消えないこと。
     ///

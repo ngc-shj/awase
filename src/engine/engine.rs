@@ -361,6 +361,14 @@ impl Engine {
             }
         }
 
+        // Phase 0.5: 同じ物理押下の途中で扱いを変えない。非活性中に素通しした
+        // KeyDown の auto-repeat が活性化後に FSM へ入ると、「最初は生キー、
+        // リピートは変換」という混在が起き、OS へ渡した KeyDown に対応する
+        // KeyUp も渡らなくなる（`passed_while_inactive` の doc 参照）
+        if is_key_down && self.lifecycle.is_passed_while_inactive(event.vk_code) {
+            return Decision::pass_through();
+        }
+
         // Phase 1: Special keys (engine toggle + IME control)
         if is_key_down {
             if let Some(decision) = self.check_special_keys(ctx, &event) {

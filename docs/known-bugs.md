@@ -12481,23 +12481,34 @@ engine が活性のまま 英数 が押下中になり、後続の文字が左�
 PassThrough へ倒すと FSM の KeyUp 処理を広範に変えることになり、
 Windows/Linux 共通コードでの退行リスクが高いため、影響範囲を活性化境界に絞った。
 
-**追補（活性化をまたぐ auto-repeat）:** 初版は、同じキーが両方のリストに載る
-経路を塞いでいなかった。`k` を押したまま Engine が活性化すると、auto-repeat の
-KeyDown は FSM に Consume され `active_keys` にも載る。`on_key_up` は
-`active_keys` を先に見るため `passed_while_inactive` 側が残留し、後続の無関係な
-KeyUp を誤って素通しさせる。`on_key_down_consumed` / `on_key_down_passed_while_inactive`
-の双方で相手側の記録を破棄し、**1 つのキーの disposition は常に 1 つ・最後の
-KeyDown の扱いが勝つ**ようにした（逆向き＝ Consume 済みのキーを押したまま
-非活性化して auto-repeat が素通しされるケースも同様）。
+**追補（活性化をまたぐ auto-repeat）:** 初版は、押したまま Engine が活性化した
+ときの auto-repeat KeyDown を FSM が Consume し、同じキーが `active_keys` にも
+載る経路を塞いでいなかった。`on_key_up` は `active_keys` を先に見るため
+`passed_while_inactive` 側が残留し、後続の無関係な KeyUp を誤って素通しさせる。
+
+第 2 版では「最後の KeyDown の扱いが勝つ」として相手側の記録を破棄したが、これは
+**誤り**だった。auto-repeat の KeyDown は新しい物理押下ではないため、途中で
+disposition を変えると
+
+- 最初の生キーと、変換されたリピート出力が混在する
+- OS へ渡した最初の KeyDown に対応する KeyUp が渡らず、キーが押しっぱなし扱いになる
+- 「KeyDown を PassThrough したら KeyUp も PassThrough」というモジュールの不変条件に反する
+
+残留エントリは消えるが、入力系列そのものを Pass → Consume へ明示的に変えてしまう。
+
+**確定版の原則: 1 つの物理押下の扱いは最初の KeyDown で決まり、KeyUp まで維持する。**
+`is_passed_while_inactive()` を追加し、`on_input` は素通し中の押下の KeyDown を
+FSM へ入れず即座に `pass_through` する（Phase 0.5）。両方の登録関数は、相手側で
+既に追跡中の押下を上書きしない。
 
 **テスト:** `key_down_passed_while_inactive_makes_key_up_pass_through`、
-`passed_while_inactive_is_not_doubled_by_auto_repeat`、
-`a_repeat_consumed_after_activation_replaces_the_pass_through_record`、
-`a_repeat_passed_after_deactivation_replaces_the_consume_record`。変異検査で、
-2 方向の掃除をそれぞれ外すと対応する 1 本だけが落ちることを確認済み。**Engine レベルの回帰テストは書けなかった** — 実機では FSM に
-投機出力が保留された状態で KeyUp が出力を生んだが、その状態を合成したテストでは
-修正の有無で結果が変わらず、判別できないテストになったため削除した。engine の
-配線が正しいことの根拠は上記の実機ログに委ねる。
+`a_press_keeps_its_pass_through_disposition_across_activation`、
+`a_press_keeps_its_consume_disposition_across_deactivation`、
+`passed_while_inactive_is_not_doubled_by_auto_repeat`（`KeyLifecycle`）と、
+`an_auto_repeat_keeps_the_pass_through_disposition_of_its_press`（Engine レベル）。
+最後のものは Phase 0.5 のゲートを外すと落ちることを変異検査で確認済み — 初版で
+「Engine レベルのテストは書けなかった」と記録したが、**リピートの扱いという形なら
+判別できるテストが書ける**と分かった。
 
 **修正履歴:** `macos-port` ブランチで実装（本エントリ記録と同一コミット）。
 
