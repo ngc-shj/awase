@@ -12333,3 +12333,67 @@ OFF に落ちた（実測 14:14:20: `inj-tap 0x68` → `inj-tap 0x66` → `ABC` 
 **関連ファイル:** `src/engine/nicola_fsm.rs`, `src/engine/engine.rs`,
 `src/engine/fsm_adapter.rs`, `crates/awase-macos/src/main.rs`。
 関連: BUG-101, BUG-102。
+
+## BUG-104: awase の張り直しが IME OFF 側の入力ソースをユーザーの選択から勝手に移す
+
+**採番根拠:** BUG-103 修正後の実機運用中に判明。作業時点の最大番号が BUG-103
+（同一ブランチ `macos-port`）であることを確認し BUG-104 とした。
+
+**症状:** 利用者が気づかないうちに、IME OFF 側の入力ソースが
+`com.apple.keylayout.ABC` から `com.justsystems.inputmethod.atok36.Roman` へ
+移り、macOS がそれを記憶して以後ずっとその構成になる。ユーザーの言葉では
+「いつのまにか ATOK の英字になってますね」。
+
+**再現ログ（2026-09-02 14:34、`RUST_LOG=debug`）:**
+
+```
+14:34:39.673 WARN IME switch to open=false not observed; re-asserting it
+14:34:39.674 input source: …atok36.Japanese -> …atok36.Roman
+```
+
+この行より前に `Roman` の出現は 0 件。**BUG-102 で追加した
+`recover_failed_switch` が `expected=false` で `set_ime_on(false)` を呼んだ瞬間**に
+切り替わっている。
+
+**真因:** `select_for(false)` が「同じ IM ファミリの Roman/Eiji を優先し、
+無ければ keylayout」という **優先順位** で選んでおり、ユーザーが実際に何を
+使っていたかを見ていない。ON 側は 2026-08-29 レビューの指摘（「述語ベースの
+選択だとリスト先頭の OS 標準 IME に化ける」）を受けて `last_japanese_id` で
+観測済み ID を厳密に復元するようになっていたが、OFF 側に同じ手当てが無かった。
+
+手当てが無かったのは、**BUG-102 以前は `set_ime_on(false)` が事実上呼ばれ
+なかった**ため（2026-09-02 のログで `set_open` は 0 件）。BUG-102 の修正が
+この経路を初めて実行可能にし、そこで顕在化した。既存コードが
+`ImeEffect::SetOpen` の `ActivationSync` 分岐のコメントで
+「`TISSelectInputSource` で実行すると OS/IME 自身の切替と競合する（ATOK が
+OS 標準 IME に化ける等）」と警告していた事象そのものであり、そのコメントを
+引用しながら OFF 方向に同じ経路を作ってしまった。
+
+**副作用:** 構成が変わった結果、物理「かな」キーの切替失敗率が上がった。
+2026-09-02（ABC 構成）は往復あたり 4〜5 回だったのに対し、2026-09-03
+（ATOK Roman 構成）は ON 切替 180 回中 17 回（約 9%）が `EXPECTATION_GRACE`
+超過。16 回のフラッシュのうち 13 回が張り直し経由になっていた。**BUG-101 の
+`OBSERVATION_SETTLE` を詰める作業は、この構成を直してから測り直すこと** —
+さもないと awase 自身が作った構成に対するチューニングになる。
+
+**修正:** `crates/awase-macos/src/ime.rs`
+
+- `classify_input_source` を純粋関数として切り出した（ID → `Option<bool>`）。
+- `last_off_id` を追加し、観測が `Some(false)` のときにその ID をそのまま記憶する
+  （ABC keylayout でも ATOK 英字モードでも、使っている方を記録）。
+- `select_for(false)` はまず `last_off_id` を厳密一致で復元し、未観測のとき
+  （英字モードで起動した等）だけ従来の優先順位へフォールバックする。
+
+**テスト:** `both_atok_roman_and_abc_classify_as_ime_off` を追加。ATOK 英字・
+ABC・HalfWidthEiji が等しく `Some(false)`、かなモードが `Some(true)`、非日本語 IM
+が `None` になることを固定する。ここが片方だけだと `last_off_id` に記録されず
+優先順位選択に落ちる。`select_for` 自体は `TISSelectInputSource` を伴うため
+ユニットテストできず、本エントリと実機確認に委ねる。
+
+**利用者側の復旧:** 入力メニューから一度 ABC を選び直せば、修正後の awase は
+それを `last_off_id` として記憶し以後 ABC を復元する。ATOK 英字のままを好むなら
+そのままでよい（どちらを常用するかはユーザーの選択であり、awase は選ばない）。
+
+**修正履歴:** `macos-port` ブランチで実装（本エントリ記録と同一コミット）。
+
+**関連ファイル:** `crates/awase-macos/src/ime.rs`。関連: BUG-101, BUG-102。

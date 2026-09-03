@@ -76,6 +76,23 @@ mod imp {
             && !id.contains("Eiji")
     }
 
+    /// 入力ソース ID から IME 状態を判定する（TIS 観測から切り離した純粋部分）。
+    ///
+    /// - `Some(true)`: IME ON（ひらがな・カタカナモード等）
+    /// - `Some(false)`: IME OFF（日本語 IM の英字モード、または IME なしレイアウト）
+    /// - `None`: 判定不可（日本語 IM でもキーボードレイアウトでもない）
+    fn classify_input_source(id: &str) -> Option<bool> {
+        if is_japanese_im(id) {
+            // "…Japanese" / "…Japanese.Katakana" は ON、
+            // "…Roman" / "…FullWidthRoman" / "…HalfWidthEiji"（英字モード）は OFF
+            Some(!(id.contains("Roman") || id.contains("Eiji")))
+        } else if id.contains("keylayout") {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
     /// ID の末尾セグメントを除いた IM ファミリ prefix を返す。
     ///
     /// かな/英字などのモード違いで同じ値になる。例:
@@ -254,6 +271,16 @@ mod imp {
         /// しないため、ATOK Roman → ABC keylayout のような日本語 IM の外へ
         /// 出る遷移が誰の直後に起きたのか追えなかった（BUG-101 の追跡課題）。
         last_observed_id: std::cell::RefCell<Option<String>>,
+        /// 最後に観測した「IME OFF を意味する入力ソース」の ID。ABC keylayout も
+        /// ATOK の英字モードも、ユーザーが使っている方をそのまま記憶する。
+        ///
+        /// ON 側（`last_japanese_id`）と対称にするためのもの。`select_for(false)` が
+        /// 「同ファミリの Roman/Eiji を優先し、無ければ keylayout」という優先順位で
+        /// 選ぶと、ABC を使っている環境が ATOK の英字モードへ勝手に移り、macOS が
+        /// それを記憶して以後ずっと変わってしまう（BUG-104。実際に BUG-102 の
+        /// 張り直し経路がこれを起こした）。優先順位を押し付けず、観測した実物を
+        /// 復元する。
+        last_off_id: std::cell::RefCell<Option<String>>,
         /// 観測されないまま猶予切れした切替の目標状態。呼び出し側が
         /// `take_failed_switch` で一度だけ受け取り、張り直しに使う（BUG-102）。
         failed_switch: std::cell::Cell<Option<bool>>,
@@ -272,6 +299,7 @@ mod imp {
                 last_japanese_prefix: std::cell::RefCell::new(None),
                 pending: std::cell::RefCell::new(None),
                 last_observed_id: std::cell::RefCell::new(None),
+                last_off_id: std::cell::RefCell::new(None),
                 failed_switch: std::cell::Cell::new(None),
                 last_confirmed_at: std::cell::Cell::new(None),
             };
@@ -399,14 +427,19 @@ mod imp {
                         *last = Some(id.clone());
                     }
                 }
-                // "…Japanese" / "…Japanese.Katakana" は ON、
-                // "…Roman" / "…FullWidthRoman" / "…HalfWidthEiji"（英字モード）は OFF
-                Some(!(id.contains("Roman") || id.contains("Eiji")))
-            } else if id.contains("keylayout") {
-                Some(false)
-            } else {
-                None
             }
+            let observed = classify_input_source(&id);
+            // OFF 側も ON 側と対称に、ユーザーが実際に使っている入力ソースを
+            // 記憶する（BUG-104）。`select_for(false)` が優先順位で選ぶと、
+            // ABC を使っている環境が ATOK の英字モードへ勝手に移る
+            if observed == Some(false) {
+                let mut last = self.last_off_id.borrow_mut();
+                if last.as_deref() != Some(id.as_str()) {
+                    log::debug!("IME off-source observed: {id}");
+                    *last = Some(id);
+                }
+            }
+            observed
         }
 
         /// 日本語 IME がアクティブかどうか（英数モードも含む）
@@ -469,6 +502,16 @@ mod imp {
                 );
                 false
             } else {
+                // まずユーザーが実際に使っている OFF 側の入力ソースを厳密に復元する
+                // （`last_off_id` の doc 参照。ON 側の `last_japanese_id` と対称）
+                let last_off = self.last_off_id.borrow().clone();
+                if let Some(ref id) = last_off {
+                    if select_input_source_matching(|c| c == id) {
+                        return true;
+                    }
+                    log::warn!("IME off-source restore failed for {id}, trying fallbacks");
+                }
+                // 未観測（英字モードで起動した等）のときだけ優先順位に頼る
                 if let Some(ref prefix) = prefix {
                     // 例: …atok34.Japanese → …atok34.Roman / …atok34.…Eiji
                     if select_input_source_matching(|c| {
@@ -602,6 +645,35 @@ mod imp {
                 Expectation::Clear
             );
             assert!(exp.confirmed.is_none());
+        }
+
+        /// BUG-104 の一部: ATOK の英字モードも ABC keylayout も等しく
+        /// 「OFF を意味する入力ソース」として分類される。ここが片方だけだと
+        /// `last_off_id` に記録されず、`select_for(false)` が優先順位で
+        /// 選び直してユーザーの入力ソースを勝手に移してしまう。
+        #[test]
+        fn both_atok_roman_and_abc_classify_as_ime_off() {
+            assert_eq!(
+                classify_input_source("com.justsystems.inputmethod.atok36.Roman"),
+                Some(false)
+            );
+            assert_eq!(
+                classify_input_source("com.apple.keylayout.ABC"),
+                Some(false)
+            );
+            assert_eq!(
+                classify_input_source("com.justsystems.inputmethod.atok36.Japanese.HalfWidthEiji"),
+                Some(false)
+            );
+            assert_eq!(
+                classify_input_source("com.justsystems.inputmethod.atok36.Japanese"),
+                Some(true)
+            );
+            // 日本語 IM でもキーボードレイアウトでもない（中国語 IM 等）
+            assert_eq!(
+                classify_input_source("com.apple.inputmethod.SCIM.ITABC"),
+                None
+            );
         }
 
         #[test]
