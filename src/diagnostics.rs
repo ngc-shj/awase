@@ -40,13 +40,20 @@ pub fn key_content_enabled() -> bool {
 #[derive(Debug, Clone, Copy)]
 pub struct MaskedVk(pub u16);
 
-impl fmt::Display for MaskedVk {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if key_content_enabled() {
-            write!(f, "0x{:02X}", self.0)
+impl MaskedVk {
+    /// 表示の中核（オプトイン判定を引数で受ける純粋部分）。
+    fn write(f: &mut fmt::Formatter<'_>, code: u16, detailed: bool) -> fmt::Result {
+        if detailed {
+            write!(f, "0x{code:02X}")
         } else {
             f.write_str("<masked>")
         }
+    }
+}
+
+impl fmt::Display for MaskedVk {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Self::write(f, self.0, key_content_enabled())
     }
 }
 
@@ -63,10 +70,24 @@ mod tests {
         assert!(!key_content_value_enabled(None));
     }
 
-    /// 既定（オプトイン無し）では VK が出ないこと。テストプロセスは
-    /// `AWASE_LOG_KEY_CONTENT` を設定しないので `key_content_enabled()` は false。
+    /// 判定を引数で受けて表示を確かめる。プロセスの環境変数に依存させない
+    /// —— 診断時は `AWASE_LOG_KEY_CONTENT=1` を立てて実行するので、
+    /// `key_content_enabled()` を直接使うテストはその環境で落ちる。
+    struct Probe(u16, bool);
+
+    impl core::fmt::Display for Probe {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            MaskedVk::write(f, self.0, self.1)
+        }
+    }
+
     #[test]
     fn a_masked_vk_hides_the_code_without_the_opt_in() {
-        assert_eq!(MaskedVk(0x28).to_string(), "<masked>");
+        assert_eq!(Probe(0x28, false).to_string(), "<masked>");
+    }
+
+    #[test]
+    fn a_masked_vk_shows_the_code_with_the_opt_in() {
+        assert_eq!(Probe(0x28, true).to_string(), "0x28");
     }
 }

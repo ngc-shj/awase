@@ -1452,16 +1452,72 @@ mod debug_label_tests {
         })
     }
 
+    fn thumb() -> PendingThumbData {
+        PendingThumbData {
+            scan_code: ScanCode(0x7B),
+            vk_code: VkCode(0x1D),
+            is_left: true,
+            timestamp: 0,
+            modifier_key: None,
+        }
+    }
+
+    fn char_key() -> PendingKey {
+        match pending_char() {
+            EngineState::PendingChar(k) => k,
+            _ => unreachable!(),
+        }
+    }
+
+    /// 全状態を並べる。1 状態しか確認しないと、他の分岐に VK を足したときの
+    /// 漏えい回帰を検出できない。
+    fn all_states() -> Vec<EngineState> {
+        vec![
+            EngineState::Idle,
+            pending_char(),
+            EngineState::PendingThumb(thumb()),
+            EngineState::PendingCharThumb {
+                char_key: char_key(),
+                thumb: thumb(),
+                char1_released_at: Some(1),
+            },
+            EngineState::SpeculativeChar(char_key()),
+        ]
+    }
+
     /// 既定では VK を出さない。ここが漏れると `RUST_LOG=debug` だけで
     /// 打鍵内容が復元できてしまう（VK の列は本質的にキーログ）。
     #[test]
-    fn a_state_label_hides_the_vk_without_the_opt_in() {
-        let label = pending_char().debug_label_with(false);
-        assert_eq!(label, "PendingChar");
-        assert!(!label.contains("vk"), "no vk in the default label: {label}");
-        assert!(
-            !label.contains("28"),
-            "no key code in the default label: {label}"
+    fn no_state_label_leaks_a_key_code_without_the_opt_in() {
+        for state in all_states() {
+            let label = state.debug_label_with(false);
+            assert!(!label.contains("vk"), "no vk in the default label: {label}");
+            // 使った VK / スキャンコードが 16 進で出ていないこと
+            for leaked in ["28", "1D", "7B", "25"] {
+                assert!(
+                    !label.contains(leaked),
+                    "no key code {leaked} in the default label: {label}"
+                );
+            }
+        }
+    }
+
+    /// 伏せても状態の形は残す（診断に使えなくなっては意味がない）。
+    #[test]
+    fn the_default_label_still_carries_the_state_shape() {
+        assert_eq!(pending_char().debug_label_with(false), "PendingChar");
+        assert_eq!(
+            EngineState::PendingThumb(thumb()).debug_label_with(false),
+            "PendingThumb(left=true)"
+        );
+        assert_eq!(
+            EngineState::PendingCharThumb {
+                char_key: char_key(),
+                thumb: thumb(),
+                char1_released_at: Some(1),
+            }
+            .debug_label_with(false),
+            "PendingCharThumb(left=true,released=true)"
         );
     }
 
