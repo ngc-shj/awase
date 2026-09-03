@@ -12496,17 +12496,29 @@ disposition を変えると
 
 残留エントリは消えるが、入力系列そのものを Pass → Consume へ明示的に変えてしまう。
 
-**確定版の原則: 1 つの物理押下の扱いは最初の KeyDown で決まり、KeyUp まで維持する。**
+**確定版の原則: 素通しした押下の扱いは最初の KeyDown で決まり、KeyUp まで維持する。**
 `is_passed_while_inactive()` を追加し、`on_input` は素通し中の押下の KeyDown を
-FSM へ入れず即座に `pass_through` する（Phase 0.5）。両方の登録関数は、相手側で
-既に追跡中の押下を上書きしない。
+FSM へ入れず即座に `pass_through` する（Phase 0.5。ただし `check_active_transition`
+は通す — 素の `PassThrough` で帰ると、押しっぱなしのキーの repeat しか届かない間
+`prev_activation`・UI 通知・ActivationSync が更新されず遷移が遅れる）。
+
+**維持するのは Pass → 活性化の向きだけで、逆向きは意図的に維持しない。**
+`check_active_transition` が active→inactive 遷移で `flush_pending_key_ups()` を
+呼び `active_keys` を空にするため（「consumed した KeyDown の対応 KeyUp が
+inactive 時に到着しても consumed されないように」という既存の設計判断）。
+非対称でよい理由は、Consume は OS に何も渡していないので途中で素通しへ切り替えても
+OS 側のキー状態が壊れないのに対し、Pass は既に KeyDown を渡しており対応する KeyUp を
+渡さないとキーが押しっぱなしになるため。第 3 版では両方向を宣言し
+`a_press_keeps_its_consume_disposition_across_deactivation` を足したが、これは
+`KeyLifecycle` を直接呼んで Engine の遷移処理を通さないため**存在しない仕様を
+固定していた**ので撤去した。
 
 **テスト:** `key_down_passed_while_inactive_makes_key_up_pass_through`、
 `a_press_keeps_its_pass_through_disposition_across_activation`、
-`a_press_keeps_its_consume_disposition_across_deactivation`、
 `passed_while_inactive_is_not_doubled_by_auto_repeat`（`KeyLifecycle`）と、
-`an_auto_repeat_keeps_the_pass_through_disposition_of_its_press`（Engine レベル）。
-最後のものは Phase 0.5 のゲートを外すと落ちることを変異検査で確認済み — 初版で
+`an_auto_repeat_keeps_the_pass_through_disposition_of_its_press` /
+`a_repeat_of_a_passed_press_still_reports_the_activation_transition`（Engine レベル）。
+後 2 者はそれぞれ Phase 0.5 のゲート・遷移検知を外すと落ちることを変異検査で確認済み — 初版で
 「Engine レベルのテストは書けなかった」と記録したが、**リピートの扱いという形なら
 判別できるテストが書ける**と分かった。
 

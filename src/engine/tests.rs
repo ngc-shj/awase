@@ -5293,6 +5293,31 @@ mod engine_integration_tests {
         );
     }
 
+    /// BUG-106 追補2: 素通し中の押下の repeat でも活性化遷移は検知する。
+    ///
+    /// Phase 0.5 が素の `PassThrough` で帰ると、押しっぱなしのキーの repeat しか
+    /// 届かない間 `prev_activation`・UI 通知・ActivationSync が更新されず、
+    /// 次の別キーまで遷移が遅れる。
+    #[test]
+    fn a_repeat_of_a_passed_press_still_reports_the_activation_transition() {
+        let mut engine = make_test_engine();
+
+        // 非活性中に KeyDown を素通し（ここで active→inactive 遷移も起きる）
+        let _ = engine.on_input(Ev::down(VK_A).at(0).build(), &ime_off_ctx());
+
+        // 押したまま IME が ON に。届くのはこのキーの repeat だけ
+        let repeat = engine.on_input(Ev::down(VK_A).at(30).build(), &ime_on_ctx());
+        assert!(!repeat.is_consumed(), "the repeat still passes through");
+        assert!(
+            has_effect(&repeat, |e| matches!(
+                e,
+                Effect::Ui(UiEffect::EngineStateChanged { enabled: true, .. })
+            )),
+            "the inactive→active transition must be reported, got {:?}",
+            effects_of(&repeat)
+        );
+    }
+
     /// BUG-103: 親指キーが IME 切替キーを兼ねる構成（macOS の 英数/かな）で、
     /// 親指を押したまま engine が非活性化しても切替キーが消えないこと。
     ///

@@ -366,7 +366,14 @@ impl Engine {
         // リピートは変換」という混在が起き、OS へ渡した KeyDown に対応する
         // KeyUp も渡らなくなる（`passed_while_inactive` の doc 参照）
         if is_key_down && self.lifecycle.is_passed_while_inactive(event.vk_code) {
-            return Decision::pass_through();
+            // 遷移検知だけは通す。ここで素通しして帰ると、押しっぱなしのキーの
+            // repeat しか届かない間 `prev_activation`・UI 通知・ActivationSync が
+            // 更新されず、次の別キーまで遷移が遅れる
+            let effects = self.check_active_transition(ctx);
+            if effects.is_empty() {
+                return Decision::pass_through();
+            }
+            return Decision::pass_through_with(effects);
         }
 
         // Phase 1: Special keys (engine toggle + IME control)

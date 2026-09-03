@@ -42,10 +42,19 @@ pub struct KeyLifecycle {
     /// 「KeyDown を PassThrough したら KeyUp も PassThrough」を、この
     /// 活性化境界のケースに限って保証するために持つ。
     ///
-    /// **1 つの物理押下の扱いは最初の KeyDown で決まり、KeyUp まで維持する。**
+    /// **素通しした押下の扱いは最初の KeyDown で決まり、KeyUp まで維持する。**
     /// auto-repeat の KeyDown は新しい押下ではないので disposition を変えない。
     /// 変えると「最初は生キー、リピートは変換」という混在が起き、さらに OS へ
     /// 渡した KeyDown に対応する KeyUp が渡らずキーが押しっぱなし扱いになる。
+    ///
+    /// **この維持は Pass → 活性化の向きだけ**で、逆向き（Consume 済みの押下が
+    /// 非活性化をまたぐ）は意図的に維持しない。`Engine::check_active_transition`
+    /// が active→inactive 遷移で `flush_pending_key_ups()` を呼び `active_keys` を
+    /// 空にするため（「consumed した KeyDown の対応 KeyUp が inactive 時に到着しても
+    /// consumed されないように」という既存の設計判断）。非対称なのは、
+    /// Consume は OS に何も渡していないので途中で素通しへ切り替えても OS 側の
+    /// キー状態が壊れないのに対し、Pass は既に KeyDown を渡してしまっており
+    /// 対応する KeyUp を渡さないとキーが押しっぱなしになるため。
     passed_while_inactive: Vec<VkCode>,
 }
 
@@ -85,7 +94,11 @@ impl KeyLifecycle {
     /// 対応する KeyUp も PassThrough すべきことを記録する
     /// （`passed_while_inactive` の doc 参照）。
     pub fn on_key_down_passed_while_inactive(&mut self, vk_code: VkCode) {
-        // 既に Consume として追跡中の押下は上書きしない（同上）
+        // 二重登録の防御。Engine 経路では非活性化時に `flush_pending_key_ups()` が
+        // 先に `active_keys` を空にするため到達しないが、両方に載ると `on_key_up` が
+        // `active_keys` を先に見て PassThrough 側が残留するので、型で防げない以上
+        // ここで弾く（逆向きの disposition 維持を意味するものではない —
+        // `passed_while_inactive` の doc の非対称の説明を参照）
         if self.active_keys.iter().any(|k| k.vk_code == vk_code) {
             return;
         }
@@ -213,18 +226,6 @@ mod tests {
         // KeyUp まで PassThrough を維持する
         assert_eq!(lc.on_key_up(VkCode(0x41)), KeyUpDisposition::PassThrough);
         assert!(!lc.is_passed_while_inactive(VkCode(0x41)));
-    }
-
-    /// 逆向きも同じ原則: Consume 済みの押下は非活性化後の auto-repeat でも
-    /// PassThrough へ変わらない。
-    #[test]
-    fn a_press_keeps_its_consume_disposition_across_deactivation() {
-        let mut lc = KeyLifecycle::new();
-        lc.on_key_down_consumed(&make_event(VkCode(0x41), KeyEventType::KeyDown));
-        lc.on_key_down_passed_while_inactive(VkCode(0x41));
-
-        assert!(!lc.is_passed_while_inactive(VkCode(0x41)));
-        assert_eq!(lc.on_key_up(VkCode(0x41)), KeyUpDisposition::Consume);
     }
 
     #[test]
