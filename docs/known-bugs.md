@@ -12149,6 +12149,18 @@ ATOK atok36）で **リテラル出力ゼロ** を確認しており、間接的
 増やす」の盲目的エスカレーションにしないため、値を上げる前に「保留の起点
 （`expect_ime_on` を張る位置）がずれていないか」を先に疑う。
 
+**フィールド検証（2026-09-05〜09-10）:** ATOK atok36、通常使用 6 日間を
+`RUST_LOG=debug AWASE_LOG_KEY_CONTENT=1` で連続記録（19.3 万行）。ON 切替
+n=1253（p50 43ms / p90 162 / p99 208 / max 240）、OFF 切替 n=1394。結果:
+**リテラル化 0 件・保留破棄（入力消失）0 件**。settle 完了から 50〜59ms で
+送出したケースを多数含むため、`OBSERVATION_SETTLE = 50ms` は「間接的裏付け
+のみ」から「実地検証済み（間接）」へ更新する。切替失敗 → 張り直しは 18 回
+（約 3 回/日、全て回復。多くは Cmd 押下中の物理切替キーを ATOK が無視する
+ケースで、代償は ~0.4 秒の待ち）。ON 切替の実測 max は 191 → 208 → 240ms と
+計測のたびに伸びており、`EXPECTATION_GRACE = 300ms` とのマージンは残り 60ms
+— 次にこの定数を動かすときは裾の伸びを前提にすること。なお生ログはセッション
+再起動時の scratchpad 消去で失われ、本統計は消去前の解析出力のみが残る。
+
 **テスト:** `crates/awase-macos/src/ime.rs` の `imp::tests` に
 `expectation_keeps_holding_output_through_the_settle_window`（本バグの回帰）、
 `expectation_clears_once_the_settle_window_elapses`、
@@ -12389,6 +12401,11 @@ ABC・HalfWidthEiji が等しく `Some(false)`、かなモードが `Some(true)`
 が `None` になることを固定する。ここが片方だけだと `last_off_id` に記録されず
 優先順位選択に落ちる。`select_for` 自体は `TISSelectInputSource` を伴うため
 ユニットテストできず、本エントリと実機確認に委ねる。
+
+**フィールド検証（2026-09-05〜09-10）:** 修正後 6 日間の通常使用で再発なし。
+ドリフト構成（ATOK Roman 化）では ON 切替の約 9% が失敗していたのに対し、
+この 6 日間は 1253 回中 4 回（0.3%）で、構成が ABC のまま保たれていることを
+間接的に裏付ける。
 
 **利用者側の復旧:** 入力メニューから一度 ABC を選び直せば、修正後の awase は
 それを `last_off_id` として記憶し以後 ABC を復元する。ATOK 英字のままを好むなら
