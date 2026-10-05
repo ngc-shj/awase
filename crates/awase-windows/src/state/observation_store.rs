@@ -398,8 +398,10 @@ pub struct ObservationStore {
     /// 変わるケースは epoch 単独では検知できず、hwnd も併せて照合する必要がある。
     ///
     /// **private**: 書き込み口は `clear_on_focus_change()`（プロセス変更時、観測
-    /// プールごとクリアし両軸を丸ごと差し替え）と `update_focus_window()`（同一
-    /// プロセス内でのウィンドウ変化、hwnd のみ更新）の2つに限定する。かつて
+    /// プールごとクリアし両軸を丸ごと差し替え）、`update_focus_window()`（同一
+    /// プロセス内でのウィンドウ変化、hwnd のみ更新）、`establish_initial_fence()`
+    /// （起動時の初回フォーカススコープ確立、プールを触らず両軸を差し替え。
+    /// BUG-102）の3つに限定する。かつて
     /// epoch/hwnd を別々の `pub` フィールドとして持ち回っていたときは、
     /// `update_focus_hwnd()` を呼び忘れると `admit()`（`platform.focus.current.hwnd`
     /// を毎 tick 参照）は新しい hwnd を正しく受理するのに `derive_any()` の
@@ -445,6 +447,7 @@ impl ObservationStore {
         self.record_any(observed, at);
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(?observed))]
     fn record_any(&mut self, observed: AnyObservation, at: Instant) {
         let source = observed.source();
         // input_mode 専用の 2 ソースは open 観測プールに構造的に入らない。
@@ -454,7 +457,7 @@ impl ObservationStore {
             source,
             ObservationSource::ConvBitsInference | ObservationSource::GjiIoInference
         ) {
-            log::debug!("[observation] {source:?} は open 観測プールに入らないため破棄");
+            tracing::debug!("[observation] {source:?} は open 観測プールに入らないため破棄");
             return;
         }
         self.per_source.set(
@@ -499,6 +502,49 @@ impl ObservationStore {
         self.current_fence = new_fence;
     }
 
+    /// 起動時（bootstrap）に確立した最初のフォーカススコープへ fence を合わせる
+    /// 3つ目の書き込み口（BUG-102）。`ImeEvent::InitialFocusFenceEstablished` の
+    /// reducer からのみ呼ぶ。
+    ///
+    /// `clear_on_focus_change()` との違い: **観測プールと drift をクリアしない**。
+    /// bootstrap はフォーカスの「変更」ではなく、既にフォーカスされているウィンドウに
+    /// 名前（epoch + hwnd）を付ける操作であり、捨てるべき「旧窓の観測」が存在しない
+    /// （`app/bootstrap.rs::run_all` はこの呼び出しより前にメッセージループを
+    /// ポンプしないため、この時点でプールは空である）。
+    ///
+    /// `update_focus_window()` との違い: **epoch も含めて差し替える**。bootstrap では
+    /// `enter_focus_scope` が `FocusStore::focus_epoch` を 0→1 に進めているため、
+    /// hwnd だけ合わせても epoch が食い違ったままになり `is_identity_ok` が
+    /// `ImmCrossProbe`（High）を導出から外し続ける。
+    ///
+    /// # 前提と、その担保のしかた
+    ///
+    /// - **「initial」であること**（`current_fence` がまだ既定値）は下の
+    ///   `debug_assert!` が実行時に固定する。同じ値での再確立（no-op）だけは
+    ///   許容し、**別の値への差し替えは拒否する** ——それは fence の張り替えで
+    ///   あって初回確立ではなく、`clear_on_focus_change()`（観測プールごと
+    ///   差し替える）の仕事だから。
+    /// - **プールが空であること**は `debug_assert!` にしない。ここでプールが
+    ///   空であることは呼び出し元（bootstrap）の性質であって本メソッドの契約では
+    ///   なく、assert にすると「プールを消さない」という本メソッドの設計意図
+    ///   （`establish_initial_fence_does_not_clear_the_pool_or_drift` が固定）を
+    ///   到達不能な分岐にしてしまう。上の fence assert が「bootstrap 以外から
+    ///   呼ばれた」場合を既に捕まえるため、重ねる価値も小さい。
+    pub fn establish_initial_fence(&mut self, fence: FocusFence) {
+        debug_assert!(
+            self.current_fence == FocusFence::default() || self.current_fence == fence,
+            "establish_initial_fence は fence 未確立（既定値）のうちに1度だけ呼ぶこと。\
+             既に動いている fence の張り替えは clear_on_focus_change の役割\
+             （現在: {:?} / 要求: {fence:?}、BUG-102）",
+            self.current_fence
+        );
+        tracing::debug!(
+            "[focus-fence] establish_initial_fence: {:?} -> {fence:?}",
+            self.current_fence
+        );
+        self.current_fence = fence;
+    }
+
     /// 同一プロセス内でフォーカス hwnd だけが変わった場合の更新口（ADR-106 決定3）。
     ///
     /// `clear_on_focus_change()` と異なり、epoch・観測プール・drift には触れない
@@ -507,7 +553,7 @@ impl ObservationStore {
     /// 追従させることで、`derive_any()` の `is_identity_ok` が stale な hwnd と
     /// 比較し続けて以後の観測を恒久的に拒否する退行を防ぐ。
     pub fn update_focus_window(&mut self, new_hwnd: HwndId) {
-        log::debug!(
+        tracing::debug!(
             "[focus-hwnd-track] update_focus_window: current_fence.hwnd {:?} -> {new_hwnd:?}",
             self.current_fence.hwnd
         );
@@ -565,7 +611,7 @@ impl ObservationStore {
     /// （INV-46）、BUG-33 型の収束偽装が構造的に不可能になる。
     ///
     /// ADR-089 Phase C の時点では `ConvergedReceipt` は構築されるだけで
-    /// `log::debug!` にしか渡らず、実際の収束判定は
+    /// `tracing::debug!` にしか渡らず、実際の収束判定は
     /// `most_recent_trusted_after` が返す `ImeObservation` が担っていた
     /// （§9-16「効いていない」）。本メソッドと `most_recent_trusted_after` の
     /// module private 化で、初めてコンパイラ強制になる。
@@ -584,10 +630,10 @@ impl ObservationStore {
         query: ReadBackQuery,
         attempts: u32,
     ) -> ConvergedReceipt {
-        let latest = self.most_recent_trusted_after(now, since);
         let resolution = match query {
             // 旧: `most_recent_trusted_after(now, act_sent_at).is_some_and(|o| o.open == desired)`
             ReadBackQuery::Converged { desired } => {
+                let latest = self.most_recent_trusted_after(now, since);
                 if latest.is_some_and(|o| o.open == desired) {
                     Resolution::Confirmed
                 } else {
@@ -595,7 +641,38 @@ impl ObservationStore {
                 }
             }
             // 旧: `most_recent_trusted_after(now, gave_up_at).is_some()`
+            //
+            // **BUG-114 追補（ADR-134 Finding 5、実機確認済み・2段階で拡張）**:
+            // 読み戻し手段が構造的に無いと自ら宣言しているプロファイル
+            // （TsfNative/Imm32Unavailable、`Blacklist` 戦略）では、
+            // `desired` が実現したかを一切確認していない自己言及的な弱い
+            // 代理指標が複数の経路から継続的に record され続ける。これを
+            // `AnyFreshEvidence` が無区別に「外界が動いた証拠」として
+            // 採用すると、`Blind` の `GiveUp` 後クールダウン（3秒）が実質
+            // 意味を失い、`attempts=5` の `GiveUp` から次のバーストまで
+            // 数秒おきに永久に繰り返す暴走になる（`docs/known-bugs.md`
+            // BUG-114）。実機で確認済みの2ソース:
+            // - `ObserverPoll`: `observe_gji_after_focus`（GJI I/O 活動監視）。
+            // - `ConvOpenInference`: `kp_stage_idle_conv_check` が conv ビットの
+            //   `NativeToggleShadowOff`/`KatakanaShadowOff` から書く open 推測
+            //   （`state/platform_state.rs::report_conv_open_inference`）。
+            //   これは shadow-toggle 自身が動かした conv 状態を読み返して
+            //   いるだけの自己言及的な信号であり、実機で ~250〜380ms 間隔の
+            //   高頻度で record され続けることを確認した（[[feedback_conv_mode_unreliable_dont_gate_actuation_on_it]]
+            //   と同じ理由でこの用途にも使うべきでない）。
+            // この query に限りこの2ソースを鮮度判定から除外する——
+            // `Converged`（`Read` policy の収束確認、`OsPoll` 戦略の genuine
+            // な `ObserverPoll` に依存）には一切影響しない。
             ReadBackQuery::AnyFreshEvidence => {
+                const EXCLUDED_FROM_ANY_FRESH_EVIDENCE: [ObservationSource; 2] = [
+                    ObservationSource::ObserverPoll,
+                    ObservationSource::ConvOpenInference,
+                ];
+                let latest = self.most_recent_trusted_after_excluding(
+                    now,
+                    since,
+                    &EXCLUDED_FROM_ANY_FRESH_EVIDENCE,
+                );
                 if latest.is_some() {
                     Resolution::ExternalChange
                 } else {
@@ -615,9 +692,21 @@ impl ObservationStore {
     /// `platform_state.rs`）専用であり、actuation の読み戻しではない。
     #[must_use]
     pub fn most_recent_trusted(&self, now: Instant) -> Option<&ImeObservation> {
+        self.most_recent_trusted_excluding(now, &[])
+    }
+
+    /// [`most_recent_trusted`] と同じだが、指定した `ObservationSource` 群を選ぶ前に除外する。
+    /// drift correction が `ConvOpenInference` を根拠にしない（BUG-173 追補3）ために、選んだ後に捨てる形にすると
+    /// 同じ Medium の他ソース（`ObserverPoll` 等）の正当な観測まで覆い隠すので、選ぶ前に除外する（Opus round2 R2-2）。
+    #[must_use]
+    pub fn most_recent_trusted_excluding(
+        &self,
+        now: Instant,
+        exclude: &[ObservationSource],
+    ) -> Option<&ImeObservation> {
         self.per_source
             .iter()
-            .filter(|o| !o.is_expired(now))
+            .filter(|o| !o.is_expired(now) && !exclude.contains(&o.source))
             .max_by(|a, b| a.confidence.cmp(&b.confidence).then(a.at.cmp(&b.at)))
     }
 
@@ -635,9 +724,34 @@ impl ObservationStore {
     /// 「読み戻しの意味を宣言させる」という本設計の狙いである（B-R2）。
     #[must_use]
     fn most_recent_trusted_after(&self, now: Instant, since: Instant) -> Option<&ImeObservation> {
+        // `most_recent_trusted_after_excluding(now, since, &[])` に委譲する
+        // （code-review指摘、2026-09-05）: 除外リストが空なら
+        // `exclude.contains(&o.source)` は常に false のため、フィルタ条件は
+        // 元の実装と完全に同値。フィルタ/tie-breakロジックが2箇所に
+        // 重複していると、将来どちらか一方だけを変更してしまい
+        // BUG-114型の再発（AnyFreshEvidence側だけ古いロジックのまま残る等）
+        // を招くリスクがあったため一本化した。
+        self.most_recent_trusted_after_excluding(now, since, &[])
+    }
+
+    /// [`most_recent_trusted_after`] と同じだが、指定した `ObservationSource`
+    /// 群を鮮度判定の対象から除外する。BUG-114 追補（ADR-134 Finding 5）で
+    /// `ReadBackQuery::AnyFreshEvidence` 専用に追加した——`ObserverPoll`/
+    /// `ConvOpenInference` のように「読み戻し手段が構造的に無いプロファイル
+    /// からも自己言及的に書かれうる」ソースを、無区別に「外界が動いた
+    /// 証拠」として扱わないため。除外リストは実機で確認され次第拡張する
+    /// 前提（`read_back` の呼び出し元コメント参照）——現状は既知の2ソース
+    /// のみで、将来別のソースが同種の暴走を起こすと判明したら足すこと。
+    #[must_use]
+    fn most_recent_trusted_after_excluding(
+        &self,
+        now: Instant,
+        since: Instant,
+        exclude: &[ObservationSource],
+    ) -> Option<&ImeObservation> {
         self.per_source
             .iter()
-            .filter(|o| !o.is_expired(now) && o.at >= since)
+            .filter(|o| !o.is_expired(now) && o.at >= since && !exclude.contains(&o.source))
             .max_by(|a, b| a.confidence.cmp(&b.confidence).then(a.at.cmp(&b.at)))
     }
 
@@ -660,8 +774,9 @@ impl ObservationStore {
     ///
     /// ## 鮮度ウィンドウ
     ///
-    /// `FRESH` を超えた観測は無視する。フォーカス変更時に `clear_on_focus_change()` が
-    /// 呼ばれるため通常は問題にならないが、稀に残留する古い観測を排除するためのガード。
+    /// `tuning::OBSERVATION_FRESH_WINDOW_MS` を超えた観測は無視する。フォーカス変更時に
+    /// `clear_on_focus_change()` が呼ばれるため通常は問題にならないが、稀に残留する古い
+    /// 観測を排除するためのガード。
     ///
     /// ## Epoch フィルタ（ImmCrossProbe / FocusProbe のみ）
     ///
@@ -696,10 +811,10 @@ impl ObservationStore {
         now: Instant,
         accept: impl Fn(ObservationSource) -> bool,
     ) -> Option<DeriveOutcome> {
-        const FRESH: Duration = Duration::from_secs(3);
+        let fresh_window = Duration::from_millis(crate::tuning::OBSERVATION_FRESH_WINDOW_MS);
         let current_fence = self.current_fence;
 
-        let is_fresh = |o: &ImeObservation| !o.is_expired(now) && o.age(now) <= FRESH;
+        let is_fresh = |o: &ImeObservation| !o.is_expired(now) && o.age(now) <= fresh_window;
 
         // フォーカス同一性照合が必要なソース（async/first-key トリガーのスナップショット
         // probe）。epoch はプロセス変更でのみ進むため、同一プロセス内でウィンドウだけが
@@ -722,7 +837,7 @@ impl ObservationStore {
                     // ADR-106 決定3: epoch は一致しているのに hwnd だけ不一致で
                     // 除外されるケース（同一プロセス内でのウィンドウ切替）を、
                     // epoch 不一致による除外と区別して実機ログで確認できるようにする。
-                    log::debug!(
+                    tracing::debug!(
                         "[identity-gate] hwnd不一致で除外: source={:?} obs_hwnd={:?} current_hwnd={:?} confidence={:?}",
                         o.source,
                         obs_fence.hwnd,
@@ -846,6 +961,23 @@ mod tests {
             expires_at: None,
             focus_epoch: 0,
         }
+    }
+
+    /// issue #136 / BUG-90 決定4: `AppImeProfile::InputRelay`（PowerToys Mouse
+    /// Without Borders 等の入力中継ツール）は `can_read_imm32_open_status() ==
+    /// false` なので、IMM32 open status を実際に読み取れた場合でも
+    /// `NotObservable` になり `ObservedOpenValue` は構築されない。この窓由来の
+    /// open 観測は belief に一切取り込まれない（条件(c)、タスク3で
+    /// `can_read_imm32_open_status(InputRelay) = false` を固定済み。ここでは
+    /// `FocusProbeOpenStatus::classify` がその述語を正しく consume することを
+    /// 固定する）。
+    #[test]
+    fn input_relay_profile_makes_open_status_not_observable_even_with_a_real_reading() {
+        let status = FocusProbeOpenStatus::classify(Some(true), AppImeProfile::InputRelay);
+        assert!(matches!(
+            status,
+            FocusProbeOpenStatus::NotObservable(AppImeProfile::InputRelay)
+        ));
     }
 
     #[test]
@@ -1145,6 +1277,11 @@ mod tests {
         }
     }
 
+    /// **BUG-114 追補（ADR-134 Finding 5）で `ConvOpenInference`/`ObserverPoll`
+    /// は「旧述語」からの意図的な乖離になったため、ここでは除外対象に
+    /// 含まれない `Gji` を使う**（除外対象2ソースの専用テストは
+    /// `read_back_any_fresh_evidence_ignores_observer_poll_alone` /
+    /// `read_back_any_fresh_evidence_ignores_conv_open_inference_alone` を参照）。
     #[test]
     fn read_back_any_fresh_evidence_matches_the_legacy_predicate_exhaustively() {
         let base = Instant::now();
@@ -1169,7 +1306,7 @@ mod tests {
             for confidence in confidences {
                 for open in [false, true] {
                     let mut s = ObservationStore::default();
-                    let mut o = obs(open, ObservationSource::ConvOpenInference, at);
+                    let mut o = obs(open, ObservationSource::Gji, at);
                     o.confidence = confidence;
                     rec(&mut s, o);
                     let now = since + Duration::from_millis(20);
@@ -1190,6 +1327,96 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// BUG-114 追補（ADR-134 Finding 5）の回帰テスト。
+    ///
+    /// `ObserverPoll` ソースの観測（`Blacklist` 戦略の GJI I/O 活動監視、
+    /// `observe_gji_after_focus` が書く）だけが `since` 以降に record された
+    /// 場合、`AnyFreshEvidence` は「外界が動いた証拠」として採用せず
+    /// `GiveUp`（再武装しない）のままであることを固定する。実機で
+    /// `attempts=5` の `GiveUp` から数秒〜数十秒おきに際限なく再武装する
+    /// 暴走が確認されており（`docs/known-bugs.md` BUG-114）、この観測source
+    /// が「鮮度だけで無条件に外界の変化とみなされる」ことが原因だった。
+    #[test]
+    fn read_back_any_fresh_evidence_ignores_observer_poll_alone() {
+        let base = Instant::now();
+        let since = base;
+        let now = since + Duration::from_millis(20);
+        let mut s = ObservationStore::default();
+        rec(&mut s, obs(true, ObservationSource::ObserverPoll, since));
+        let receipt = s.read_back(now, since, ReadBackQuery::AnyFreshEvidence, 5);
+        assert_eq!(
+            receipt.resolution(),
+            Resolution::GaveUp,
+            "ObserverPoll 単独の新しい観測は AnyFreshEvidence の再武装条件にしてはならない \
+             (BUG-114/ADR-134 Finding 5)"
+        );
+    }
+
+    /// BUG-114 追補・第2弾（実機で ObserverPoll 除外だけでは不十分と判明）の
+    /// 回帰テスト。`ConvOpenInference`（`kp_stage_idle_conv_check` が conv
+    /// ビットの `NativeToggleShadowOff` 等から書く open 推測、shadow-toggle
+    /// 自身が動かした状態を読み返すだけの自己言及的な信号）が単独で
+    /// `since` 以降に record されても再武装しないことを固定する。実機で
+    /// ~250〜380ms 間隔の高頻度で record され続け、`ObserverPoll` を除外
+    /// しただけでは暴走が別の形（`gave up` は正しく5回で止まるが、3秒
+    /// クールダウン明けにこのソースだけでほぼ即座に再武装する）で残った。
+    #[test]
+    fn read_back_any_fresh_evidence_ignores_conv_open_inference_alone() {
+        let base = Instant::now();
+        let since = base;
+        let now = since + Duration::from_millis(20);
+        let mut s = ObservationStore::default();
+        rec(
+            &mut s,
+            obs(true, ObservationSource::ConvOpenInference, since),
+        );
+        let receipt = s.read_back(now, since, ReadBackQuery::AnyFreshEvidence, 5);
+        assert_eq!(
+            receipt.resolution(),
+            Resolution::GaveUp,
+            "ConvOpenInference 単独の新しい観測も AnyFreshEvidence の再武装条件に\
+             してはならない (BUG-114/ADR-134 Finding 5 第2弾、実機確認済み)"
+        );
+    }
+
+    /// 上記2件と対になる確認: 除外対象**以外**のソース（例: `Gji`）が
+    /// `since` 以降に記録されていれば、従来どおり `ExternalChange` として
+    /// 再武装する。除外対象を `ObserverPoll`/`ConvOpenInference` の2つに
+    /// 限定していることの固定。
+    #[test]
+    fn read_back_any_fresh_evidence_still_reacts_to_non_excluded_sources() {
+        let base = Instant::now();
+        let since = base;
+        let now = since + Duration::from_millis(20);
+        let mut s = ObservationStore::default();
+        rec(&mut s, obs(true, ObservationSource::Gji, since));
+        let receipt = s.read_back(now, since, ReadBackQuery::AnyFreshEvidence, 5);
+        assert_eq!(
+            receipt.resolution(),
+            Resolution::ExternalChange,
+            "除外対象以外のソースは従来どおり再武装条件になること"
+        );
+    }
+
+    /// 除外対象の2ソースと、それ以外の新しい観測が両方存在する場合は、
+    /// 後者だけで `ExternalChange` になること（除外は指定ソースの
+    /// レコードだけをフィルタし、他の観測の判定に影響しないこと）。
+    #[test]
+    fn read_back_any_fresh_evidence_reacts_when_excluded_and_other_source_both_fresh() {
+        let base = Instant::now();
+        let since = base;
+        let now = since + Duration::from_millis(20);
+        let mut s = ObservationStore::default();
+        rec(&mut s, obs(true, ObservationSource::ObserverPoll, since));
+        rec(
+            &mut s,
+            obs(true, ObservationSource::ConvOpenInference, since),
+        );
+        rec(&mut s, obs(true, ObservationSource::Gji, since));
+        let receipt = s.read_back(now, since, ReadBackQuery::AnyFreshEvidence, 5);
+        assert_eq!(receipt.resolution(), Resolution::ExternalChange);
     }
 
     /// `AnyFreshEvidence` は `open` の値に依存しない——同じ `since` で
@@ -1351,7 +1578,7 @@ mod tests {
         let past = Instant::now()
             .checked_sub(Duration::from_secs(10))
             .expect("test instant can be backdated");
-        // 10 秒前の Medium obs は FRESH(3s) を超えているため無視される
+        // 10 秒前の Medium obs は OBSERVATION_FRESH_WINDOW_MS(3s) を超えているため無視される
         let mut old = obs(false, ObservationSource::ObserverPoll, past);
         old.confidence = ObservationConfidence::Medium;
         rec(&mut s, old);
@@ -1547,6 +1774,86 @@ mod tests {
             Some(true),
             "update_focus_window() 後は hwnd が一致し観測が採用される"
         );
+    }
+
+    /// BUG-102 の再現＋修正確認: 起動直後（bootstrap）に
+    /// `establish_initial_focus_scope` が live 側フェンスを
+    /// `{epoch: 1, hwnd: 実 hwnd}` に進めるのに対し、`ObservationStore` 側は
+    /// `FocusFence::default()`（`{epoch: 0, hwnd: NULL}`）のまま残っていた。
+    /// この状態では、起動時にフォーカスされていたアプリで発生する
+    /// `ImmCrossProbe` 観測（live 側フェンスでスタンプされる）が
+    /// `is_identity_ok` に恒久的に拒否される（別プロセスへ切り替えて戻り
+    /// `FocusChanged` が来るまで直らない）。
+    ///
+    /// `is_identity_ok` は `FocusProbe` も照合対象にするが、`FocusProbe` は
+    /// `Low`（`state/evidence.rs`）で `derive_filtered` の High 分岐にも
+    /// Medium 分岐にも元から載らないため、フェンスの一致・不一致で結論が
+    /// 変わらない。ここで固定するのは `ImmCrossProbe`（High）1 ソースである。
+    ///
+    /// なお `derive_any()` が `None` を返しても `ImeModel::resolve_open_at` は
+    /// `most_recent_trusted()`（フェンス照合なし）にフォールバックするため、
+    /// **belief の値として症状が出るのは競合する fresh な Medium 観測がある場合
+    /// だけ**である。そちらは
+    /// `state::ime_model::tests::bootstrap_fence_desync_lets_medium_poll_override_high_probe`
+    /// が固定する。
+    #[test]
+    fn establish_initial_fence_unblocks_the_first_probe_after_bootstrap() {
+        let mut s = ObservationStore::default();
+        let now = Instant::now();
+        let bootstrap_fence = FocusFence {
+            epoch: 1, // enter_focus_scope が 0 -> 1 に進めた
+            hwnd: HwndId(0xABCD),
+        };
+
+        // 起動時にフォーカスされていたアプリの高信頼観測（live 側フェンスでスタンプ）。
+        let mut high = obs(true, ObservationSource::ImmCrossProbe, now);
+        high.confidence = ObservationConfidence::High;
+        high.focus_epoch = bootstrap_fence.epoch;
+        high.hwnd = bootstrap_fence.hwnd;
+        rec(&mut s, high);
+
+        // 同期しない場合（退行の再現）: current_fence が既定値のままで棄却される。
+        assert_eq!(
+            s.current_fence(),
+            FocusFence::default(),
+            "bootstrap 前の current_fence は既定値（epoch=0, hwnd=NULL）"
+        );
+        assert_eq!(
+            s.derive_any(now).map(|o| o.value()),
+            None,
+            "fence を同期しないと、起動直後のアプリの観測が epoch/hwnd 不一致で棄却される"
+        );
+
+        // 同期すると受理される。
+        s.establish_initial_fence(bootstrap_fence);
+        assert_eq!(s.current_fence(), bootstrap_fence);
+        assert_eq!(
+            s.derive_any(now).map(|o| o.value()),
+            Some(true),
+            "establish_initial_fence 後は live 側と一致し観測が採用される"
+        );
+    }
+
+    /// `establish_initial_fence` は fence 以外に触れない（観測プール・drift を
+    /// クリアしない）ことを固定する。`clear_on_focus_change` との差はここにある。
+    #[test]
+    fn establish_initial_fence_does_not_clear_the_pool_or_drift() {
+        let mut s = ObservationStore::default();
+        let now = Instant::now();
+        rec(&mut s, obs(true, ObservationSource::ObserverPoll, now));
+        s.update_drift(false, true, now);
+        assert!(s.drift.is_some());
+
+        s.establish_initial_fence(FocusFence {
+            epoch: 1,
+            hwnd: HwndId(7),
+        });
+
+        assert!(
+            s.observation(ObservationSource::ObserverPoll).is_some(),
+            "観測プールはクリアされない（bootstrap は「旧窓」を持たないため）"
+        );
+        assert!(s.drift.is_some(), "drift もクリアされない");
     }
 
     #[test]

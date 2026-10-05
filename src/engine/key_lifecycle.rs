@@ -9,23 +9,34 @@
 
 use crate::types::{RawKeyEvent, VkCode};
 
+/// KeyUp が到着したときに Engine が負う義務（ADR-112 決定2）。
+///
+/// 旧実装（`on_key_up` が bool を返し、Consume 済みなら `Engine::on_input` が
+/// FSM を呼ばずに即 `Decision::consumed()` を返していた）は、「OS へ漏らさない」
+/// という義務の判定と、「FSM にイベントを渡すかどうか」を同じ早期 return に
+/// 混同していたため、`NicolaFsm::on_key_up` 配下の KeyUp 処理が実運用で
+/// 一切呼ばれないという構造的リグレッション（BUG-101）を生んでいた。
+///
+/// `UpDuty` は前者（義務の有無）だけを表す。イベントは義務の有無によらず
+/// 常に FSM まで届き、`Engine::on_input` の唯一の出口で `Consume` 義務が
+/// あれば `Decision::force_consume()` により最終的に必ず Consume へ格上げする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UpDuty {
+    /// 対応する KeyDown が無い、または PassThrough だった。義務なし。
+    None,
+    /// 対応する KeyDown が Consume 済み。KeyUp も最終的に必ず Consume へ格上げする。
+    Consume,
+    /// 対応する KeyDown を Engine 非活性中に PassThrough した。活性化後に届いても
+    /// FSM へ渡さず PassThrough する（`KeyLifecycle::passed_while_inactive` の doc 参照）。
+    PassThrough,
+}
+
 /// Consume 済みで KeyUp 待ちのキー
 #[derive(Debug, Clone, Copy)]
 struct ActiveKey {
     vk_code: VkCode,
     /// 再注入用の元イベントデータ
     event: RawKeyEvent,
-}
-
-/// KeyUp を KeyDown と同じ扱いにするための判定結果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyUpDisposition {
-    /// 対応する KeyDown が Consume 済み → KeyUp も Consume
-    Consume,
-    /// 対応する KeyDown を非活性中に PassThrough した → KeyUp も PassThrough
-    PassThrough,
-    /// 対応する KeyDown を追跡していない → 呼び出し側の通常処理へ委ねる
-    Unknown,
 }
 
 /// キーの Down/Up ペア追跡
@@ -95,7 +106,7 @@ impl KeyLifecycle {
     /// （`passed_while_inactive` の doc 参照）。
     pub fn on_key_down_passed_while_inactive(&mut self, vk_code: VkCode) {
         // 二重登録の防御。Engine 経路では非活性化時に `flush_pending_key_ups()` が
-        // 先に `active_keys` を空にするため到達しないが、両方に載ると `on_key_up` が
+        // 先に `active_keys` を空にするため到達しないが、両方に載ると `take_key_up_duty` が
         // `active_keys` を先に見て PassThrough 側が残留するので、型で防げない以上
         // ここで弾く（逆向きの disposition 維持を意味するものではない —
         // `passed_while_inactive` の doc の非対称の説明を参照）
@@ -116,11 +127,17 @@ impl KeyLifecycle {
         self.passed_while_inactive.contains(&vk_code)
     }
 
-    /// KeyUp が到着した場合に呼ぶ。
-    pub fn on_key_up(&mut self, vk_code: VkCode) -> KeyUpDisposition {
+    /// KeyUp が到着した場合に呼ぶ。対応する KeyDown が Consume 済みなら
+    /// `active_keys` から除去して `UpDuty::Consume` を返す（KeyUp は最終的に
+    /// 必ず Consume すべき）。非活性中に素通しした押下なら `UpDuty::PassThrough`、
+    /// どちらでもなければ `UpDuty::None`。
+    ///
+    /// 除去はするが、イベント自体を FSM に渡すかどうかはこのメソッドの
+    /// 呼び出し元（`Engine::on_input`）が決める（ADR-112 決定2、`UpDuty` のdoc参照）。
+    pub(super) fn take_key_up_duty(&mut self, vk_code: VkCode) -> UpDuty {
         if let Some(pos) = self.active_keys.iter().position(|k| k.vk_code == vk_code) {
             self.active_keys.remove(pos);
-            return KeyUpDisposition::Consume;
+            return UpDuty::Consume;
         }
         if let Some(pos) = self
             .passed_while_inactive
@@ -128,9 +145,9 @@ impl KeyLifecycle {
             .position(|vk| *vk == vk_code)
         {
             self.passed_while_inactive.remove(pos);
-            return KeyUpDisposition::PassThrough;
+            return UpDuty::PassThrough;
         }
-        KeyUpDisposition::Unknown
+        UpDuty::None
     }
 
     /// コンテキスト変更時: Consume 済みだが KeyUp が来ていないキーの KeyUp を
@@ -162,6 +179,8 @@ mod tests {
 
     fn make_event(vk: VkCode, event_type: KeyEventType) -> RawKeyEvent {
         RawKeyEvent {
+            was_down: false,
+            press_id: None,
             vk_code: vk,
             scan_code: ScanCode(0),
             event_type,
@@ -172,6 +191,8 @@ mod tests {
             ime_relevance: ImeRelevance::default(),
             modifier_key: None,
             modifier_snapshot: Default::default(),
+            left_thumb_down_snapshot: None,
+            right_thumb_down_snapshot: None,
             injected: false,
         }
     }
@@ -184,14 +205,14 @@ mod tests {
         lc.on_key_down_consumed(&event);
         assert_eq!(lc.active_count(), 1);
 
-        assert_eq!(lc.on_key_up(VkCode(0x41)), KeyUpDisposition::Consume);
+        assert_eq!(lc.take_key_up_duty(VkCode(0x41)), UpDuty::Consume);
         assert_eq!(lc.active_count(), 0);
     }
 
     #[test]
     fn untracked_key_up_is_left_to_the_caller() {
         let mut lc = KeyLifecycle::new();
-        assert_eq!(lc.on_key_up(VkCode(0x41)), KeyUpDisposition::Unknown);
+        assert_eq!(lc.take_key_up_duty(VkCode(0x41)), UpDuty::None);
     }
 
     /// Engine 非活性中に素通しした KeyDown の KeyUp は、活性化後に届いても
@@ -203,9 +224,9 @@ mod tests {
     fn key_down_passed_while_inactive_makes_key_up_pass_through() {
         let mut lc = KeyLifecycle::new();
         lc.on_key_down_passed_while_inactive(VkCode(0x41));
-        assert_eq!(lc.on_key_up(VkCode(0x41)), KeyUpDisposition::PassThrough);
+        assert_eq!(lc.take_key_up_duty(VkCode(0x41)), UpDuty::PassThrough);
         // 一度きり。次の同じキーは通常処理へ戻す
-        assert_eq!(lc.on_key_up(VkCode(0x41)), KeyUpDisposition::Unknown);
+        assert_eq!(lc.take_key_up_duty(VkCode(0x41)), UpDuty::None);
     }
 
     /// 押したまま Engine が活性化しても、その押下の扱いは最初の KeyDown のまま。
@@ -224,7 +245,7 @@ mod tests {
         assert!(lc.is_passed_while_inactive(VkCode(0x41)));
 
         // KeyUp まで PassThrough を維持する
-        assert_eq!(lc.on_key_up(VkCode(0x41)), KeyUpDisposition::PassThrough);
+        assert_eq!(lc.take_key_up_duty(VkCode(0x41)), UpDuty::PassThrough);
         assert!(!lc.is_passed_while_inactive(VkCode(0x41)));
     }
 
@@ -233,8 +254,8 @@ mod tests {
         let mut lc = KeyLifecycle::new();
         lc.on_key_down_passed_while_inactive(VkCode(0x41));
         lc.on_key_down_passed_while_inactive(VkCode(0x41));
-        assert_eq!(lc.on_key_up(VkCode(0x41)), KeyUpDisposition::PassThrough);
-        assert_eq!(lc.on_key_up(VkCode(0x41)), KeyUpDisposition::Unknown);
+        assert_eq!(lc.take_key_up_duty(VkCode(0x41)), UpDuty::PassThrough);
+        assert_eq!(lc.take_key_up_duty(VkCode(0x41)), UpDuty::None);
     }
 
     #[test]
@@ -273,11 +294,11 @@ mod tests {
     }
 
     #[test]
-    fn on_key_up_for_never_consumed_is_unknown() {
+    fn on_key_up_for_never_consumed_returns_none() {
         let mut lc = KeyLifecycle::new();
         // Consume key 0x41 but ask about 0x42
         lc.on_key_down_consumed(&make_event(VkCode(0x41), KeyEventType::KeyDown));
-        assert_eq!(lc.on_key_up(VkCode(0x42)), KeyUpDisposition::Unknown);
+        assert_eq!(lc.take_key_up_duty(VkCode(0x42)), UpDuty::None);
         // 0x41 still active
         assert_eq!(lc.active_count(), 1);
     }
@@ -305,13 +326,13 @@ mod tests {
         // First cycle: consume then key_up
         lc.on_key_down_consumed(&event);
         assert_eq!(lc.active_count(), 1);
-        assert_eq!(lc.on_key_up(VkCode(0x41)), KeyUpDisposition::Consume);
+        assert_eq!(lc.take_key_up_duty(VkCode(0x41)), UpDuty::Consume);
         assert_eq!(lc.active_count(), 0);
 
         // Second cycle: consume same key again
         lc.on_key_down_consumed(&event);
         assert_eq!(lc.active_count(), 1);
-        assert_eq!(lc.on_key_up(VkCode(0x41)), KeyUpDisposition::Consume);
+        assert_eq!(lc.take_key_up_duty(VkCode(0x41)), UpDuty::Consume);
         assert_eq!(lc.active_count(), 0);
     }
 }

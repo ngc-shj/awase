@@ -4,7 +4,7 @@ pub type Timestamp = u64;
 /// プラットフォーム固有のキーコード（Windows VK, macOS keycode, Linux evdev keycode）
 ///
 /// Engine はこの値を直接検査しない。再注入・ログ出力等でプラットフォーム層に返すために保持する。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct VkCode(pub u16);
 
 impl From<u16> for VkCode {
@@ -146,7 +146,25 @@ pub enum ShadowImeAction {
     Toggle,
 }
 
+impl ShadowImeAction {
+    /// 現在の実効IME開閉状態（`current_open`）から、このactionが要求する
+    /// 新しい開閉状態を解決する（/code-review指摘、2026-09-08——
+    /// `engine.rs::apply_ime_open_request`と
+    /// `awase-windows::key_pipeline::kp_stage_shadow_ime_toggle`が
+    /// 同じ`match`を独立に書いていたため共有ヘルパーへ統合）。
+    #[must_use]
+    pub const fn resolve(self, current_open: bool) -> bool {
+        match self {
+            Self::TurnOn => true,
+            Self::TurnOff => false,
+            Self::Toggle => !current_open,
+        }
+    }
+}
+
 /// キーの IME 関連情報（プラットフォーム層が事前分類）
+#[allow(clippy::struct_excessive_bools)]
+// 各フィールドは独立の判定軸を1:1で表現（enum化はwiden/意味混同のリスクを増やす）
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ImeRelevance {
     /// このキーが IME 状態を変更する可能性がある
@@ -159,6 +177,23 @@ pub struct ImeRelevance {
     pub sync_direction: Option<ShadowImeAction>,
     /// IME 制御キー（半角/全角等、保留フラッシュ必要）
     pub is_ime_control: bool,
+    /// この打鍵の直後、IME 側の状態（open/conv）が遷移しうるか
+    /// （＝今この瞬間に conv を読んでも信用できないか）。
+    ///
+    /// `may_change_ime`（awase が IME refresh をスケジュールすべきか）とも
+    /// `vk_may_mutate_conv`（IMM32 の conv ワードを変えるか、`VK_NONCONVERT`
+    /// は意図的に除外）とも判定軸が異なる第3の軸（BUG-113 残置課題）。
+    /// GJI 既定キーマップでは 無変換=直接入力/変換=ひらがな であり、この軸が
+    /// 無いと素の 変換/無変換 の直後に idle-conv-check の cross-process 読み取りが
+    /// 走り、GJI の TSF composition がまだ遷移中の値を拾って drift correction の
+    /// actuation を誘発しうる（読み取りと書き込みの時間的近接、実機A/Bで
+    /// 「@」の独立した十分条件と確定済み、docs/known-bugs.md BUG-113参照）。
+    pub is_ime_mode_key: bool,
+    /// 打鍵の取り込み時点で読んだ、フォーカス窓のスレッドの入力言語(日本語か)。`None` = 不明・読まなかった。
+    ///
+    /// プラットフォーム層が `handle_hook_key_event`(engine スレッドの取り込み口)で設定する。drain 再生でも、
+    /// 取り込み時点の値が運ばれる(ADR-129 と同じ原則)。Engine は参照しない([ADR-223](../docs/adr/223-input-language-change-detected-at-key-time.md))。
+    pub layout_japanese: Option<bool>,
 }
 
 // ── キーイベント ──
@@ -170,7 +205,7 @@ pub enum KeyEventType {
 }
 
 /// キーの基本分類（プラットフォーム層が事前に決定）
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(strum::IntoStaticStr, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyClassification {
     /// 文字キー（NICOLA 変換対象、PhysicalPos あり）
     Char,
@@ -180,6 +215,45 @@ pub enum KeyClassification {
     RightThumb,
     /// パススルー（修飾キー、Fキー、ナビゲーション等）
     Passthrough,
+}
+
+/// 物理キーの「非リピート KeyDown 1 回」を識別する不透明な ID（[ADR-208](../docs/adr/208-absolute-ime-keys-must-not-be-elided-on-stale-applied-in-blind-windows.md) 決定2 D1）。
+///
+/// 単調増加の `u64` を包むだけで、値の大小や連続性に意味は持たせない（等価比較だけに使う）。
+/// プラットフォーム層（フック）が [`is_press_start`] を満たす KeyDown にだけ振り、`RawKeyEvent::press_id` として運ぶ。
+/// 同じ押下を再処理する経路（reinject・drain replay・Ctrl 救済の 50ms 保留）は同じ `RawKeyEvent` を使うので同じ ID になる。
+/// Engine は ID の中身を見ず、単独タップの確定まで運んで `ImeEffect::SetOpen.press` に載せるだけ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PressId(u64);
+
+impl PressId {
+    /// 値からの構築。プラットフォーム層のカウンタ（フック）が使う。
+    #[must_use]
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// ログ・journal 用の生値（比較には `==` を使うこと）。
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl core::fmt::Display for PressId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "#{}", self.0)
+    }
+}
+
+/// フックが `PressId` を振る条件（ADR-208 決定1「対象押下」の土台）: **非注入の非リピート KeyDown**。
+///
+/// `was_down` は `RawKeyEvent::was_down`（直前に同じ VK が物理的に押されたままだったか）。KeyUp と自動リピートの
+/// Down には振らない（リピートは `press=None` として従来の `applied` 省略に任せ、押し続けた間に書き込みが
+/// 連発するのを防ぐ）。注入イベントは `was_down` を更新しないのでここで除外する。
+#[must_use]
+pub const fn is_press_start(is_keydown: bool, injected: bool, was_down: bool) -> bool {
+    is_keydown && !injected && !was_down
 }
 
 /// フックから受け取る生のキーイベント
@@ -206,9 +280,30 @@ pub struct RawKeyEvent {
     /// フック時点でキャプチャした修飾キー状態スナップショット
     ///
     /// `GetAsyncKeyState` を replay 時ではなく capture 時に呼ぶことで、
-    /// OUTPUT_PENDING_QUEUE 経由の drain 時に modifier 状態が変化していても
-    /// 正しい文脈でイベントを再処理できる。
+    /// `crate::INPUT_DEFER` 経由の drain 時に modifier 状態が変化していても
+    /// 正しい文脈でイベントを再処理できる（doc は元々 `OUTPUT_PENDING_QUEUE` と
+    /// 書いていたが、実際にこの前提へ依存している経路は `INPUT_DEFER` である。
+    /// ADR-129 未決定事項4）。
     pub modifier_snapshot: ModifierState,
+    /// フック時点でキャプチャした左/右親指キーの押下タイムスタンプ
+    /// （[ADR-129](../docs/adr/129-thumb-timestamp-live-requery-during-gate-drain-replay.md)）。
+    ///
+    /// **T1系**（`hook.rs` の `update_thumb` クロージャ内 `now_timestamp()`）
+    /// 由来である。同一構造体の `timestamp` フィールドは **T2系**
+    /// （`build_raw_key_event` 内の `now_timestamp()`）由来で、同じ物理押下
+    /// でも数 µs ずれる。**両者を減算・比較してはならない。** 本フィールドの
+    /// 用途は `InputContext.left/right_thumb_down` への供給（＝
+    /// `NicolaFsm::phys` への供給）のみであり、そこでの比較相手は同じく
+    /// T1系の `left_thumb_consumed`/`right_thumb_consumed` である。
+    ///
+    /// `modifier_snapshot` と同じ理由（capture 時点で埋め込み、drain replay
+    /// 時にライブ再取得しない）でこのフィールドを持つ。`OUTPUT_GATE` active
+    /// 中に `crate::INPUT_DEFER` へ退避されたイベントの drain replay で、
+    /// このスナップショットが無ければ「replay を実行している"今"」のライブ
+    /// 値を誤って読んでしまう（ADR-129 が扱う実インシデント）。
+    pub left_thumb_down_snapshot: Option<Timestamp>,
+    /// [`Self::left_thumb_down_snapshot`] の右親指版。
+    pub right_thumb_down_snapshot: Option<Timestamp>,
     /// ソフトウェア注入イベント（Windows: `LLKHF_INJECTED`）。
     ///
     /// awase 自身の注入（marker 付き）はフック層で除外済みのため、これが true なのは
@@ -217,6 +312,36 @@ pub struct RawKeyEvent {
     /// に昇格させてはならない（BUG-14: 外部注入 VK_DBE_HIRAGANA を物理かなキーと誤読し
     /// ユーザーの IME OFF を Engine ON で上書きし続けた）。
     pub injected: bool,
+    /// このイベント（KeyDown・KeyUp いずれも）の直前に、同じ `vk_code` が
+    /// 物理的に押されたままだったか（[ADR-169](../docs/adr/169-journal-key-input-repeat-coalescing.md)）。
+    ///
+    /// **KeyDown/KeyUp 両方のイベントで更新・設定される点に注意。** ごく
+    /// 普通の1回のタップ（KeyDown→KeyUp）でも、KeyUp イベント時点では
+    /// 直前は「押されていた」ので `was_down: true` になる——これは
+    /// auto-repeat（同一キーの連続 KeyDown）の証拠では**ない**。呼び出し側
+    /// （journal の OS auto-repeat 判定）は `was_down` の値だけに頼らず、
+    /// 必ず「このイベント自体が KeyDown であること」も併せて確認すること
+    /// （`journal_policy::KeyInputIdentity::is_down` 参照。この確認漏れは
+    /// 実装時に一度実際に発生し、通常の単発タップの大半が「押しっぱなしで
+    /// 一度も離されていない」という誤った journal 記録になる回帰を招いた）。
+    ///
+    /// **診断専用フィールドであり、core（本クレート）のどのロジックも参照しない。**
+    /// `injected`/`modifier_snapshot` 等（core が実際に読んで判断に使う値）とは
+    /// 性質が異なる。`injected` なイベントはこのビットを更新しないため、常に
+    /// 直前の非 injected 状態を反映する（呼び出し側は `was_down` の値だけに
+    /// 頼らず、必ず `!injected` も併せて確認すること）。
+    ///
+    /// `modifier_snapshot`/`left_thumb_down_snapshot` と同じ理由（capture 時点で
+    /// 埋め込み、`INPUT_DEFER`/`OUTPUT_PENDING_QUEUE` の drain replay 時にライブ
+    /// 再取得しない）でこのフィールドを持つ——ADR-129 が扱った「replay を実行している
+    /// "今" の値を誤って読む」事故と同型の罠を避けるため。
+    pub was_down: bool,
+    /// 非注入の非リピート KeyDown だけに付く押下 ID（[`is_press_start`]）。KeyUp・自動リピート・注入イベントは `None`。
+    ///
+    /// ADR-208 決定2 D1: 「この押下で既に書いた」ことの記録（`last_written_press`）と、`applied` の already-matched 省略を
+    /// 押下の書き込みだけ緩めるための印。`modifier_snapshot`/`was_down` と同じ理由（capture 時点で埋め込み、
+    /// drain replay 時にライブ再取得しない）でこのフィールドを持つ。
+    pub press_id: Option<PressId>,
 }
 
 impl RawKeyEvent {
@@ -270,6 +395,14 @@ pub enum KeyAction {
     Romaji(String),
     /// キーシーケンスとして出力（IME がキーストロークを変換する）
     KeySequence(String),
+    /// Ctrl+VK の単一チョード送信（ADR-115 決定1）。1回の `SendInput` バッチで
+    /// press/release が自己完結するため、`OutputHistory` の KeyUp 整合性索引
+    /// の対象にはならない（`Key`/`KeyUp` と違い解放すべき片割れを持たない）。
+    CtrlChord(VkCode),
+    /// 打鍵列（ADR-115 決定4）。1回の `send_keys` 呼び出しの中で即座に全要素を
+    /// 実行する同期バッチモデル——待機（`Wait`）を含むステップは表現しない
+    /// （ADR-115 決定11、将来別概念として設計する）。
+    Sequence(Vec<Self>),
 }
 
 impl KeyAction {
@@ -303,9 +436,54 @@ pub enum ContextChange {
 
 #[cfg(test)]
 mod tests {
+    use super::{is_press_start, PressId};
+
+    #[test]
+    fn press_id_is_assigned_only_to_non_injected_non_repeat_key_down() {
+        // (is_keydown, injected, was_down) -> 振るか
+        assert!(is_press_start(true, false, false), "物理の新規押下には振る");
+        assert!(
+            !is_press_start(true, false, true),
+            "自動リピートの Down には振らない"
+        );
+        assert!(!is_press_start(false, false, false), "KeyUp には振らない");
+        assert!(
+            !is_press_start(false, false, true),
+            "押下後の KeyUp にも振らない"
+        );
+        assert!(
+            !is_press_start(true, true, false),
+            "注入イベントには振らない"
+        );
+        assert!(!is_press_start(true, true, true));
+    }
+
+    #[test]
+    fn press_id_compares_by_value_and_displays_for_logs() {
+        assert_eq!(PressId::new(7), PressId::new(7));
+        assert_ne!(PressId::new(7), PressId::new(8));
+        assert_eq!(PressId::new(7).get(), 7);
+        assert_eq!(PressId::new(7).to_string(), "#7");
+    }
     use itertools::Itertools as _;
 
     use super::*;
+
+    // ── ShadowImeAction::resolve ──
+
+    #[test]
+    fn shadow_ime_action_resolve_matches_expected_truth_table() {
+        // /code-review指摘（2026-09-08）で追加した共有ヘルパー。
+        // engine.rs::apply_ime_open_request と
+        // key_pipeline.rs::kp_stage_shadow_ime_toggle が独立に実装していた
+        // 同じ真理値表をここに固定する。
+        assert!(ShadowImeAction::TurnOn.resolve(false));
+        assert!(ShadowImeAction::TurnOn.resolve(true));
+        assert!(!ShadowImeAction::TurnOff.resolve(false));
+        assert!(!ShadowImeAction::TurnOff.resolve(true));
+        assert!(ShadowImeAction::Toggle.resolve(false));
+        assert!(!ShadowImeAction::Toggle.resolve(true));
+    }
 
     // ── RawKeyEvent::starts_focus_resync ──
 
@@ -326,7 +504,11 @@ mod tests {
             ime_relevance: ImeRelevance::default(),
             modifier_key: None,
             modifier_snapshot,
+            left_thumb_down_snapshot: None,
+            right_thumb_down_snapshot: None,
             injected,
+            was_down: false,
+            press_id: None,
         }
     }
 

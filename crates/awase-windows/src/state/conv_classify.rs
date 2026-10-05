@@ -32,19 +32,20 @@ pub enum ConvSyncReason {
 pub enum EngineSync {
     /// engine への働きかけなし。
     None,
-    /// engine を ON にする (`handle_engine_activation_sync(true)`)。`RomajiRecovered`
+    /// engine を ON にする（`should_release_panic_guard` が true になる唯一の variant）。`RomajiRecovered`
     /// のみがこの経路を使う: `effective_open` が既に true の状態での belief 再同期で
     /// あり、shadow=OFF から新たに ON 意図を作り出すものではない。かつてはユーザー
     /// 意図経路 (`UserImeSetIntent{Command}`) の再利用を許容していたが、発火条件が
     /// `effective_open == true` を要求する以上 `desired_open := effective_open` の
-    /// 循環 echo（`ime_model.rs` の `EngineActivationSync` arm が明文で禁じるパターン）
-    /// にあたるため、BUG-51 追補 v3 で `handle_engine_activation_sync` へ移した
+    /// 循環 echo にあたるため、BUG-51 追補 v3 で last_intent/desired_open を書かない
+    /// 経路（旧 `EngineActivationSync`。ADR-213 P2c で `handle_conv_engine_on_sync` へ整理、P2d-1 で
+    /// 副作用を PanicReset ガード解除だけに縮小）へ移した
     /// （IntentStore への偽 intent 永続化の防止も兼ねる）。
     SetOpen(ConvSyncReason),
-    /// `ObservedEisu` 観測 → engine OFF + DirectInput。conv の英数モードは IME-ON の
-    /// 確証（conv=0x10 は ROMAN ビット付き半角英数）のため、`effective_open=true` の
-    /// belief を直接注入して apply する。
-    DirectInput,
+    // ADR-185: かつてここに`DirectInput`（`ObservedEisu`観測 → open軸へ`false`を書き、IME OFFを実送信）が
+    // あった。半角英数はIME ONのままなので、open軸の書き込み・actuationは撤去した。`ObservedEisu`は
+    // `input_mode`のbelief更新（`ConvTransition::input_mode_update`）だけで扱い、`engine`は`None`になる。
+    // （GJIの`DirectInput`＝「IMEが本当にOFF」との命名衝突も解消。）
     /// conv ビットが shadow=OFF 中に NATIVE への切替を示した (`NativeToggleShadowOff`)。
     ///
     /// かつては `SetOpen` として `handle_engine_set_open(true)` を直接呼び、
@@ -60,6 +61,18 @@ pub enum EngineSync {
     /// (`check_drift_correction` / `ir_apply_drift_correction`、BUG-20 で OFF 方向も
     /// 修正済み) に委ねられる。
     ReportOpenInference(ConvSyncReason),
+}
+
+/// conv 観測由来の engine 同期が「陽性の証拠」として PanicReset ガードを解除してよいか。
+///
+/// `SetOpen`（`effective_open == true` かつ romaji 回復を conv で観測）だけが true。
+/// ガードが立っている間は `effective_open()` が常に true を返すため、この観測だけでは
+/// 本物の ON か stale かを区別できないが、conv が romaji 可能へ回復したこと自体は
+/// panic reset 後の stale poll ではない陽性証拠として扱う（旧 `on_set_open_requested`
+/// 内の `force_guards.clear()` が担っていた解除の、PanicReset 限定の置き換え。ADR-213 P2d-1）。
+#[must_use]
+pub const fn should_release_panic_guard(engine_sync: EngineSync) -> bool {
+    matches!(engine_sync, EngineSync::SetOpen(_))
 }
 
 /// idle-conv-check の判断結果。input_mode belief の更新と engine 同期を分離して表す。
@@ -130,9 +143,9 @@ pub fn classify_conv_transition(
             EngineSync::None
         },
         |new_mode| {
-            if matches!(new_mode, InputModeState::ObservedEisu) {
-                EngineSync::DirectInput
-            } else if !was_romaji_capable && new_mode.is_romaji_capable() && effective_open {
+            // ObservedEisu（NATIVE=0）は`is_romaji_capable()`が偽で`has_native`も偽なので、下のどの分岐
+            // にも当たらず`EngineSync::None`になる（ADR-185: open軸は書かない）。
+            if !was_romaji_capable && new_mode.is_romaji_capable() && effective_open {
                 EngineSync::SetOpen(ConvSyncReason::RomajiRecovered)
             } else if conv_mode_changed && has_native && !effective_open {
                 EngineSync::ReportOpenInference(ConvSyncReason::NativeToggleShadowOff)
@@ -207,6 +220,23 @@ mod tests {
     const CONV_ZENKATA: u32 = NATIVE | KATAKANA | FULLSHAPE; // 0x000B: 全角カタカナ
     const CONV_HANKATA: u32 = NATIVE | KATAKANA; // 0x0003: 半角カタカナ 1544d3f
 
+    #[test]
+    fn should_release_panic_guard_only_for_set_open() {
+        assert!(should_release_panic_guard(EngineSync::SetOpen(
+            ConvSyncReason::RomajiRecovered
+        )));
+        assert!(should_release_panic_guard(EngineSync::SetOpen(
+            ConvSyncReason::NativeToggleShadowOff
+        )));
+        assert!(!should_release_panic_guard(EngineSync::None));
+        assert!(!should_release_panic_guard(
+            EngineSync::ReportOpenInference(ConvSyncReason::RomajiRecovered)
+        ));
+        assert!(!should_release_panic_guard(
+            EngineSync::ReportOpenInference(ConvSyncReason::NativeToggleShadowOff)
+        ));
+    }
+
     fn assumed() -> InputModeState {
         InputModeState::AssumedRomaji {
             reason: AssumedReason::ImmBridgeBroken,
@@ -232,13 +262,13 @@ mod tests {
         )
     }
 
-    // ── 英数モード検出（ObservedEisu → DirectInput）──────────────────────────────
+    // ── 英数モード検出（ObservedEisu → input_modeのみ、engine同期なし。ADR-185）──────────────────────────────
 
     #[test]
-    fn hanalpha_detected_as_eisu_direct_input() {
+    fn hanalpha_detected_as_eisu_without_engine_sync() {
         let t = classify(CONV_HANALPHA, assumed(), true, true);
         assert_eq!(t.input_mode_update, Some(InputModeState::ObservedEisu));
-        assert_eq!(t.engine, EngineSync::DirectInput);
+        assert_eq!(t.engine, EngineSync::None);
     }
 
     /// fc18cc7 回帰: ROMAN ビット付き半角英数 (conv=0x0010) も英数モードとして扱う。
@@ -246,19 +276,19 @@ mod tests {
     fn eisu_with_roman_bit_0x10_is_still_eisu() {
         let t = classify(CONV_EISU_ROMAN, assumed(), true, true);
         assert_eq!(t.input_mode_update, Some(InputModeState::ObservedEisu));
-        assert_eq!(t.engine, EngineSync::DirectInput);
+        assert_eq!(t.engine, EngineSync::None);
     }
 
     #[test]
-    fn zenalpha_detected_as_eisu_direct_input() {
+    fn zenalpha_detected_as_eisu_without_engine_sync() {
         let t = classify(CONV_ZENALPHA, assumed(), false, true);
         assert_eq!(t.input_mode_update, Some(InputModeState::ObservedEisu));
-        // ObservedEisu は NATIVE=0 なので NativeToggle 系とは排他 → DirectInput のみ。
-        assert_eq!(t.engine, EngineSync::DirectInput);
+        // ObservedEisu は NATIVE=0 なので NativeToggle 系とは排他 → engine同期なし（ADR-185）。
+        assert_eq!(t.engine, EngineSync::None);
     }
 
     #[test]
-    fn eisu_when_belief_already_eisu_no_input_mode_update_but_still_direct_input() {
+    fn eisu_when_belief_already_eisu_no_input_mode_update_and_no_engine_sync() {
         // classify_idle は既に ObservedEisu の場合 None を返すが、それは belief 変化なし
         // であって engine 同期の必要性とは別。conv 不変なら engine も触らない。
         let t = classify(CONV_HANALPHA, InputModeState::ObservedEisu, false, false);
@@ -539,7 +569,7 @@ mod tests {
             false,
         );
         assert_eq!(t.input_mode_update, Some(InputModeState::ObservedEisu));
-        assert_eq!(t.engine, EngineSync::DirectInput);
+        assert_eq!(t.engine, EngineSync::None);
     }
 
     // ── engine None（何も同期しない）ケース ─────────────────────────────────────
@@ -586,13 +616,13 @@ mod tests {
                 for &open in &[false, true] {
                     for &changed in &[false, true] {
                         let t = classify(conv, belief, open, changed);
-                        // 英数モードは常に ObservedEisu → DirectInput（belief が既に Eisu の
-                        // 場合を除く）を返すという不変条件。
+                        // 英数モードは常に ObservedEisu（belief が既に Eisu の場合を除く）で、
+                        // engine同期は行わない（ADR-185: open軸を書かない）という不変条件。
                         if ConvMode::from_u32(conv).is_eisu() {
                             match t.input_mode_update {
                                 Some(m) => {
                                     assert_eq!(m, InputModeState::ObservedEisu);
-                                    assert_eq!(t.engine, EngineSync::DirectInput);
+                                    assert_eq!(t.engine, EngineSync::None);
                                 }
                                 None => {
                                     // belief が既に ObservedEisu のケースのみ。
@@ -663,7 +693,8 @@ mod tests {
                     EngineSync::None
                 }
             }
-            Some(InputModeState::ObservedEisu) => EngineSync::DirectInput,
+            // ADR-185: 半角英数（ObservedEisu）はopen軸を動かさない。
+            Some(InputModeState::ObservedEisu) => EngineSync::None,
             Some(new_mode) => {
                 // engine 既に open 中に romaji 不可 → 可へ回復。
                 let romaji_recovered_while_open =
@@ -769,5 +800,130 @@ mod tests {
             mismatches.len(),
             mismatches.join("\n")
         );
+    }
+
+    // ── ADR-158 TI1: proptestスパイク ──────────────────────────────────────
+    //
+    // ルートawaseクレート(src/engine/proptest_tests.rs)の既存パターンを踏襲し、
+    // `classify_conv_transition`（純粋関数、非gatedモジュール）へ適用する。
+    // ADR-161 D2の対象範囲見極め(TI2)の前提として、実際に動くスパイクを1つ用意する。
+    mod proptest_spike {
+        use super::*;
+        use awase::engine::AssumedReason;
+        use proptest::prelude::*;
+
+        fn arb_assumed_reason() -> impl Strategy<Value = AssumedReason> {
+            prop_oneof![
+                Just(AssumedReason::ImmBridgeBroken),
+                Just(AssumedReason::FocusTransition),
+                Just(AssumedReason::AppKindExcluded),
+                Just(AssumedReason::ForceOnGuardActive),
+                Just(AssumedReason::UserHalfWidthAlnumToggleOff),
+            ]
+        }
+
+        fn arb_input_mode_state() -> impl Strategy<Value = InputModeState> {
+            prop_oneof![
+                Just(InputModeState::ObservedRomaji),
+                Just(InputModeState::ObservedKana),
+                Just(InputModeState::ObservedEisu),
+                arb_assumed_reason().prop_map(|reason| InputModeState::AssumedRomaji { reason }),
+                Just(InputModeState::Unknown),
+            ]
+        }
+
+        fn arb_conv_mode() -> impl Strategy<Value = ConvMode> {
+            (any::<bool>(), any::<bool>()).prop_map(|(eisu, romaji)| ConvMode { eisu, romaji })
+        }
+
+        // 2026-09-09（opus code review S4で訂正）: 当初は3つのpropertyを持っていたが、
+        // 独立レビューで2件の問題が見つかり修正した。
+        //
+        // - 削除した「deterministic_for_same_inputs」（同じ入力からは同じ結果、を検証）は
+        //   vacuousだった。`classify_conv_transition`はCopy型の引数のみを取り、内部状態も
+        //   グローバル状態も一切持たない。このテストを失敗させうるコード変更は存在しない
+        //   （失敗させるには関数シグネチャ自体を変えるしかない）。「純粋関数である」という
+        //   事実は型シグネチャから自明であり、実行時テストとして固定する価値が無いと判断し
+        //   削除した。
+        // - 残した「no_self_transition_to_identical_input_mode」のdocは当初
+        //   「`conv_mode_changed=false`かつ`cm`が変わらない場合」と書いていたが誤りだった。
+        //   実装（`classify_conv_transition`本体、`cm.classify_idle(is_cold, current,
+        //   is_roman_reliable)`の呼び出し）を見ると`conv_mode_changed`はこの判定に一切
+        //   関与しない。また関数は前回の`cm`を引数に取らないため「`cm`が変わらない」は
+        //   そもそも表現不能な条件だった。実際に固定できているのは
+        //   「`classify_idle`は`Some(current)`（自己遷移）を返さない」という
+        //   `conv_mode_changed`の値に関わらず成立する、より単純な命題——これはこの直下の
+        //   直接呼び出しテストとして書き直した（proptestである必要はない、有限4値
+        //   （`ConvMode`は2bool）×belief5種×bool3個の組み合わせを全数確認すれば足りる）。
+        proptest! {
+            /// `classify_conv_transition` は任意の入力に対してpanicしない
+            /// （直下の`exhaustive_classify_conv_transition_matches_independent_oracle`が
+            /// 同じ320通りの入力空間を全数実行しておりこのpropertyを完全に包含するが、
+            /// 将来入力空間が広がった場合の安価な第一防衛線として残す）。
+            #[test]
+            fn never_panics_on_arbitrary_inputs(
+                cm in arb_conv_mode(),
+                current in arb_input_mode_state(),
+                is_cold in any::<bool>(),
+                effective_open in any::<bool>(),
+                conv_mode_changed in any::<bool>(),
+                is_roman_reliable in any::<bool>(),
+            ) {
+                let _ = classify_conv_transition(
+                    cm,
+                    current,
+                    is_cold,
+                    effective_open,
+                    conv_mode_changed,
+                    is_roman_reliable,
+                );
+            }
+        }
+
+        /// `classify_idle`は`Some(current)`（同じ値への自己遷移）を返さない——
+        /// 遷移が無いなら`None`のはず、という不変条件。`conv_mode_changed`の値には
+        /// 依存しない（`classify_conv_transition`本体がこの判定に`conv_mode_changed`を
+        /// 使わないため）ことを明示するため、true/false両方で確認する。
+        #[test]
+        fn no_self_transition_to_identical_input_mode() {
+            for &eisu in &[false, true] {
+                for &romaji in &[false, true] {
+                    let cm = ConvMode { eisu, romaji };
+                    for &current in &[
+                        InputModeState::ObservedRomaji,
+                        InputModeState::ObservedKana,
+                        InputModeState::ObservedEisu,
+                        InputModeState::Unknown,
+                    ] {
+                        for &is_cold in &[false, true] {
+                            for &effective_open in &[false, true] {
+                                for &conv_mode_changed in &[false, true] {
+                                    for &is_roman_reliable in &[false, true] {
+                                        let result = classify_conv_transition(
+                                            cm,
+                                            current,
+                                            is_cold,
+                                            effective_open,
+                                            conv_mode_changed,
+                                            is_roman_reliable,
+                                        );
+                                        if let Some(update) = result.input_mode_update {
+                                            assert_ne!(
+                                                update, current,
+                                                "自己遷移が発生: cm={cm:?} current={current:?} \
+                                                 is_cold={is_cold} \
+                                                 effective_open={effective_open} \
+                                                 conv_mode_changed={conv_mode_changed} \
+                                                 is_roman_reliable={is_roman_reliable}"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

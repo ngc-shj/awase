@@ -172,8 +172,10 @@ impl InputTracker {
             scan_code: event.scan_code,
             vk_code: event.vk_code,
             timestamp: event.timestamp,
+            injected: event.injected,
             is_ime_control: event.ime_relevance.is_ime_control,
             modifier_key: event.modifier_key,
+            press_id: event.press_id,
         }
     }
 
@@ -211,6 +213,8 @@ mod tests {
 
     fn make_event(event_type: KeyEventType) -> RawKeyEvent {
         RawKeyEvent {
+            was_down: false,
+            press_id: None,
             vk_code: VkCode(0),
             scan_code: ScanCode(0),
             event_type,
@@ -221,6 +225,8 @@ mod tests {
             ime_relevance: ImeRelevance::default(),
             modifier_key: None,
             modifier_snapshot: Default::default(),
+            left_thumb_down_snapshot: None,
+            right_thumb_down_snapshot: None,
             injected: false,
         }
     }
@@ -257,6 +263,14 @@ mod tests {
         assert!(got.shift);
         assert!(!got.alt);
         assert!(!got.win);
+    }
+
+    #[test]
+    fn classify_copies_injected_flag() {
+        let mut ev = make_event(KeyEventType::KeyDown);
+        ev.injected = true;
+        let classified = InputTracker::classify(&ev);
+        assert!(classified.injected);
     }
 
     #[test]

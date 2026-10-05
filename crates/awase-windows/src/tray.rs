@@ -51,6 +51,7 @@ const IDM_AUTOSTART: u16 = 54;
 const IDM_RESTART: u16 = 56;
 const IDM_ABOUT: u16 = 57;
 const IDM_BUG_REPORT: u16 = 58;
+const IDM_UPDATE: u16 = 59;
 const IDM_TOGGLE: u16 = 1001;
 const IDM_EXIT: u16 = 1002;
 
@@ -67,6 +68,7 @@ const IDM_CAPSLOCK: u16 = 200;
 // 不採用とし、Ctrl+Alt+R / Ctrl+Alt+K の直接ホットキー（フォーカス文脈が
 // 確実に正しい）へ切り替えた。詳細は docs/known-bugs.md BUG-61 参照。
 const IDM_RESET_STATE: u16 = 209;
+const IDM_KANA_LOCK_HELP: u16 = 210;
 
 /// トレイメニューから選択されたコマンド
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,10 +82,12 @@ pub enum TrayCommand {
     Restart,
     About,
     BugReport,
+    OpenUpdatePage,
     /// 配列選択（インデックスは `IDM_LAYOUT_BASE` からのオフセット）
     SelectLayout(usize),
     CapsLock,
     ResetState,
+    KanaLockHelp,
 }
 
 /// 文字列メニュー項目を追加するヘルパー。
@@ -143,6 +147,10 @@ pub struct SystemTray {
     current_layout_name: String,
     /// 管理者権限で実行中かどうか
     elevated: bool,
+    /// エンジン有効状態（ツールチップ復元用）
+    enabled: bool,
+    /// OS かな入力ロック警告中かどうか
+    kana_lock_warned: bool,
 }
 
 impl std::fmt::Debug for SystemTray {
@@ -211,15 +219,15 @@ impl SystemTray {
             };
 
             // ツールチップ設定
-            set_tooltip(&mut nid, enabled, "", elevated);
+            set_tooltip(&mut nid, enabled, "", elevated, false);
 
             // トレイアイコンを追加
             // シェル未起動時（ログオン直後等）は失敗しても OK。
             // TaskbarCreated がブロードキャストされた時点で recreate() が呼ばれる。
             if Shell_NotifyIconW(NIM_ADD, &raw const nid).as_bool() {
-                log::info!("System tray icon created (elevated={elevated})");
+                tracing::info!("System tray icon created (elevated={elevated})");
             } else {
-                log::warn!("Shell_NotifyIcon NIM_ADD failed — shell not ready, will retry on TaskbarCreated");
+                tracing::warn!("Shell_NotifyIcon NIM_ADD failed — shell not ready, will retry on TaskbarCreated");
             }
 
             Ok(Self {
@@ -228,17 +236,21 @@ impl SystemTray {
                 layout_names: Vec::new(),
                 current_layout_name: String::new(),
                 elevated,
+                enabled,
+                kana_lock_warned: false,
             })
         }
     }
 
     /// トレイアイコンのツールチップとアイコンを更新する
     pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
         set_tooltip(
             &mut self.nid,
             enabled,
             &self.current_layout_name,
             self.elevated,
+            self.kana_lock_warned,
         );
         if let Some(icon) = create_keyboard_icon(enabled) {
             // 古いアイコンを破棄してから差し替え
@@ -274,9 +286,10 @@ impl SystemTray {
         self.current_layout_name = name.to_string();
         set_tooltip(
             &mut self.nid,
-            true,
+            self.enabled,
             &self.current_layout_name,
             self.elevated,
+            self.kana_lock_warned,
         );
         // SAFETY: `self.nid` は `new()` で正しく初期化された有効な `NOTIFYICONDATAW`。
         //         `self.hwnd` は生存中の有効なトレイウィンドウハンドル。
@@ -291,6 +304,31 @@ impl SystemTray {
         self.hwnd
     }
 
+    /// OS かな入力ロック警告状態をトレイ表示へ反映する。
+    pub fn set_kana_lock_warned(&mut self, warned: bool) {
+        if self.kana_lock_warned == warned {
+            return;
+        }
+        self.kana_lock_warned = warned;
+        set_tooltip(
+            &mut self.nid,
+            self.enabled,
+            &self.current_layout_name,
+            self.elevated,
+            self.kana_lock_warned,
+        );
+        // SAFETY: `self.nid` は `new()` で正しく初期化された有効な `NOTIFYICONDATAW`。
+        //         `self.hwnd` は生存中の有効なトレイウィンドウハンドル。
+        unsafe {
+            let _ = Shell_NotifyIconW(NIM_MODIFY, &raw const self.nid);
+        }
+    }
+
+    #[must_use]
+    pub const fn kana_lock_warned(&self) -> bool {
+        self.kana_lock_warned
+    }
+
     /// Explorer 再起動時にトレイアイコンを再登録する
     pub fn recreate(&self) {
         // SAFETY: `self.nid` は `new()` で正しく初期化された有効な `NOTIFYICONDATAW`。
@@ -298,7 +336,7 @@ impl SystemTray {
         unsafe {
             let _ = Shell_NotifyIconW(NIM_ADD, &raw const self.nid);
         }
-        log::info!("Tray icon re-registered after Explorer restart");
+        tracing::info!("Tray icon re-registered after Explorer restart");
     }
 
     /// バルーン通知を表示する
@@ -336,7 +374,7 @@ impl Drop for SystemTray {
             let _ = Shell_NotifyIconW(NIM_DELETE, &raw const self.nid);
             let _ = DestroyWindow(self.hwnd);
         }
-        log::info!("System tray icon destroyed");
+        tracing::info!("System tray icon destroyed");
     }
 }
 
@@ -488,22 +526,31 @@ fn create_keyboard_icon(enabled: bool) -> Option<windows::Win32::UI::WindowsAndM
 }
 
 /// ツールチップ文字列を `NOTIFYICONDATAW` に設定する
-fn set_tooltip(nid: &mut NOTIFYICONDATAW, enabled: bool, layout_name: &str, elevated: bool) {
+fn set_tooltip(
+    nid: &mut NOTIFYICONDATAW,
+    enabled: bool,
+    layout_name: &str,
+    elevated: bool,
+    kana_lock_warned: bool,
+) {
     let admin_suffix = if elevated { " (管理者)" } else { "" };
-    let tip = if layout_name.is_empty() {
+    let tip = if kana_lock_warned {
+        format!("awase - かな入力になっています{admin_suffix}")
+    } else if layout_name.is_empty() {
         if enabled {
-            format!("NICOLA: ON{admin_suffix}")
+            format!("親指シフト入力{admin_suffix}")
         } else {
-            format!("NICOLA: OFF{admin_suffix}")
+            format!("ローマ字入力{admin_suffix}")
         }
     } else if enabled {
-        format!("NICOLA: ON ({layout_name}){admin_suffix}")
+        format!("親指シフト入力 ({layout_name}){admin_suffix}")
     } else {
-        format!("NICOLA: OFF ({layout_name}){admin_suffix}")
+        format!("ローマ字入力 ({layout_name}){admin_suffix}")
     };
 
     let tip_wide = crate::win32::to_wide(&tip);
     let len = tip_wide.len().min(nid.szTip.len());
+    nid.szTip.fill(0);
     nid.szTip[..len].copy_from_slice(&tip_wide[..len]);
 }
 
@@ -517,11 +564,13 @@ pub fn handle_tray_message(
     layout_names: &[String],
     current_layout_name: &str,
     elevated: bool,
+    kana_lock_warned: bool,
+    update_check_enabled: bool,
 ) {
     #[expect(clippy::cast_sign_loss)]
     let event = (lparam.0 & 0xFFFF) as u32;
 
-    log::debug!(
+    tracing::debug!(
         "Tray message: event=0x{event:04X} lparam=0x{:016X}",
         lparam.0
     );
@@ -540,6 +589,20 @@ pub fn handle_tray_message(
     }
     .focused_hwnd;
     MENU_TARGET_HWND.store(captured.map_or(0, |h| h.0 as isize), Ordering::Relaxed);
+
+    // 更新確認が無効なら update_check.json を読みもしない（右クリックのたびに無駄な
+    // ファイルI/O + JSONパースが走るのを避ける。display() はどのみち enabled=false を
+    // 見た瞬間に state を無視して Disabled を返すだけなので、読む意味が無い）。
+    let should_spawn_update_check;
+    let update_display = if update_check_enabled {
+        let update_state = awase::update_state::load(&awase::update_state::default_path());
+        let now = awase::update_state::now_unix();
+        should_spawn_update_check = awase::update_state::should_attempt(&update_state, now);
+        awase::update_state::display(&update_state, true, env!("CARGO_PKG_VERSION"), now)
+    } else {
+        should_spawn_update_check = false;
+        awase::update_state::Display::Disabled
+    };
 
     // SAFETY: `hwnd` はシステムトレイ作成時に `CreateWindowExW` で得た有効なウィンドウハンドル。
     //         `GetCursorPos`・`CreatePopupMenu`・`AppendMenuW`・`TrackPopupMenu`・`DestroyMenu` は
@@ -568,6 +631,15 @@ pub fn handle_tray_message(
             append_menu_sep(hmenu);
         }
 
+        if kana_lock_warned {
+            append_menu_item(
+                hmenu,
+                IDM_KANA_LOCK_HELP,
+                "⚠ かな入力になっています（対処方法）",
+            );
+            append_menu_sep(hmenu);
+        }
+
         // Caps Lock
         let caps_lock_on = crate::ime::is_caps_lock_on();
         append_menu_item_checked(hmenu, IDM_CAPSLOCK, "Caps Lock", caps_lock_on);
@@ -581,7 +653,7 @@ pub fn handle_tray_message(
         append_menu_item(
             hmenu,
             IDM_RESET_STATE,
-            "状態をリセット (Engine ON/Caps OFF/ひらがな)",
+            "状態をリセット (親指シフト入力/Caps OFF/ひらがな)",
         );
 
         // 実験: cold warmup（F2送信/probe待機/捨て駒スキップ、per-VK confirm）は
@@ -591,7 +663,11 @@ pub fn handle_tray_message(
         append_menu_sep(hmenu);
 
         append_menu_item(hmenu, IDM_SETTINGS, "設定...");
-        append_menu_item(hmenu, IDM_CLEAR_IMM_CACHE, "学習キャッシュをクリア");
+        append_menu_item(
+            hmenu,
+            IDM_CLEAR_IMM_CACHE,
+            "IME 制御の学習キャッシュをクリア",
+        );
         append_menu_item(hmenu, IDM_RESTART, "再起動");
         let autostart_registered = crate::autostart::is_registered();
         append_menu_item_checked(
@@ -606,8 +682,15 @@ pub fn handle_tray_message(
 
         append_menu_sep(hmenu);
         append_menu_item(hmenu, IDM_ABOUT, "awase について");
+        if let awase::update_state::Display::Available { version, .. } = update_display {
+            append_menu_item(
+                hmenu,
+                IDM_UPDATE,
+                &format!("新しいバージョン {version} があります..."),
+            );
+        }
         append_menu_item(hmenu, IDM_BUG_REPORT, "不具合を報告...");
-        append_menu_item(hmenu, IDM_TOGGLE, "有効/無効切替");
+        append_menu_item(hmenu, IDM_TOGGLE, "親指シフト入力／ローマ字入力 切替");
         append_menu_item(hmenu, IDM_EXIT, "終了");
 
         // メニュー表示前にウィンドウをフォアグラウンドにする（メニューが閉じるために必要）
@@ -628,6 +711,14 @@ pub fn handle_tray_message(
 
         let _ = DestroyMenu(hmenu);
     }
+
+    // メニュー表示・選択が終わった後にspawnする。結果は今回のメニューには
+    // 反映されない（ユーザー決定どおり、次回以降の右クリックに反映される）ので
+    // 前倒しして得るものが無い一方、CreateProcessW の同期コストをメニュー表示の
+    // 待ち時間から外せる（AVのオンアクセススキャンが重い環境で効く）。
+    if should_spawn_update_check {
+        crate::app::launch_settings_with_args(["--check-update".to_owned()]);
+    }
 }
 
 /// `WM_COMMAND` の `WPARAM` からトレイコマンドを解釈する。
@@ -644,13 +735,44 @@ pub fn handle_tray_command(wparam: WPARAM) -> Option<TrayCommand> {
         IDM_RESTART => Some(TrayCommand::Restart),
         IDM_ABOUT => Some(TrayCommand::About),
         IDM_BUG_REPORT => Some(TrayCommand::BugReport),
+        IDM_UPDATE => Some(TrayCommand::OpenUpdatePage),
         IDM_CAPSLOCK => Some(TrayCommand::CapsLock),
         IDM_RESET_STATE => Some(TrayCommand::ResetState),
+        IDM_KANA_LOCK_HELP => Some(TrayCommand::KanaLockHelp),
         c if (IDM_LAYOUT_BASE..IDM_CAPSLOCK).contains(&c) => {
             Some(TrayCommand::SelectLayout(usize::from(c - IDM_LAYOUT_BASE)))
         }
         _ => None,
     }
+}
+
+/// かな入力ロックの解除案内ダイアログを表示する。
+pub fn show_kana_lock_help_dialog() {
+    let text = "\
+IMEが「かな入力」モードになっています。
+この状態では、awaseが送るローマ字キーがJISかな配列として
+解釈され、意図しない文字（例:「な」「とに」）が入力されます。
+
+awaseからこのモードを元に戻すことはできません
+（Windowsにプログラムから変更する手段が提供されていないため）。
+お手数ですが、次のいずれかの操作でローマ字入力に戻してください。
+
+【Microsoft IME】
+ ・タスクバーの「あ」/「A」を右クリック →
+   「ローマ字入力/かな入力」→「ローマ字入力」
+
+【Google 日本語入力】
+ ・タスクバーのアイコンを右クリック →「プロパティ」→
+   「一般」タブ →「入力方式」を「ローマ字入力」に
+
+いますぐWindowsのIME設定画面を開きますか？"
+        .to_string();
+    // check_and_warn（MS-IMEキー割り当て競合）と同一構造のダイアログなので
+    // 共有ヘルパーに委譲する（msime_key_assignment.rs参照）。
+    crate::msime_key_assignment::spawn_yes_open_ime_settings_dialog(
+        "awase - かな入力モードの検知",
+        text,
+    );
 }
 
 /// 現在のプロセスが管理者権限で実行中かどうかを判定する。
@@ -676,7 +798,7 @@ pub fn restart_as_admin() {
     let exe = match std::env::current_exe() {
         Ok(e) => e,
         Err(e) => {
-            log::error!("Failed to get current exe path: {e}");
+            tracing::error!("Failed to get current exe path: {e}");
             return;
         }
     };
@@ -697,11 +819,10 @@ pub fn restart_as_admin() {
         );
         // ShellExecuteW returns HINSTANCE > 32 on success
         if result.0 as isize > 32 {
-            log::info!("Restarting as admin, exiting current process");
+            tracing::info!("Restarting as admin, exiting current process");
             std::process::exit(0);
-        } else {
-            log::warn!("Failed to restart as admin (user may have cancelled UAC)");
         }
+        tracing::warn!("Failed to restart as admin (user may have cancelled UAC)");
     }
 }
 
@@ -712,17 +833,19 @@ pub fn restart_self() {
     let exe = match std::env::current_exe() {
         Ok(e) => e,
         Err(e) => {
-            log::error!("Failed to get current exe path: {e}");
+            tracing::error!("Failed to get current exe path: {e}");
             return;
         }
     };
-    match std::process::Command::new(&exe).spawn() {
+    // stdio null 化の理由は crate::win32::spawn_command_with_null_stdio の
+    // doc 参照（BUG-79/BUG-134）。
+    match crate::win32::spawn_command_with_null_stdio(&exe).spawn() {
         Ok(_) => {
-            log::info!("Restarting self, exiting current process");
+            tracing::info!("Restarting self, exiting current process");
             std::process::exit(0);
         }
         Err(e) => {
-            log::error!("Failed to restart self: {e}");
+            tracing::error!("Failed to restart self: {e}");
         }
     }
 }
@@ -732,19 +855,57 @@ const HOMEPAGE_URL: &str = "https://awase.cc";
 
 /// バージョン情報ダイアログを表示する。
 ///
-/// 「はい」を選ぶとホームページ（`HOMEPAGE_URL`）を既定のブラウザで開く。
+/// 「はい」を選ぶとホームページまたは更新版のリリースページを既定のブラウザで開く。
 /// ユーザー要望（2026-07-29: 「about awase」の追加とホームページへのリンク）に
 /// 対応するもので、インストール済みファイル名からしかバージョンを確認できな
 /// かった状態を解消する。
-pub fn show_about_dialog() {
+pub fn show_about_dialog(enabled: bool) {
     use windows::core::{w, PCWSTR};
     use windows::Win32::UI::WindowsAndMessaging::{
         MessageBoxW, IDYES, MB_ICONINFORMATION, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
     };
 
+    let state = awase::update_state::load(&awase::update_state::default_path());
+    let now = awase::update_state::now_unix();
+    let display = awase::update_state::display(&state, enabled, env!("CARGO_PKG_VERSION"), now);
+    let (update_text, yes_url) = match display {
+        awase::update_state::Display::Disabled => (
+            "更新の自動確認は無効になっています".to_owned(),
+            HOMEPAGE_URL.to_owned(),
+        ),
+        awase::update_state::Display::NeverSucceeded { last_attempt_ago } => {
+            let text = last_attempt_ago.map_or_else(
+                || "まだ最新版を確認できていません".to_owned(),
+                |ago| {
+                    format!(
+                        "まだ最新版を確認できていません（最後の試行: {}前）",
+                        approx_duration(ago)
+                    )
+                },
+            );
+            (text, HOMEPAGE_URL.to_owned())
+        }
+        awase::update_state::Display::NoUpdate { last_success_ago } => (
+            format!(
+                "更新は見つかりませんでした（最終確認: {}前）",
+                approx_duration(last_success_ago)
+            ),
+            HOMEPAGE_URL.to_owned(),
+        ),
+        awase::update_state::Display::Available {
+            version,
+            last_success_ago,
+        } => (
+            format!(
+                "新しいバージョン {version} があります（最終確認: {}前）",
+                approx_duration(last_success_ago)
+            ),
+            awase::version::release_url(&version),
+        ),
+    };
     let text = format!(
-        "awase バージョン {}\n\n{HOMEPAGE_URL}\n\n\
-         ホームページをブラウザで開きますか？",
+        "awase バージョン {}\n\n{update_text}\n\n{HOMEPAGE_URL}\n\n\
+         関連ページをブラウザで開きますか？",
         env!("CARGO_PKG_VERSION"),
     );
     let text_wide = crate::win32::to_wide(&text);
@@ -759,16 +920,21 @@ pub fn show_about_dialog() {
         )
     };
     if result == IDYES {
-        open_homepage();
+        open_url(&yes_url);
     }
 }
 
 /// `HOMEPAGE_URL` を既定のブラウザで開く。
 fn open_homepage() {
+    open_url(HOMEPAGE_URL);
+}
+
+/// URLを既定のブラウザで開く。
+fn open_url(url: &str) {
     use windows::core::{w, PCWSTR};
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-    let url_wide = crate::win32::to_wide(HOMEPAGE_URL);
+    let url_wide = crate::win32::to_wide(url);
     // SAFETY: url_wide は NUL 終端済み UTF-16 で呼び出し中有効。他はすべて静的リテラル。
     let result = unsafe {
         ShellExecuteW(
@@ -782,10 +948,35 @@ fn open_homepage() {
     };
     // ShellExecuteW returns HINSTANCE > 32 on success
     if result.0 as isize > 32 {
-        log::info!("Opened homepage: {HOMEPAGE_URL}");
+        tracing::info!("Opened URL: {url}");
     } else {
-        log::warn!("Failed to open homepage (result={result:?})");
+        tracing::warn!("Failed to open URL {url} (result={result:?})");
     }
+}
+
+pub fn open_update_page() {
+    let state = awase::update_state::load(&awase::update_state::default_path());
+    match state
+        .last_seen_latest
+        .as_deref()
+        .and_then(awase::version::parse)
+    {
+        Some(version) => open_url(&awase::version::release_url(&version)),
+        None => open_homepage(),
+    }
+}
+
+fn approx_duration(seconds: u64) -> String {
+    if seconds < 60 {
+        return "約1分".to_owned();
+    }
+    if seconds < 60 * 60 {
+        return format!("約{}分", seconds / 60);
+    }
+    if seconds < 24 * 60 * 60 {
+        return format!("約{}時間", seconds / (60 * 60));
+    }
+    format!("約{}日", seconds / (24 * 60 * 60))
 }
 
 /// 自動起動のトグル処理。
@@ -807,28 +998,57 @@ pub(crate) fn handle_autostart_toggle() {
     };
 
     if success {
-        save_auto_start_config(new_value);
-        let _ = crate::with_app(|app| {
-            app.show_tray_balloon("awase", msg);
-        });
+        // /code-review指摘（PR #127、5回目）: save_auto_start_configが
+        // Vec<String>を返す実装だと「警告0件で成功」と「読み込み/保存自体が
+        // 失敗」がどちらも空Vecになり区別できず、実際には保存に失敗していても
+        // 成功バルーンが出てしまっていた。Option<Vec<String>>にし、
+        // Noneを保存失敗として明示的に扱う。
+        match save_auto_start_config(new_value) {
+            Some(warnings) if warnings.is_empty() => {
+                let _ = crate::with_app(|app| {
+                    app.show_tray_balloon("awase", msg);
+                });
+            }
+            Some(warnings) => {
+                // /code-review指摘（PR #127、3回目）: save_auto_start_config
+                // がvalidate()を経由するようになったことで、config.toml内の
+                // 他の項目（例: 廃止済みconfirm_mode="speculative"、範囲外の
+                // simultaneous_threshold_ms等）がauto_start切替のついでに
+                // 無言でリセットされうる。以前はlog::warn!だけで、トレイ経由
+                // の操作にはコンソールが無くユーザーには実質見えなかった。
+                // 既存のバルーン通知機構を使い、警告をユーザーへ可視化する。
+                let _ = crate::with_app(|app| {
+                    app.show_tray_balloon(
+                        "awase — 設定を修正しました",
+                        &format!("{msg}\n{}", warnings.join("\n")),
+                    );
+                });
+            }
+            None => {
+                let _ = crate::with_app(|app| {
+                    app.show_tray_balloon(
+                        "awase — 保存に失敗しました",
+                        "自動起動の設定は変更されましたが、config.tomlへの保存に\
+                         失敗しました。ログを確認してください。",
+                    );
+                });
+            }
+        }
     }
 }
 
-/// config.toml の `auto_start` 値を書き換えて保存する。
-fn save_auto_start_config(value: &str) {
+/// config.toml の `auto_start` 値を書き換えて保存する。`Some(warnings)`
+/// なら保存に成功（`warnings`は検証で正規化・警告が発生した項目、無ければ
+/// 空）、`None`なら読み込み/保存自体が失敗（呼び出し元は成功バルーンを
+/// 出してはならない）。
+/// 実処理は [`awase::config::AppConfig::save_auto_start`]（`awase-settings`
+/// の設定画面と共通化、Opus敵対的レビュー指摘 Minor 11、2026-09-07）。
+fn save_auto_start_config(value: &str) -> Option<Vec<String>> {
     let Ok(config_path) = crate::app::find_config_path() else {
-        log::warn!("Could not find config path to save auto_start");
-        return;
+        tracing::warn!("Could not find config path to save auto_start");
+        return None;
     };
-    match awase::config::AppConfig::load(&config_path) {
-        Ok(mut config) => {
-            config.general.auto_start = value.to_string();
-            if let Err(e) = config.save(&config_path) {
-                log::error!("Failed to save auto_start config: {e}");
-            }
-        }
-        Err(e) => log::error!("Failed to load config for saving auto_start: {e}"),
-    }
+    awase::config::AppConfig::save_auto_start(&config_path, value)
 }
 
 /// トレイウィンドウプロシージャ
@@ -881,7 +1101,7 @@ unsafe extern "system" fn tray_wnd_proc(
             // 届くのは taskkill（/f なし）やタスクマネージャーの「タスクの終了」など、
             // 外部からの明示的な終了要求のみ（2026-07-22 実機ログで確認済み）。
             // これらを正常終了として受理する。
-            log::info!("Tray window received WM_CLOSE — shutting down");
+            tracing::info!("Tray window received WM_CLOSE — shutting down");
             PostQuitMessage(0);
             LRESULT(0)
         }

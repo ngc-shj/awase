@@ -40,8 +40,10 @@ Apply       dispatch_event → reduce()  ← belief の唯一の書き込み点
 
 - **パニックリセット（全面復旧）**: `ImeEvent::PanicReset { target }` — `apply_panic_reset` 専用。`last_intent` を設定しない。
 - **HWND キャッシュ復元**: `ImeEvent::HwndCacheRestored { target }` — `apply_hwnd_cache_restore` 専用。`last_intent` を設定しない。
+- **通過させたモードキーの結果（ADR-191、BUG-157）**: `ImeEvent::ModeKeyPassedThrough { align_desired }` — `ImeStateHub::pass_through_observed` 専用。`last_intent` を捨て、`align_desired` かつ観測から導ける開閉（`derive_any`）があるときだけ `desired_open` をそれへ揃える。観測が成功しないまま窓が切れた破棄（`align_desired == false`）は `desired_open` を書かない。**unit variant にしない**（dylint の構築検出は構造体形式の式を見る）。
+- **打鍵時予測（ADR-191）**: `ImeEvent::KeyEffectPredicted { open, mode, track }` — `apply_key_effect_prediction` 専用。`input_mode` を書き、`last_intent` を捨て、`applied` を落とす。`desired_open` は書かない（`architecture_guard` が固定）。
 
-これら2つのイベントは「観測ではないが、ユーザー意図でもない、直接書き込みの正当な例外」として明示的に隔離されている。**新しい呼び出し元を追加する前に、本当に「全面復旧」「キャッシュ復元」に該当するか確認すること**。該当しないヒューリスティックな推測は `ObserverReported` + `ObservationConfidence::Low` を使うこと。
+これら4つのイベントは「観測ではないが、ユーザー意図でもない、直接書き込みの正当な例外」として明示的に隔離されている。**新しい呼び出し元を追加する前に、本当に「全面復旧」「キャッシュ復元」に該当するか確認すること**。該当しないヒューリスティックな推測は `ObserverReported` + `ObservationConfidence::Low` を使うこと。
 
 ## input_mode の変更ルール
 
@@ -123,14 +125,14 @@ IME を ON にする経路を追加したら、stale `ObservedEisu` の救済（
 
 ## belief の書き込み点
 
-`ImeModel::reduce()` in `state/ime_model.rs` が唯一の書き込み点。`desired_open` / `input_mode` フィールドは private であり、`reduce()` 以外からの直接代入はコンパイルエラーになる。
+`ImeModel::reduce()` in `state/ime_model.rs` が唯一の書き込み点。`desired_open` / `input_mode` フィールドは private であり、**`state/ime_model.rs` モジュール外からの直接代入はコンパイルエラーになる**（Rust の private はモジュールスコープであり、`reduce()` という特定の関数だけを強制する言語機構ではない）。同一モジュール内の任意の関数は書き込めるため、`reduce()` からのみ呼ばれる private ヘルパーを追加する場合、そのヘルパーが実際に `reduce()` の本体からのみ呼ばれていることは自動検証で担保する必要がある。ADR-170 決定1で追加した `fn reduce_*` ヘルパー（`reduce_focus_changed` 等）は `tests/architecture_guard.rs::reduce_helpers_are_called_only_from_reduce_body` が対象（ヘルパー名を自動抽出し、`reduce()` 本体内での呼び出し数とファイル全体での呼び出し数が一致することを固定、コンパイラではなくCIテストによる強制）。一方 PR #214 由来の `record_intent`（`reduce()` の複数 arm から呼ばれる、`reduce_` prefix ではないヘルパー）はこのテストの対象外であり、「`reduce()` 本体からのみ呼ぶ」という制約は依然として散文（コードコメント）に頼っている——新しい `reduce_` prefix 以外のヘルパーを追加する場合は、上記テストへの組み込みか同等の自動検証を検討すること。
 
 ## この規約を実際に強制する仕組み（散文だけに頼らない）
 
 規約は「読めば守れる」を前提にしない。以下の3段構えで、規約を破る近道が実際に取れないか、少なくとも自動で検知されるようにしている。
 
-1. **コンパイラ（最強）**: `desired_open` / `input_mode` フィールドの private 化。`UserIntentSource` から `Recovery` / `HwndCache` を削除し `PanicReset` / `HwndCacheRestored` 専用イベントに分離。`InputModeObserved` への `confidence` フィールド必須化。
-2. **dylint lint（HIR レベルの意味解析）**: `lints/ime_event_guard` — `ImeEvent::PanicReset` / `HwndCacheRestored` が designated 関数（`apply_panic_reset` / `apply_hwnd_cache_restore`）以外で構築されると warning。`lints/observation_source_guard` — 禁止パターン2（観測偽装）を直接検出する: `InputModeObserved { source: ObservationSource::ImmGetOpenStatus, .. }` はどこで構築しても warning（この組合せは常に偽装）、`ConvBitsInference` は `apply_idle_conv_check` 以外で構築すると warning。`cargo dylint --all -p awase-windows -- --target x86_64-pc-windows-msvc` で両方まとめて実行。
+1. **コンパイラ（最強、ただしモジュール外に対して）**: `desired_open` / `input_mode` フィールドの private 化。`UserIntentSource` から `Recovery` / `HwndCache` を削除し `PanicReset` / `HwndCacheRestored` 専用イベントに分離。`InputModeObserved` への `confidence` フィールド必須化。
+2. **dylint lint（HIR レベルの意味解析）**: `lints/ime_event_guard` — `ImeEvent::PanicReset` / `HwndCacheRestored` / `KeyEffectPredicted` / `ModeKeyPassedThrough` が designated 関数（`apply_panic_reset` / `apply_hwnd_cache_restore` / `apply_key_effect_prediction` / `pass_through_observed`）以外で構築されると warning。`lints/observation_source_guard` — 禁止パターン2（観測偽装）を直接検出する: `InputModeObserved { source: ObservationSource::ImmGetOpenStatus, .. }` はどこで構築しても warning（この組合せは常に偽装）、`ConvBitsInference` は `apply_idle_conv_check` 以外で構築すると warning。`cargo dylint --all -p awase-windows -- --target x86_64-pc-windows-msvc` で両方まとめて実行。
 3. **CI テスト（軽量な第二の防衛線）**: `crates/awase-windows/tests/architecture_guard.rs` — `PanicReset` / `HwndCacheRestored` / `InputModeObserved` の構築箇所数をテキスト走査で固定し、想定外の増加を検知する。`cargo test -p awase-windows --test architecture_guard`（Linux でも実行可能、CI に組み込み済み）。
 
 新しい「観測が乏しい状況での安全デフォルト」や「awase 自身の能動的訂正」を追加するときは、上記のどの仕組みにも引っかからないからといって「近道が許されている」わけではない。まず本当に `ObserverReported`（confidence 付き）/ `InputModeApplied`（strategy 付き）で表現できないか検討すること。
@@ -151,12 +153,12 @@ ADR-089 の r2〜r5 は **4 ラウンド連続で**「この 2 crate は Phase A
 | dylint crate | 見ているもの | Phase A（open 軸の型化）との関係 |
 |---|---|---|
 | `observation_source_guard` | `ImeEvent::InputModeObserved { source: .. }` の source 偽装。すなわち **input_mode 軸** | 無関係。Phase A が型化したのは `ObserverReported`（**open 軸**） |
-| `ime_event_guard` | `PanicReset` / `HwndCacheRestored` / `EngineActivationSync` の designated 関数外での構築 | 無関係。この 3 variant は**観測でも意図でもない**（`desired_open` の直接書き込み口＝ escape hatch）ため `Observed<E>` にも witness にも載らない |
+| `ime_event_guard` | `PanicReset` / `HwndCacheRestored` / `KeyEffectPredicted` / `ModeKeyPassedThrough` の designated 関数外での構築 | 無関係。この 4 variant は**観測でも意図でもない**（belief の直接書き込み口＝ escape hatch）ため `Observed<E>` にも witness にも載らない |
 
 `ime_event_guard` を型化しない理由は「できない」ではなく
 **「型化しても保証が上がらない」**である。`Observed<E>` の witness が成立するのは
 「probe を実行した」「物理キーが来た」といった**引数として渡せる外部事実**が
-あるからで、escape hatch の 3 variant にはそれが無い。designated 関数の中でしか
+あるからで、escape hatch の 5 variant にはそれが無い。designated 関数の中でしか
 作れないトークンを要求する形にしても、そのトークンは crate 内では `pub` に
 ならざるを得ず（構築点と reduce 側が別モジュール）、結局「designated 関数の中で
 作られていること」は件数ガードでしか担保できない。
@@ -187,12 +189,9 @@ input_mode 軸の型化は**ありうる**が、それは ADR-088 トラック A
    同名 variant を持つ別型やコメント／マクロ展開の差で誤検出・見逃しが
    起きうる。dylint は `is_ime_event()` で `typeck` 結果の ADT が
    `ime_event::ImeEvent` であることを確認してから判定する。
-3. **`EngineActivationSync` は dylint 単独防御である。**
-   `RESTRICTED_VARIANTS`（`lints/ime_event_guard/src/lib.rs:73`）の 3 variant の
-   うち `PanicReset` / `HwndCacheRestored` には `architecture_guard` の等価な
-   テキスト検査があるが、**`EngineActivationSync`（BUG-48）には無い**
-   （`grep -n EngineActivationSync crates/awase-windows/tests/architecture_guard.rs`
-   がヒットしないことで確認できる）。
+3. **`EngineActivationSync` は ADR-213 P2c で撤去した**（かつては `architecture_guard` に等価な
+   テキスト検査が無い dylint 単独防御の variant だった）。`RESTRICTED_VARIANTS` の残りは
+   `PanicReset` / `HwndCacheRestored` / `KeyEffectPredicted` / `ModeKeyPassedThrough`。
 
 **過大評価しないこと**: `observation_source_guard` の `path_expr_ident`
 （`lints/observation_source_guard/src/lib.rs:191`）は `ExprKind::Path` の
@@ -212,8 +211,8 @@ dylint は安くない。`.github/workflows/ci.yml` の `dylint` ジョブは ni
 1. まず nightly のピンを上げて追従する（3 crate 同時のコミットになる）。
 2. それが現実的でなくなったら、**`architecture_guard.rs` のテキスト検査へ
    降格する**（`lints/` を削除して「守らなくてよい」にはしない）。
-   降格 PR の**必須項目**: 上記 3 点のうち **(3) `EngineActivationSync` の
-   テキスト検査を新設すること**。これをしないと降格と同時に防御がゼロになる。
+   降格 PR では、dylint 単独で守っている variant（現在は無い。新設時は
+   テキスト検査を併せて用意すること）が降格と同時に無防備にならないようにし、
    失う検出力（(1)(2)）も ADR に記録する。
 3. **「dylint が壊れたから規律をやめる」は選択肢に入れない。**
 
@@ -223,7 +222,7 @@ dylint は安くない。`.github/workflows/ci.yml` の `dylint` ジョブは ni
 一切無く、`GjiEvent::CompositionReset`/`NativeF2Consumed` が弱い代理指標
 （`gji_candidate_visible_now()` の素の `AtomicBool` 読み取り）だけで無条件に
 belief を書き換えていたことが、実機バグ2件（確定済み文字が VK_BACK で消える、
-`docs/known-bugs.md` BUG-33 追補3・4）の根本原因だった。修正は dylint 新設や
+`docs/known-bugs/BUG-033.md` 追補3・4）の根本原因だった。修正は dylint 新設や
 private 化ではなく、`gji_idle_ms`（実観測値）をイベントの必須パラメータ化する
 という軽量な手法で行った。
 

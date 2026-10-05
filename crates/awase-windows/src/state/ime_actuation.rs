@@ -11,10 +11,12 @@ use super::ime_event::ObservationSource;
 /// Feedback（収束確認）方針。プロファイルごとに `AppImePolicy::default_feedback` として持つ。
 ///
 /// `serde` 導出は ADR-082「第一歩」2. の `DriftCorrectionFixture`（BUG-43 の実機ログを
-/// JSON フィクスチャとして固定化する）が `decide_actuation_action` の実引数をそのまま
-/// 往復できるようにするため（`ConvClassifyFixture` が `ConvTransition` 等の本番型を
-/// 直接シリアライズする既存パターンと同じ）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// JSON フィクスチャとして固定化する）が [`FeedbackPolicy::decide_action`] の実引数を
+/// そのまま往復できるようにするため（`ConvClassifyFixture` が `ConvTransition` 等の
+/// 本番型を直接シリアライズする既存パターンと同じ）。
+#[derive(
+    strum::IntoStaticStr, Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
 pub enum FeedbackPolicy {
     /// 実読み戻しが可能（ImmCross 等）。
     Read {
@@ -27,6 +29,65 @@ pub enum FeedbackPolicy {
         max_attempts: u32,
         backoff: std::time::Duration,
     },
+}
+
+impl FeedbackPolicy {
+    /// `Blind` の有界終端を判定する（`runtime`層がLinuxでテストできないため、
+    /// この核心ロジックだけ`state`層に切り出してある。ADR-080 / BUG-43 参照）。
+    ///
+    /// `Blind` は `attempts >= max_attempts` で厳密に打ち切る（それ未満では決して諦めず、
+    /// それ以上でも決して `Send` に戻らない）。`Read` は試行回数だけでは打ち切らず常に
+    /// `Send` を返す（収束は観測確認で成立し、その終端は別処理が担う）。
+    ///
+    /// 2026-09-10、自由関数`decide_actuation_action(policy, attempts)`から
+    /// `FeedbackPolicy`のメソッドへ変更した（第1引数`FeedbackPolicy`をselfにせず
+    /// 取り続けていたため）。挙動は変更していない。
+    #[must_use]
+    pub fn decide_action(&self, attempts: u32) -> ActuationAction {
+        match self {
+            Self::Blind { max_attempts, .. } => {
+                if attempts >= *max_attempts {
+                    ActuationAction::GiveUp
+                } else {
+                    ActuationAction::Send
+                }
+            }
+            Self::Read { .. } => ActuationAction::Send,
+        }
+    }
+
+    /// `EventSource::SelfActuated` の `strategy` 識別子。
+    ///
+    /// [`Self::origin`] が内部で使うほか、`tests/drift_correction_replay.rs` が
+    /// フィクスチャの `policy` から独立に `EventSource` を再構築して照合する
+    /// ためにも呼ぶ（`DriftCorrectionFixture` は `EventSource` 自体を
+    /// deserialize できない、`&'static str` のため。`state/event_origin.rs`参照）。
+    /// ここが`strategy`文字列の唯一の定義点。
+    #[must_use]
+    pub const fn strategy(&self) -> &'static str {
+        match self {
+            // Imm32Unavailable / TsfNative（実読み戻し不能）。BUG-43 はこちら。
+            Self::Blind { .. } => "drift_correction_blind",
+            // ImmCross 等（実読み戻し可能）。
+            Self::Read { .. } => "drift_correction_read",
+        }
+    }
+
+    /// actuation 試行1回分の `EventOrigin` を組み立てる。
+    ///
+    /// `source` は常に `SelfActuated`（awase 自身の能動的訂正）で、`strategy` は
+    /// [`Self::strategy`]。`epoch` は「この actuation 系列の何回目の試行か」を
+    /// `Generation` で表す（`Actuation.attempts` と歩調を合わせて単調増加。target が変わって
+    /// 新しい `Actuation` になると 0 から振り直す）。
+    #[must_use]
+    pub fn origin(&self, epoch: Generation) -> EventOrigin {
+        EventOrigin::new(
+            EventSource::SelfActuated {
+                strategy: self.strategy(),
+            },
+            epoch,
+        )
+    }
 }
 
 /// actuation 試行の帰結。`GaveUp`/deadline超過時は observations ストアへ一切書き込まない
@@ -142,35 +203,17 @@ impl ConvergedReceipt {
     }
 }
 
-/// `decide_actuation_action` の判定結果。次に actuate すべきか、打ち切るべきか。
+/// [`FeedbackPolicy::decide_action`] の判定結果。次に actuate すべきか、打ち切るべきか。
 ///
 /// `serde` 導出は `DriftCorrectionFixture`（下記）の `expected` フィールド用。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    strum::IntoStaticStr, Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
 pub enum ActuationAction {
     /// まだ試行回数に余裕がある、実際に actuate してよい。
     Send,
     /// `Blind` の `max_attempts` 到達、`Resolution::GaveUp` にする。
     GiveUp,
-}
-
-/// `Blind` の有界終端を判定する純粋関数（`runtime`層がLinuxでテストできないため、
-/// この核心ロジックだけ`state`層に切り出してある。ADR-080 / BUG-43 参照）。
-///
-/// `Blind` は `attempts >= max_attempts` で厳密に打ち切る（それ未満では決して諦めず、
-/// それ以上でも決して `Send` に戻らない）。`Read` は試行回数だけでは打ち切らず常に
-/// `Send` を返す（収束は観測確認で成立し、その終端は別処理が担う）。
-#[must_use]
-pub fn decide_actuation_action(policy: FeedbackPolicy, attempts: u32) -> ActuationAction {
-    match policy {
-        FeedbackPolicy::Blind { max_attempts, .. } => {
-            if attempts >= max_attempts {
-                ActuationAction::GiveUp
-            } else {
-                ActuationAction::Send
-            }
-        }
-        FeedbackPolicy::Read { .. } => ActuationAction::Send,
-    }
 }
 
 /// `Blind` が `GiveUp` した後、再武装判定（`ReadBackQuery::AnyFreshEvidence`）を
@@ -198,115 +241,15 @@ pub fn blind_rearm_cooldown_elapsed(
         .is_some_and(|elapsed| elapsed >= std::time::Duration::from_millis(cooldown_ms))
 }
 
-// ── force-ON 再試行の有界化（ADR-098 決定1-c、BUG-69）──────────────────────────
-
-/// `apply_force_on_for_imm_broken` の直近試行時刻。
-///
-/// `ImeEvent::FocusChanged` でリセットする＝クールダウンの単位は「1 フォーカス」。
-/// 試行回数の上限は**設けない**——`FocusChanged` はプロセス変更時にしか発火せず、
-/// 同一プロセス内のウィンドウ/タブ切替では 1 セッションが数十分続きうる。その間
-/// `applied` は drift correction・ユーザー明示操作等で繰り返し blocking 状態から
-/// 外れる。1 フォーカスあたりの試行回数に上限を設けると、observer の揺れが
-/// クールダウン窓より長く続いた場合に予算を使い切り、そのプロセスに居る限り
-/// force-ON が二度と飛ばなくなる——BUG-16 の原症状（settle 明け再試行の恒久
-/// no-op）を作り直すことになる（ラウンド3 レビューで発見・rejected）。止める
-/// べきは再試行そのものではなく再試行密度であり、クールダウン単独で十分。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ForceOnRetryState {
-    last_attempt_ms: u64,
-}
-
-impl ForceOnRetryState {
-    /// `last_attempt_ms == 0`（`Default`）を「未試行」の意味に使う。決定6-a が
-    /// `AppliedImeState` から追放した `ts==0` センチネルと同型の設計に見えるが、
-    /// あちらは「時刻のつもりで渡した値が誤って Confirmed を意味してしまう」
-    /// という**型の取り違えリスク**が問題だった。こちらは `u64` 単独の値で
-    /// `Option<u64>` へラップするほどの複雑さを要求せず、`GetTickCount64()`
-    /// が実際に 0 を返すのはシステム起動直後のごく短い窓に限られ実害が無い
-    /// （`blind_rearm_cooldown_elapsed` の `Instant` ベース設計とは表現力が
-    /// 異なるため、同一パターンへの統一はしない）。
-    pub fn note_attempt(&mut self, now_ms: u64) {
-        self.last_attempt_ms = now_ms;
-    }
-}
-
-/// force-ON（`apply_force_on_for_imm_broken`）を今送ってよいかを判定する純粋関数
-/// （ADR-098 決定1-c、BUG-69）。
-///
-/// 決定1-a により TsfNative の `applied` はフォーカス入場後 `Unknown` のまま
-/// 残るようになる。従来のスパムガード（`Optimistic(true) | Confirmed{open:true}`
-/// のときだけ送らない）は、chain が `Failed` を返した場合に生成される
-/// `Confirmed{open:false}` を素通ししてしまい、`post_ime_refresh()` が
-/// outcome によらず無条件に張る 20ms タイマーと組み合わさって、TsfNative では
-/// これを上書きする周期ポーリングが無いため実効 50Hz の無限再試行ループを
-/// 開く（打鍵中かどうかを問わず `mark_composition_cold` を伴う、BUG-31 族の
-/// 最悪形）。このクールダウンがその歯止めになる。
-#[must_use]
-pub fn force_on_attempt_allowed(
-    applied: super::ime_model::AppliedImeState,
-    retry: ForceOnRetryState,
-    now_ms: u64,
-    cooldown_ms: u64,
-) -> bool {
-    // (1) 既に ON を apply 済み → 送らない（500ms poll ごとの F2 再送スパム防止、BUG-16 由来）。
-    if matches!(
-        applied,
-        super::ime_model::AppliedImeState::Optimistic(true)
-            | super::ime_model::AppliedImeState::Confirmed { open: true, .. }
-    ) {
-        return false;
-    }
-    // (2) 未試行（last_attempt_ms == 0）は無条件に通す。
-    //     決定1-a 適用後、TsfNative フォーカス復帰直後は必ずここを通る——
-    //     これが決定1の主目的（BUG-16 の修正を TsfNative で初めて実効させる）。
-    if retry.last_attempt_ms == 0 {
-        return true;
-    }
-    // (3) クールダウン: 20ms リフレッシュ連鎖に相乗りした高速再試行を潰す。
-    //     GetTickCount の巻き戻りでは saturating_sub が 0 になり
-    //     「未経過」＝安全側（送らない）に倒れる。
-    now_ms.saturating_sub(retry.last_attempt_ms) >= cooldown_ms
-}
-
 // ── EventOrigin 配線（ADR-082 Phase 0.5）──────────────────────────────────────
 //
 // drift correction の actuation 試行に「出所（誰が起こしたか）」と「世代（何回目か）」を
 // 型として持たせるための構築経路。runtime 層（`ir_apply_drift_correction`）と journal
-// リプレイテストの両方がこの純粋関数を通って `EventOrigin` を組み立てる（構築経路の
-// 集約、`.claude/rules/ime-belief-architecture.md`）。`runtime/` は Linux で実行検証
+// リプレイテストの両方が [`FeedbackPolicy::origin`]（上記 `impl FeedbackPolicy` 参照）を
+// 通って `EventOrigin` を組み立てる（構築経路の集約、
+// `.claude/rules/ime-belief-architecture.md`）。`runtime/` は Linux で実行検証
 // できないため、`EventOrigin` の中身を決めるロジックはここ（`state`）に置き、Linux で
 // ユニットテストする。
-
-/// actuation 試行の出所を表す `EventSource::SelfActuated` の `strategy` 識別子。
-///
-/// `FeedbackPolicy` から一意に導出する。`DriftCorrectionFixture` は `EventSource` 自体を
-/// deserialize せず（`&'static str` のため不可、`state/event_origin.rs` 参照）、`policy`
-/// からこの関数で `strategy` を再構築するため、ここが `strategy` 文字列の唯一の定義点。
-#[must_use]
-pub const fn actuation_strategy(policy: FeedbackPolicy) -> &'static str {
-    match policy {
-        // Imm32Unavailable / TsfNative（実読み戻し不能）。BUG-43 はこちら。
-        FeedbackPolicy::Blind { .. } => "drift_correction_blind",
-        // ImmCross 等（実読み戻し可能）。
-        FeedbackPolicy::Read { .. } => "drift_correction_read",
-    }
-}
-
-/// actuation 試行1回分の `EventOrigin` を組み立てる。
-///
-/// `source` は常に `SelfActuated`（awase 自身の能動的訂正）で、`strategy` は
-/// `actuation_strategy(policy)`。`epoch` は「この actuation 系列の何回目の試行か」を
-/// `Generation` で表す（`Actuation.attempts` と歩調を合わせて単調増加。target が変わって
-/// 新しい `Actuation` になると 0 から振り直す）。
-#[must_use]
-pub fn actuation_origin(policy: FeedbackPolicy, epoch: Generation) -> EventOrigin {
-    EventOrigin::new(
-        EventSource::SelfActuated {
-            strategy: actuation_strategy(policy),
-        },
-        epoch,
-    )
-}
 
 /// actuation 試行1回分の構造化レコード（ADR-082 Phase 0.5）。
 ///
@@ -329,12 +272,12 @@ pub struct ActuationRecord {
     pub policy: FeedbackPolicy,
     /// tick 開始前の累積試行回数（0-origin）。
     pub attempts: u32,
-    /// `decide_actuation_action(policy, attempts)` の判定（`Send`/`GiveUp`）。
+    /// `policy.decide_action(attempts)` の判定（`Send`/`GiveUp`）。
     pub action: ActuationAction,
 }
 
 impl ActuationRecord {
-    /// 唯一の構築経路。`action` は `decide_actuation_action` で一意に決まるため引数に
+    /// 唯一の構築経路。`action` は `FeedbackPolicy::decide_action` で一意に決まるため引数に
     /// 取らず内部で導出する（呼び出し元が origin と食い違う action を渡す事故を防ぐ）。
     #[must_use]
     pub fn new(origin: EventOrigin, target: bool, policy: FeedbackPolicy, attempts: u32) -> Self {
@@ -343,7 +286,7 @@ impl ActuationRecord {
             target,
             policy,
             attempts,
-            action: decide_actuation_action(policy, attempts),
+            action: policy.decide_action(attempts),
         }
     }
 }
@@ -356,13 +299,13 @@ impl ActuationRecord {
 // `Actuation`/`FeedbackPolicy::Blind` で試行回数を有界にする型強制を実装済み
 // （`IME_ACTUATION_BLIND_MAX_ATTEMPTS`、`state/app_ime_policy.rs`）。
 //
-// `decide_actuation_action` は journal に記録される実際の呼び出し (`Actuation` 経由)
+// `FeedbackPolicy::decide_action` は journal に記録される実際の呼び出し (`Actuation` 経由)
 // ではなく、まだ配線されていない当時の生ログから手で書き起こしたフィクスチャで
 // リプレイする（`ConvClassifyFixture` と同じ「実機で観測済みの入力を固定化する」
 // 考え方だが、こちらは journal ダンプ経由ではなく known-bugs.md の記述から手で
 // 再構成している — 詳細は `DriftCorrectionFixture` のドキュメントコメント参照）。
 
-/// BUG-43 の実機ログを `decide_actuation_action` でリプレイするための固定フィクスチャ。
+/// BUG-43 の実機ログを `FeedbackPolicy::decide_action` でリプレイするための固定フィクスチャ。
 /// `tests/journals/*.json` に配列として保存し、`tests/drift_correction_replay.rs`
 /// （または `journal_replay.rs`）が読み込んで再実行・照合する。
 ///
@@ -373,10 +316,10 @@ impl ActuationRecord {
 /// 存在しなかったため、このフィクスチャは `docs/known-bugs.md` BUG-43 節の記述
 /// （「675ms の間に16回連続、observe tick 20ms とほぼ同期、`duration_ms` は
 /// 84502ms→85176ms と単調増加」）から手で再構成した近似値である。`ticks` の
-/// `observed_at_ms` はこの近似の記録用メタデータであり、`decide_actuation_action`
+/// `observed_at_ms` はこの近似の記録用メタデータであり、`decide_action`
 /// の呼び出し自体（`policy`/`attempts` のみが入力）には使わない。
 ///
-/// `decide_actuation_action(policy, attempts) -> ActuationAction` は時刻を取らない
+/// `policy.decide_action(attempts) -> ActuationAction` は時刻を取らない
 /// 純粋関数なので、このフィクスチャの本質的な入力は `policy` と `ticks[].attempts`
 /// の列のみ。BUG-43 は 16 回の drift 検知それぞれが独立に `apply_ime_open(false)` を
 /// 送信していた（旧実装は試行回数を数えていなかった）ため、`attempts` はここでは
@@ -408,10 +351,10 @@ pub struct DriftCorrectionTick {
     /// に積まれる世代の配線が壊れていないことを固定する。
     pub epoch: Generation,
     /// 実機ログの経過時間（ms）。ドキュメント用途のみ（BUG-43 記述からの近似復元、
-    /// 上記モジュールコメント参照）、`decide_actuation_action` の判定には使わない。
+    /// 上記モジュールコメント参照）、`decide_action` の判定には使わない。
     #[serde(default)]
     pub observed_at_ms: Option<u64>,
-    /// `decide_actuation_action(fixture.policy, attempts)` の期待される結果。
+    /// `fixture.policy.decide_action(attempts)` の期待される結果。
     pub expected: ActuationAction,
 }
 
@@ -437,7 +380,7 @@ mod tests {
     fn blind_sends_before_reaching_max() {
         for attempts in 0..3 {
             assert_eq!(
-                decide_actuation_action(blind(3), attempts),
+                blind(3).decide_action(attempts),
                 ActuationAction::Send,
                 "attempts={attempts} は max_attempts=3 未満なので Send のはず"
             );
@@ -447,7 +390,7 @@ mod tests {
     #[test]
     fn blind_gives_up_exactly_at_max() {
         assert_eq!(
-            decide_actuation_action(blind(3), 3),
+            blind(3).decide_action(3),
             ActuationAction::GiveUp,
             "attempts == max_attempts の厳密境界で GiveUp"
         );
@@ -456,7 +399,7 @@ mod tests {
     #[test]
     fn blind_stays_gave_up_past_max() {
         assert_eq!(
-            decide_actuation_action(blind(3), 4),
+            blind(3).decide_action(4),
             ActuationAction::GiveUp,
             "境界を越えても Send に戻らない"
         );
@@ -466,7 +409,7 @@ mod tests {
     fn read_always_sends() {
         for attempts in [0, 1, 3, 4, 100, u32::MAX] {
             assert_eq!(
-                decide_actuation_action(read(), attempts),
+                read().decide_action(attempts),
                 ActuationAction::Send,
                 "Read は試行回数で打ち切らない (attempts={attempts})"
             );
@@ -523,111 +466,17 @@ mod tests {
         assert!(!blind_rearm_cooldown_elapsed(gave_up_at, now, 3_000));
     }
 
-    // ── force_on_attempt_allowed（ADR-098 決定1-c、BUG-69）──────────────────
-
-    use super::super::ime_model::AppliedImeState;
-
-    #[test]
-    fn force_on_allowed_when_applied_unknown_and_unattempted() {
-        // crux: 決定1-a 適用後、TsfNative フォーカス復帰直後は必ずこの状態。
-        // ここが false になったら決定1が無意味化している。
-        assert!(force_on_attempt_allowed(
-            AppliedImeState::Unknown,
-            ForceOnRetryState::default(),
-            1_000,
-            3_000,
-        ));
-    }
-
-    #[test]
-    fn force_on_blocked_when_applied_confirmed_open() {
-        // 従来のスパムガードの保存: 既に ON を apply 済みなら送らない。
-        // `retry` はあえて「試行済み・cooldown 経過済み」（分岐(3)なら true を
-        // 返すはずの状態）にして、分岐(1)（`applied` が既に ON）がそれより
-        // 先に効いて block することを検証する。
-        let mut retry = ForceOnRetryState::default();
-        retry.note_attempt(500);
-        assert!(!force_on_attempt_allowed(
-            AppliedImeState::Confirmed {
-                open: true,
-                at_ms: 500
-            },
-            retry,
-            10_000,
-            3_000,
-        ));
-    }
-
-    #[test]
-    fn force_on_blocked_when_applied_optimistic_open() {
-        assert!(!force_on_attempt_allowed(
-            AppliedImeState::Optimistic(true),
-            ForceOnRetryState::default(),
-            1_000,
-            3_000,
-        ));
-    }
-
-    #[test]
-    fn force_on_blocked_within_cooldown_after_failed_attempt() {
-        // 20ms 無限ループの封鎖そのもの: Failed → Confirmed{open:false} で
-        // 試行済みになった直後（20ms 後）は送らない。
-        let mut retry = ForceOnRetryState::default();
-        retry.note_attempt(1_000);
-        assert!(!force_on_attempt_allowed(
-            AppliedImeState::Confirmed {
-                open: false,
-                at_ms: 1_000
-            },
-            retry,
-            1_020,
-            3_000,
-        ));
-    }
-
-    #[test]
-    fn force_on_allowed_after_cooldown_elapses() {
-        // 過渡的失敗からの復帰が死んでいないこと（BUG-16 の意図を保つ）。
-        let mut retry = ForceOnRetryState::default();
-        retry.note_attempt(1_000);
-        assert!(force_on_attempt_allowed(
-            AppliedImeState::Confirmed {
-                open: false,
-                at_ms: 1_000
-            },
-            retry,
-            4_000,
-            3_000,
-        ));
-    }
-
-    #[test]
-    fn force_on_tick_wraparound_is_treated_as_not_elapsed() {
-        // GetTickCount の巻き戻り（本来起こらないが防御的に安全側へ倒す）。
-        let mut retry = ForceOnRetryState::default();
-        retry.note_attempt(5_000);
-        assert!(!force_on_attempt_allowed(
-            AppliedImeState::Confirmed {
-                open: false,
-                at_ms: 5_000
-            },
-            retry,
-            100, // now < last_attempt_ms
-            3_000,
-        ));
-    }
-
     // ── EventOrigin 配線（ADR-082 Phase 0.5）─────────────────────────────────
 
     #[test]
     fn actuation_strategy_distinguishes_policy() {
-        assert_eq!(actuation_strategy(blind(5)), "drift_correction_blind");
-        assert_eq!(actuation_strategy(read()), "drift_correction_read");
+        assert_eq!(blind(5).strategy(), "drift_correction_blind");
+        assert_eq!(read().strategy(), "drift_correction_read");
     }
 
     #[test]
     fn actuation_origin_is_self_actuated_with_policy_strategy() {
-        let origin = actuation_origin(blind(5), Generation::new(3));
+        let origin = blind(5).origin(Generation::new(3));
         assert_eq!(
             origin.source,
             EventSource::SelfActuated {
@@ -643,8 +492,8 @@ mod tests {
     #[test]
     fn actuation_origin_epoch_tracks_attempt_generation() {
         // 同じ actuation 系列の連続試行では epoch が単調増加する。
-        let prev = actuation_origin(blind(5), Generation::new(0));
-        let next = actuation_origin(blind(5), Generation::new(1));
+        let prev = blind(5).origin(Generation::new(0));
+        let next = blind(5).origin(Generation::new(1));
         assert!(next.epoch.is_newer_than(prev.epoch));
     }
 
@@ -654,11 +503,11 @@ mod tests {
         // その再構築が生の actuation_origin と一致することを固定する。
         for policy in [blind(5), read()] {
             let epoch = Generation::new(7);
-            let rebuilt = actuation_origin(policy, epoch);
+            let rebuilt = policy.origin(epoch);
             assert_eq!(
                 rebuilt.source,
                 EventSource::SelfActuated {
-                    strategy: actuation_strategy(policy),
+                    strategy: policy.strategy(),
                 }
             );
             assert_eq!(rebuilt.epoch, epoch);

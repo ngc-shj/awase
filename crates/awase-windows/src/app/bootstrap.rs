@@ -27,11 +27,13 @@ use crate::tray;
 use crate::tray::SystemTray;
 use crate::{with_app, with_app_ref, LayoutEntry, Runtime, RUNTIME};
 
+use super::logging;
 use super::{
-    build_panic_trigger_combos, init_ime_sync_keys, init_ngram_validated, load_config,
-    parse_key_combos, resolve_relative, run_message_loop, set_taskbar_created_msg, HotKeyGuard,
-    RapidPressTracker, StartupDiagnostics, DUMP_TRIGGER, HOTKEY_ID_FOCUS_OVERRIDE,
-    HOTKEY_ID_TOGGLE, RAPID_IME_TIMESTAMPS, WM_DUPLICATE_INSTANCE,
+    build_panic_trigger_combos, cli_arg_config_path, ensure_default_layouts_exist,
+    init_ime_sync_keys, init_ngram_validated, load_config, parse_key_combos, resolve_relative,
+    run_message_loop, set_taskbar_created_msg, HotKeyGuard, RapidPressTracker, StartupDiagnostics,
+    DUMP_TRIGGER, HOTKEY_ID_FOCUS_OVERRIDE, HOTKEY_ID_TOGGLE, RAPID_IME_TIMESTAMPS,
+    WM_DUPLICATE_INSTANCE,
 };
 
 fn show_no_layouts_dialog(layouts_dir: &Path) {
@@ -44,6 +46,49 @@ fn show_no_layouts_dialog(layouts_dir: &Path) {
     );
     crate::win32::show_error_dialog("awase - レイアウトが見つかりません", &message);
     super::launch_settings();
+}
+
+/// `default_layout` に指定したファイルが実際には読み込まれず、別のレイアウトへ
+/// フォールバックしていた場合にモーダルダイアログでユーザーへ知らせる（BUG-104）。
+/// フォールバックが実際に起きていれば `true` を返す（呼び出し元が設定画面を
+/// 開くかどうかの判断に使う）。
+///
+/// これまでは `StartupDiagnostics` 経由のトレイバルーン「N件の警告があります」
+/// としか通知していなかったため、独自レイアウトが UTF-8 でない等の理由で
+/// 読込に失敗し、無言でバンドル版へ差し替わっていることにユーザーが気づけない
+/// 実例（report `01M13EACMQ7D2VETW75N0BTZ9C`、`docs/known-bugs.md` BUG-104）が
+/// あった。**起動時（`init_engine_validated`）専用**——`reload_config`
+/// からは呼ばない。`show_error_dialog` は `MessageBoxW` で呼び出しスレッドを
+/// ブロックするため、起動前（メッセージループ開始前）は安全だが、
+/// `reload_config` はキーボードフックと async executor が生きている
+/// メッセージループスレッド上で直接実行されるため、そこでモーダルを出すと
+/// ダイアログが閉じるまで入力処理が滞留するリスクがある（/code-review 指摘、
+/// PR #131）。設定リロード時の通知は既存の `StartupDiagnostics` 経由の
+/// トレイバルーンのみで妥協する。
+pub(super) fn warn_layout_fallback(
+    layouts_dir: &Path,
+    default_layout: &str,
+    resolved_name: &str,
+) -> bool {
+    let configured_name = crate::runtime::strip_yab_extension(default_layout);
+    if configured_name.eq_ignore_ascii_case(resolved_name) {
+        return false;
+    }
+    let reason = if layouts_dir.join(default_layout).exists() {
+        "読み込みに失敗しました（ファイルの内容にエラーがあるか、文字コードが UTF-8 \
+         になっていない可能性があります）"
+    } else {
+        "見つかりませんでした"
+    };
+    let message = format!(
+        "設定されたレイアウト「{default_layout}」を{reason}。\n\n\
+         代わりに「{resolved_name}.yab」を使用しています。独自にカスタマイズした\
+         内容は反映されていません。\n\n\
+         詳細は awase.log を確認するか、これから開く設定画面で配列を選び直して\
+         ください。"
+    );
+    crate::win32::show_error_dialog("awase - レイアウトの読み込みに失敗しました", &message);
+    true
 }
 
 /// 親指+小指シフト複合面を有効にできる親指キー構成かを返す。
@@ -75,6 +120,9 @@ pub(crate) fn log_path() -> PathBuf {
 }
 
 pub(super) fn init_logging(debug_console: bool) {
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    use tracing_subscriber::EnvFilter;
+
     let log_path = log_path();
 
     if debug_console {
@@ -86,38 +134,56 @@ pub(super) fn init_logging(debug_console: bool) {
             const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
             let _ = AttachConsole(ATTACH_PARENT_PROCESS);
         }
-        let mut builder =
-            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"));
-        builder.format_timestamp_millis();
-        builder.target(env_logger::Target::Stderr);
-        builder.init();
-        log::info!("--debug: ログをコンソール(stderr)に出力, レベル=debug");
+        // --debug の stderr 経路は ADR-139 決定2 のスコープ外（同期のまま）。
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .finish()
+            .init();
+        tracing::info!("--debug: ログをコンソール(stderr)に出力, レベル=debug");
     } else {
-        let log_file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path);
-
-        let mut builder =
-            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
-        builder.format_timestamp_millis();
-
-        if let Ok(file) = log_file {
-            builder.target(env_logger::Target::Pipe(Box::new(file)));
-        }
-        // ファイルが開けない場合は stderr フォールバック
-
-        builder.init();
-        log::info!(
+        // ADR-139 決定2: awase.log は固定パスを維持したまま BufWriter でラップし、
+        // 書き込みバイト数が閾値を超えたら awase.log.old へ1世代だけリネームする。
+        // `tracing-appender::rolling` は時間ベースのみでサイズベース実測に合わず、
+        // 日付サフィックス付きファイル名が bug_report_log_path() の
+        // exists() 契約を壊すため採用しない。
+        let writer = logging::RotatingLogWriter::init_global(log_path.clone());
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(writer)
+            // ファイル出力にANSIエスケープシーケンスを混入させない
+            // （env_loggerのWriteStyle::Autoは非端末出力で自動的に無効化していたが、
+            // tracing-subscriberは既定でansi featureが有効なため明示指定が必要。
+            // 不具合報告に添付されるawase.logが読めなくなるのを防ぐ）。
+            .with_ansi(false)
+            .finish()
+            .init();
+        tracing::info!(
             "Keyboard Layout Emulator starting... (log → {})",
             log_path.display()
         );
     }
 }
 
-/// 自動起動の設定を処理する
+/// 自動起動の設定状態を確認する
 ///
-/// `auto_start` の値（"enabled"/"disabled"）に応じて HKCU Run キーへの登録/解除を行う。
+/// HKCU Run キーへの登録/解除はトレイメニュー（`tray::handle_autostart_toggle`）
+/// または設定画面のチェックボックスから、ユーザーが直接ボタン操作した場合にのみ
+/// 行う。ここでは書き込みを一切行わない。`auto_start = "enabled"` なのに実際の
+/// 登録が失われている（ズレている）場合も、トレイバルーン等でユーザーに割り込む
+/// ことはせず、ログにのみ記録する（ユーザーとの相談で「設定UIを開いたときの
+/// 警告だけで十分」と方針決定、2026-09-07）。実際の警告表示は設定画面
+/// （`awase-settings`）の `recompute_diagnostics` が同じズレを検知して行う。
+///
+/// Windows Defender の Behavior:Win32/Persistence.A!.ml 誤検知対策
+/// （2026-09-07）: 起動のたびにユーザー操作なしで Run キーへ書き込む
+/// 「自己修復」は、グローバルキーフックと組み合わさると持続化型マルウェアの
+/// 典型的な挙動パターンと見分けがつかない。ユーザーが過去にトレイ/設定画面で
+/// 有効化したという文脈をDefenderは知らないため、無操作での再書き込みだけが
+/// 単独のシグナルとして観測される。書き込みをボタン起点の経路に限定すること
+/// でこのシグナルを消す。
 pub(super) fn handle_auto_start(config: &awase::config::AppConfig) {
     use crate::autostart;
 
@@ -127,12 +193,15 @@ pub(super) fn handle_auto_start(config: &awase::config::AppConfig) {
     match config.general.auto_start.as_str() {
         "enabled" => {
             if !autostart::is_registered() {
-                let _ = autostart::register();
+                tracing::warn!(
+                    "auto_start is enabled in config.toml but no Windows Run key entry \
+                     was found; re-enable it via the tray menu or settings UI"
+                );
             }
         }
         "disabled" => {}
         other => {
-            log::warn!("Unknown auto_start value: {other}, ignoring");
+            tracing::warn!("Unknown auto_start value: {other}, ignoring");
         }
     }
 }
@@ -166,8 +235,21 @@ pub(super) fn init_engine_validated(
             config.general.right_thumb_key
         ))?;
 
+    // CLI引数でconfigパスが明示されている場合は自己修復しない
+    // （ADR-178 決定2、v14 opusレビュー M2対応——.yab側もconfig.toml側と
+    // 同じゲートを通す。無ければ`my.toml`の`layouts_dir`が絶対パスの場合に
+    // ユーザーの任意のディレクトリへ6ファイル書き込んでしまう）。
+    if cli_arg_config_path().is_none() {
+        ensure_default_layouts_exist(&config.general.layouts_dir);
+    }
     let layouts_dir = resolve_relative(&config.general.layouts_dir);
-    let layouts = LayoutEntry::scan_all(&layouts_dir, diag, config.general.keyboard_model)?;
+    let layouts = LayoutEntry::scan_all(
+        &layouts_dir,
+        diag,
+        config.general.keyboard_model,
+        &config.keystroke_macro,
+        config.general.keystroke_sequence,
+    )?;
     let Some(layouts) = NonEmptyLayouts::new(layouts) else {
         show_no_layouts_dialog(&layouts_dir);
         return Err(anyhow::anyhow!(
@@ -176,11 +258,18 @@ pub(super) fn init_engine_validated(
         ));
     };
     let layout_names = layouts.names();
-    log::info!("Available layouts: {layout_names:?}");
+    tracing::info!("Available layouts: {layout_names:?}");
 
     let (layout, initial_layout_name) = select_default_layout(layouts.as_slice(), config)
         .context("default layout selection failed")?;
-    log::info!(
+    if warn_layout_fallback(
+        &layouts_dir,
+        &config.general.default_layout,
+        &initial_layout_name,
+    ) {
+        super::launch_settings();
+    }
+    tracing::info!(
         "Layout loaded: {} normal keys, {} left thumb keys, {} right thumb keys",
         layout.normal.len(),
         layout.left_thumb.len(),
@@ -218,8 +307,19 @@ fn select_default_layout(
     Some((entry.layout.clone(), entry.name.clone()))
 }
 
-/// 競合する親指シフトソフトウェアが起動中でないかチェックし、警告を出す
-pub(crate) fn detect_conflicting_software() -> Vec<String> {
+struct ConflictEntry {
+    exe: &'static str,
+    display: &'static str,
+}
+
+/// 実行中プロセス一覧を1回スキャンし、`candidates` に名前（大文字小文字を無視）が
+/// 一致したものの表示名を重複無しで返す。`detect_conflicting_software`/
+/// `detect_relay_or_remap_software` の共通実装。
+/// Toolhelp32スナップショットで実行中プロセスの`szExeFile`一覧を列挙する
+/// （OSの列挙順のまま、重複除去・ソートはしない）。`scan_running_processes`/
+/// `list_all_running_process_names`共通のヘルパー（opusコードレビュー指摘:
+/// 同一のCreateToolhelp32Snapshot手順が2箇所に重複していた）。
+fn enumerate_process_exe_names() -> Vec<String> {
     use std::mem::size_of;
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -227,11 +327,52 @@ pub(crate) fn detect_conflicting_software() -> Vec<String> {
         TH32CS_SNAPPROCESS,
     };
 
-    struct ConflictEntry {
-        exe: &'static str,
-        display: &'static str,
+    // SAFETY: CreateToolhelp32Snapshot / Process32FirstW / Process32NextW は
+    //         有効なハンドルと dwSize 設定済み PROCESSENTRY32W を渡す標準的な呼び出し。
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return Vec::new();
+        };
+        let mut entry = PROCESSENTRY32W {
+            dwSize: u32::try_from(size_of::<PROCESSENTRY32W>()).unwrap_or(0),
+            ..Default::default()
+        };
+        let mut names: Vec<String> = Vec::new();
+        if Process32FirstW(snap, &raw mut entry).is_ok() {
+            loop {
+                let end = entry
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                names.push(String::from_utf16_lossy(&entry.szExeFile[..end]));
+                if Process32NextW(snap, &raw mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+        names
     }
+}
 
+fn scan_running_processes(candidates: &[ConflictEntry]) -> Vec<String> {
+    let mut results: Vec<String> = Vec::new();
+    for exe_name in enumerate_process_exe_names() {
+        for candidate in candidates {
+            if exe_name.eq_ignore_ascii_case(candidate.exe)
+                && !results.iter().any(|name| name == candidate.display)
+            {
+                results.push(candidate.display.to_owned());
+                break;
+            }
+        }
+    }
+    results
+}
+
+/// 競合する親指シフトソフトウェアが起動中でないかチェックし、警告を出す
+pub(crate) fn detect_conflicting_software() -> Vec<String> {
     const CONFLICTS: &[ConflictEntry] = &[
         ConflictEntry {
             exe: "yamabuki.exe",
@@ -246,42 +387,165 @@ pub(crate) fn detect_conflicting_software() -> Vec<String> {
             display: "紅皿",
         },
     ];
+    scan_running_processes(CONFLICTS)
+}
 
-    // SAFETY: CreateToolhelp32Snapshot / Process32FirstW / Process32NextW は
-    //         有効なハンドルと dwSize 設定済み PROCESSENTRY32W を渡す標準的な呼び出し。
-    unsafe {
-        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
-            return Vec::new();
-        };
-        let mut entry = PROCESSENTRY32W {
-            dwSize: u32::try_from(size_of::<PROCESSENTRY32W>()).unwrap_or(0),
-            ..Default::default()
-        };
-        let mut results: Vec<String> = Vec::new();
-        if Process32FirstW(snap, &raw mut entry).is_ok() {
-            loop {
-                let end = entry
-                    .szExeFile
-                    .iter()
-                    .position(|&c| c == 0)
-                    .unwrap_or(entry.szExeFile.len());
-                let exe_name = String::from_utf16_lossy(&entry.szExeFile[..end]);
-                for conflict in CONFLICTS {
-                    if exe_name.eq_ignore_ascii_case(conflict.exe)
-                        && !results.iter().any(|name| name == conflict.display)
-                    {
-                        results.push(conflict.display.to_owned());
-                        break;
-                    }
-                }
-                if Process32NextW(snap, &raw mut entry).is_err() {
-                    break;
-                }
-            }
-        }
-        let _ = CloseHandle(snap);
-        results
-    }
+/// 親指シフト機能そのものとは競合しないが、入力デリバリ経路（マウス/キーボード
+/// 共有、リモートデスクトップ、X サーバー転送、独自リマップ等）に影響しうると
+/// 既知の相互作用が確認されているツール。
+///
+/// `detect_conflicting_software` とは別関数にしている理由: あちらは
+/// `check_conflicting_software` で「終了してください」という起動時警告に使われるが、
+/// ここに挙げるツールは正当な用途で起動されていることが多く、終了を促すのは
+/// 不適切。不具合報告（`competing_software`）の診断情報としてのみ使う
+/// （issue #165: D&D不可・印刷不能の切り分け用）。
+///
+/// リストは網羅的ではない。過去に実際に相互作用が確認できたもののみ収録:
+/// Mouse Without Borders（issue #136/BUG-90）、mstsc.exe（BUG-78、KeyUp消失）、
+/// VcXsrv（project memory記録、合成Ctrl KeyDownの送りっぱなし）。
+///
+/// **`PowerToys.KeyboardManagerEngine.exe`/`PowerToys.PowerLauncher.exe`
+/// （2026-09-28追記）**: issue #165 の不具合報告 `01M3JTVDPMW35MF81DGRKW10MQ`
+/// は `competing_software: ["PowerToys"]`（本関数が検出した汎用の
+/// `PowerToys.exe` ランチャープロセス）を伴っていた。その後
+/// `crates/e2e-uwp-inputsite-probe` による CI 実証実験で、awase より後に
+/// インストールされ `CallNextHookEx` を呼ばない別の `WH_KEYBOARD_LL` フックが
+/// あると issue #165 の watchdog シグネチャと同一の症状（キー入力が遅延では
+/// なく完全消失）を確実に再現できることを確認した（PR #347）。PowerToys の
+/// Keyboard Manager モジュールは公式に `WH_KEYBOARD_LL` を使い、専用の別
+/// プロセス `PowerToys.KeyboardManagerEngine.exe` がそのフックをホストする
+/// （PowerToys本体のアーキテクチャドキュメントで確認、awase側で直接検証した
+/// 事実ではない）。汎用の `PowerToys.exe` だけでは「PowerToys スイートの
+/// どのモジュールが有効か」が分からないため、次に同種の報告が来たとき
+/// Keyboard Manager 自体が動いていたかを直接判別できるよう、この専用プロセス
+/// 名も候補に加える。PowerToys Run（`PowerToys.PowerLauncher.exe`）は
+/// BUG-053（Win キー押下で検索UIが開く際のフック競合）と同系統のグローバル
+/// ホットキー常駐という点で候補に加えたが、`WH_KEYBOARD_LL` 使用の直接確認は
+/// していない。**いずれも issue #165 の原因と確定したわけではなく、次の
+/// 報告で相関を取るための候補**（`docs/bug-reports-triage.md` の
+/// `01M3JTVDPMW35MF81DGRKW10MQ` 追記も参照）。
+///
+/// `is_relay_or_remap_software_process`（hook watchdog 自己修復、issue #165 F3）と
+/// 共有するため module-level const にしてある（fix/hook-self-heal-v2、opus
+/// round2 M7対応: develop側PR #347が追加した2件を含む7件全てをここに集約）。
+const RELAY_OR_REMAP_CANDIDATES: &[ConflictEntry] = &[
+    ConflictEntry {
+        exe: "PowerToys.MouseWithoutBorders.exe",
+        display: "Mouse Without Borders",
+    },
+    ConflictEntry {
+        exe: "PowerToys.MouseWithoutBordersHelper.exe",
+        display: "Mouse Without Borders (Helper)",
+    },
+    ConflictEntry {
+        exe: "PowerToys.exe",
+        display: "PowerToys",
+    },
+    ConflictEntry {
+        exe: "PowerToys.KeyboardManagerEngine.exe",
+        display: "PowerToys Keyboard Manager",
+    },
+    ConflictEntry {
+        exe: "PowerToys.PowerLauncher.exe",
+        display: "PowerToys Run",
+    },
+    ConflictEntry {
+        exe: "mstsc.exe",
+        display: "リモートデスクトップ接続 (mstsc)",
+    },
+    ConflictEntry {
+        exe: "vcxsrv.exe",
+        display: "VcXsrv",
+    },
+    // opus round3 M4（2026-09-28追記、round4でVMware/VirtualBoxのexe名を訂正）:
+    // VM/リモート操作クライアントは前面でキーボードを捕捉している間、自分の
+    // `WH_KEYBOARD_LL`で注入キーも含めて握りつぶすのが一般的で、issue #165と
+    // 同じシグネチャ（hook_starved）になりうる。ここでスキップしないと、
+    // 自己修復がこれらのフックより先頭に割り込み、ゲスト/リモート側に届く
+    // はずの物理キーをNICOLA変換してしまう。いずれもawase側で直接検証した
+    // 事実ではなく、一般的に知られる実行ファイル名からの候補
+    // （`detect_relay_or_remap_software`の既存エントリと同水準）。
+    // `vmware-vmx.exe`はVM本体プロセスでありフォアグラウンドウィンドウを
+    // 持たないため除外し、実際にコンソールを所有する`vmware.exe`
+    // （Workstation）/`vmplayer.exe`（Player）を使う。
+    //
+    // opus round1 M3（round4の訂正が逆向きだった）: VirtualBoxは逆に、
+    // `VirtualBox.exe`はManagerのGUIでキーボードを捕捉せず、ゲストへの
+    // 入力を捕捉するVMコンソール（Qtウィンドウ）を実際に所有するのは
+    // `VirtualBoxVM.exe --startvm ...`側（VirtualBox 5.2以降）。
+    // `VirtualBox.exe`も害は無いので残しつつ、実際に効く方を追加する。
+    ConflictEntry {
+        exe: "vmware.exe",
+        display: "VMware Workstation (VM)",
+    },
+    ConflictEntry {
+        exe: "vmplayer.exe",
+        display: "VMware Player (VM)",
+    },
+    ConflictEntry {
+        exe: "VirtualBox.exe",
+        display: "VirtualBox (Manager)",
+    },
+    ConflictEntry {
+        exe: "VirtualBoxVM.exe",
+        display: "VirtualBox (VM)",
+    },
+    ConflictEntry {
+        exe: "vmconnect.exe",
+        display: "Hyper-V 仮想マシン接続",
+    },
+    ConflictEntry {
+        exe: "TeamViewer.exe",
+        display: "TeamViewer",
+    },
+    ConflictEntry {
+        exe: "AnyDesk.exe",
+        display: "AnyDesk",
+    },
+    ConflictEntry {
+        exe: "parsecd.exe",
+        display: "Parsec",
+    },
+    ConflictEntry {
+        exe: "wfica32.exe",
+        display: "Citrix Workspace (ICA)",
+    },
+    ConflictEntry {
+        exe: "CDViewer.exe",
+        display: "Citrix Workspace (Desktop Viewer)",
+    },
+];
+
+pub(crate) fn detect_relay_or_remap_software() -> Vec<String> {
+    scan_running_processes(RELAY_OR_REMAP_CANDIDATES)
+}
+
+/// フォアグラウンドプロセス名が `detect_relay_or_remap_software` と同じ既知の
+/// 入力中継/リマップソフトのいずれかに一致するか（プロセス全列挙をしない軽量版）。
+///
+/// hook watchdog 自己修復（`TIMER_HOOK_WATCHDOG`、issue #165 F3）は3秒周期の
+/// ホットパスから呼ぶため、`CreateToolhelp32Snapshot`によるプロセス全列挙
+/// （`detect_relay_or_remap_software`）ではなく、既に取得済みのフォアグラウンド
+/// プロセス名1件だけを比較するこちらを使う。
+#[must_use]
+pub(crate) fn is_relay_or_remap_software_process(process_name: &str) -> bool {
+    RELAY_OR_REMAP_CANDIDATES
+        .iter()
+        .any(|c| process_name.eq_ignore_ascii_case(c.exe))
+}
+
+/// 実行中の全プロセスの実行ファイル名（重複除去・昇順ソート、パスは含まない）
+/// を返す。issue #165 の hook_starved（`WH_KEYBOARD_LL` フックチェーンへの
+/// イベント配送が数秒単位で途絶える）の切り分け用。`detect_relay_or_remap_software`
+/// は既知の候補との照合に限られるため、まだ知らない競合ソフトを後から遡って
+/// 発見できるよう、不具合報告の任意添付（`attach_running_processes`、既定オフ）
+/// としてこちらも用意する。プロセス名のみでパス（ユーザー名を含みうる）は
+/// 含めない。
+pub(crate) fn list_all_running_process_names() -> Vec<String> {
+    let mut names = enumerate_process_exe_names();
+    names.sort_unstable_by_key(|n| n.to_ascii_lowercase());
+    names.dedup();
+    names
 }
 
 pub(super) fn check_conflicting_software(diag: &mut StartupDiagnostics) {
@@ -297,7 +561,7 @@ pub(super) fn check_conflicting_software(diag: &mut StartupDiagnostics) {
 /// キーボードレイアウトが日本語(106/109)かどうかを検証し、警告を出す
 pub(super) fn check_keyboard_layout(diag: &mut StartupDiagnostics) {
     let (is_japanese, lang_id) = ime::keyboard_layout_info();
-    log::info!("Keyboard layout: LANGID=0x{lang_id:04X}, Japanese={is_japanese}");
+    tracing::info!("Keyboard layout: LANGID=0x{lang_id:04X}, Japanese={is_japanese}");
     if !is_japanese {
         if lang_id == crate::vk::LANGID_ENGLISH_US {
             diag.warn(
@@ -333,6 +597,7 @@ pub(super) fn init_tray(
 /// 検証済み設定でフック登録とホットキー登録を行う
 pub(super) fn install_hooks_and_hotkeys_validated(
     config: &ValidatedConfig,
+    diag: &mut StartupDiagnostics,
 ) -> Result<(hook::HookGuard, Option<HotKeyGuard>, Option<HotKeyGuard>)> {
     let guard = hook::install_hook().context("Failed to install keyboard hook")?;
 
@@ -341,49 +606,59 @@ pub(super) fn install_hooks_and_hotkeys_validated(
         .engine_toggle_hotkey
         .as_ref()
         .and_then(|hotkey_str| {
-            register_toggle_hotkey(hotkey_str)
-                .map_err(|e| log::warn!("{e}"))
+            // 名前の解決の失敗（`Invalid toggle hotkey format`）と `RegisterHotKey` の失敗
+            // （他のアプリが先に使っている等）の両方を診断に流す（ADR-201 決定2(e)）。
+            HotKeyGuard::register_toggle(hotkey_str)
+                .map_err(|e| diag.warn(format!("general.engine_toggle_hotkey: {e:#}")))
                 .ok()
         });
-    let app_override_guard = register_app_override_hotkey()
-        .map_err(|e| log::warn!("{e}"))
+    let app_override_guard = HotKeyGuard::register_app_override()
+        .map_err(|e| tracing::warn!("{e}"))
         .ok();
     Ok((guard, toggle_guard, app_override_guard))
 }
 
-/// トグルホットキーを登録する
-fn register_toggle_hotkey(hotkey_str: &str) -> Result<HotKeyGuard> {
-    let (modifiers, vk) = crate::vk::parse_hotkey(hotkey_str)
-        .context(format!("Invalid toggle hotkey format: {hotkey_str}"))?;
-    // SAFETY: RegisterHotKey with None HWND registers on the calling thread's message queue; VK and modifiers are valid values.
-    unsafe {
-        RegisterHotKey(
-            None,
-            HOTKEY_ID_TOGGLE,
-            HOT_KEY_MODIFIERS(modifiers),
-            u32::from(vk.0),
-        )
-        .context(format!("Failed to register toggle hotkey: {hotkey_str}"))?;
+impl HotKeyGuard {
+    /// トグルホットキーを登録する。
+    ///
+    /// 2026-09-10、自由関数からメソッドへ変更した（戻り値`Result<HotKeyGuard>`の
+    /// ためだけの関数が型定義（`app/mod.rs`）から離れたファイルにあった）。
+    /// 挙動は変更していない。
+    fn register_toggle(hotkey_str: &str) -> Result<Self> {
+        let (modifiers, vk) = crate::vk::parse_hotkey(hotkey_str)
+            .context(format!("Invalid toggle hotkey format: {hotkey_str}"))?;
+        // SAFETY: RegisterHotKey with None HWND registers on the calling thread's message queue; VK and modifiers are valid values.
+        unsafe {
+            RegisterHotKey(
+                None,
+                HOTKEY_ID_TOGGLE,
+                HOT_KEY_MODIFIERS(modifiers),
+                u32::from(vk.0),
+            )
+            .context(format!("Failed to register toggle hotkey: {hotkey_str}"))?;
+        }
+        tracing::info!("Toggle hotkey registered: {hotkey_str}");
+        Ok(Self(HOTKEY_ID_TOGGLE))
     }
-    log::info!("Toggle hotkey registered: {hotkey_str}");
-    Ok(HotKeyGuard(HOTKEY_ID_TOGGLE))
-}
 
-/// 手動アプリオーバーライドホットキー (Ctrl+Shift+F11) を登録する
-fn register_app_override_hotkey() -> Result<HotKeyGuard> {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{MOD_CONTROL, MOD_SHIFT};
-    // SAFETY: RegisterHotKey with None HWND registers on the calling thread's message queue; VK and modifiers are valid values.
-    unsafe {
-        RegisterHotKey(
-            None,
-            HOTKEY_ID_FOCUS_OVERRIDE,
-            MOD_CONTROL | MOD_SHIFT,
-            u32::from(crate::vk::VK_F11.0),
-        )
-        .context("Failed to register focus override hotkey: Ctrl+Shift+F11")?;
+    /// 手動アプリオーバーライドホットキー (Ctrl+Shift+F11) を登録する。
+    ///
+    /// 2026-09-10、自由関数からメソッドへ変更した（同上）。挙動は変更していない。
+    fn register_app_override() -> Result<Self> {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{MOD_CONTROL, MOD_SHIFT};
+        // SAFETY: RegisterHotKey with None HWND registers on the calling thread's message queue; VK and modifiers are valid values.
+        unsafe {
+            RegisterHotKey(
+                None,
+                HOTKEY_ID_FOCUS_OVERRIDE,
+                MOD_CONTROL | MOD_SHIFT,
+                u32::from(crate::vk::VK_F11.0),
+            )
+            .context("Failed to register focus override hotkey: Ctrl+Shift+F11")?;
+        }
+        tracing::info!("Focus override hotkey registered: Ctrl+Shift+F11");
+        Ok(Self(HOTKEY_ID_FOCUS_OVERRIDE))
     }
-    log::info!("Focus override hotkey registered: Ctrl+Shift+F11");
-    Ok(HotKeyGuard(HOTKEY_ID_FOCUS_OVERRIDE))
 }
 
 /// `WTSRegisterSessionNotification` の RAII ガード。Drop 時に解除する。
@@ -395,7 +670,7 @@ impl Drop for WtsGuard {
         unsafe {
             let _ = super::WTSUnRegisterSessionNotification(self.0);
         }
-        log::info!("WTS session notification unregistered");
+        tracing::info!("WTS session notification unregistered");
     }
 }
 
@@ -407,7 +682,7 @@ pub(super) fn register_session_notification() -> Result<WtsGuard> {
         super::WTSRegisterSessionNotification(tray_hwnd, super::NOTIFY_FOR_THIS_SESSION).as_bool()
     };
     anyhow::ensure!(ok, "WTSRegisterSessionNotification failed");
-    log::info!("WTS session notification registered");
+    tracing::info!("WTS session notification registered");
     Ok(WtsGuard(tray_hwnd))
 }
 
@@ -426,6 +701,7 @@ pub(super) fn initialize_app(
     left_alt_impersonates: bool,
     right_alt_impersonates: bool,
     all_keymaps: crate::keymap::KeymapTable,
+    diag: &mut StartupDiagnostics,
 ) {
     let mut ps = crate::PlatformState::new();
     ps.focus.focus_debounce_ms = config.general.focus_debounce_ms;
@@ -434,57 +710,21 @@ pub(super) fn initialize_app(
     hook::set_keyboard_model(config.general.keyboard_model);
     hook::set_alt_impersonation_enabled(left_alt_impersonates, right_alt_impersonates);
     hook::set_swallow_alt_kana_mode_switch(config.general.swallow_alt_kana_input_method_switch);
-    // ADR-110 決定4/9: key_remap テーブルをコンパイルしてフックスレッドへ渡す。
-    hook::set_key_remaps(&crate::state::key_remap::compile_key_remaps(
-        &config.key_remap,
-        left_thumb_vk,
-        right_thumb_vk,
-        &crate::state::key_remap::modifier_free_hotkey_vks(&config.keys),
-    ));
-    // ADR-110 決定3 項目1: 起動時、from=VK_CAPITAL ルールが有効ならCapsLockを正規化する。
-    // SAFETY: initialize_app はメインスレッドから（起動シーケンス内で）呼ばれる。
-    unsafe {
-        hook::normalize_caps_lock_if_needed();
-    }
-
-    let engine_on_ime_vk = config
-        .keys
-        .engine_on_ime_key
-        .as_deref()
-        .and_then(VkCode::from_name);
-    let engine_off_ime_vk = config
-        .keys
-        .engine_off_ime_key
-        .as_deref()
-        .and_then(VkCode::from_name);
 
     let base_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from("."));
 
-    // [[post_bypass]] ルールをコンパイル（キー名パース + 小文字化）
-    let post_bypass_rules: Vec<crate::runtime::PostBypassEntry> = config
-        .post_bypass
-        .iter()
-        .filter_map(|rule| {
-            let combo = crate::vk::parse_key_combo(&rule.key)?;
-            if !combo.ctrl {
-                log::warn!(
-                    "[post_bypass] key {:?} は Ctrl+key 形式であること（例: \"Ctrl+J\"）",
-                    rule.key
-                );
-                return None;
-            }
-            Some(crate::runtime::PostBypassEntry {
-                vk: combo.vk,
-                process: rule.process.to_lowercase(),
-                class: rule.class.to_lowercase(),
-            })
-        })
-        .collect();
+    // [[post_bypass]] ルールをコンパイル（キー名パース + 小文字化）。
+    // 解決できない・Ctrl+key 形式でないルールは診断に流す（ADR-201 決定2(a)。以前は無言で消えていた）。
+    let (post_bypass_rules, post_bypass_warnings) =
+        crate::runtime::PostBypassEntry::compile_all(config);
+    for w in post_bypass_warnings {
+        diag.warn(w);
+    }
     if !post_bypass_rules.is_empty() {
-        log::info!("[post_bypass] {} ルールをロード", post_bypass_rules.len());
+        tracing::info!("[post_bypass] {} ルールをロード", post_bypass_rules.len());
     }
 
     // RUNTIME.set() / RAPID_IME_TIMESTAMPS.set() はメッセージループ開始前に一度だけ呼ばれる。
@@ -504,16 +744,12 @@ pub(super) fn initialize_app(
             Output::new(),
             tray,
             crate::timer::Win32Timer::new(),
-            engine_on_ime_vk,
-            engine_off_ime_vk,
-            false,
             crate::focus::tracker::FocusTracker::new(
                 crate::focus::cache::FocusCache::new(),
                 crate::focus::classifier::ForceOverrides::new(config.app_overrides.clone()),
                 crate::focus::classifier::ImmCapabilityStore::new(base_dir.clone()),
                 crate::focus::classifier::InjectionModeStore::new(base_dir),
             ),
-            crate::tsf::composition_fsm::CompositionFsm::new(),
             journal_stamper,
         ),
         layouts,
@@ -524,26 +760,32 @@ pub(super) fn initialize_app(
         all_keymaps,
         post_bypass_rules,
     ));
+    // 解決できない名前は診断に流す（ADR-201 決定2(d)）。
+    let (dedicated_fn_key, dedicated_fn_key_warning) = crate::runtime::resolve_dedicated_fn_key(
+        config.general.muhenkan_solo_tap_dedicated_fn_key.as_deref(),
+    );
+    if let Some(w) = dedicated_fn_key_warning {
+        diag.warn(w);
+    }
     let _ = with_app(|app| {
         app.set_keyboard_model(config.general.keyboard_model);
-        app.set_dbe_mode_key_policy(config.general.dbe_mode_key_policy);
+        app.set_update_check_enabled(config.general.update_check);
+        // `use_learned_keymap_table`(ADR-195 段階4 の opt-out)と ADR-209 の設定は、起動時にも反映する
+        // （`apply_config_update`は再読込でしか通らず、起動時は既定の true のままだった）。
+        app.set_use_learned_keymap_table(config.general.use_learned_keymap_table);
+        app.set_predict_henkan_open_in_unreadable_windows(
+            config.general.predict_henkan_open_in_unreadable_windows,
+        );
+        app.set_warn_state_dependent_mode_keys(config.general.warn_state_dependent_mode_keys);
+        app.set_hook_self_heal_enabled(config.diagnostics.hook_self_heal);
+        app.set_passthrough_thumb_mode_keys(&config.general);
         app.set_half_width_alnum_toggle_policy(config.general.half_width_alnum_toggle);
-        let manual_fn_key = config.general.muhenkan_solo_tap_dedicated_fn_key.as_deref();
-        app.set_muhenkan_dedicated_fn_key_config(
-            crate::runtime::resolve_dedicated_fn_key(manual_fn_key),
-            manual_fn_key.is_some(),
-        );
-        app.set_muhenkan_solo_tap_is_passthrough(
-            ModeKeyConfig::from_legacy_bools(
-                config.general.muhenkan_solo_tap_ignore_composing_guard,
-                config.general.muhenkan_solo_tap_always_suppress,
-            )
-            .is_passthrough(),
-        );
-        app.set_space_is_thumb_key(
-            config.general.left_thumb_key == "VK_SPACE"
-                || config.general.right_thumb_key == "VK_SPACE",
-        );
+        app.set_muhenkan_dedicated_fn_key_config(dedicated_fn_key);
+        app.set_space_is_thumb_key(crate::state::alt_impersonation::is_thumb_key_vk(
+            &config.general.left_thumb_key,
+            &config.general.right_thumb_key,
+            crate::vk::VK_SPACE,
+        ));
     });
     RAPID_IME_TIMESTAMPS.set(RapidPressTracker::new());
     DUMP_TRIGGER.set(crate::journal::DumpTriggerTracker::new());
@@ -558,7 +800,7 @@ pub(super) fn initialize_ime_cache() {
 pub(super) fn cleanup() {
     // cleanup() はメッセージループ終了後にメインスレッドから呼ばれる。
     RUNTIME.clear();
-    log::info!("Exited cleanly.");
+    tracing::info!("Exited cleanly.");
 }
 
 use windows::Win32::UI::WindowsAndMessaging::{EVENT_OBJECT_FOCUS, WINEVENT_OUTOFCONTEXT};
@@ -572,7 +814,7 @@ impl Drop for WinEventHookGuard {
         unsafe {
             let _ = windows::Win32::UI::Accessibility::UnhookWinEvent(self.0);
         }
-        log::info!("Focus event hook uninstalled");
+        tracing::info!("Focus event hook uninstalled");
     }
 }
 
@@ -592,7 +834,7 @@ pub(super) fn install_focus_hook() -> Result<WinEventHookGuard> {
         )
     };
     anyhow::ensure!(!hook.is_invalid(), "Failed to install focus event hook");
-    log::info!("Focus event hook installed");
+    tracing::info!("Focus event hook installed");
     Ok(WinEventHookGuard(hook))
 }
 
@@ -666,6 +908,8 @@ impl LayoutEntry {
         layouts_dir: &Path,
         diag: &mut StartupDiagnostics,
         model: awase::scanmap::KeyboardModel,
+        keystroke_macros: &[awase::config::KeystrokeMacro],
+        keystroke_sequence_policy: awase::config::KeystrokeSequencePolicy,
     ) -> Result<Vec<Self>> {
         let mut layouts = Vec::new();
 
@@ -702,19 +946,44 @@ impl LayoutEntry {
                     continue;
                 };
                 match std::fs::read_to_string(&path) {
-                    Ok(content) => match YabLayout::parse(&content, model) {
-                        Ok(yab) => {
-                            let yab = yab.resolve_kana();
-                            log::info!("Discovered layout: {stem} ({})", path.display());
-                            layouts.push(Self {
-                                name: stem,
-                                layout: yab,
-                            });
+                    Ok(content) => {
+                        // ADR-116 決定1: パース成否と独立に lint する（`yab::lint`
+                        // はパースを前提にしない設計。パース成功時のみに限定すると
+                        // keyboard_model の列数上限（US=12列等）でパース自体が
+                        // 失敗する環境で lint 結果が出なくなる非対称が生まれる）。
+                        // /code-review指摘: 1セルごとに diag.warn すると、崩れた
+                        // ファイル1つで数十件のクォート崩れがあった場合トレイ
+                        // バルーンの「N件の警告があります」の N が跳ね上がり
+                        // 信号として役に立たなくなる。1ファイルにつき1件へ集約する。
+                        let lint_warnings = awase::yab::lint(&content);
+                        if !lint_warnings.is_empty() {
+                            diag.warn(format!("{}: {}", path.display(), lint_warnings.join(" / ")));
                         }
-                        Err(e) => {
-                            diag.warn(format!("レイアウト読込失敗: {}: {e}", path.display()));
+                        match YabLayout::parse(&content, model) {
+                            Ok(yab) => {
+                                let yab = yab.resolve_kana();
+                                // ADR-115決定3: resolve_kana() の直後、打鍵列の
+                                // 新構文（CtrlChord/InlineSequence/MacroRef）を
+                                // キルスイッチとマクロ定義に基づいて確定させる。
+                                let (yab, warnings) = awase::yab::resolve_keystroke_syntax(
+                                    yab,
+                                    keystroke_macros,
+                                    keystroke_sequence_policy,
+                                );
+                                for w in warnings {
+                                    diag.warn(format!("{stem}: {w}"));
+                                }
+                                tracing::info!("Discovered layout: {stem} ({})", path.display());
+                                layouts.push(Self {
+                                    name: stem,
+                                    layout: yab,
+                                });
+                            }
+                            Err(e) => {
+                                diag.warn(format!("レイアウト読込失敗: {}: {e}", path.display()));
+                            }
                         }
-                    },
+                    }
                     Err(e) => {
                         diag.warn(format!("レイアウト読込失敗: {}: {e}", path.display()));
                     }
@@ -755,7 +1024,7 @@ pub(super) fn run_all() -> Result<()> {
             .copied()
             .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
             .unwrap_or("(non-string payload)");
-        log::error!("[PANIC] {msg} @ {location}");
+        tracing::error!("[PANIC] {msg} @ {location}");
         prev_hook(info);
     }));
 
@@ -765,10 +1034,10 @@ pub(super) fn run_all() -> Result<()> {
         .find(|w| w[0] == "--exit-after")
         .and_then(|w| w[1].parse().ok());
     if let Some(secs) = exit_after_secs {
-        log::info!("--exit-after {secs}s: {secs} 秒後に自動終了します");
+        tracing::info!("--exit-after {secs}s: {secs} 秒後に自動終了します");
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(secs));
-            log::info!("--exit-after タイムアウト ({secs}s) → 終了");
+            tracing::info!("--exit-after タイムアウト ({secs}s) → 終了");
             use windows::Win32::UI::WindowsAndMessaging::WM_QUIT;
             if crate::runtime::engine_window::engine_hwnd().is_none() {
                 std::process::exit(0);
@@ -808,13 +1077,13 @@ pub(super) fn run_all() -> Result<()> {
                     }
                 }
                 Ok(handle) => acquired_handle = Some(handle),
-                Err(e) => log::warn!("Failed to create instance mutex: {e}"),
+                Err(e) => tracing::warn!("Failed to create instance mutex: {e}"),
             }
             break;
         }
 
         if duplicate {
-            log::error!("Another instance of awase is already running. Exiting.");
+            tracing::error!("Another instance of awase is already running. Exiting.");
             let class_wide = crate::win32::to_wide(tray::WINDOW_CLASS_NAME);
             if let Ok(existing) = FindWindowW(PCWSTR(class_wide.as_ptr()), PCWSTR::null()) {
                 if !existing.is_invalid() {
@@ -837,9 +1106,9 @@ pub(super) fn run_all() -> Result<()> {
     let elevated = tray::is_elevated();
     crate::set_elevated(elevated);
     if elevated {
-        log::info!("Running with administrator privileges");
+        tracing::info!("Running with administrator privileges");
     } else {
-        log::warn!(
+        tracing::warn!(
             "Running without administrator privileges — \
              keyboard hook will not work in elevated windows (e.g. Task Manager)"
         );
@@ -847,10 +1116,12 @@ pub(super) fn run_all() -> Result<()> {
 
     let raw_config = load_config()?;
     handle_auto_start(&raw_config);
-    let (config, config_warnings) = raw_config.validate();
-    for w in &config_warnings {
-        diag.warn(w);
+    let load_notes = raw_config.load_warnings().to_vec();
+    if let Some(n) = crate::config_diagnostics::newly_effective_note(&raw_config) {
+        diag.note(n);
     }
+    let (config, config_warnings) = raw_config.validate();
+    diag.warn_config(&load_notes, config_warnings);
     let (
         fsm,
         layouts,
@@ -872,8 +1143,12 @@ pub(super) fn run_all() -> Result<()> {
         "IME control Toggle keys",
         &mut diag,
     );
-    let (ime_sync_toggle, ime_sync_on, ime_sync_off) =
-        init_ime_sync_keys(&config.keys.ime_detect, &mut diag);
+    let (ime_sync_toggle, ime_sync_on, ime_sync_off) = init_ime_sync_keys(
+        &config.keys.ime_detect,
+        left_thumb_vk,
+        right_thumb_vk,
+        &mut diag,
+    );
     check_conflicting_software(&mut diag);
     check_keyboard_layout(&mut diag);
     let system_tray = init_tray(&layout_names, &initial_layout_name, elevated)?;
@@ -886,16 +1161,28 @@ pub(super) fn run_all() -> Result<()> {
         build_panic_trigger_combos(&ime_control_on_keys, &ime_control_off_keys);
     crate::panic_detect::set_panic_trigger_combos(panic_trigger_combos);
 
-    let mut engine = Engine::new(
-        fsm,
-        SpecialKeyCombos {
-            engine_on: engine_on_keys,
-            engine_off: engine_off_keys,
-            ime_on: ime_control_on_keys,
-            ime_off: ime_control_off_keys,
-            ime_toggle: ime_control_toggle_keys,
-        },
+    crate::keymap::warn_on_engine_hotkey_collision(
+        &config.keymaps,
+        &engine_on_keys,
+        &engine_off_keys,
+        &ime_control_on_keys,
+        &ime_control_off_keys,
+        &ime_control_toggle_keys,
+        config.general.engine_toggle_hotkey.as_deref(),
     );
+
+    let mut special_keys = SpecialKeyCombos {
+        engine_on: engine_on_keys,
+        engine_off: engine_off_keys,
+        ime_on: ime_control_on_keys,
+        ime_off: ime_control_off_keys,
+        ime_toggle: ime_control_toggle_keys,
+    };
+    // ADR-206 決定4: 非推奨の `*_solo_tap_ime_action`（親指キーのもの）は bare の開閉として扱う。
+    crate::runtime::migrate_legacy_solo_tap_actions(&config.general, &mut special_keys);
+    let forced_open_actions = crate::runtime::thumb_forced_open_actions(&special_keys);
+    let mut engine = Engine::new(fsm, special_keys);
+    engine.set_thumb_forced_open_actions(forced_open_actions.0, forced_open_actions.1);
 
     // left/right のいずれかが Space (VK_SPACE) に割り当てられている場合、
     // その VK を Engine/NicolaFsm に伝える。core 側は VK 番号の意味を知らず、
@@ -911,6 +1198,10 @@ pub(super) fn run_all() -> Result<()> {
             shift_literal: config.general.space_thumb_shift_literal,
         },
     );
+
+    // ADR-120 決定0a 項目7(a): 物理 BACKSPACE の VK を Engine/NicolaFsm に伝える
+    // （観測専用、実際の変換結果には一切影響しない）。
+    engine.set_backspace_vk(Some(crate::vk::VK_BACK));
 
     // 同様に、left/right のいずれかが無変換/変換に割り当てられている場合、
     // その VK を伝える（config.rs の muhenkan/henkan_solo_tap_ignore_composing_guard
@@ -951,6 +1242,7 @@ pub(super) fn run_all() -> Result<()> {
         left_thumb_vk,
         right_thumb_vk,
     ));
+    engine.apply_general_config(&config.general);
 
     if let Some(vk) = config
         .keys
@@ -967,7 +1259,11 @@ pub(super) fn run_all() -> Result<()> {
         engine.set_engine_off_solo_repeat_vk(vk);
     }
 
-    let compiled_keymaps = crate::keymap::KeymapTable::new(&config.keymaps);
+    let (compiled_keymaps, keymap_warnings) =
+        crate::keymap::KeymapTable::new(&config.keymaps, left_thumb_vk, right_thumb_vk);
+    for w in keymap_warnings {
+        diag.warn(w);
+    }
     initialize_app(
         engine,
         system_tray,
@@ -981,25 +1277,39 @@ pub(super) fn run_all() -> Result<()> {
         left_alt_impersonates,
         right_alt_impersonates,
         compiled_keymaps,
+        &mut diag,
     );
 
     init_ngram_validated(&config, &mut diag);
     let _engine_window_guard = crate::runtime::engine_window::create_engine_window()?;
     let (hook_guard, _toggle_hotkey_guard, _app_override_hotkey_guard) =
-        install_hooks_and_hotkeys_validated(&config)?;
+        install_hooks_and_hotkeys_validated(&config, &mut diag)?;
     diag.report();
 
-    log::info!("Hook installed. Running message loop...");
+    tracing::info!("Hook installed. Running message loop...");
     // SAFETY: GetCurrentThreadId always succeeds and has no preconditions.
     crate::set_main_thread_id(unsafe { windows::Win32::System::Threading::GetCurrentThreadId() });
     if let Err(e) = install_ctrl_handler() {
-        log::warn!("{e}");
+        tracing::warn!("{e}");
     }
-    let _focus_hook_guard = install_focus_hook().map_err(|e| log::warn!("{e}")).ok();
+    let _focus_hook_guard = install_focus_hook().map_err(|e| tracing::warn!("{e}")).ok();
     let _obs_hook_guards = crate::tsf::observer::install_observation_hooks();
 
+    // issue #165 自己修復 opus round2 B1(iii): `hook_alive_tick_ms`を
+    // 起動時点で`current_tick_ms()`に初期化する。初期値0のままだと起動直後
+    // 最初のwatchdog tick（3秒後）でstale_msが稼働時間全体になり、
+    // ログオン直後のマウス操作（os_idle_ms<5000）と重なってほぼ毎回
+    // カナリアが送られてしまう（誤検知そのものは害が無いが無駄な往復になる）。
+    // **再インストール時にはこの初期化を呼ばないこと**——呼ぶとバックオフが
+    // 無意味になる（`state/hook_watchdog.rs`のモジュールdoc参照）。
+    hook::tick_hook_alive();
+
+    // issue #165（hook_starved）自己修復用: `Runtime`（`with_app`経由、プロセス
+    // 終了まで生存）へ移す。ローカル変数のままだと watchdog タイマーハンドラ
+    // （`TIMER_HOOK_WATCHDOG`）から差し替えられない。
     // 統合 IME リフレッシュタイマー + ウォッチドッグタイマー
     let _ = with_app(|app| {
+        app.set_hook_guard(hook_guard);
         app.reschedule_ime_refresh();
         app.start_hook_watchdog();
     });
@@ -1009,7 +1319,7 @@ pub(super) fn run_all() -> Result<()> {
     let _ = with_app(|app| app.set_uia_sender(uia_tx));
 
     let _wts_guard = register_session_notification()
-        .map_err(|e| log::warn!("{e}"))
+        .map_err(|e| tracing::warn!("{e}"))
         .ok();
     let _ = with_app(Runtime::establish_initial_focus_scope);
     initialize_ime_cache();
@@ -1025,7 +1335,9 @@ pub(super) fn run_all() -> Result<()> {
 
     run_message_loop();
     cleanup();
-    drop(hook_guard);
+    // issue #165自己修復対応でRuntimeへ移したため、`drop(hook_guard)`ではなく
+    // `Runtime::drop_hook_guard`経由（旧来と同じタイミングで解除する）。
+    let _ = with_app(Runtime::drop_hook_guard);
 
     Ok(())
 }
@@ -1108,7 +1420,14 @@ mod tests {
         fs::write(dir.join("my_nicola.yab"), COMMENT_ONLY_HEADER_YAB).unwrap();
 
         let mut diag = StartupDiagnostics::new();
-        let layouts = LayoutEntry::scan_all(&dir, &mut diag, KeyboardModel::Jis).unwrap();
+        let layouts = LayoutEntry::scan_all(
+            &dir,
+            &mut diag,
+            KeyboardModel::Jis,
+            &[],
+            awase::config::KeystrokeSequencePolicy::Off,
+        )
+        .unwrap();
         assert_eq!(layouts.len(), 2);
 
         let config: awase::config::AppConfig = toml::from_str(

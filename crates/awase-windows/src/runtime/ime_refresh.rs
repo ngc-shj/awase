@@ -1,8 +1,8 @@
 #![allow(unsafe_code)] // Win32 API 呼び出しに unsafe が必須(lib.rsのクレート全体allowから個別移管、Task #9)
-use awase::engine::{EngineCommand, InputModeState};
+use awase::engine::{EngineCommand, InputModeState, KanaLockHysteresis};
 
 use super::Runtime;
-use crate::state::ime_actuation::{decide_actuation_action, ActuationAction, FeedbackPolicy};
+use crate::state::ime_actuation::{ActuationAction, FeedbackPolicy};
 use crate::tuning::TYPING_IDLE_MS;
 
 // ── IoMode ──
@@ -111,6 +111,17 @@ impl Runtime {
         // Phase 2: プロセス変更時は Engine に FocusChanged（flush あり）
         if focus_changed {
             self.ir_notify_focus_changed(skip_imm_query);
+            // かな入力ロック検知は romaji VK 送信直前にのみサンプリングするため
+            // （runtime/key_pipeline.rs::kp_stage_kana_lock_warn）、フォーカスが
+            // 別アプリへ移ると新たな観測が発生しなくなる。フォーカス変更のたびに
+            // ヒステリシスとトレイ表示をリセットし、切り替え先アプリで新たに
+            // 検知し直せるようにする（issue #137 4周目のレビューで指摘: リセット
+            // 手段が engine 無効化時のみで、フォーカス変更後に警告が固着したまま
+            // 二度と晴れないケースがあった）。
+            self.kana_lock_hysteresis = KanaLockHysteresis::new();
+            self.drift_giveup_notified_this_focus = false;
+            self.drift_giveup_started_at = None;
+            self.platform.tray.set_kana_lock_warned(false);
         }
 
         FocusInfo {
@@ -121,7 +132,7 @@ impl Runtime {
 
     // ── Stage 2: 読み取り方針の決定 ──
 
-    fn ir_stage_strategy(&self, focus: &FocusInfo) -> ImeReadStrategy {
+    fn ir_stage_strategy(&mut self, focus: &FocusInfo) -> ImeReadStrategy {
         self.ir_decide_read_strategy(focus.skip_imm_query)
     }
 
@@ -138,16 +149,18 @@ impl Runtime {
         strategy: &ImeReadStrategy,
         ime_snap: Option<&crate::ime::ImeSnapshot>,
     ) {
-        log::debug!(
+        tracing::debug!(
             "[stage-observe] strategy={:?} belief_on={} explicit_intent={:?}",
             strategy,
             self.platform_state.ime.effective_open(),
             self.platform_state.ime.explicit_intent(),
         );
+        // ADR-205: 打鍵中（SkipTyping）でも、prefetch 済みの開閉の読みを外部変化の監視窓に照合する（追加 I/O なし）。
+        self.ir_follow_external_change(ime_snap);
         match strategy {
             ImeReadStrategy::SkipTyping => {}
             ImeReadStrategy::Blacklist => {
-                log::debug!("Skipping IMM query for known-broken class (shadow state SSOT)");
+                tracing::debug!("Skipping IMM query for known-broken class (shadow state SSOT)");
                 // GJI I/O 観測は active IME が GJI のときに限定する。MS-IME 使用中も
                 // GJI Converter プロセスは常駐しており、そのバックグラウンド I/O を
                 // 根拠に observer_poll を書くと無関係な belief 汚染になる。
@@ -155,10 +168,14 @@ impl Runtime {
                     == crate::tsf::observer::ActiveImeKind::GoogleJapaneseInput
                 {
                     let obs = crate::observer::gji_observer::observe_gji_after_focus(
-                        self.platform_state.focus.last_focus_change_ms,
+                        // 外部変化へ追随した直後は、閉じる前の GJI I/O 推測が追随結果を上書きしないよう柵を進める。
+                        self.platform_state
+                            .focus
+                            .last_focus_change_ms
+                            .max(self.platform_state.ime.last_external_change_ms()),
                         self.platform_state.ime.input_mode(),
                     );
-                    log::debug!(
+                    tracing::debug!(
                         "[stage-observe] observer_poll={:?}",
                         obs.observer_poll_value
                     );
@@ -177,7 +194,7 @@ impl Runtime {
                     // （state/eisu_recovery.rs の経路×救済対応表を参照）。
                     if let Some(mode) = obs.input_mode_correction {
                         let tick_ms = crate::state::TickMs(crate::hook::current_tick_ms());
-                        log::info!(
+                        tracing::info!(
                             "[stage-observe] GJI I/O 中に belief=ObservedEisu → AssumedRomaji \
                              訂正 (GjiIoInference)"
                         );
@@ -192,12 +209,42 @@ impl Runtime {
                         );
                     }
                 } else {
-                    log::debug!("[stage-observe] GJI observe skipped (active IME is not GJI)");
+                    tracing::debug!("[stage-observe] GJI observe skipped (active IME is not GJI)");
                 }
             }
             ImeReadStrategy::OsPoll => {
                 let miss_before = self.platform_state.ime.detect_miss_count();
-                self.ir_poll_and_learn(miss_before, ime_snap);
+                let got_observation = self.ir_poll_and_learn(miss_before, ime_snap);
+                let now = crate::hook::current_tick_ms();
+                let observed = got_observation
+                    && crate::state::imm_evidence::poll_counted_no_new_miss(
+                        miss_before,
+                        self.platform_state.ime.detect_miss_count(),
+                    );
+                // 直前の読み取りの成否（時間切れも失敗）。通過マークの読み直し間隔の判定に使う。
+                self.last_ime_read_ok = observed;
+                if observed
+                    && self
+                        .platform_state
+                        .ime
+                        .invalidate_intents_if_mode_key_pass_live(now, crate::state::TickMs(now))
+                {
+                    tracing::info!(
+                        "[mode-key-follow] observation arrived after mode key pass: intents invalidated"
+                    );
+                    // 最初の観測は GJI がキーを処理する前の古い状態を読むことがある。窓が切れるまで読み直す。
+                    self.schedule_ime_refresh(crate::tuning::MODE_KEY_PASS_REREAD_MS);
+                } else if observed
+                    && self
+                        .platform_state
+                        .ime
+                        .align_after_expired_mode_key_pass(now, crate::state::TickMs(now))
+                {
+                    // 窓の間の観測が全て時間切れだった通過。窓が切れた後の最初の成功観測で desired を揃える。
+                    tracing::info!(
+                        "[mode-key-follow] first successful observation after the window: desired aligned"
+                    );
+                }
             }
         }
 
@@ -207,16 +254,103 @@ impl Runtime {
         }
     }
 
+    /// ADR-205（BUG-172）: 読めない窓（`Imm32Unavailable`）で、外部注入の IME キー直後の監視窓の中に、
+    /// prefetch 済みの開閉の読みが基準値から変わったら実状態へ追随する。書き込み（開け直し）はしない。
+    fn ir_follow_external_change(&mut self, ime_snap: Option<&crate::ime::ImeSnapshot>) {
+        // Imm32Unavailable かつ GJI のときだけ（InputRelay・TsfNative・MS-IME は対象外。`external_change_watch_applies` 参照）。
+        if !self.external_change_watch_applies() {
+            return;
+        }
+        let read = ime_snap.and_then(|snap| snap.ime_on);
+        let now = crate::hook::current_tick_ms();
+        let tick_ms = crate::state::TickMs(now);
+        let accepted =
+            crate::state::probe_admission::AcceptedObservation::for_sync(self.focus_fence());
+        if let Some(open) = self
+            .platform_state
+            .ime
+            .follow_external_change(read, now, tick_ms, accepted)
+        {
+            tracing::info!(
+                "[external-change] 監視窓の中で開閉の読みが変わった → 実状態 open={open} へ追随 \
+                 (意図を捨て desired を揃える。awase は IME を書かない)"
+            );
+        }
+    }
+
+    /// ADR-227(BUG-074): `RawTsfLiteralRecovery` の give-up(否定的証拠 2 回以上・すべて SuspectedLiteral)を、
+    /// 「外部から実 IME が閉じられたかもしれない」という**読み直しのきっかけ**にする。give-up を閉の観測として
+    /// 書かない(推論しない)。監視窓(ADR-205)を開いて prefetch 済みの読みを照合し、基準値(直近の読み)から
+    /// 閉へ変わっていれば `follow_external_change` が追随する(意図を捨て desired を揃える。IME は書かない)。
+    /// 条件: GJI × Imm32Unavailable、プローブ開始時と同じ focus 世代、明示意図が ON のまま。
+    pub(crate) fn ir_follow_after_literal_giveup(
+        &mut self,
+        evidence: crate::tsf::literal_facts::GiveUpEvidence,
+    ) {
+        use crate::tsf::literal_facts::GiveUpFollowDecision;
+        let applies = self.external_change_watch_applies();
+        let gen_now = self.platform.output.ime_mode_focus_gen.get();
+        let intent = self.platform_state.ime.explicit_intent();
+        let decision = crate::tsf::literal_facts::giveup_follow_decision(
+            applies,
+            evidence.focus_gen,
+            gen_now,
+            intent,
+        );
+        let baseline = if decision == GiveUpFollowDecision::Arm {
+            self.platform_state
+                .ime
+                .arm_external_change_watch(crate::hook::current_tick_ms());
+            self.platform_state.ime.external_change_baseline()
+        } else {
+            None
+        };
+        tracing::info!(
+            "[giveup-follow] cold={} outcome={} gen_at_probe={} gen_now={gen_now} explicit_intent={intent:?} baseline={baseline:?}",
+            evidence.cold_seq,
+            decision.outcome(),
+            evidence.focus_gen
+        );
+        // 実機の不具合報告から追えるよう journal にも残す(attach_log が無くても、追随を試みたか・捨てた理由・基準値が分かる)。
+        self.platform_state
+            .ime
+            .journal
+            .record(crate::journal::JournalEntry::GiveUpFollow {
+                cold_seq: evidence.cold_seq,
+                outcome: decision.outcome(),
+                baseline,
+            });
+        if decision == GiveUpFollowDecision::Arm {
+            self.schedule_ime_refresh(crate::tuning::MODE_KEY_PASS_REREAD_MS);
+        }
+    }
+
     // ── Stage 4: Engine 通知と次回スケジュール ──
     //
     // Phase 4: Engine に RefreshState（active 遷移検知）
     // Phase 5: 次回ポーリングをスケジュール
 
     fn ir_stage_notify(&mut self) {
-        // Phase 4a: IMM-broken アプリの force-ON（Blacklist パス専用）
-        self.apply_force_on_for_imm_broken();
         // Phase 4: Engine に RefreshState（active 遷移検知）
         self.ir_notify_engine_refresh();
+        // Phase 4a: 通過マークの窓が切れても観測が一度も成功しなかったなら、古い明示意図を捨てる
+        // （意図が残るとポーリングが止まったままになる。BUG-158）。戦略（OsPoll/SkipTyping等）によらず
+        // 毎tick確認する。窓の間は`reschedule_ime_refresh`が読み直しを予約し続けるので、窓の直後に必ずここへ来る。
+        // 立てた時点から読めない窓では意図を捨てない（読み取りで訂正できず、意図がbeliefの唯一の手がかり。
+        // `reschedule_ime_refresh`参照）。立てた時点で読めた窓は、通過の途中で降格しても捨てる
+        // （`ModeKeyPassMark::readable_at_arm`、`expire_mode_key_pass_mark`が判定。レビュー round2 A-N2）。
+        let now = crate::hook::current_tick_ms();
+        if self
+            .platform_state
+            .ime
+            .expire_mode_key_pass_mark(now, crate::state::TickMs(now))
+        {
+            tracing::info!(
+                "[mode-key-follow] window expired without a successful observation: intents invalidated"
+            );
+        }
+        // Phase 4a': 起動時の初期値のままの desired_open を、最初の成功観測へ揃える（BUG-163）。
+        self.ir_align_placeholder_desired();
         // Phase 4b: desired ≠ observed ドリフト補正（ImmCross / non-ImmCross 両対応）
         self.ir_apply_drift_correction();
         // Phase 5: 次回ポーリングをスケジュール
@@ -242,8 +376,8 @@ impl Runtime {
         // 既存同様 spawn_local 経由の非同期 retry ループを含むため、この呼び出しが
         // フォーカス変更処理をブロックすることはない）。物理 Shift が押されている
         // とは限らないため synthetic Shift up の前置は不要（false）。
-        if self.platform_state.gate.half_width_alnum_toggle_active {
-            log::info!("[shift-conv-guard] FocusChanged 中 → 半角英数トグルを強制解除");
+        if self.platform_state.gate.half_width_alnum.is_toggle_active() {
+            tracing::info!("[shift-conv-guard] FocusChanged 中 → 半角英数トグルを強制解除");
             self.kp_restore_kana_from_half_width(false);
         }
         // IMM broken アプリ（Chrome 等）に切り替わった際に input_mode が
@@ -256,7 +390,7 @@ impl Runtime {
             && !self.platform_state.ime.input_mode().is_romaji_capable()
         {
             if let Some(new_mode) = self.platform_state.ime.correction_for_imm_broken() {
-                log::info!(
+                tracing::info!(
                     "FocusChanged: input_mode assumed romaji (IMM broken, stale kana from prev window)"
                 );
                 let tick_ms = crate::state::TickMs(crate::hook::current_tick_ms());
@@ -267,12 +401,14 @@ impl Runtime {
                 );
             } else {
                 // romaji-capable は外側の if で除外済みなので None = ObservedEisu のみ
-                log::info!("FocusChanged: input_mode スキップ (belief=ObservedEisu, eisu guard)");
+                tracing::info!(
+                    "FocusChanged: input_mode スキップ (belief=ObservedEisu, eisu guard)"
+                );
             }
         }
         let ctx = self.build_ctx();
         let decision = self.engine.on_command(EngineCommand::FocusChanged, &ctx);
-        self.execute_decision_suppressed(decision);
+        self.execute_decision(decision);
     }
 
     // ── 読み取り方針の決定 ──
@@ -280,13 +416,16 @@ impl Runtime {
     // 最後のキー活動（物理キー押下 または VK/TSF 出力）から TYPING_IDLE_MS 以内は
     // IMM との SendMessage を一切行わない。
 
-    fn ir_decide_read_strategy(&self, skip_imm_query: bool) -> ImeReadStrategy {
+    /// `&mut self` なのは、通過マーク(`ModeKeyPassMark`、`ScopedOneShot::peek`)がフォアグラウンド変更を見て自動失効させるため
+    /// （ADR-187）。読み取り方針の決定そのものは副作用を持たない（失効は「マークが無効になった」という事実の反映だけ）。
+    fn ir_decide_read_strategy(&mut self, skip_imm_query: bool) -> ImeReadStrategy {
         let last_activity = self.platform_state.gate.last_hook_activity_ms.max(
             crate::tsf::probe_bridge::OUTPUT_GATE
                 .last_vk_output_ms
                 .load(std::sync::atomic::Ordering::Relaxed),
         );
-        let idle_ms = crate::hook::current_tick_ms().saturating_sub(last_activity);
+        let now = crate::hook::current_tick_ms();
+        let idle_ms = now.saturating_sub(last_activity);
         let is_typing = idle_ms < TYPING_IDLE_MS;
 
         if is_typing {
@@ -294,15 +433,17 @@ impl Runtime {
             // ImmCross async が "成功" 扱いでも組み合わせ中は IME が閉じないことがあるため、
             // タイピングアイドルガードを回避して OsPoll を先行させる。
             // TsfNative/Blacklist アプリは skip_imm_query=true で弾かれるため対象外。
+            let mode_key_pass_live = self.platform_state.ime.mode_key_pass_mark_live(now);
             let explicit_verify = !skip_imm_query
-                && self.platform_state.ime.explicit_intent().is_some()
-                && self.platform_state.ime.model().applied
-                    != crate::state::ime_model::AppliedImeState::Unknown;
+                && (mode_key_pass_live
+                    || (self.platform_state.ime.explicit_intent().is_some()
+                        && self.platform_state.ime.model().applied
+                            != crate::state::ime_model::AppliedImeState::Unknown));
             if !explicit_verify {
-                log::debug!("Skipping observer/SSOT write: typing active (idle={idle_ms}ms)");
+                tracing::debug!("Skipping observer/SSOT write: typing active (idle={idle_ms}ms)");
                 return ImeReadStrategy::SkipTyping;
             }
-            log::debug!(
+            tracing::debug!(
                 "Explicit intent: bypassing typing-idle guard for IME verify (idle={idle_ms}ms)"
             );
         }
@@ -312,10 +453,10 @@ impl Runtime {
         // conv=0x00000000 は awase 自身が意図的に設定した状態であり、観測して
         // belief（input_mode=ObservedEisu 等）に反映してはならない。解放時の復元 +
         // 既存の観測経路が事後に整合させる。
-        if self.platform_state.gate.shift_conv_guard_pending
-            || self.platform_state.gate.half_width_alnum_toggle_active
+        if self.platform_state.gate.half_width_alnum.is_guard_pending()
+            || self.platform_state.gate.half_width_alnum.is_toggle_active()
         {
-            log::debug!("Skipping observer/SSOT write: shift-conv-guard 中");
+            tracing::debug!("Skipping observer/SSOT write: shift-conv-guard 中");
             return ImeReadStrategy::SkipTyping;
         }
 
@@ -328,10 +469,20 @@ impl Runtime {
 
     // ── IME 状態のポーリングと学習 ──
 
-    fn ir_poll_and_learn(&mut self, miss_before: u32, ime_snap: Option<&crate::ime::ImeSnapshot>) {
+    /// IME状態を読んでbeliefへ反映し、`imm-learning`へ渡す。戻り値は「この読み取りで観測（`ime_on`）を
+    /// 得られたか」。時間切れの空振りは`miss_count`を増やさない（BUG-158追補）ので、`miss_count`の増減では
+    /// 「読み取りが成功したか」を判定できない——通過マークの追随（ADR-187）はこの戻り値で判定する。
+    fn ir_poll_and_learn(
+        &mut self,
+        miss_before: u32,
+        ime_snap: Option<&crate::ime::ImeSnapshot>,
+    ) -> bool {
         let poll = self.platform_state.ime.capture_poll_state();
         let ime_on_before_poll = poll.ime_on;
         let input_mode_before_poll = poll.input_mode;
+        // BUG-106追補3・4: awase自身のトレイ/設定画面から読んだ観測を
+        // input_mode beliefに採用しないための判定材料（`is_own_ui_window`）。
+        let focus_process_name = self.platform.focus.process_name().to_owned();
 
         let tick_ms = crate::state::TickMs(crate::hook::current_tick_ms());
         let mut observer_out = ime_snap.map_or_else(
@@ -341,6 +492,7 @@ impl Runtime {
                     poll.force_guard,
                     poll.input_mode,
                     poll.prev_conv,
+                    &focus_process_name,
                 )
             },
             |snap| {
@@ -351,6 +503,7 @@ impl Runtime {
                     poll.force_guard,
                     poll.input_mode,
                     poll.prev_conv,
+                    &focus_process_name,
                 )
             },
         );
@@ -366,6 +519,7 @@ impl Runtime {
         {
             observer_out.new_input_mode = None;
         }
+        let observed = observer_out.observer_poll.is_some();
         let accepted =
             crate::state::probe_admission::AcceptedObservation::for_sync(self.focus_fence());
         self.platform_state
@@ -382,7 +536,7 @@ impl Runtime {
         );
 
         self.learn_imm_capability_from_miss(miss_before, miss_after);
-        self.try_force_on_bootstrap();
+        observed
     }
 
     /// [診断] フォーカス変更から 10 秒以内で状態が変わった場合にログ出力。
@@ -401,7 +555,7 @@ impl Runtime {
             let ime_changed = ime_on_before_poll != ime_on_after;
             let mode_changed = input_mode_before_poll != input_mode_after;
             if ime_changed || mode_changed {
-                log::info!(
+                tracing::info!(
                     "ObserverPoll +{}ms since focus: {}{}",
                     age_ms,
                     if ime_changed {
@@ -421,7 +575,7 @@ impl Runtime {
                     },
                 );
             } else if miss_after > 0 {
-                log::debug!(
+                tracing::debug!(
                     "ObserverPoll +{age_ms}ms since focus: detection failed (miss={miss_after}), stale ime_on={ime_on_before_poll} mode={input_mode_before_poll:?}",
                 );
             }
@@ -435,7 +589,7 @@ impl Runtime {
         if !skip_imm_query {
             crate::ime_diagnostic::ImeDiagnosticSnapshot::capture("focus_changed").log();
         }
-        log::debug!("[composition] focus change → marking cold");
+        tracing::debug!("[composition] focus change → marking cold");
 
         // `matches!(profile, AppImeProfile::TsfNative)` ではなく `is_effectively_tsf_native`
         // を使うこと。CASCADIA_HOSTING_WINDOW_CLASS (Windows Terminal) 等は
@@ -444,17 +598,17 @@ impl Runtime {
         // 判定してしまう（2026-07-05: これが原因で enforce IME OFF ブロックが
         // Windows Terminal に対して誤発火していた）。ADR-098 決定1-a のために
         // 算出位置を mirror 書き込みより前へ移した。
-        let new_profile_is_tsf_native = crate::focus::class_names::is_effectively_tsf_native(
-            self.platform.current_app_profile(),
-            self.platform.focus.class_name(),
-        );
+        let new_profile_is_tsf_native = self
+            .platform
+            .current_app_profile()
+            .is_effectively_tsf_native(self.platform.focus.class_name());
 
         let tick_ms = crate::state::TickMs(crate::hook::current_tick_ms());
         // ADR-098 決定1-a（BUG-69 F2 の修正）: TsfNative では `applied` を
         // `Unknown` のまま維持する（`focus_tracking.rs` の hard pre-sync が
         // 非 TsfNative について既に守っている不変条件——INV-A97-1——を
         // ここでも適用する）。何も apply していないのに belief を `applied
-        // = Confirmed` として書くと、`apply_force_on_for_imm_broken` の
+        // = Confirmed` として書くと、（撤去済みの）`apply_force_on_for_imm_broken` の
         // スパムガードが恒久的に早期 return し、BUG-16 の修正が TsfNative で
         // 一度も実効しない（詳細は known-bugs.md BUG-69 / ADR-098）。
         if !new_profile_is_tsf_native {
@@ -470,26 +624,17 @@ impl Runtime {
             self.platform_state.ime.journal.absorb(entry);
         }
 
-        let applied_ime_on = self
-            .platform_state
-            .ime
-            .model()
-            .applied
-            .applied_open()
-            .unwrap_or(false);
-
         // ADR-098 決定2: 旧 TsfNative force-on ブロック（GJI VK_IME_ON を
         // shadow_on 無視で強制送信）はここに存在した。決定1-a が `applied` を
         // 偽装しなくなったことで、通常の strategy chain（`shadow_on=false`
         // になる）と、決定1-c で有界化された `apply_force_on_for_imm_broken`
-        // の両方が正しく VK_IME_ON を送れるようになったため撤去した。撤去の
+        // （後に `f83084b3` で関数ごと撤去）の両方が正しく VK_IME_ON を送れるようになったため撤去した。撤去の
         // 詳細な根拠は known-bugs.md BUG-69 / ADR-098 決定2 参照。
 
         // ADR-098 決定1-b: `applied.applied_open()` の生値ではなく `warmup_ime_on()`
         // （`applied ?? belief`）を使う。決定1-a により TsfNative では `applied`
         // が `Unknown` のまま残るため、生値のままだと `unwrap_or(false)` で
         // warmup が握り潰され BUG-02 のリテラル化が再燃する。
-        let warmup_ime_on = self.platform_state.ime.warmup_ime_on();
         // 旧 eisu_guard（tray で英数／カタカナ等に切り替えた直後の conv を読み、英数なら
         // warmup をスキップする防御）は 2026-08-20、BUG-34 横展開の一環として撤去した。
         //
@@ -513,18 +658,11 @@ impl Runtime {
         // 結論として、ユーザーが tray で明示的に半角英数へ切り替えた直後にフォーカス
         // 復帰すると、この warmup で一度だけひらがなへ戻る（既知の制限として受け入れ、
         // ガードでの防御はしない）。
-        self.platform.send_eager_warmup(warmup_ime_on);
-        log::debug!(
-            "[composition] FocusChange: send_eager_tsf_warmup called (ime_on via warmup_ime_on())"
-        );
-
-        if !applied_ime_on && !new_profile_is_tsf_native {
-            // ADR-090 §2.A 設計案 3: トレイトメソッド `set_ime_open` には引数を
-            // 足せないため inherent な `set_ime_open_ordered` へ移した。
-            let order = self.issue_actuation_order(false, "focus_change_enforce_off");
-            let _ = self.platform.set_ime_open_ordered(order);
-            log::debug!("[composition] FocusChange: set_ime_open(false) called (applied_open OFF → enforce IME OFF on new window)");
-        }
+        // フォーカス変更時の eager warmup（VK_IME_ON）は ADR-212 P4 で撤去した。
+        // 旧「フォーカス変更時の強制 OFF」（非 TsfNative で belief=OFF なら新窓へ
+        // `set_ime_open_ordered(false)`）は 2026-09-25 に撤去した。CI 実測で現 develop では
+        // warrant が拒否して書き込まないか発火しないかのどちらかで、撤去前後に差が出なかった
+        // （docs/adr/191-calibration-experiments.md「A/B-1」）。
     }
 
     // ── ドリフト補正 ──
@@ -534,21 +672,59 @@ impl Runtime {
     // - IMM32 クロスプロセス対応アプリ（LINE 等 ImmCross）: set_ime_open(desired) を使う。
     // - non-ImmCross（GJI/TsfNative/Blacklist、Chrome/Windows Terminal 等）:
     //   set_ime_open は can_use_imm32_cross_process=false で no-op になるため使えない。
-    //   apply_force_on_for_imm_broken は ON 方向専用で OFF 方向の乖離は担当しないため、
-    //   ここで strategy chain 経由の apply_ime_open_with_belief（実 VK 送信）を使う
+    //   （撤去済みの）apply_force_on_for_imm_broken は ON 方向専用で OFF 方向の乖離は担当しなかったため、
+    //   ここで view を構築し、strategy chain 経由の apply_ime_open_with_view（実 VK 送信）を使う
     //   （2026-07-08 実機: Windows Terminal/Chrome + GJI で IME OFF コンボ送信後、
     //   Engine 内部は即 OFF になるが OS 側 IME は ON のまま固定される不具合。
     //   set_ime_open の戻り値を見ずに mirror_applied_open_with_ts で belief だけ
     //   「反映済み」にしていたため、実際には一切再送されていなかった。詳細は
     //   docs/known-bugs.md BUG-20 を参照）。
 
-    fn ir_check_drift_correction(&self, now: std::time::Instant) -> Option<(bool, bool, u64)> {
+    /// 起動時の初期値のままの `desired_open` を最初の成功観測へ 1 回だけ揃える（BUG-163、代案A）。
+    ///
+    /// 揃えた値が「開」で、非 TsfNative なら、フォーカス時にスキップした先同期（`presync_applied_open_on`。GJI への ImeOn
+    /// 通知を含む）をここで行う。「閉」なら行わない（IME を閉じて起動したとき awase が開けない）。
+    fn ir_align_placeholder_desired(&mut self) {
+        if !self.engine.is_user_enabled() || !self.platform_state.ime.belief.is_japanese_ime() {
+            return;
+        }
+        let now_ms = crate::hook::current_tick_ms();
+        let tick_ms = crate::state::TickMs(now_ms);
+        let Some(open) = self
+            .platform_state
+            .ime
+            .align_placeholder_desired(std::time::Instant::now(), tick_ms)
+        else {
+            return;
+        };
+        tracing::info!("[startup-align] desired_open を最初の成功観測へ揃えた: desired={open}");
+        let tsf_native = self
+            .platform
+            .current_app_profile()
+            .is_effectively_tsf_native(self.platform.focus.class_name());
+        if open && !tsf_native {
+            self.presync_applied_open_on(tick_ms);
+        }
+    }
+
+    fn ir_check_drift_correction(
+        &self,
+        now: std::time::Instant,
+    ) -> Option<crate::state::platform_state::DriftCorrection> {
         let explicit_intent = self.platform_state.ime.explicit_intent();
         self.platform_state
             .ime
             .check_drift_correction(now, explicit_intent)
     }
 
+    // `#[tracing::instrument]`（ADR-139決定3）のマクロ展開が実測でcognitive_complexityを
+    // 17/15へ押し上げた（Windows実機CIで検出、log→tracingのマクロ名置換自体は
+    // ADR-139決定1で影響なしと確認済みだったが、#[instrument]の展開はそれとは
+    // 別に複雑度を増やす）。この関数はADR-080不変条件6の対象で
+    // architecture_guard.rsのマーカーベーステストが依存する繊細な構造のため、
+    // ロジックの分割はしない。
+    #[allow(clippy::cognitive_complexity)]
+    #[tracing::instrument(level = "debug", skip_all)]
     fn ir_apply_drift_correction(&mut self) {
         // BUG-20 で non-ImmCross（GJI/TsfNative/Blacklist）向けの再送分岐を追加した際、
         // この関数冒頭に残っていた `ir_resolve_skip_imm_query()`（=
@@ -562,11 +738,12 @@ impl Runtime {
         }
 
         let now = std::time::Instant::now();
-        let Some((desired, observed, duration_ms)) = self.ir_check_drift_correction(now) else {
+        let Some(drift) = self.ir_check_drift_correction(now) else {
             return;
         };
+        let (desired, observed, duration_ms) = (drift.desired, drift.observed, drift.duration_ms);
         if self.ime_apply_should_defer() {
-            // apply_force_on_for_imm_broken と同じく settle 明けに必ず再試行する。
+            // 他の settle 対応経路（撤去済みの apply_force_on_for_imm_broken 等）と同じく settle 明けに必ず再試行する。
             self.schedule_settle_retry(&format!(
                 "drift correction skipped (settling): desired={desired} observed={observed}"
             ));
@@ -600,9 +777,30 @@ impl Runtime {
             )
         };
 
+        // BUG-163: 授権（warrant）が下りない補正は、そもそも書けない（`set_ime_open_ordered` は ADR-090 A-2 で
+        // `Unwarranted` を拒否する）。書けないのに「検知」（journal・`DriftDetected`＝`applied` を `Optimistic` に
+        // 偽装・試行回数の加算・「IME状態を確認できません」のバルーン）まで進めると、起動直後（明示意図なし・
+        // 観測だけが「閉」）に 500ms ごとの空振りと誤通知が続く。書き込み経路（`set_ime_open_ordered`）を通る
+        // ImmCross だけを対象にする（Blind の再送・give-up の有界化〈BUG-43〉は従来どおり）。
+        if self.can_use_imm32_cross_process()
+            && self
+                .issue_actuation_order_with_origin(desired, act_origin)
+                .would_have_blocked()
+        {
+            tracing::debug!(
+                "[drift] 授権が下りないため補正を見送る（検知しない）: desired={desired} \
+                 observed={observed} for {duration_ms}ms (source={:?} confidence={:?})",
+                drift.source,
+                drift.confidence,
+            );
+            return;
+        }
+
+        self.ir_notify_drift_giveup_diagnostic(desired, observed, duration_ms, now);
+
         match act_policy {
             FeedbackPolicy::Blind { .. } => {
-                let action = decide_actuation_action(act_policy, act_attempts);
+                let action = act_policy.decide_action(act_attempts);
                 if action == ActuationAction::GiveUp {
                     // ADR-082 Phase 0.5: 打ち切り判定も出所・世代付きで構造化記録する
                     // （BUG-43 の「16 回中 5 回だけ送り、残りは GiveUp」を journal から
@@ -648,7 +846,7 @@ impl Runtime {
                                 crate::state::ime_actuation::Resolution::GaveUp,
                                 act_attempts,
                             );
-                            log::debug!(
+                            tracing::debug!(
                                 "[drift] actuation gave up (Blind): desired={desired} \
                                  observed={observed} converged={} attempts={}",
                                 receipt.converged(),
@@ -704,7 +902,7 @@ impl Runtime {
                             if receipt.resolution()
                                 == crate::state::ime_actuation::Resolution::ExternalChange
                             {
-                                log::debug!(
+                                tracing::debug!(
                                     "[drift] fresh observation after give-up → 試行を破棄して\
                                      再試行: desired={desired} observed={observed} attempts={}",
                                     receipt.attempts()
@@ -737,7 +935,7 @@ impl Runtime {
                     act_attempts,
                 );
                 if receipt.converged() {
-                    log::debug!(
+                    tracing::debug!(
                         "[drift] actuation confirmed (Read): desired={desired} \
                          converged={} attempts={} → 破棄",
                         receipt.converged(),
@@ -749,14 +947,16 @@ impl Runtime {
             }
         }
 
-        log::warn!(
+        tracing::warn!(
             "[drift] correction: observed={observed} ≠ desired={desired} for {duration_ms}ms \
-             → set_ime_open({desired})"
+             → set_ime_open({desired}) (source={:?} confidence={:?})",
+            drift.source,
+            drift.confidence,
         );
         // ADR-082 Phase 0.5: 実送信する試行を出所・世代付きで構造化記録する。
         // `Blind` はここに到達する時点で必ず `Send`（`GiveUp` は上で return 済み）、
         // `Read` は常に `Send`。`action` は `ActuationRecord::new` が
-        // `decide_actuation_action` で導出する。
+        // `FeedbackPolicy::decide_action` で導出する。
         self.platform_state
             .ime
             .journal
@@ -777,25 +977,36 @@ impl Runtime {
             },
             tick_ms,
         );
+        // ADR-090 §2.A 設計案 3 / A-1（shadow）。drift correction は既に
+        // `EventOrigin`（`act_origin`）を持っているので、それをそのまま
+        // order の出所として使う（journal の `ImeActuation` と揃う）。
+        let order = self.issue_actuation_order_with_origin(desired, act_origin);
         if self.can_use_imm32_cross_process() {
-            // ADR-090 §2.A 設計案 3 / A-1（shadow）。drift correction は既に
-            // `EventOrigin`（`act_origin`）を持っているので、それをそのまま
-            // order の出所として使う（journal の `ImeActuation` と揃う）。
-            let order = self.issue_actuation_order_with_origin(desired, act_origin);
-            let _ = self.platform.set_ime_open_ordered(order);
-            self.platform_state.ime.record_optimistic(desired);
+            // ADR-090 §2.A A-2（2026-09-19）: `set_ime_open_ordered`が実際に
+            // 書いたときだけ`applied`を`Optimistic`にする。以前は戻り値を
+            // 無視して無条件に呼んでおり、A-2導入前（常に書き込む shadow
+            // モード）は実害が無かったが、warrant無し（`Unwarranted`）で
+            // 書き込みを拒否した場合に「送っていないのに送った体で記録する」
+            // 欠陥になっていた（ADR-098が警告する「belief をactuationの
+            // 記録として書く」誤用と同型）。
+            if self.platform.set_ime_open_ordered(order) {
+                self.platform_state.ime.record_optimistic(desired);
+            }
         } else {
             // set_ime_open は IMM32専用で Blacklist/TsfNative では no-op のため、
-            // apply_force_on_for_imm_broken と同じ strategy chain 経由の実送信を使う。
-            let belief = crate::output::OpenBelief {
-                effective_open: desired,
-                confident: true,
-            };
-            let order = self.issue_actuation_order_with_origin(desired, act_origin);
-            let outcome = self
-                .platform
-                .apply_ime_open_with_belief(order, None, belief);
-            log::info!("Blacklist drift correction: apply_ime_open({desired}) → {outcome:?}");
+            // （撤去済みの）apply_force_on_for_imm_broken と同じ strategy chain 経由の実送信を使う。
+            let view = self.platform.build_ime_control_view(None);
+            let (outcome, mut record) = self.platform.apply_ime_open_with_view(order, &view);
+            // /code-review指摘（PR #201 wave3）: この同期記録点は`caller`が
+            // 常に`None`のままで、`site=Sync`の他の呼び出し元と記録上区別
+            // できなかった（B-2、PR #201パターンに揃える）。
+            record.caller =
+                Some(crate::state::ime_actuation_decision::DecisionSite::BlacklistDriftCorrection);
+            self.platform_state
+                .ime
+                .journal
+                .record(crate::journal::JournalEntry::ActuationDecision { record });
+            tracing::info!("Blacklist drift correction: apply_ime_open({desired}) → {outcome:?}");
             self.on_ime_apply_complete(
                 desired,
                 outcome,
@@ -814,17 +1025,95 @@ impl Runtime {
         }
     }
 
+    /// `ir_apply_drift_correction` から切り出したユーザー向け診断通知
+    /// （clippy `cognitive_complexity` 対策、敵対的コードレビュー由来の
+    /// CI失敗を受けた純粋なリファクタ——挙動は変更しない）。
+    ///
+    /// ADR-132 Phase 1 follow-up: the user-facing diagnostic must be based on how long
+    /// the drift has persisted, not on `FeedbackPolicy::Blind` reaching `GiveUp`.
+    /// `FeedbackPolicy::Read` intentionally never gives up by attempts, so tying this
+    /// notification to `GiveUp` leaves read-back capable apps silent during long drift.
+    ///
+    /// Reuse the already-measured drift-correction wait constant instead of adding a new
+    /// tuning number: this is the same "how long should drift correction wait before
+    /// escalating" context as Blind re-arm, and avoids introducing an unmeasured magic
+    /// number under `.claude/rules/tuning-constants.md`.
+    fn ir_notify_drift_giveup_diagnostic(
+        &mut self,
+        desired: bool,
+        observed: bool,
+        duration_ms: u64,
+        now: std::time::Instant,
+    ) {
+        if duration_ms < crate::tuning::DRIFT_CORRECTION_BLIND_REARM_COOLDOWN_MS
+            || self.drift_giveup_notified_this_focus
+        {
+            return;
+        }
+        self.show_tray_balloon(
+            "awase",
+            "このアプリではIME状態を確認できません。\n入力に違和感があれば、該当のIME切替キーをもう一度押してください。",
+        );
+        self.drift_giveup_notified_this_focus = true;
+        self.drift_giveup_started_at = Some(now);
+
+        let trusted = self
+            .platform_state
+            .ime
+            .model()
+            .observations
+            .most_recent_trusted(now);
+        let sent_vk = vec![crate::journal::ImeVkDiagnostic {
+            vk_code: if desired {
+                crate::vk::VK_IME_ON.0
+            } else {
+                crate::vk::VK_IME_OFF.0
+            },
+            kind: if desired { "VK_IME_ON" } else { "VK_IME_OFF" },
+            source: "drift-correction-duration-giveup",
+        }];
+        self.platform_state.ime.journal.record(
+            crate::journal::JournalEntry::DriftGiveUpDiagnostic {
+                record: crate::journal::DriftGiveUpDiagnosticRecord {
+                    desired_open: desired,
+                    observed_open: observed,
+                    drift_duration_ms: duration_ms,
+                    observation_source: trusted.map(|o| o.source),
+                    observation_confidence: trusted.map(|o| o.confidence),
+                    sent_vk,
+                    intent_source: self
+                        .platform_state
+                        .ime
+                        .model()
+                        .last_intent
+                        .as_ref()
+                        .map(|intent| intent.source),
+                    layout_name: self.platform.tray.current_layout_name().to_string(),
+                    half_width_alnum_toggle_active: self
+                        .platform_state
+                        .gate
+                        .half_width_alnum
+                        .is_toggle_active(),
+                },
+            },
+        );
+    }
+
     // ── Engine 通知 ──
+
+    pub(super) fn notify_engine_refresh(&mut self) {
+        self.ir_notify_engine_refresh();
+    }
 
     fn ir_notify_engine_refresh(&mut self) {
         let ctx = self.build_ctx();
-        log::debug!(
+        tracing::debug!(
             "[notify-refresh] ctx.ime_on={} ctx.is_jp={} explicit_intent={:?}",
             ctx.ime_on,
             ctx.is_japanese_ime,
             self.platform_state.ime.explicit_intent(),
         );
         let decision = self.engine.on_command(EngineCommand::RefreshState, &ctx);
-        self.execute_decision_suppressed(decision);
+        self.execute_decision(decision);
     }
 }

@@ -1,5 +1,8 @@
 ;NICOLA配列
 ;http://nicola.sunicom.co.jp/spec/kikaku.htm
+;
+;標準JISキーボードのキートップ印字通りに記号（＠［］：￥＾等）を出したい
+;場合は layout/nicola_keytop.yab を使うこと（新規インストールの既定）。
 
 [ローマ字シフト無し]
 '１','２','３','４','５','６','７','８','９','０','－',無,無

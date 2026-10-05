@@ -13,8 +13,9 @@
 ///
 /// 大文字小文字を無視し、末尾の `.exe` の有無どちらでも一致する
 /// （`process = "mstsc"` でも `process = "mstsc.exe"` でも同じ意味になる）。
-/// 前方一致は使わない — `keymap.rs::filter_active` のような `starts_with` 方式は
-/// 予期しない過剰マッチ（例: `"note"` が `"notepad.exe"` に誤爆）を招く。
+/// 前方一致は使わない — `starts_with` 方式は予期しない過剰マッチ
+/// （例: `"note"` が `"notepad.exe"` に誤爆）を招く（`keymap.rs::filter_active`
+/// もこの理由で ADR-114 により完全一致へ揃えた）。
 ///
 /// `process_name` が空文字列の場合は常に `false` を返す。`get_process_name` が
 /// 失敗して空文字列を返すケースがあり、これが空文字列エントリと一致すると
@@ -31,9 +32,20 @@ pub fn matches_disabled_app(entries: &[String], process_name: &str) -> bool {
 }
 
 /// プロセス名を比較用に正規化する（小文字化 + 末尾 `.exe` 除去）。
-fn normalize_process_name(name: &str) -> String {
+///
+/// `keymap.rs::filter_active` からも使う（ADR-114）ため `pub(crate)`。
+pub(crate) fn normalize_process_name(name: &str) -> String {
     let lower = name.to_ascii_lowercase();
     lower.strip_suffix(".exe").unwrap_or(&lower).to_string()
+}
+
+/// ADR-195段階1の独立学習プロセス（`awase-keymap-learn-win.exe`）名と一致するか。
+///
+/// 学習中は合成注入キーを awase が変換しないよう、`FocusTracker::is_app_disabled`が
+/// このプロセスを恒久バイパスする（旧`calibration_ipc.rs`〈ADR-176手動較正、撤去済み〉から移設）。
+#[must_use]
+pub fn is_keymap_learn_process_name(name: &str) -> bool {
+    normalize_process_name(name) == normalize_process_name("awase-keymap-learn-win.exe")
 }
 
 /// フォーカス変更前後で「無効化対象アプリへの出入り」のどちらが起きたかを表す。
@@ -64,6 +76,15 @@ pub const fn edge(prev: bool, next: bool) -> SuppressionEdge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keymap_learn_process_name_ignores_case_and_exe_suffix() {
+        assert!(is_keymap_learn_process_name("awase-keymap-learn-win.exe"));
+        assert!(is_keymap_learn_process_name("AWASE-KEYMAP-LEARN-WIN.EXE"));
+        assert!(is_keymap_learn_process_name("awase-keymap-learn-win"));
+        assert!(!is_keymap_learn_process_name("awase.exe"));
+        assert!(!is_keymap_learn_process_name(""));
+    }
 
     #[test]
     fn matches_ignores_case() {

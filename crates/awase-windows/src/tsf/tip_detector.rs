@@ -9,9 +9,14 @@
 //!
 //! ## スレッドモデル
 //!
-//! このモジュールの全関数は COM STA 初期化済みのスレッド（`gji-io-monitor`）から呼ぶこと。
-//! COM インターフェース（`ITfInputProcessorProfileMgr` 等）は STA アパートメントに束縛されるため、
-//! 生成スレッド以外で使ってはいけない。
+//! このモジュールの全関数は COM STA 初期化済みのスレッドから呼ぶこと。COM インターフェース
+//! （`ITfInputProcessorProfileMgr` 等）は STA アパートメントに束縛されるため、生成スレッド以外で
+//! 使ってはいけない。`pub(super)` な関数群は awase.exe の `gji-io-monitor` スレッドから呼ばれる。
+//! [`query_tip_identity_on_current_sta`] だけは `pub` で、`awase-keymap-learn-win`
+//! （学習プロセス、`RealImeDriver::new`が確立するTSFスレッド）からも呼ばれる
+//! （ADR196-T2「1e前半」、opus-adversarial-consult 2026-09-23 A-5）——COM初期化・
+//! `ITfThreadMgr::Activate`済みのスレッドから呼ぶのは呼び出し側の責任とし、この関数自体は
+//! 一切のCOM初期化/終了を行わない。
 
 use std::sync::OnceLock;
 use std::sync::RwLock;
@@ -50,11 +55,13 @@ pub(super) fn create_profile_ctx(
     unsafe {
         let mgr: ITfInputProcessorProfileMgr =
             CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER)
-                .map_err(|e| log::warn!("[tip-detect] CoCreateInstance(ProfileMgr) failed: {e}"))
+                .map_err(|e| {
+                    tracing::warn!("[tip-detect] CoCreateInstance(ProfileMgr) failed: {e}");
+                })
                 .ok()?;
         let profiles: ITfInputProcessorProfiles = mgr
             .cast()
-            .map_err(|e| log::warn!("[tip-detect] cast(ITfInputProcessorProfiles) failed: {e}"))
+            .map_err(|e| tracing::warn!("[tip-detect] cast(ITfInputProcessorProfiles) failed: {e}"))
             .ok()?;
         Some((mgr, profiles))
     }
@@ -77,10 +84,10 @@ pub(super) fn discover_and_cache_gji_clsid(
     match find_gji_clsid(mgr, profiles) {
         Some(clsid) => {
             let _ = GJI_CLSID.set(clsid);
-            log::info!("[tip-detect] GJI CLSID discovered: {}", fmt_guid(&clsid));
+            tracing::info!("[tip-detect] GJI CLSID discovered: {}", fmt_guid(&clsid));
         }
         None => {
-            log::info!("[tip-detect] GJI not found in EnumProfiles(JA)");
+            tracing::info!("[tip-detect] GJI not found in EnumProfiles(JA)");
         }
     }
 }
@@ -92,7 +99,7 @@ fn find_gji_clsid(
     unsafe {
         let enumerator = mgr
             .EnumProfiles(0x0411 /* Japanese */)
-            .map_err(|e| log::warn!("[tip-detect] EnumProfiles(JA) failed: {e}"))
+            .map_err(|e| tracing::warn!("[tip-detect] EnumProfiles(JA) failed: {e}"))
             .ok()?;
         loop {
             let mut prof = TF_INPUTPROCESSORPROFILE::default();
@@ -118,34 +125,113 @@ fn find_gji_clsid(
     }
 }
 
+/// `EnumProfiles(JA)` から、日本語(0x0411)で有効な TIP を集める(BUG-179: HKL がアクティブのとき用)。
+fn enabled_ja_tips(mgr: &ITfInputProcessorProfileMgr) -> Vec<crate::state::ime_kind::EnabledJaTip> {
+    let mut out = Vec::new();
+    unsafe {
+        let Ok(enumerator) = mgr.EnumProfiles(0x0411) else {
+            return out;
+        };
+        loop {
+            let mut prof = TF_INPUTPROCESSORPROFILE::default();
+            let mut fetched: u32 = 0;
+            let res = enumerator.Next(std::slice::from_mut(&mut prof), &raw mut fetched);
+            if res.is_err() || fetched == 0 {
+                break;
+            }
+            // TF_IPP_FLAG_ENABLED = 0x2(0x1 は ACTIVE。CI ログでは本体 TIP が flags=0x2)。langid 0 の言語中立 TIP(タッチ入力・音声認識)は除く。
+            if prof.dwProfileType == TF_PROFILETYPE_INPUTPROCESSOR
+                && prof.langid == 0x0411
+                && prof.dwFlags & 0x2 != 0
+            {
+                out.push(crate::state::ime_kind::EnabledJaTip {
+                    clsid: prof.clsid.to_u128(),
+                });
+            }
+        }
+    }
+    out
+}
+
 // ── アクティブ IME 種別クエリ ──────────────────────────────────────────────
 
-/// 現在アクティブな TIP の CLSID から IME 種別を返す。
+/// 現在アクティブな TIP の CLSID から、`ActiveImeKind`（互換の2値）と `TipIdentity`（GJI/Microsoft IME本体/
+/// それ以外を区別する3値）の両方を返す。
 ///
-/// - プロセス内キャッシュ済み GJI CLSID と一致 → `GoogleJapaneseInput`
-/// - それ以外の TIP または IMM32 HKL → `MicrosoftIme`
+/// **`TSF_OBS` には書き込まない**（`ime_product_name` を除く、診断専用で即時反映してよい）。両方の値は
+/// 呼び出し元（`gji_monitor::monitor_loop`）が**同じデバウンスの単位**で確定させてから書き込むこと
+/// （レビュー round3 NR1: `TipIdentity` をデバウンスせず即時に書いていたため、`ActiveImeKind` のデバウンス
+/// 〈`ImeKindDebounce`〉が2値〈GJI/MicrosoftIme〉でしか動かず、ATOK と Microsoft IME 本体はどちらも
+/// `MicrosoftIme` になるこの軸だけ単発フリップに無防備だった）。
+///
+/// - プロセス内キャッシュ済み GJI CLSID と一致 → `(GoogleJapaneseInput, Gji)`
+/// - それ以外の TIP または IMM32 HKL → `(MicrosoftIme, MsImeNative | Other)`
 /// - 取得失敗 → `None`（呼び出し元はフォールバック値を使う）
-pub(super) fn query_active_kind(mgr: &ITfInputProcessorProfileMgr) -> Option<ActiveImeKind> {
+pub(super) fn query_active_kind(
+    mgr: &ITfInputProcessorProfileMgr,
+) -> Option<(ActiveImeKind, crate::state::ime_kind::TipIdentity)> {
+    use crate::state::ime_kind::TipIdentity;
     unsafe {
         let mut prof = TF_INPUTPROCESSORPROFILE::default();
         mgr.GetActiveProfile(&GUID_TFCAT_TIP_KEYBOARD, &raw mut prof)
-            .map_err(|e| log::debug!("[tip-detect] GetActiveProfile failed: {e}"))
+            .map_err(|e| tracing::debug!("[tip-detect] GetActiveProfile failed: {e}"))
             .ok()?;
 
         if prof.dwProfileType != TF_PROFILETYPE_INPUTPROCESSOR {
-            // IMM32 ベースの HKL → MS-IME 系とみなす
+            // IMM32 ベースの HKL → MS-IME 系とみなす（種別は互換のため MicrosoftIme のまま。
+            // ただし Microsoft IME 本体とは同定しない）
             TSF_OBS.set_ime_product_name(None);
-            return Some(ActiveImeKind::MicrosoftIme);
+            let identity =
+                crate::state::ime_kind::identify_hkl_by_enabled_tips(&enabled_ja_tips(mgr));
+            return Some((ActiveImeKind::MicrosoftIme, identity));
         }
 
         TSF_OBS.set_ime_product_name(cached_profile_description(&prof));
 
-        if let Some(gji_clsid) = GJI_CLSID.get() {
-            if prof.clsid == *gji_clsid {
-                return Some(ActiveImeKind::GoogleJapaneseInput);
-            }
+        let identity = crate::state::ime_kind::identify_tip(
+            Some(prof.clsid.to_u128()),
+            GJI_CLSID.get().map(GUID::to_u128),
+        );
+        if identity == TipIdentity::Gji {
+            return Some((ActiveImeKind::GoogleJapaneseInput, identity));
         }
-        Some(ActiveImeKind::MicrosoftIme)
+        Some((ActiveImeKind::MicrosoftIme, identity))
+    }
+}
+
+/// 現在のSTAスレッドでアクティブな`TipIdentity`を一発で問い合わせる（ADR196-T2「1e前半」）。
+///
+/// [`query_active_kind`]と違い、`TSF_OBS`（awase.exeプロセスの観測ストア）へは一切書き込まない
+/// ——呼び出し元が別プロセス（学習プロセス）の場合、awase.exeの文脈でしか意味の無いグローバルを
+/// 初期化・更新してしまうため（opus-adversarial-consult 2026-09-23 A-5）。GJIのCLSID発見
+/// （[`find_gji_clsid`]）も、`awase.exe`側の`GJI_CLSID`キャッシュ（[`discover_and_cache_gji_clsid`]）を
+/// 経由せず、呼ぶたびに`EnumProfiles`をやり直す——呼び出し元は短命な学習プロセスで、1セッション
+/// あたり高々数回しか呼ばないため、キャッシュを共有する意味が無い。
+///
+/// COM初期化（`CoInitializeEx`）は呼び出し側の責任。この関数自体は一切のCOM初期化/終了を行わない
+/// （関数内で対にすると、呼び出し元のアパートメントの寿命を乱すため）。
+///
+/// 取得できなければ`None`（COMオブジェクト生成失敗・`GetActiveProfile`失敗のいずれか。
+/// 呼び出し元はエラーの詳細を区別する必要が無い——安全側に倒して「同定できなかった」として扱う）。
+#[must_use]
+pub fn query_tip_identity_on_current_sta() -> Option<crate::state::ime_kind::TipIdentity> {
+    use crate::state::ime_kind::identify_tip;
+    let (mgr, profiles) = create_profile_ctx()?;
+    let gji_clsid = find_gji_clsid(&mgr, &profiles);
+    unsafe {
+        let mut prof = TF_INPUTPROCESSORPROFILE::default();
+        mgr.GetActiveProfile(&GUID_TFCAT_TIP_KEYBOARD, &raw mut prof)
+            .map_err(|e| tracing::debug!("[tip-detect] GetActiveProfile failed: {e}"))
+            .ok()?;
+        if prof.dwProfileType != TF_PROFILETYPE_INPUTPROCESSOR {
+            return Some(crate::state::ime_kind::identify_hkl_by_enabled_tips(
+                &enabled_ja_tips(&mgr),
+            ));
+        }
+        Some(identify_tip(
+            Some(prof.clsid.to_u128()),
+            gji_clsid.map(|g| g.to_u128()),
+        ))
     }
 }
 
@@ -159,10 +245,10 @@ pub(super) fn dump_profiles(
     mgr: &ITfInputProcessorProfileMgr,
     profiles: &ITfInputProcessorProfiles,
 ) {
-    log::info!("[tip-detect] ── EnumProfiles(JA) start ──");
+    tracing::info!("[tip-detect] ── EnumProfiles(JA) start ──");
     unsafe {
         let Ok(enumerator) = mgr.EnumProfiles(0x0411) else {
-            log::warn!("[tip-detect] EnumProfiles(JA) failed");
+            tracing::warn!("[tip-detect] EnumProfiles(JA) failed");
             return;
         };
         loop {
@@ -189,16 +275,17 @@ pub(super) fn dump_profiles(
             if prof.dwProfileType == TF_PROFILETYPE_INPUTPROCESSOR {
                 cache_profile_description(&prof, &desc);
             }
-            log::info!(
+            tracing::info!(
                 "[tip-detect] {kind} clsid={clsid} profile={pguid} lang={lang:04x} \
-                 desc={desc:?}",
+                 flags={flags:#x} desc={desc:?}",
+                flags = prof.dwFlags,
                 clsid = fmt_guid(&prof.clsid),
                 pguid = fmt_guid(&prof.guidProfile),
                 lang = prof.langid,
             );
         }
     }
-    log::info!("[tip-detect] ── EnumProfiles(JA) end ──");
+    tracing::info!("[tip-detect] ── EnumProfiles(JA) end ──");
 }
 
 // ── ユーティリティ ──────────────────────────────────────────────────────────

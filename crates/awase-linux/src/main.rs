@@ -14,22 +14,29 @@ use awase_linux::output::UinputOutput;
 use awase_linux::vk::key_name_to_evdev;
 
 fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .finish()
+        .init();
 
-    log::info!("awase-linux starting");
+    tracing::info!("awase-linux starting");
 
     // 1. Load config
     let config_path = Path::new("config.toml");
     let config = if config_path.exists() {
         AppConfig::load(config_path)?
     } else {
-        log::warn!("config.toml not found, using defaults");
+        tracing::warn!("config.toml not found, using defaults");
         let toml_str = "[general]";
         toml::from_str(toml_str).context("Failed to create default config")?
     };
     let (config, warnings) = config.validate();
     for w in &warnings {
-        log::warn!("Config: {w}");
+        tracing::warn!("Config: {w}");
     }
 
     // 2. Resolve key names to evdev keycodes
@@ -52,9 +59,18 @@ fn main() -> Result<()> {
     let layout_path = Path::new(&config.general.layouts_dir).join(&config.general.default_layout);
     let layout = if layout_path.exists() {
         let content = std::fs::read_to_string(&layout_path)?;
-        YabLayout::parse(&content, keyboard_model)?.resolve_kana()
+        let layout = YabLayout::parse(&content, keyboard_model)?.resolve_kana();
+        let (layout, keystroke_warnings) = awase::yab::resolve_keystroke_syntax(
+            layout,
+            &config.keystroke_macro,
+            config.general.keystroke_sequence,
+        );
+        for w in &keystroke_warnings {
+            tracing::warn!("Layout ({}): {w}", layout_path.display());
+        }
+        layout
     } else {
-        log::warn!(
+        tracing::warn!(
             "Layout file not found: {}, using empty layout",
             layout_path.display()
         );
@@ -82,6 +98,11 @@ fn main() -> Result<()> {
             && awase_linux::hook::classify_modifier(u32::from(right_thumb.0))
                 != Some(ModifierKey::Shift),
     );
+    // /code-review指摘（PR #127、3回目）: timing_margin_percent/
+    // min_overlap_margin_percentをconfig.tomlで設定可能にしたが、Windows側
+    // （crates/awase-windows/src/app/bootstrap.rs）の対応する配線がこのstubには
+    // 無く、値を設定しても無反応だった。
+    fsm.apply_general_config(&config.general);
     let mut engine = Engine::new(
         fsm,
         SpecialKeyCombos {
@@ -94,7 +115,7 @@ fn main() -> Result<()> {
     );
 
     // 6. Open evdev device (using config)
-    log::info!("Input backend: {}", config.general.linux_input_backend);
+    tracing::info!("Input backend: {}", config.general.linux_input_backend);
     if config.general.linux_input_backend != "evdev" {
         anyhow::bail!(
             "Backend \"{}\" is not yet implemented. Currently only \"evdev\" is supported.",
@@ -102,24 +123,24 @@ fn main() -> Result<()> {
         );
     }
     let mut evdev = if let Some(ref dev_path) = config.general.linux_evdev_device {
-        log::info!("Using configured evdev device: {dev_path}");
+        tracing::info!("Using configured evdev device: {dev_path}");
         EvdevInput::open(Path::new(dev_path))?
     } else {
-        log::info!("Auto-detecting keyboard device");
+        tracing::info!("Auto-detecting keyboard device");
         EvdevInput::open_auto()?
     };
-    log::info!("Keyboard device opened");
+    tracing::info!("Keyboard device opened");
 
     // 7. Grab device (exclusive access)
     evdev.grab()?;
-    log::info!("Device grabbed (exclusive access)");
+    tracing::info!("Device grabbed (exclusive access)");
 
     // 8. Create output
     let mut output = UinputOutput::new()?;
-    log::info!("Virtual keyboard created");
+    tracing::info!("Virtual keyboard created");
 
     // 9. Run blocking event loop
-    log::info!("awase-linux running. Press Ctrl+C to exit.");
+    tracing::info!("awase-linux running. Press Ctrl+C to exit.");
 
     let mut modifiers = ModifierState::default();
     let mut left_thumb_down: Option<Timestamp> = None;

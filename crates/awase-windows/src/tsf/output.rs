@@ -36,7 +36,7 @@ pub enum ColdReason {
     SetOpenTrue,
     /// `ImeEffect::SetOpen(false)` 実行後（IME OFF → composition context 無効化）
     SetOpenFalse,
-    /// 物理 F2 (VK_DBE_HIRAGANA) をフックで Consume（TSF モード）
+    /// 物理 F2 (VK_DBE_HIRAGANA) KeyDown（TSF モード）。物理 F2 は素通し（BUG-173）で、名前は歴史的経緯
     NativeF2Consumed,
     /// Space/Enter/Escape のパススルー
     PassthroughConfirmKey,
@@ -54,6 +54,11 @@ pub enum ColdReason {
     RawTsfLiteralRecovery,
     /// Ctrl+key パススルー時の composition キャンセル（IME ショートカット横取り防止）
     CtrlKeyBypass,
+    /// `[[keymap]]` の `target_vk` 送信前の composition キャンセル（IME
+    /// ショートカット横取り防止、ADR-114 決定3・実装レビュー m-2）。
+    /// `CtrlKeyBypass` と目的は同じだが、journal・診断で cold-start の連鎖を
+    /// 追う際に「Ctrl bypass が原因」と誤誘導しないよう区別する。
+    KeymapTarget,
 }
 
 impl ColdReason {
@@ -154,6 +159,7 @@ pub(crate) fn kana_for_romaji_static(romaji: &str) -> Option<char> {
 ///
 /// # Panics
 /// `INPUT` のサイズが `i32` に収まらない場合（実際には起こらない）。
+#[tracing::instrument(level = "debug")]
 pub fn flush_raw_tsf_literal_backspaces() {
     use crate::vk::{VK_BACK, VK_ESCAPE};
     use std::sync::atomic::Ordering::Relaxed;
@@ -175,6 +181,6 @@ pub fn flush_raw_tsf_literal_backspaces() {
             make_key_input_ex(VK_BACK, true, INJECTED_MARKER),
         ]
     }));
-    log::debug!("[raw-tsf-literal] flush escape={escape_composition} backspace ×{n}");
+    tracing::debug!("[raw-tsf-literal] flush escape={escape_composition} backspace ×{n}");
     let _ = crate::win32::send_input_safe(&inputs);
 }

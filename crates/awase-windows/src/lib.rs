@@ -22,14 +22,21 @@
 
 // ── 純粋モジュール（全プラットフォーム）──────────────────────────────────────────
 pub mod bug_report;
+pub mod config_diagnostics;
+#[cfg(test)]
+mod config_key_resolution_tests;
 pub mod focus;
 pub mod focus_resync;
 pub mod gji_charset_autodetect;
-pub mod gji_charset_popup;
-pub mod gji_charset_write;
 pub mod hook_channel;
 pub mod journal_policy;
+pub(crate) mod lifetime_counter;
 pub mod msime_key_assignment;
+// 本番の呼び出し元（`read_legacy_toggle_assignment`/`read_legacy_compat_mode_enabled`）は
+// `#[cfg(windows)]` のため、純粋なパース部分は非 Windows では未使用になる（テストは Linux で回す）。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub mod msime_legacy_keymap;
+pub mod scancode_map;
 pub mod scanmap;
 pub mod single_thread_cell;
 pub mod state;
@@ -55,7 +62,12 @@ pub(crate) mod imm;
 pub mod input_defer;
 #[cfg(windows)]
 pub mod journal;
-#[cfg(windows)]
+// `KeymapTable`/`find_match`/`filter_active` は純粋な値比較のみで Windows API に
+// 依存しないため ungated（ADR-114、Linux で `cargo test -p awase-windows --lib`
+// から全数テストできるようにする。唯一の呼び出し元 `runtime/message_handlers.rs`
+// は `#[cfg(windows)]` のため非 Windows では未使用になる、他の純粋関数モジュール
+// と同じ局所抑制パターン）。
+#[cfg_attr(not(windows), allow(dead_code))]
 pub mod keymap;
 #[cfg(windows)]
 pub mod observer;
@@ -66,9 +78,13 @@ pub mod panic_detect;
 #[cfg(windows)]
 pub mod platform;
 #[cfg(windows)]
+pub(crate) mod probe_actuation_fence;
+#[cfg(windows)]
 pub mod runtime;
 #[cfg(windows)]
 pub(crate) mod send_health;
+#[cfg(windows)]
+pub(crate) mod shadow_send_trace;
 #[cfg(windows)]
 pub mod timer;
 #[cfg(windows)]
@@ -104,37 +120,56 @@ pub use crate::tsf::probe_bridge::{OUTPUT_GATE, WM_DRAIN_OUTPUT_QUEUE};
 #[cfg(windows)]
 pub use crate::input_defer::{InputDeferQueue, INPUT_DEFER};
 
-// ── クロススレッド共有グローバル状態 ──
+// ── クロススレッド共有グローバル状態（ADR-164 フェーズ6）──
 //
 // Ctrl+C ハンドラ（別スレッド）からアクセスされるため、Atomic 型でなければならない。
+// 3フィールドをまとめて1つのロックフリー struct-of-atomics singleton に集約する
+// （分類A2、`hook.rs`/`probe_actuation_fence.rs`と同型。Mutexは使わない）。
+// フィールドごとの `Ordering` は集約前と完全に同一（`main_thread_id`/`quit_requested`
+// は `SeqCst`、`elevated` は `Relaxed`）——この非対称は意図的なため変更しない。
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-static MAIN_THREAD_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+struct ProcessFlags {
+    main_thread_id: AtomicU32,
+    quit_requested: AtomicBool,
+    elevated: AtomicBool,
+}
+
+impl ProcessFlags {
+    const fn new() -> Self {
+        Self {
+            main_thread_id: AtomicU32::new(0),
+            quit_requested: AtomicBool::new(false),
+            elevated: AtomicBool::new(false),
+        }
+    }
+}
+
+static PROCESS_FLAGS: ProcessFlags = ProcessFlags::new();
+
 pub fn main_thread_id() -> u32 {
-    MAIN_THREAD_ID.load(Ordering::SeqCst)
+    PROCESS_FLAGS.main_thread_id.load(Ordering::SeqCst)
 }
 #[cfg(windows)]
 pub(crate) fn set_main_thread_id(tid: u32) {
-    MAIN_THREAD_ID.store(tid, Ordering::SeqCst);
+    PROCESS_FLAGS.main_thread_id.store(tid, Ordering::SeqCst);
 }
 
-static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 pub fn is_quit_requested() -> bool {
-    QUIT_REQUESTED.load(Ordering::SeqCst)
+    PROCESS_FLAGS.quit_requested.load(Ordering::SeqCst)
 }
 #[cfg(windows)]
 pub(crate) fn request_quit() {
-    QUIT_REQUESTED.store(true, Ordering::SeqCst);
+    PROCESS_FLAGS.quit_requested.store(true, Ordering::SeqCst);
 }
 
-static ELEVATED: AtomicBool = AtomicBool::new(false);
 pub fn is_elevated() -> bool {
-    ELEVATED.load(Ordering::Relaxed)
+    PROCESS_FLAGS.elevated.load(Ordering::Relaxed)
 }
 #[cfg(windows)]
 pub(crate) fn set_elevated(v: bool) {
-    ELEVATED.store(v, Ordering::Relaxed);
+    PROCESS_FLAGS.elevated.store(v, Ordering::Relaxed);
 }
 
 /// raw TSF literal 検出後の回収ペイロード。
@@ -196,14 +231,14 @@ pub static RUNTIME: SingleThreadCell<Runtime> = SingleThreadCell::new();
 /// `RUNTIME` グローバルへの集約アクセスポイント。
 ///
 /// `RefCell` の実行時借用チェックにより再入を安全に検出する。
-/// 再入を検出した場合は `log::warn!` を出力して `None` を返す（UB なし）。
+/// 再入を検出した場合は `tracing::warn!` を出力して `None` を返す（UB なし）。
 #[cfg(windows)]
 #[must_use = "再入時は None を返す。消えてはいけないメッセージには with_app_or_repost を、\
 意図的に捨てる場合は `let _ = with_app(...)` を使うこと"]
 pub fn with_app<R>(f: impl FnOnce(&mut Runtime) -> R) -> Option<R> {
     RUNTIME.try_borrow_mut().map_or_else(
         || {
-            log::warn!(
+            tracing::warn!(
                 "with_app re-entry detected — returning None (caller should re-post if needed)"
             );
             None
@@ -259,6 +294,10 @@ pub const TIMER_IME_OFF_RESCUE: usize = 107;
 pub const TIMER_GJI_LONG_IDLE: usize = 108;
 /// フォーカス復帰後 resync のハード期限タイマー ID（report `01M0VGJ2M5KQHD1D9V7HAMBHNT`）
 pub const TIMER_FOCUS_RESYNC: usize = 109;
+/// hook watchdog カナリア確認タイマー ID（issue #165 自己修復 round2 B1(i)）。
+/// 一発タイマーで、ハンドラ冒頭で自ら `kill` する（`TIMER_TSF_GATE`/
+/// `TIMER_POWER_RESUME`と同じ流儀）。
+pub const TIMER_HOOK_WATCHDOG_CANARY_CHECK: usize = 110;
 
 // ── Windows メッセージ定数 ──────────────────────────────────────────────────────
 
@@ -301,32 +340,21 @@ pub const WM_IME_KIND_CHANGED: u32 = windows::Win32::UI::WindowsAndMessaging::WM
 #[cfg(windows)]
 pub const WM_ASYNC_IME_APPLY_COMPLETE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 22;
 
-/// GJI 向け設定支援ポップアップ（`gji_charset_popup`）が別スレッドで
-/// `config1.db` への書き込みに成功したことをメインスレッドへ通知する。
-///
-/// `gji_charset_popup::apply_and_notify` はダイアログ表示のため
-/// `std::thread::spawn` した非メインスレッドで動く。`RUNTIME`
-/// （`SingleThreadCell`）はメインスレッド以外からのアクセスを許さないため、
-/// `with_app` を直接呼ばず `wparam` に `VkCode`（`u16`）を積んで
-/// `post_to_main_thread_with` 経由でメインスレッドへ投函し、
-/// `handle_wm_gji_charset_fn_key_activated` が `with_app` 経由で
-/// `set_muhenkan_dedicated_fn_key_auto` を呼ぶ（`WM_ASYNC_IME_APPLY_COMPLETE`
-/// と同じ「ワーカースレッドは with_app を握らない」パターン）。
-#[cfg(windows)]
-pub const WM_GJI_CHARSET_FN_KEY_ACTIVATED: u32 =
-    windows::Win32::UI::WindowsAndMessaging::WM_APP + 23;
-
-/// GJI reinit retry 用 IMC poll の完了通知。
-///
-/// poll future は `with_app` 内で送信を行わず、`wparam=retry token`,
-/// `lparam=GjiReinitPollStatus` としてこのメッセージを投函する。メインメッセージ
-/// ループが `with_app_or_repost_with` で Runtime 境界へ戻してから retry 送信と
-/// post-send effects を実行する。
-#[cfg(windows)]
-pub const WM_GJI_REINIT_RETRY_COMPLETE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 24;
 #[cfg(windows)]
 pub(crate) const WM_ENGINE_QUIT_REQUEST: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 25;
-
+/// OS かな入力ロック警告のトレイ表示を更新する契機。
+///
+/// wparam/lparam に真偽値を積んで運ばない — 投函時点の値を運ぶと、
+/// `with_app_or_repost` による再入時の repost で WARN/CLEAR の処理順序が
+/// 入れ替わった場合にトレイ表示が実状態と食い違ったまま固着しうる
+/// （issue #137 実装レビューで指摘）。dispatch 時に毎回ライブの `warned()` を
+/// 読み直す設計にすることで、何度再入・repost されても最終的に正しい値へ
+/// 収束する（冪等）。
+#[cfg(windows)]
+pub const WM_KANA_LOCK_WARNING_CHANGED: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 26;
+/// hook の IME-mode 診断ログを journal へ吸い上げる契機。
+#[cfg(windows)]
+pub const WM_HOOK_IME_MODE_DIAGNOSTIC: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 27;
 // ── RawKeyEventExt ───────────────────────────────────────────────────────────────
 
 /// `RawKeyEvent` の SendInput 再注入ヘルパー。
@@ -345,34 +373,25 @@ impl RawKeyEventExt for RawKeyEvent {
     #[allow(unsafe_code)]
     unsafe fn reinject(&self) {
         use crate::output::INJECTED_MARKER;
-        use crate::vk::is_extended_key;
         use awase::types::KeyEventType;
         use windows::Win32::UI::Input::KeyboardAndMouse::{
-            INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY,
-            KEYEVENTF_KEYUP, VIRTUAL_KEY,
+            INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
+            VIRTUAL_KEY,
         };
 
         let is_keyup = matches!(self.event_type, KeyEventType::KeyUp);
-
-        // ADR-110 決定6: 右Ctrl/右Alt・矢印・Home/End 等の拡張キーは
-        // KEYEVENTF_EXTENDEDKEY を立てないと左修飾キー/テンキーと誤解釈されうる
-        // （Alt なりすまし・key_remap 双方の reinject 経路が共有する）。
-        let mut flags = if is_keyup {
-            KEYEVENTF_KEYUP
-        } else {
-            KEYBD_EVENT_FLAGS(0)
-        };
-        if is_extended_key(self.vk_code) {
-            flags |= KEYEVENTF_EXTENDEDKEY;
-        }
 
         let input = INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
                 ki: KEYBDINPUT {
                     wVk: VIRTUAL_KEY(self.vk_code.0),
-                    wScan: 0,
-                    dwFlags: flags,
+                    wScan: vk::reinject_scan_code(self.vk_code, self.scan_code.0),
+                    dwFlags: if is_keyup {
+                        KEYEVENTF_KEYUP
+                    } else {
+                        KEYBD_EVENT_FLAGS(0)
+                    },
                     time: 0,
                     dwExtraInfo: INJECTED_MARKER,
                 },

@@ -213,6 +213,8 @@ fn classify_modifier(vk: VkCode) -> Option<ModifierKey> {
 fn build_event(vk: VkCode, event_type: KeyEventType, timestamp: u64) -> RawKeyEvent {
     let (kc, pos) = classify_vk(vk);
     RawKeyEvent {
+        was_down: false,
+        press_id: None,
         vk_code: vk,
         scan_code: ScanCode(0),
         event_type,
@@ -223,6 +225,8 @@ fn build_event(vk: VkCode, event_type: KeyEventType, timestamp: u64) -> RawKeyEv
         ime_relevance: crate::types::ImeRelevance::default(),
         modifier_key: classify_modifier(vk),
         modifier_snapshot: Default::default(),
+        left_thumb_down_snapshot: None,
+        right_thumb_down_snapshot: None,
         injected: false,
     }
 }

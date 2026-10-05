@@ -10,24 +10,15 @@ use crate::hook;
 use crate::hook::CallbackResult;
 use crate::state::evidence::IntentWitness;
 use crate::state::focus_probe_plan::{plan_focus_probe, FocusProbeEffect};
-use crate::state::half_width_alnum::{
-    plan_half_width_alnum_action, HalfWidthAlnumAction, ShiftKeyUpKind,
-};
+use crate::state::half_width_alnum::{HalfWidthAlnumAction, HalfWidthAlnumEffect, ShiftSide};
 use crate::state::observation_store::FocusProbeOpenStatus;
 use crate::win32::post_to_main_thread;
-use crate::{Runtime, TIMER_IME_REFRESH, WM_EXECUTE_EFFECTS};
-use awase::engine::InputModeState;
+use crate::{Runtime, TIMER_IME_REFRESH, WM_EXECUTE_EFFECTS, WM_KANA_LOCK_WARNING_CHANGED};
+use awase::engine::{Effect, InputEffect, InputModeState, KanaLockStreak, WarnAction};
 use awase::platform::TsfComposition as _;
-use awase::types::{KeyEventType, RawKeyEvent, ShadowImeAction};
+use awase::types::{KeyAction, KeyEventType, RawKeyEvent, ShadowImeAction};
 
-/// Shadow IME トグルの意図ソース (この pipeline 内のローカル routing 用)。
-#[derive(Debug, Clone, Copy)]
-enum IntentKind {
-    /// config 由来の同期キー
-    SyncKey,
-    /// 物理 KANJI キー
-    PhysicalImeKey,
-}
+use crate::state::explicit_press::ShadowIntentKind as IntentKind;
 
 impl Runtime {
     /// キーイベント処理エントリポイント
@@ -45,12 +36,16 @@ impl Runtime {
     #[expect(clippy::cognitive_complexity)]
     #[expect(clippy::too_many_lines)]
     fn kp_run_inner(&mut self, mut event: RawKeyEvent, skip_rescue_defer: bool) -> CallbackResult {
+        // ADR-223 段階 1: 取り込み時に読んだ入力言語を belief に反映する(ctx を組む前。同じ打鍵から通過になる)。
+        self.lang_check_apply(&event);
         self.enrich_ime_relevance(&mut event);
+        self.enrich_key_role(&mut event);
+        self.enrich_thumb_key_role(&event);
 
         // TsfGate: PendingWarmup 中はキーを保留し TSF モード確定を待つ。
         // run_with_prefetched 完了後に OUTPUT_PENDING_QUEUE 経由で再処理される。
         if self.platform.try_hold_key(event) {
-            log::debug!(
+            tracing::debug!(
                 "[tsf-gate-hold] vk=0x{:02X} {:?} held by TsfGate (PendingWarmup)",
                 event.vk_code,
                 event.event_type
@@ -70,13 +65,13 @@ impl Runtime {
                 // Ctrl↑ within 50ms: 「Ctrl+他キー中の誤打 無変換」を破棄する。
                 // ctrl=false で発火すると NICOLA FSM が PendingThumb に入り thumb shift に
                 // 化けてしまうため、無変換を消費する（IME OFF も発火しない）。
-                log::info!(
+                tracing::info!(
                     "[ime-off-rescue] Ctrl↑ within 50ms → 無変換 vk=0x{:02X} を破棄（thumb shift 防止）",
                     pending_event.vk_code
                 );
                 // 続けて現在 event (Ctrl↑) を通常処理する
             } else {
-                log::info!(
+                tracing::info!(
                     "[ime-off-rescue] non-Ctrl↑ event 到着 → 保留 vk=0x{:02X} を IME OFF として発火",
                     pending_event.vk_code
                 );
@@ -90,19 +85,36 @@ impl Runtime {
             }
         }
 
-        // kp_stage_focus_probe が FocusTransition barrier を consume する前に
-        // settle 状態をスナップショットしておく（post_decision で使う。
-        // 消費後に読むと常に false になり判断できないため）。
-        let focus_transition_was_pending = self
-            .platform_state
-            .ime
-            .is_focus_transition_settling(std::time::Instant::now());
-
-        self.kp_stage_focus_probe(&mut event);
+        self.kp_stage_focus_probe();
         self.kp_stage_idle_conv_check(&event);
-        let shadow_toggled = self.kp_stage_shadow_ime_toggle(&event);
+        // ADR-208 D1（PR #419 Opus M-4）: 同じ打鍵で Engine が `SetOpen` を出すキー（`keys.ime_on/off/toggle`・自動検出トグル等）
+        // では、shadow の書き込みを抑止して Engine に任せる（衝突を書く前に静的に解く）。ctx は shadow の判断**前**の
+        // belief で組む（トグル型の向きが `!ctx.ime_on` で決まる）。
+        let engine_owns_open_key = matches!(event.event_type, KeyEventType::KeyDown) && {
+            let pre_ctx = super::build_input_context(
+                self.platform_state.ime.effective_open(),
+                self.platform_state.ime.input_mode(),
+                self.platform_state.ime.belief.is_japanese_ime(),
+                crate::tsf::observer::ime_composition_active_now(),
+                &event.modifier_snapshot,
+                event.left_thumb_down_snapshot,
+                event.right_thumb_down_snapshot,
+            );
+            self.engine.matches_ime_set_open(&pre_ctx, &event).is_some()
+        };
+        let shadow_toggled = self.kp_stage_shadow_ime_toggle(&event, engine_owns_open_key);
+        self.settle_fkey_role_latch(&event, shadow_toggled);
 
-        let (left_thumb_down, right_thumb_down) = hook::thumb_down_timestamps();
+        // ADR-129: ライブクエリ（`hook::thumb_down_timestamps()`）は使わない。
+        // drain replay 中に「replay を実行している"今"」の値を誤って読んでしまう
+        // ため、`hook.rs::build_raw_key_event` が capture 時点で埋め込んだ
+        // スナップショットをそのまま使う。ライブ配送と drain replay が同一の
+        // 値の出所（capture-time snapshot）を共有することになり、両者の分岐が
+        // 構造的に無くなる。
+        let (left_thumb_down, right_thumb_down) = (
+            event.left_thumb_down_snapshot,
+            event.right_thumb_down_snapshot,
+        );
         let ctx = super::build_input_context(
             self.platform_state.ime.effective_open(),
             self.platform_state.ime.input_mode(),
@@ -135,14 +147,12 @@ impl Runtime {
         // phys_ctrl は PHYSICAL_KEY_STATE (SendInput 非影響) での Ctrl 押下状態。
         // gas_ctrl と乖離する場合、synthetic KeyUp が SendInput されて
         // GetAsyncKeyState が汚染されている可能性がある。
-        // ADR-110 決定5: key_remap で to=Ctrl系にリマップ中のキーの物理押下も
-        // 含める（`hook::key_remap_ctrl_effectively_held` と同じ判定、
-        // でなければ CapsLock→Ctrl remap 下で本来無害な食い違いを毎打鍵警告してしまう）。
-        let phys_ctrl = hook::key_remap_ctrl_effectively_held();
-        log::debug!(
+        let phys_ctrl = hook::is_physical_key_down(crate::vk::VK_LCONTROL)
+            || hook::is_physical_key_down(crate::vk::VK_RCONTROL);
+        tracing::debug!(
             "[engine-input] vk=0x{:02X} {:?} ts={}us delay={}ms state={} \
              mods(c={} s={} a={} w={}) gas_ctrl={} phys_ctrl={} extra=0x{:X} \
-             pending_drain={} gate_active={} \
+             pending_drain={} gate_active={} l_thumb={:?} r_thumb={:?} \
              [diag-ctx] ime_on={} japanese={} input_mode={:?} composing={}",
             event.vk_code,
             event.event_type,
@@ -158,13 +168,15 @@ impl Runtime {
             event.extra_info,
             pending_drain.map_or_else(|| "?".to_owned(), |n| n.to_string()),
             gate_active,
+            ctx.left_thumb_down,
+            ctx.right_thumb_down,
             ctx.ime_on,
             ctx.is_japanese_ime,
             ctx.input_mode,
             ctx.composing,
         );
         if !mods.ctrl && phys_ctrl {
-            log::warn!(
+            tracing::warn!(
                 "[engine-input] CTRL MISMATCH: mods.ctrl=false だが phys_ctrl=true (vk=0x{:02X} {:?}) \
                  → synthetic Ctrl↑ が GetAsyncKeyState を汚染した可能性がある",
                 event.vk_code, event.event_type,
@@ -180,7 +192,7 @@ impl Runtime {
             && hook::ctrl_consumed_since_down()
             && self.engine.matches_ime_off(&ctx, &event)
         {
-            log::debug!(
+            tracing::debug!(
                 "[ime-off-rescue] vk=0x{:02X} を 50ms 保留 (Ctrl consumed)",
                 event.vk_code
             );
@@ -189,28 +201,9 @@ impl Runtime {
         }
 
         let state_before = self.engine.debug_state_label();
-        let mut decision = self.engine.on_input(event, &ctx);
-        // キーボード経路の一次フィルタ（decision 除去の単一実装は executor 側ヘルパ）。
-        // フォーカス遷移直後（settle 期間内）に Engine が発行した SetOpen effect は、
-        // 実行(kp_stage_execute → 実際の SendInput)まで到達する前にここで取り除く。
-        // handle_engine_set_open 側のフィルタは belief の書き込み(desired_open等)を防ぐ
-        // 最終防衛線で意図が異なり、decision.effects に残った SetOpen は kp_stage_execute
-        // 経由で無条件に実行されてしまうため、effect 自体を落とすこの一次フィルタが必須
-        // （2026-07-05: 前回の修正が効かなかった原因）。
-        // この経路は kp_stage_focus_probe が barrier を consume 済みのため、live 評価ではなく
-        // イベント開始時にスナップショットした focus_transition_was_pending を settle 判定に使う。
-        let stripped_set_open = crate::runtime::executor::strip_ime_set_open_if_settling(
-            &mut decision,
-            focus_transition_was_pending,
-        );
-        if stripped_set_open.is_some() {
-            // settle 中に握りつぶした SetOpen は自然には再発行されない
-            // （Engine::prev_activation は遷移確定済みのため）。既存の
-            // apply_force_on_for_imm_broken 等と同じ「settle 明けに refresh で再試行」
-            // パターンで確実に一度だけ再同期する
-            // （2026-07-08: GjiFsm が resync できず「このせっけい」の文字欠落に至った実機ログから判明）。
-            self.schedule_settle_retry("SetOpen stripped from kp_run_inner decision");
-        }
+        let decision = self.engine.on_input(event, &ctx);
+        // ADR-213 P2d-2: settle 中の SetOpen 除去（旧 `strip_ime_set_open_if_settling`）は撤去した。
+        // SetOpen は明示操作だけが出し、settle 直後の書き込みも受け付けられると実測した。
         let state_after = self.engine.debug_state_label();
         // 配送判断(physical)をここで一度だけ確定させ、KeyInput journal 記録と
         // kp_stage_execute の実処理の両方に同じ値を渡す（BUG-90 調査: 以前は
@@ -219,19 +212,21 @@ impl Runtime {
         // 参照。decision だけでは実際に OS へ届いたかが journal から
         // 分からなかった点が調査のきっかけ）。
         let profile = self.platform.current_app_profile();
+        let active_ime_kind = crate::tsf::observer::tsf_obs().active_ime_kind();
         let physical = crate::runtime::PhysicalKeyDisposition::plan(
             &event,
             profile,
             shadow_toggled,
-            self.platform.is_tsf_mode(),
-            self.platform.output.f2_warmup_owned(),
-            crate::tsf::observer::tsf_obs().active_ime_kind(),
-            self.dbe_mode_key_policy,
+            active_ime_kind,
         );
-        self.platform_state
-            .ime
-            .journal
-            .record(crate::journal::JournalEntry::KeyInput {
+        let physical = self.kp_latch_keyup_to_keydown_disposition(&event, physical);
+        // ADR-169: JournalEntry::KeyInput の本番構築点はここ1箇所のみ
+        // （`tests/architecture_guard.rs` の出現数固定テストで保証）。
+        // OS auto-repeat の畳み込み判定に使う `was_down` は
+        // `event.was_down`（`hook.rs::HOOK_STATE.physical_key_state` の
+        // `swap` 由来、capture時点のスナップショット）をそのまま使う。
+        self.platform_state.ime.journal.record_key_input(
+            crate::journal::JournalEntry::KeyInput {
                 event: crate::journal::KeyEventSummary::from_raw(&event),
                 state_before,
                 state_after,
@@ -239,9 +234,17 @@ impl Runtime {
                 physical: crate::journal::PhysicalDispositionSummary::new(
                     physical.suppress_reason(&event, profile),
                 ),
-            });
+                // プレースホルダー値: record_key_input() が
+                // MergeIntoPrevious/NewEntry いずれの経路でも上書きするため
+                // ここでの実際の値は意味を持たない（呼び出し規約）。
+                repeat_count: 1,
+                last_timestamp_us: event.timestamp,
+                last_elapsed_ms: 0,
+            },
+            event.was_down,
+        );
 
-        self.kp_stage_post_decision(&decision, &event, focus_transition_was_pending);
+        self.kp_stage_post_decision(&decision, &event);
 
         // Ctrl 系 KeyUp で chord barrier を解除する。
         // chord 状態の判断は ImeStateHub.on_ctrl_key_up() に集約（パイプラインは VK 分類のみ担う）。
@@ -261,8 +264,43 @@ impl Runtime {
         callback
     }
 
+    /// BUG-173追補: KeyUp の配送を、対応する最初の KeyDown の配送に揃える（純粋部は
+    /// `key_effect_runtime::keyup_follows_keydown`）。無変換/変換と role F13〜F24 は別の所有者
+    /// （`thumb_or_role_fkey_disposition` のステートレス再評価 / `key_role_latch`）が Down/Up を揃えるため、
+    /// 注入イベントとともに対象外。記録するのは `plan()` の判定値であり、実際に OS へ届いたかではない。
+    fn kp_latch_keyup_to_keydown_disposition(
+        &mut self,
+        event: &RawKeyEvent,
+        physical: crate::runtime::PhysicalKeyDisposition,
+    ) -> crate::runtime::PhysicalKeyDisposition {
+        use crate::runtime::PhysicalKeyDisposition::{Allow, Suppress};
+        let input = crate::state::key_effect_runtime::KeyUpLatchInput {
+            scan: event.scan_code,
+            is_down: event.event_type == KeyEventType::KeyDown,
+            is_up: event.event_type == KeyEventType::KeyUp,
+            was_down: event.was_down,
+            relevant: event.ime_relevance.shadow_action.is_some(),
+            excluded: event.injected
+                || matches!(
+                    event.vk_code,
+                    crate::vk::VK_CONVERT | crate::vk::VK_NONCONVERT
+                )
+                || crate::vk::is_role_fkey(event.vk_code),
+        };
+        let suppress = crate::state::key_effect_runtime::keyup_follows_keydown(
+            &mut self.platform_state.gate.shadow_key_down_disposition,
+            input,
+            physical == Suppress,
+        );
+        if suppress {
+            Suppress
+        } else {
+            Allow
+        }
+    }
+
     /// フォーカス切替直後の非同期プローブ
-    fn kp_stage_focus_probe(&mut self, _event: &mut RawKeyEvent) {
+    fn kp_stage_focus_probe(&mut self) {
         // Step 5: focus_transition_pending: bool は InputBarrier::FocusTransition に置換。
         // 最初のキー入力で barrier を consume する (one-shot 動作維持)。
         if !self.platform_state.ime.consume_focus_barrier() {
@@ -271,7 +309,6 @@ impl Runtime {
 
         // キャプチャ（async タスク内で使う）
         let probe_started_ms = hook::current_tick_ms();
-        let warmup_ms = self.platform.eager_warmup_sent_ms();
         let obs = crate::state::ObservedState::from_snapshot(crate::tsf::observer::tsf_obs());
         let gji_last_io_ms = obs.gji_last_io_ms;
         let active_ime_kind = obs.active_ime_kind;
@@ -300,7 +337,6 @@ impl Runtime {
                         app.apply_focus_probe(
                             probe,
                             probe_started_ms,
-                            warmup_ms,
                             gji_last_io_ms,
                             last_focus_change_ms,
                             shadow_on,
@@ -359,6 +395,14 @@ impl Runtime {
     /// 戻り値: 非同期 conv 読み取りを spawn した（＝resync の場合、gate がまだ
     /// active で呼び出し元がハード期限タイマーを武装すべき）なら `true`。
     /// いずれかのガードで同期的に return した場合は `false`。
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(
+            is_first_key_after_focus = is_first_key_after_focus,
+            resync_generation = resync_generation
+        )
+    )]
     fn kp_stage_idle_conv_check_inner(
         &mut self,
         event: &RawKeyEvent,
@@ -370,8 +414,8 @@ impl Runtime {
         // awase 自身が意図的に設定した状態であり、ObservedEisu → DirectInput
         // （IME OFF 落ち）に反応させてはならない。Shift 解放時の復元が
         // explicit IME action として抑止を引き継ぐ。
-        if self.platform_state.gate.shift_conv_guard_pending
-            || self.platform_state.gate.half_width_alnum_toggle_active
+        if self.platform_state.gate.half_width_alnum.is_guard_pending()
+            || self.platform_state.gate.half_width_alnum.is_toggle_active()
         {
             self.close_focus_resync_gate_if_current(resync_generation);
             return false;
@@ -383,10 +427,10 @@ impl Runtime {
             .platform_state
             .ime
             .explicit_ime_action_age_ms(now_tick_at_spawn);
-        let is_tsf_native = crate::focus::class_names::is_effectively_tsf_native(
-            self.platform.current_app_profile(),
-            self.platform.focus.class_name(),
-        );
+        let is_tsf_native = self
+            .platform
+            .current_app_profile()
+            .is_effectively_tsf_native(self.platform.focus.class_name());
         if !awase::engine::should_run_idle_conv_check(
             matches!(event.event_type, KeyEventType::KeyDown),
             is_tsf_native,
@@ -395,6 +439,7 @@ impl Runtime {
             crate::tuning::TYPING_IDLE_MS,
             crate::tuning::EXPLICIT_IME_SUPPRESS_MS,
             is_first_key_after_focus,
+            event.ime_relevance.is_ime_mode_key,
         ) {
             // explicit IME 操作直後のスキップのみデバッグログを残す
             // （KeyDown・TsfNative・idle の 3 条件を通過した上で explicit_age だけが残っている場合）
@@ -404,7 +449,7 @@ impl Runtime {
                     || is_first_key_after_focus)
                 && explicit_age < crate::tuning::EXPLICIT_IME_SUPPRESS_MS
             {
-                log::debug!(
+                tracing::debug!(
                     "[idle-conv-check] TsfNative: explicit IME action {}ms ago → スキップ (suppress={}ms)",
                     explicit_age,
                     crate::tuning::EXPLICIT_IME_SUPPRESS_MS,
@@ -443,12 +488,12 @@ impl Runtime {
             if let Some(since) = self.platform_state.gate.idle_conv_check_in_flight_since_ms {
                 let elapsed = now_ms_for_gate.saturating_sub(since);
                 if elapsed < crate::state::platform_state::IDLE_CONV_CHECK_IN_FLIGHT_STALE_MS {
-                    log::debug!(
+                    tracing::debug!(
                         "[idle-conv-check] 前回の conv 読み取りが in-flight のためスキップ"
                     );
                     return false;
                 }
-                log::warn!(
+                tracing::warn!(
                     "[idle-conv-check] 前回の in-flight が {elapsed}ms 未解放 → 放棄されたとみなし再武装"
                 );
             }
@@ -469,9 +514,47 @@ impl Runtime {
         // 一本化する（旧 output_in_flight_ms ベースの last_send 比較は
         // apply_idle_conv_check 側で撤去、下記 doc 参照）。
         let conv_mutation_seq_at_spawn = crate::conv_mutation::current();
+        // ADR-140 Step1 決定A/C: probe/actuation フェンスの spawn 時スナップショット。
+        // `get_ime_conversion_mode_fenced_async` がこの値と issue 直前
+        // （メイン/ワーカー両スレッド）で再比較し、spawn 以降に GJI actuation が
+        // 発行されていれば OS 呼び出し自体を発行せず Abandoned を返す。
+        let probe_actuation_fence_at_spawn = crate::probe_actuation_fence::current();
+        // ADR-140 Step1 決定I / 実装レビュー指摘M1: abandon 率の分母として、
+        // probe を実際に spawn した回数を記録する（resync/通常を分けて数える
+        // のは record_abandoned と同じ理由、probe_actuation_fence module doc 参照）。
+        crate::probe_actuation_fence::record_spawned(resync_generation);
         win32_async::spawn_local(async move {
-            let conv = crate::ime::get_ime_conversion_mode_raw_timeout_async(10).await;
+            let outcome = crate::ime::get_ime_conversion_mode_fenced_async(
+                10,
+                probe_actuation_fence_at_spawn,
+            )
+            .await;
+            // 実装レビュー指摘m1: with_app は再入時に None を返しうる
+            // （下記 spawn_local body 冒頭のコメント参照）。abandon カウンタは
+            // app 状態に依存しないので、with_app の外・outcome が確定した直後に
+            // 記録することで、再入による取りこぼしを避ける。
+            if matches!(
+                outcome,
+                crate::probe_actuation_fence::FencedProbeOutcome::Abandoned
+            ) {
+                crate::probe_actuation_fence::record_abandoned(resync_generation);
+            }
             let _ = crate::with_app(|app| {
+                let conv = match outcome {
+                    // ADR-140 Step1 決定E/F: フェンス不一致で abandon した場合は
+                    // 純粋な読み取り失敗（FencedProbeOutcome::Read(None)）とは区別し、
+                    // resync 経路では gate を閉じない（ハード期限タイマーに引き取らせる
+                    // ——`kp_trigger_focus_resync` が spawn 時点で同期的に武装済みの
+                    // deadline が必ず拾う、`close_focus_resync_gate_if_current` を
+                    // 呼ばないだけで安全）。通常経路では in-flight フラグだけ解放する。
+                    crate::probe_actuation_fence::FencedProbeOutcome::Abandoned => {
+                        if resync_generation.is_none() {
+                            app.platform_state.gate.idle_conv_check_in_flight_since_ms = None;
+                        }
+                        return;
+                    }
+                    crate::probe_actuation_fence::FencedProbeOutcome::Read(conv) => conv,
+                };
                 if resync_generation.is_none() {
                     app.platform_state.gate.idle_conv_check_in_flight_since_ms = None;
                 }
@@ -496,6 +579,7 @@ impl Runtime {
                         app.apply_idle_conv_check(
                             conv,
                             conv_mutation_seq_at_spawn,
+                            probe_actuation_fence_at_spawn,
                             explicit_action_ms_at_spawn,
                             accepted.fence,
                         );
@@ -540,23 +624,25 @@ impl Runtime {
     ///
     /// 読み取りが in-flight の間（旧同期コードでは起こり得なかった隙間）に、
     /// awase 自身が (a) shift ガードを立てる、(b) explicit IME 操作を記録する、
-    /// (c) conv ワードを変えうる書き込みを送る、のいずれかを行っていたら、
+    /// (c) conv ワードを変えうる書き込みを送る、(d) GJI actuation の issue と
+    /// 交錯する（ADR-140 Step1 決定D チェックポイント3）のいずれかを行っていたら、
     /// 読み取った `conv` は awase 自身の遷移途中を拾った汚染値の可能性がある。
     /// spawn 時のスナップショット（`conv_mutation_seq_at_spawn` /
-    /// `explicit_action_ms_at_spawn`）と apply 時点を突き合わせて、これらが
-    /// 起きていないことを再確認してから適用する。
+    /// `probe_actuation_fence_at_spawn` / `explicit_action_ms_at_spawn`）と apply
+    /// 時点を突き合わせて、これらが起きていないことを再確認してから適用する。
     fn apply_idle_conv_check(
         &mut self,
         conv: u32,
         conv_mutation_seq_at_spawn: u64,
+        probe_actuation_fence_at_spawn: u64,
         explicit_action_ms_at_spawn: u64,
         spawn_fence: crate::state::probe_admission::FocusFence,
     ) {
         // (a) shift ガード再検証: spawn 後に kp_stage_shift_conv_guard が立てた可能性がある。
-        if self.platform_state.gate.shift_conv_guard_pending
-            || self.platform_state.gate.half_width_alnum_toggle_active
+        if self.platform_state.gate.half_width_alnum.is_guard_pending()
+            || self.platform_state.gate.half_width_alnum.is_toggle_active()
         {
-            log::debug!(
+            tracing::debug!(
                 "[idle-conv-check] apply 時に shift ガードが有効 → 読み取り結果 conv=0x{conv:08X} を破棄"
             );
             return;
@@ -577,7 +663,7 @@ impl Runtime {
         // 関わらず「spawn〜apply の間に明示操作があった」事実だけで確実に棄却できる。
         if self.platform_state.ime.last_explicit_ime_action_ms_raw() != explicit_action_ms_at_spawn
         {
-            log::debug!(
+            tracing::debug!(
                 "[idle-conv-check] apply 時に spawn 後の explicit IME action を検出 → \
                  読み取り結果 conv=0x{conv:08X} を破棄 (spawn={explicit_action_ms_at_spawn}ms)"
             );
@@ -590,7 +676,7 @@ impl Runtime {
         // パターンであり、この suppress window 判定はそれとは別軸）。
         let explicit_age = self.platform_state.ime.explicit_ime_action_age_ms(now_tick);
         if explicit_age < crate::tuning::EXPLICIT_IME_SUPPRESS_MS {
-            log::debug!(
+            tracing::debug!(
                 "[idle-conv-check] apply 時に explicit IME action {explicit_age}ms 前 → \
                  読み取り結果 conv=0x{conv:08X} を破棄 (suppress={}ms)",
                 crate::tuning::EXPLICIT_IME_SUPPRESS_MS,
@@ -613,9 +699,35 @@ impl Runtime {
         // conv ワードを変えうる VK でのみ増分）のビット一致に置き換える。
         let conv_mutation_seq_now = crate::conv_mutation::current();
         if conv_mutation_seq_now != conv_mutation_seq_at_spawn {
-            log::debug!(
+            tracing::debug!(
                 "[idle-conv-check] apply 時に自己出力(conv変異)を検出 \
                  (conv_mutation_seq {conv_mutation_seq_at_spawn}→{conv_mutation_seq_now}) → \
+                 読み取り結果 conv=0x{conv:08X} を破棄"
+            );
+            return;
+        }
+
+        // (d) ADR-140 Step1 決定D チェックポイント3(apply): probe issue(main)/issue(worker)
+        // の2チェックポイント（`crate::ime::get_ime_conversion_mode_fenced_async`）は
+        // いずれも「issue する前」の
+        // 検査であり、issue 後〜結果が返るまでの間（`SendMessageTimeoutW` 自体の
+        // 所要時間中）に発行された actuation は捕捉できない。上の conv_mutation_seq
+        // チェックと同型の比較を probe/actuation フェンスでも行い、この窓を塞ぐ。
+        // ここに到達する時点で resync gate は既にクローズ済みのため（この関数は
+        // `close_focus_resync_gate_if_current` の後に呼ばれる）、issue(main)/(worker)
+        // のような「gate を閉じない」特別扱いはしない——読み取り結果を破棄するだけで
+        // 汚染された conv が belief に適用されるのを防ぐという目的は達成される。
+        // 実装レビュー指摘M3: この discard は abandon カウンタ（`record_abandoned`）
+        // には数えない——ここに到達する時点で体感遅延は既にゼロ（resync gate
+        // クローズ済み）であり、上の (a)(b)(c) discard も同様に数えていないのと
+        // 整合させる。カウントすると、決定Iが分けた「resync 経路の abandon は
+        // 体感遅延に直結する」という信号に、遅延ゼロの discard が混入し薄まる
+        // （`probe_actuation_fence` module doc 参照）。
+        let probe_actuation_fence_now = crate::probe_actuation_fence::current();
+        if probe_actuation_fence_now != probe_actuation_fence_at_spawn {
+            tracing::debug!(
+                "[idle-conv-check] apply 時に GJI actuation との交錯を検出 \
+                 (probe_actuation_fence {probe_actuation_fence_at_spawn}→{probe_actuation_fence_now}) → \
                  読み取り結果 conv=0x{conv:08X} を破棄"
             );
             return;
@@ -687,7 +799,7 @@ impl Runtime {
         // ここが key_pipeline 内で唯一の idle-conv-check InputModeObserved 構築点。
         match transition.input_mode_update {
             None => {
-                log::debug!(
+                tracing::debug!(
                     "[idle-conv-check] TsfNative: conv=0x{:08X}{} → belief {:?} 変更なし",
                     conv,
                     if is_cold && conv & crate::imm::IME_CMODE_ROMAN != 0 {
@@ -699,7 +811,7 @@ impl Runtime {
                 );
             }
             Some(new_mode) => {
-                log::info!(
+                tracing::info!(
                     "[idle-conv-check] TsfNative: conv=0x{conv:08X} → belief {current:?}→{new_mode:?}"
                 );
                 // source=ConvBitsInference: 実態は conv ビット（ImmGetConversionStatus 由来）
@@ -735,7 +847,7 @@ impl Runtime {
         now_tick: crate::state::TickMs,
     ) {
         use crate::state::conv_classify::EngineSync;
-        let target = match engine {
+        match engine {
             EngineSync::None => return,
             EngineSync::ReportOpenInference(reason) => {
                 // KatakanaShadowOff/NativeToggleShadowOff: engine を actuate せず
@@ -743,7 +855,7 @@ impl Runtime {
                 // 変更されないため、実際に補正が必要かは既存の drift correction
                 // 経路（check_drift_correction、BUG-20 で OFF 方向も修正済み）に
                 // 委ねる（2026-07-08 BUG-19 再発対策）。
-                log::info!(
+                tracing::info!(
                     "[idle-conv-check] TsfNative: conv observation open=true reason={reason:?} \
                      (conv=0x{conv:08X}) → ObserverReported として記録 (engine は actuate しない)"
                 );
@@ -763,55 +875,18 @@ impl Runtime {
                 return;
             }
             EngineSync::SetOpen(reason) => {
-                log::info!(
+                tracing::info!(
                     "[idle-conv-check] TsfNative: engine ON 同期 (conv=0x{conv:08X}, reason={reason:?})"
                 );
-                true
             }
-            EngineSync::DirectInput => {
-                log::info!("[idle-conv-check] TsfNative: ObservedEisu 検出 → DirectInput (conv=0x{conv:08X})");
-                false
-            }
-        };
-        self.platform.timer.kill(TIMER_IME_REFRESH);
-        let generation = self.platform_state.ime.allocate_event_generation();
-        if matches!(engine, EngineSync::DirectInput) {
-            // DirectInput: desired_open=false の belief 書き込みが
-            // is_eligible_for_ime_force_on() 経由で force-ON 3経路（ADR-086
-            // conv_mode_policy=force 実機ソーク中の経路含む）・
-            // last_user_explicit_off_ms・from_explicit_off_intent を支えている
-            // load-bearing な書き込みのため、従来どおり handle_engine_set_open を使う
-            // （BUG-51 追補 v3 pre-mortem #2、「なぜ DirectInput を変えないか」）。
+        }
+        // conv 観測は明示操作ではなく、書き込みと対の副作用（TIMER_IME_REFRESH の kill・
+        // 世代・`ImeApplyRequested`・抑制窓）は C2 では何も守らず害があったため持たない
+        // （ADR-213 P2d-1）。残すのは PanicReset ガードの解除だけ。
+        if crate::state::conv_classify::should_release_panic_guard(engine) {
             self.platform_state
                 .ime
-                .handle_engine_set_open(target, false, false, generation, now_tick);
-            // conv の英数モード観測は IME-ON の確証。direct belief で already_matched を
-            // バイパスして apply する。
-            let belief = crate::output::OpenBelief {
-                effective_open: true,
-                confident: true,
-            };
-            // ADR-090 §2.A A-1（shadow）。
-            let order = self.issue_actuation_order(false, "idle_conv_check_direct_input");
-            let outcome = self
-                .platform
-                .apply_ime_open_with_belief(order, None, belief);
-            self.on_ime_apply_complete(
-                false,
-                outcome,
-                None,
-                crate::state::ime_event::OpenApplyReason::DriftCorrection,
-            );
-        } else {
-            // SetOpen(RomajiRecovered): conv 観測からの自動同期であり、ユーザーの
-            // 明示操作ではない。発火条件が effective_open==true を要求するため
-            // desired_open へ書くと desired_open := effective_open という循環 echo
-            // （ime_model.rs の EngineActivationSync arm が明文で禁じるパターン）に
-            // なる。BUG-48 の ActivationSync 経路（last_intent/desired_open/
-            // IntentStore を書かず actuation は同一）を使う（BUG-51 追補 v3）。
-            self.platform_state
-                .ime
-                .handle_engine_activation_sync(target, false, false, generation, now_tick);
+                .release_panic_reset_guard_on_positive_evidence();
         }
     }
 
@@ -822,7 +897,11 @@ impl Runtime {
     // shadow IME belief トグルは分岐が本質的に多い。分割は挙動変更リスクが高いため
     // 複雑度警告のみ抑制する。
     #[expect(clippy::cognitive_complexity)]
-    fn kp_stage_shadow_ime_toggle(&mut self, event: &RawKeyEvent) -> bool {
+    fn kp_stage_shadow_ime_toggle(
+        &mut self,
+        event: &RawKeyEvent,
+        engine_owns_open_key: bool,
+    ) -> bool {
         if !matches!(event.event_type, KeyEventType::KeyDown) {
             return false;
         }
@@ -868,7 +947,7 @@ impl Runtime {
             if event.ime_relevance.sync_direction.is_some()
                 || event.ime_relevance.shadow_action.is_some()
             {
-                log::info!(
+                tracing::info!(
                     "[shadow-toggle] injected IME キー vk=0x{:02X} はユーザー意図に昇格させない \
                      (BUG-14) — belief 追従は may_change_ime refresh 観測に委譲",
                     event.vk_code,
@@ -876,35 +955,52 @@ impl Runtime {
             }
             return false;
         }
-        // 同期キー (config sync_direction) > 物理 KANJI (Japanese 限定) の順で意図を採用する。
-        let intent_kind = if let Some(a) = event.ime_relevance.sync_direction {
-            Some((a, IntentKind::SyncKey))
-        } else if self.platform_state.ime.belief.is_japanese_ime() {
-            event
-                .ime_relevance
-                .shadow_action
-                .map(|a| (a, IntentKind::PhysicalImeKey))
-        } else {
-            None
-        };
+        // /code-review指摘: 直後の`current`と同じ`effective_open()`を2回
+        // 呼んでいた（間に belief を書き換える処理は無い）ため、1回にまとめる。
+        let current = self.platform_state.ime.effective_open();
+        // 同期キー (config sync_direction) > 物理 KANJI 等 (GJI/MS-IME 自動検出由来のshadow_action、
+        // 非リピートなら `is_japanese_ime` は問わない。0x19 は TIP 同定済みのときだけ) の順で意図を採用する。
+        // 無変換/変換単独タップの開閉（bare `keys.ime_*`／IME 設定由来の役割）はここを通らず、
+        // エンジンの特殊キー照合・FSM の単独タップ解決が担う（ADR-206）。
+        // 昇格する意図の選択（同期キー > 0x16/0x1A > 日本語 IME のときの shadow_action）は、ADR-208 L0 で
+        // `state/explicit_press.rs::select_shadow_intent`（ungated）へ挙動を変えずに切り出した
+        // （`explicit_press_delivery_with` の全列挙テストが同じ判断を Linux で呼ぶため）。
+        // L2（ADR-208 D2）: 非リピートの押下は `is_japanese_ime` が偽でも昇格する（0x19 等が固着しないように）。
+        let intent_kind = crate::state::explicit_press::select_shadow_intent(
+            event,
+            self.platform_state.ime.belief.is_japanese_ime(),
+            // 0x19 は TIP 同定済み（GJI、または CLSID で同定できた MS-IME 本体）のときだけ昇格する（ADR-208 D2）。
+            crate::tsf::observer::tsf_obs().table_ime_kind().is_some(),
+        );
         let Some((action, kind)) = intent_kind else {
             return false;
         };
-
-        let current = self.platform_state.ime.effective_open();
-        let new_val = match action {
-            ShadowImeAction::Toggle => !current,
-            ShadowImeAction::TurnOn => true,
-            ShadowImeAction::TurnOff => false,
-        };
+        // Engine が同じ打鍵の開閉を担う（`engine_owns_open_key`）なら、shadow は belief も書き込みも触らない。
+        // belief・意図・eisu 救済は Engine の `SetOpen`（`kp_stage_post_decision`）が担う。物理は Engine の Consume が握る。
+        if engine_owns_open_key {
+            tracing::info!(
+                "[shadow-toggle] vk=0x{:02X} は Engine が同じ打鍵の SetOpen を出す（keys.ime_* 等）→ shadow は昇格・書き込みしない（ADR-208 D1）",
+                event.vk_code
+            );
+            return false;
+        }
+        let new_val = action.resolve(current);
         let tick_ms = crate::state::TickMs(hook::current_tick_ms());
         // 診断ログ (2026-08-05 "IME OFF 後 FocusChange 無しで Engine が勝手に ON へ
         // 戻る" 再発報告の切り分け用): このステージが last_intent を書き換える唯一
         // 経路の一つでありながら、従来ここには INFO ログが一切無く、実機ログだけでは
         // どの VK がこの昇格を発火させたか判別できなかった。挙動は変更しない。
-        log::info!(
+        // 2026-09-07 実験追加: awase が actuate しない委譲シナリオ
+        // （半角/全角キー等、この関数は belief 追随のみ行いactuationは
+        // しない）で、GJI 自身がこの物理キーに反応したかを事後に
+        // gji_write_ops/gji_other_ops のバックグラウンドポーリング
+        // （`[gji-io]`、tsf/gji_monitor.rs）と突き合わせて検証できる
+        // よう、判断時点の累積値をベースラインとして残す（診断専用、
+        // 判定ロジックには使わない。project_adr151_force_on_rescue_
+        // observation_experiment_2026_09_07 参照）。
+        tracing::info!(
             "[shadow-toggle] intent 昇格: vk=0x{:02X} scan=0x{:02X} action={:?} \
-             kind={:?} injected={} {}→{}",
+             kind={:?} injected={} {}→{} w_ops0={} x_ops0={} x_KB0={:.1}",
             event.vk_code,
             event.scan_code,
             action,
@@ -912,6 +1008,9 @@ impl Runtime {
             event.injected,
             current,
             new_val,
+            crate::tsf::observer::gji_write_ops(),
+            crate::tsf::observer::gji_other_ops(),
+            crate::tsf::observer::gji_other_bytes() as f64 / 1024.0,
         );
         // witness は「注入されていない実キーイベント」の存在証明（BUG-14 の
         // 型化、ADR-089 §2.2）。上の `event.injected` 早期 return と同じ条件を
@@ -940,7 +1039,7 @@ impl Runtime {
             // 実 OS IME が別経路 (物理キー直結等) で乖離していても訂正されない。
             // hook.rs の [hook] IME-mode ログと突き合わせ、直前に対応する KeyDown
             // (vk=0xF0 等) が self_injected=false で到達していたか確認すること。
-            log::debug!(
+            tracing::debug!(
                 "[shadow-toggle] no-op: vk=0x{:02X} action={:?} source={:?} \
                  effective_open は既に {} → apply-ime 見送り",
                 event.vk_code,
@@ -955,6 +1054,13 @@ impl Runtime {
             // ここで同様の stale ObservedEisu 救済を別途行う（2026-07-09 MS Edge/MS-IME
             // で実発生: IME open のまま conv だけ Eisu に固着すると、ひらがなキーを
             // 押しても復帰できなかった）。
+            //
+            // ADR-203 (ii): belief が既に ON でも、ON 系キー（OFF を見逃した後の ON 等）では GjiFsm を開き直す。
+            if matches!(action, ShadowImeAction::TurnOn) {
+                self.kp_reopen_gji_fsm(
+                    crate::state::gji_direct_mechanism::ReopenSource::ShadowNoop,
+                );
+            }
             if let Some(new_mode) = crate::state::eisu_recovery::eisu_reset_on_turn_on_while_open(
                 matches!(action, ShadowImeAction::TurnOn),
                 self.platform_state.ime.input_mode(),
@@ -963,8 +1069,10 @@ impl Runtime {
                 // スキップしてトグルOFF処理そのものを呼ぶ。実convとbeliefの整合を保つ
                 // ため（2026-07-11 codexレビュー: 単に書き戻すとbeliefだけromaji-capable
                 // に戻り実convは半角英数のままの壊れた中間状態になる）。
-                if self.platform_state.gate.half_width_alnum_toggle_active {
-                    log::info!("[shadow-toggle] TurnOn（半角英数トグルON中）→ トグルOFF処理へ委譲");
+                if self.platform_state.gate.half_width_alnum.is_toggle_active() {
+                    tracing::info!(
+                        "[shadow-toggle] TurnOn（半角英数トグルON中）→ トグルOFF処理へ委譲"
+                    );
                     self.kp_restore_kana_from_half_width(false);
                 } else {
                     self.apply_input_mode_correction(
@@ -972,15 +1080,22 @@ impl Runtime {
                         crate::state::ime_event::InputModeApplyStrategy::UserTurnOnEisuReset,
                         tick_ms,
                     );
-                    log::info!(
+                    tracing::info!(
                         "[shadow-toggle] TurnOn (IME既にopen) + ObservedEisu → AssumedRomaji に \
                          リセット (UserTurnOnEisuReset)"
                     );
                 }
             }
-            return false;
+            // ADR-208 D4（L3a）: belief が既に向きと一致していても、この押下の物理キーが Suppress される窓では
+            // 実 IME へ誰も応答しない（外から実 IME が変わった・読み取りが嘘のとき固着する、S-3）。
+            return self.kp_shadow_noop_write(event, new_val, tick_ms);
         }
         self.platform_state.ime.on_ime_toggled();
+        // ADR-203 (ii): OFF→ON に倒した瞬間は GjiFsm を開き直す（ON 方向のみ。向きは belief 次第で
+        // Imm32Unavailable では逆になりうるため OFF は同期しない）。
+        if self.platform_state.ime.effective_open() {
+            self.kp_reopen_gji_fsm(crate::state::gji_direct_mechanism::ReopenSource::ShadowToggle);
+        }
 
         // OFF→ON の場合、stale な ObservedEisu を先回りで訂正する。
         // ObservedEisu は engine activation を NotRomajiInput で塞ぎ、activation 側の
@@ -989,14 +1104,25 @@ impl Runtime {
         // engine が永久に inactive のままになる（2026-07-06 MS Edge で実発生）。
         // ユーザーが明示的に IME を ON にした時点で IME はひらがなモードで再開する
         // ため、過去の英数観測は stale（eisu guard の保護対象と衝突しない）。
+        //
+        // ただし GJI は閉→開で変換モードを保持する（`docs/adr/191-gji-state-scope-spec.md`、BUG-159）。
+        // 追跡中の変換モードが英数と既知なら、ひらがなに直さず保持した英数のままにする
+        // （`gji_retains_tracked_eisu`。MS-IME 本体は 0x19 へ戻るので従来どおりリセット）。
+        let mode_retained = crate::state::eisu_recovery::gji_retains_tracked_eisu(
+            crate::state::ime_kind::ImeKindId::from(
+                crate::tsf::observer::tsf_obs().active_ime_kind(),
+            ),
+            self.platform_state.ime.model().key_track().conv,
+        );
         if let Some(new_mode) = crate::state::eisu_recovery::eisu_reset_on_ime_on(
             !current && self.platform_state.ime.effective_open(),
             self.platform_state.ime.input_mode(),
+            mode_retained,
         ) {
             // 半角英数持続トグルON中は、通常のObservedEisu→AssumedRomaji書き戻しを
             // スキップしてトグルOFF処理そのものを呼ぶ（E節の理由は上の分岐と同じ）。
-            if self.platform_state.gate.half_width_alnum_toggle_active {
-                log::info!("[shadow-toggle] IME ON（半角英数トグルON中）→ トグルOFF処理へ委譲");
+            if self.platform_state.gate.half_width_alnum.is_toggle_active() {
+                tracing::info!("[shadow-toggle] IME ON（半角英数トグルON中）→ トグルOFF処理へ委譲");
                 self.kp_restore_kana_from_half_width(false);
             } else {
                 self.apply_input_mode_correction(
@@ -1004,7 +1130,7 @@ impl Runtime {
                     crate::state::ime_event::InputModeApplyStrategy::UserImeOnEisuReset,
                     tick_ms,
                 );
-                log::info!(
+                tracing::info!(
                     "[shadow-toggle] IME ON + ObservedEisu → AssumedRomaji にリセット \
                      (UserImeOnEisuReset, engine 即活性化)"
                 );
@@ -1012,70 +1138,32 @@ impl Runtime {
         }
 
         // ON→OFF の場合、OS IME を明示的に OFF にする。
-        // activation (inactive→active) が ImeEffect::SetOpen(true) を生成して OS IME を
-        // 強制 ON するのと対称な処理。deactivation は SetOpen(false) を生成しないため、
-        // TSF モード (WezTerm 等) では物理キー reinject だけでは OS IME が OFF にならない。
+        // 【2026-09-17 訂正、ADR-179（旧178） round4/round8】旧コメントは「deactivation は
+        // SetOpen(false) を生成しないため、このブロックが必要」としていたが誤り。
+        // `Engine::transition_activation` は（当時）active→inactive 遷移でも自動で
+        // `SetOpen(false)` を発行していた。ADR-213 P2b/P2c で観測・RefreshState 由来の遷移は
+        // SetOpen を出さなくなり、この書き込みが shadow toggle の唯一の実書き込みになった。
+        // このブロックが必要な本当の理由は、TSF モード (WezTerm 等) では物理キー
+        // reinject だけでは OS IME が OFF にならない（IME 自身がこの物理キーに
+        // 反応して状態を変えるとは限らない）ため、awase 自身が明示的に actuate する
+        // 経路を用意する必要がある、という点にある。
         //
-        // Imm32Unavailable (Chrome/Edge) では VK_KANJI が唯一の IME クローズ手段であり、
-        // KanjiToggleStrategy が shadow_on (latch) を見て送信するかを決める。
-        // ここでは latch が true のうちに strategy chain を起動することで VK_KANJI が
-        // 確実に送られる。
+        // Imm32Unavailable (Chrome/Edge) では読み戻しができないため、latch が true の
+        // うちに strategy chain を起動して、冪等な直接キー送信へつなぐ。
         //
         // IMM クロスプロセス対応アプリ (WezTerm 等の TSF mode) は SendMessageTimeoutW を
         // 含む sync `set_ime_open_cross_process` がフック内で `with_app` 再入を引き起こす
         // ため、async に spawn_local + OutputActiveGuard で dispatch する。
-        // それ以外 (GjiDirect / KanjiToggle) は SendInput-only で非ブロッキングなので sync。
-        if !self.platform_state.ime.effective_open() {
-            let view = self.shadow_ime_control_view();
-            let imm_first =
-                crate::ime_controller::ImeController::imm_cross_is_first_applicable(&view);
-            if imm_first {
-                // async 完了前から ImeModel を OFF に確定させる（ADR-098 決定5/6-a:
-                // 旧コメント「楽観的 C」は実体（Confirmed）と食い違っていたため訂正。
-                // 直前の `!effective_open()` 確認 + 直後の実 ImmCross apply を伴う
-                // ため、belief laundering ではなく正当な pre-actuation write）。
-                self.platform_state.ime.record_confirmed(false, tick_ms.0);
-                // ADR-090 §2.A A-1（shadow）: 起案は spawn_local の**外**で行う
-                // ——future の中では `with_app` 再入で `ImeStateHub` に届かない
-                // （ADR-090 §4.2）。
-                let order = self.issue_actuation_order(false, "shadow_toggle_off");
-                let guard = crate::tsf::probe_bridge::OutputActiveGuard::begin();
-                win32_async::spawn_local(async move {
-                    // ADR-089 §2.3 Phase B: ImmCross を機構チェーンの**要素**と
-                    // して実行する。`Failed` のときのフォールスルー（旧
-                    // `apply_skipping_imm`）は `run_chain_async` が行う。
-                    // 宛先の捕獲（ADR-086 INV-14）はこの経路では未移行のため
-                    // `Untargeted` のまま（Phase C）。
-                    let outcome = crate::runtime::open_chain::run_open_chain_async(
-                        order,
-                        crate::runtime::open_chain::ImmCrossOp::Untargeted,
-                    )
-                    .await;
-                    // B+C(ts更新)+D(noop)+E
-                    let _ = crate::with_app(|app| {
-                        app.on_ime_apply_complete(
-                            false,
-                            outcome,
-                            None,
-                            crate::state::ime_event::OpenApplyReason::ShadowToggle,
-                        );
-                    });
-                    drop(guard);
-                });
-            } else {
-                let order = self.issue_actuation_order(false, "shadow_toggle_off_sync");
-                let outcome = crate::ime_controller::ImeController::apply(order, &view);
-                // B+C+D(noop)+E
-                self.on_ime_apply_complete(
-                    false,
-                    outcome,
-                    None,
-                    crate::state::ime_event::OpenApplyReason::ShadowToggle,
-                );
-            }
-            log::debug!("[shadow-toggle] ON→OFF: apply_ime_open(false) dispatched + applied=false");
-        }
-        log::debug!(
+        // それ以外 (GjiDirect / MsImeDirect) は SendInput-only で非ブロッキングなので sync。
+        //
+        // ADR-213 決定1: ON/OFF とも明示 actuation（`current` と `effective_open()` は
+        // 冒頭の no-op 判定で必ず食い違っている）。
+        self.kp_shadow_actuate(
+            self.platform_state.ime.effective_open(),
+            event.press_id,
+            tick_ms,
+        );
+        tracing::debug!(
             "Shadow IME toggle: {} → {} (vk=0x{:02X}, source={:?})",
             if current { "ON" } else { "OFF" },
             if self.platform_state.ime.effective_open() {
@@ -1089,17 +1177,231 @@ impl Runtime {
         true
     }
 
-    /// Engine 判断後の後処理（IME 制御キー検出 + may_change_ime パススルー）
+    /// shadow toggle の no-op 分岐（belief が既に押下の向き〈キーの意味 `key_target`〉と一致）の書き込み（ADR-208 決定2 D4・L3a、S-3）。
     ///
-    /// `focus_transition_was_pending`: この event 処理開始時点で FocusTransition
-    /// barrier が settle 期間内だったか（`kp_run_inner` でのスナップショット）。
-    fn kp_stage_post_decision(
+    /// `plan` と shadow 判断の循環は**固定点**で解く: `plan(shadow_toggled=false)` を先に評価し、Suppress なら書いて
+    /// `true`（後段の本物の `plan(true)` が評価される）を返す。Allow（物理が IME に届く窓）なら書かない（INV-L1 の
+    /// 「ちょうど一方」。BUG-113 の二重送信を作らない）。リピート（`press_id=None`）と TsfNative（BUG-124 の実機 A/B 〈L3'〉まで
+    /// 段階制御、`shadow_noop_write_target`）は従来どおり書かない。同じ押下で Engine が出すキーは呼び出し前に除外済み
+    /// （`engine_owns_open_key`）で、他の経路の予約とは `kp_shadow_actuate` の `claim_press_write` で重ならない。
+    fn kp_shadow_noop_write(
         &mut self,
-        decision: &awase::engine::Decision,
         event: &RawKeyEvent,
-        focus_transition_was_pending: bool,
+        key_target: bool,
+        tick_ms: crate::state::TickMs,
+    ) -> bool {
+        let profile = self.platform.current_app_profile();
+        let plan0 = crate::runtime::PhysicalKeyDisposition::plan(
+            event,
+            profile,
+            false,
+            crate::tsf::observer::tsf_obs().active_ime_kind(),
+        );
+        let effectively_tsf_native =
+            profile.is_effectively_tsf_native(self.platform.focus.class_name());
+        // 書く向きはキーの意味（belief ではない）。PanicReset ガード等で belief が動かず `current != key_target` の
+        // まま no-op に入っても、逆向きを書かない（M-1）。
+        let Some(open) = crate::state::explicit_press::shadow_noop_write_target(
+            event.press_id.is_some(),
+            effectively_tsf_native,
+            plan0 == crate::runtime::PhysicalKeyDisposition::Suppress,
+            key_target,
+        ) else {
+            return false;
+        };
+        tracing::info!(
+            "[shadow-toggle] no-op だが物理キーは Suppress される窓 → 書く（ADR-208 D4）vk=0x{:02X} open={open}",
+            event.vk_code
+        );
+        self.kp_shadow_actuate(open, event.press_id, tick_ms);
+        true
+    }
+
+    /// shadow toggle が belief を `open` に倒した直後の、OS IME への明示 actuation
+    /// （ADR-213 決定1。ON→OFF・OFF→ON を1本にまとめる）。
+    ///
+    /// 物理キーは `shadow_toggled` で Suppress されるため、ここで書かないと実 IME は
+    /// 開閉しない。`Decision` の effect を経由しないので C3（`strip_ime_set_open_if_settling`）
+    /// には落とされない（settle 中でもユーザーのキーへの応答として書く）。
+    ///
+    /// - `applied` が直前の belief と食い違う（`Some(open)`。この関数は belief が `!open` から
+    ///   `open` に倒れたとき、または no-op 分岐から呼ばれる〈L3a の `kp_shadow_noop_write`、belief==`open`〉）なら、view の `shadow_on` を未知（`None`）として渡す
+    ///   （GjiDirect の already-matched 省略で、Suppress された物理キーの応答が消えるのを防ぐ。M1）。
+    /// - 書き込みで `note_explicit_ime_action` を呼ぶ（idle-conv-check の抑制窓。M4）。
+    /// - ImmCross が先頭の窓は async（`with_app` 再入回避）。ON は（撤去した）executor の ActivationSync と同じ
+    ///   `Targeted`+`decide_dispatch_conv_after_open`（ROMAN 補完と宛先 hwnd 捕獲）。
+    ///
+    /// IMM クロスプロセス対応アプリ (WezTerm 等の TSF mode) は SendMessageTimeoutW を含む sync
+    /// `set_ime_open_cross_process` がフック内で `with_app` 再入を引き起こすため async に
+    /// `spawn_local` + OutputActiveGuard で dispatch する。それ以外 (GjiDirect / MsImeDirect) は
+    /// SendInput-only で非ブロッキングなので sync。
+    fn kp_shadow_actuate(
+        &mut self,
+        open: bool,
+        press: Option<awase::types::PressId>,
+        tick_ms: crate::state::TickMs,
     ) {
-        if let Some((new_ime_on, origin)) = decision.find_ime_set_open_with_origin() {
+        use crate::state::ime_actuation_decision::DecisionSite;
+        // ADR-208 D1: この押下で既に同じ向きを書いた（reinject・drain replay・Ctrl 救済の 50ms 保留の再処理で
+        // 同じ `RawKeyEvent` が再び来た場合）なら書かない。order の発行直前に予約する（ImmCross の async は
+        // 完了が後から届くため、完了時の記録では二重送信を防げない）。`press=None`（自動リピート）は従来どおり書く判断に回す。
+        let claim = self.platform_state.ime.claim_press_write(
+            press,
+            open,
+            crate::state::press_ledger::PressSource::Shadow,
+        );
+        if !claim.writes() {
+            tracing::debug!(
+                "[shadow-toggle] 同じ押下で既に書いた/Engine が優先（{}）→ 書かない press={press:?} open={open}",
+                claim.label()
+            );
+            return;
+        }
+        self.platform_state.ime.note_explicit_ime_action(tick_ms);
+        // P2c で ActivationSync（打鍵前に予約した TIMER_IME_REFRESH を kill していた経路）を撤去したため、この書き込みの
+        // 直後に予約済みの refresh → drift correction が同じ向きを重ねうる（BUG-113 型。PR #408 Opus M-1 が strip 経路で
+        // 同じ kill を足していた）。書き込みの前に打鍵前の refresh 予約を kill する。完了後の refresh は
+        // `on_ime_apply_complete` が改めて予約する（書き込み後の観測で再評価）。
+        self.platform.timer.kill(TIMER_IME_REFRESH);
+        let caller = if open {
+            DecisionSite::ShadowToggleOn
+        } else {
+            DecisionSite::ShadowToggleOff
+        };
+        // D1: 押下の書き込みは `applied` が向きと一致していても省略の根拠にしない（`explicit_press_applied_pair`）。
+        // 以前は shadow 経路だけが無条件に降格していた（PR #408）。`press=None`（自動リピート）は従来の `applied` のまま。
+        let applied = crate::state::ime_actuation_decision::explicit_press_applied_pair(
+            self.platform_state
+                .ime
+                .model()
+                .applied_state()
+                .applied_open(),
+            open,
+            press.is_some(),
+        );
+        let mut view = self.platform.build_ime_control_view(applied);
+        view.belief_input_mode = self.platform_state.ime.input_mode();
+        let imm_first = crate::ime_controller::ImeController::imm_cross_is_first_applicable(&view);
+        if imm_first {
+            if !open {
+                // async 完了前から ImeModel を OFF に確定させる（ADR-098 決定5/6-a:
+                // 直前の `!effective_open()` 確認 + 直後の実 ImmCross apply を伴うため、
+                // belief laundering ではなく正当な pre-actuation write）。
+                self.platform_state.ime.record_confirmed(false, tick_ms.0);
+            }
+            // ADR-090 §2.A A-1（shadow）: 起案は spawn_local の**外**で行う
+            // ——future の中では `with_app` 再入で `ImeStateHub` に届かない（ADR-090 §4.2）。
+            let order = self
+                .issue_actuation_order(
+                    open,
+                    if open {
+                        "shadow_toggle_on"
+                    } else {
+                        "shadow_toggle_off"
+                    },
+                )
+                .with_press(press);
+            let focus_gen = self.platform.output.ime_mode_focus_gen.get();
+            let conv_after_open: crate::ime::ConvAfterOpen =
+                crate::state::ime_actuation_decision::decide_dispatch_conv_after_open(
+                    (&view).into(),
+                    open,
+                )
+                .into();
+            let guard = crate::tsf::probe_bridge::OutputActiveGuard::begin();
+            win32_async::spawn_local(async move {
+                let reason = crate::state::ime_event::OpenApplyReason::ShadowToggle;
+                // ON: 旧 ActivationSync と同じ Targeted（ROMAN 補完と宛先捕獲）。
+                // OFF: 宛先の捕獲（ADR-086 INV-14）は未移行のため `Untargeted`（Phase C）。
+                // `run_open_chain_async` の呼び出し箇所は1つに保つ（architecture_guard）。
+                let (op, site) = if open {
+                    let Some(target) = crate::ime::ActuationTarget::capture(focus_gen).await else {
+                        tracing::debug!(
+                            "[shadow-toggle] capture 失敗（フォーカス無し） → UnsafeToToggle"
+                        );
+                        crate::runtime::message_handlers::post_async_ime_apply_complete(
+                            open,
+                            awase::platform::ImeOpenOutcome::UnsafeToToggle,
+                            None,
+                            reason,
+                        );
+                        drop(guard);
+                        return;
+                    };
+                    (
+                        crate::runtime::open_chain::ImmCrossOp::Targeted {
+                            target,
+                            conv_after_open,
+                            focus_gen,
+                        },
+                        DecisionSite::DispatchImeSetOpen,
+                    )
+                } else {
+                    (
+                        crate::runtime::open_chain::ImmCrossOp::Untargeted,
+                        DecisionSite::RunOpenChainAsync,
+                    )
+                };
+                // ADR-089 §2.3 Phase B: ImmCross を機構チェーンの**要素**として実行する。
+                // ADR-163 Part D S-8対応: OFF の `site` は force-on bootstrap 経路と同値のため
+                // `caller` で区別する。
+                let outcome =
+                    crate::runtime::open_chain::run_open_chain_async(order, op, site, Some(caller))
+                        .await;
+                // 書き込み後に await 中にフォーカスが変わっていたら、完了を `UnsafeToToggle`
+                // （記録を動かさない）に落とす。generation の無い完了が新しい窓の applied を
+                // `Confirmed` にしてしまうのを防ぐ（PR #408 Opus M-3）。取得できない（再入）ときは一致扱い。
+                let outcome = if crate::with_app(|app| app.platform.output.ime_mode_focus_gen.get())
+                    .is_some_and(|g| g != focus_gen)
+                {
+                    awase::platform::ImeOpenOutcome::UnsafeToToggle
+                } else {
+                    outcome
+                };
+                // `with_app` を握らず WM 経由で `on_ime_apply_complete` へ（再入で黙って消えない）。
+                crate::runtime::message_handlers::post_async_ime_apply_complete(
+                    open, outcome, None, reason,
+                );
+                drop(guard);
+            });
+        } else {
+            let order = self
+                .issue_actuation_order(
+                    open,
+                    if open {
+                        "shadow_toggle_on_sync"
+                    } else {
+                        "shadow_toggle_off_sync"
+                    },
+                )
+                .with_press(press);
+            let (outcome, mut record) = crate::ime_controller::ImeController::apply(order, &view);
+            // 同期の書き込みが何も送らなかったなら予約を解く（同じ押下の Engine 経路が書ける。async は解けない）。
+            if crate::state::press_ledger::outcome_sent_nothing(outcome) {
+                self.platform_state.ime.release_press_write(press, open);
+            }
+            // `site` は `Sync` のまま（replay の chain 再導出を保つ）、呼び出し元は `caller` で識別する。
+            record.caller = Some(caller);
+            self.platform_state
+                .ime
+                .journal
+                .record(crate::journal::JournalEntry::ActuationDecision { record });
+            self.on_ime_apply_complete(
+                open,
+                outcome,
+                None,
+                crate::state::ime_event::OpenApplyReason::ShadowToggle,
+            );
+        }
+        tracing::debug!(
+            "[shadow-toggle] {}: explicit apply dispatched (imm_first={imm_first})",
+            if open { "OFF→ON" } else { "ON→OFF" },
+        );
+    }
+
+    /// Engine 判断後の後処理（IME 制御キー検出 + may_change_ime パススルー）
+    fn kp_stage_post_decision(&mut self, decision: &awase::engine::Decision, event: &RawKeyEvent) {
+        if let Some(new_ime_on) = decision.find_ime_set_open() {
             // IME-ON コンボ（既定: Ctrl+変換）は現在の IME 状態によらず SetOpen(true) を
             // 無条件で再発行する（`build_ime_set_open_decision` の「二重 enqueue 防止」
             // コメント参照）。このため handle_engine_set_open で belief を更新する前に
@@ -1108,80 +1410,53 @@ impl Runtime {
             // ローマ字入力 + CapsLock OFF へリセットする。既に OFF→ON の場合は従来通り
             // 単純に ON にするだけで良い）。
             let was_open_before = self.platform_state.ime.effective_open();
-            // 診断ログ用スナップショット (2026-08-05): handle_engine_set_open/
-            // handle_engine_activation_sync 呼び出し前の last_intent を控えておく。
-            // これらの呼び出しが last_intent を書き換えるため、後で「遷移直前は
+            // 診断ログ用スナップショット (2026-08-05): handle_engine_set_open 呼び出し前の
+            // last_intent を控えておく。この呼び出しが last_intent を書き換えるため、後で「遷移直前は
             // 本当に明示意図があったか」を確認するには呼び出し前に読む必要がある。
             let last_intent_before = self.platform_state.ime.explicit_intent();
             self.platform.timer.kill(TIMER_IME_REFRESH);
             let generation = self.platform_state.ime.allocate_event_generation();
             let tick_ms = crate::state::TickMs(hook::current_tick_ms());
-            // `origin` で belief 更新の経路を分ける（`SetOpenOrigin` の doc / 2026-08-04
-            // 「IME OFF・Engine ON」再発対策参照）。
-            // - ExplicitUserAction: IME/エンジン ON/OFF コンボ等、本物のユーザー操作。
-            //   `last_intent` を設定してよい（`handle_engine_set_open`）。
-            // - ActivationSync: `check_active_transition` が対称性のために自動発行した
-            //   echo（`ctx.ime_on` の観測駆動な変化だけでも起こりうる）。`last_intent` を
-            //   設定すると、この echo が「ユーザーの本物の意図」として固定化され、
-            //   以後の drift correction が効かなくなる（IME OFF 直後に Engine が勝手に
-            //   ON へ戻る再発の根本原因だった）。`handle_engine_activation_sync` で
-            //   `desired_open` のみ更新する。
-            let applied = match origin {
-                awase::engine::SetOpenOrigin::ExplicitUserAction => {
-                    let applied = self.platform_state.ime.handle_engine_set_open(
-                        new_ime_on,
-                        event.modifier_snapshot.ctrl,
-                        focus_transition_was_pending,
-                        generation,
-                        tick_ms,
-                    );
-                    if applied {
-                        // IntentStore（BUG-51 追補 v3）: IME/エンジン ON/OFF コンボ等、
-                        // 本物のユーザー操作であることが origin から確定している場合のみ
-                        // 記録する。`applied` ゲートは v1 の意味論（chord/focus-settle
-                        // フィルタで belief 書き込み自体がスキップされた場合は記録しない）を
-                        // そのまま保存する。記録を**この arm の中**に置くことで、
-                        // `ActivationSync`（conv 由来の対称 echo）が偽の明示意図を
-                        // 永続化する経路が構造的に存在しなくなる。
-                        self.platform_state.ime.record_explicit_intent(
-                            new_ime_on,
-                            crate::state::ime_event::UserIntentSource::Command,
-                            tick_ms,
-                        );
-                    }
-                    applied
-                }
-                awase::engine::SetOpenOrigin::ActivationSync => {
-                    self.platform_state.ime.handle_engine_activation_sync(
-                        new_ime_on,
-                        event.modifier_snapshot.ctrl,
-                        focus_transition_was_pending,
-                        generation,
-                        tick_ms,
-                    )
-                }
-            };
+            // Engine が発行する SetOpen は明示操作（IME/エンジン ON/OFF コンボ等）だけ
+            // （観測・RefreshState 由来の遷移は SetOpen を出さない。ADR-213 P2b/P2c）。
+            // よって `last_intent` を設定し、IntentStore に記録してよい。
+            let applied = self.platform_state.ime.handle_engine_set_open(
+                new_ime_on,
+                event.modifier_snapshot.ctrl,
+                generation,
+                tick_ms,
+            );
+            if applied {
+                // IntentStore（BUG-51 追補 v3）。`applied` ゲートは v1 の意味論（chord/focus-settle
+                // フィルタ（chord のみ）で belief 書き込み自体がスキップされた場合は記録しない）をそのまま保存する。
+                self.platform_state.ime.record_explicit_intent(
+                    new_ime_on,
+                    crate::state::ime_event::UserIntentSource::Command,
+                    tick_ms,
+                );
+            }
             // 2026-08-05: 実機再発報告（IME OFF 後 FocusChange 無しで Engine が勝手に
             // ON へ戻る）の切り分けのため debug → info に格上げし、遷移直前の
             // last_intent 内訳を追加した。この分岐は Engine の active/inactive が実際に
             // 遷移した時だけ通るため、毎 tick 出るログではない（低頻度）。
-            log::info!(
-                "IME control: preconditions.ime_on = {new_ime_on} (SetOpenRequest, origin={origin:?}), \
+            tracing::info!(
+                "IME control: preconditions.ime_on = {new_ime_on} (SetOpenRequest), \
                  was_open_before={was_open_before} last_intent_before={last_intent_before:?} \
                  poll suspended{}",
-                if applied { "" } else { " [chord barrier active → skipped]" }
+                if applied {
+                    ""
+                } else {
+                    " [chord barrier active → skipped]"
+                }
             );
 
             // IME-ON コンボの既定値 `Ctrl+変換`（Shift/Alt/Win 無し）と一致する場合のみ
             // ひらがな＋ローマ字＋CapsLock OFF へのリセットを行う。
             //
-            // 注意: `origin==ExplicitUserAction` は IME-ON コンボだけでなく
+            // 注意: Engine が出す SetOpen は IME-ON コンボだけでなく
             // `Ctrl+Shift+変換`（EngineOn コンボ、`apply_active_transition` 経由）等の
-            // 他の明示操作も含む（`SetOpenOrigin` の doc 参照）。ActivationSync の echo
-            // を弾くのは `origin` チェックの役目だが、EngineOn コンボ等の
-            // "ExplicitUserAction だが IME-ON コンボそのものではない" ケースを弾いて
-            // いるのは `is_default_ime_on_combo` の VK/modifier 判定（特に `!shift`）
-            // のほうであり、こちらは削除できない。`keys.ime_on` をカスタマイズした
+            // 他の明示操作も含む。それらを弾いているのは `is_default_ime_on_combo` の
+            // VK/modifier 判定（特に `!shift`）であり、削除できない。`keys.ime_on` をカスタマイズした
             // 場合はこの判定も合わせて更新すること。
             let is_default_ime_on_combo = event.vk_code == crate::vk::VK_CONVERT
                 && event.modifier_snapshot.ctrl
@@ -1200,11 +1475,7 @@ impl Runtime {
             // なら実質no-op）。BUG-50 の originally-undetermined だった発生原因は
             // 追補（2026-08-17）で BUG-52 の機構と特定・修正済みであり、この
             // 無条件化はその機構への対症療法ではなく、charset 軸撤去の帰結。
-            if applied
-                && matches!(origin, awase::engine::SetOpenOrigin::ExplicitUserAction)
-                && new_ime_on
-                && is_default_ime_on_combo
-            {
+            if applied && new_ime_on && is_default_ime_on_combo {
                 Self::kp_reset_to_hiragana_romaji_capsoff(
                     self.platform.output.ime_mode_focus_gen.get(),
                 );
@@ -1216,15 +1487,25 @@ impl Runtime {
             // AssumedRomaji にリセットして engine を即座に活性化する。
             // (1500ms 後の idle-conv-check で GJI 実状態を再確認・訂正する)
             // 判定は shadow toggle 経路 (UserImeOnEisuReset) と共通の純関数に集約。
+            // ただし GJI は閉→開で変換モードを保持する（BUG-159、shadow toggle 経路と同じ規則）。追跡中の変換モードが
+            // 英数と既知なら、ひらがなに直さず保持した英数のままにする（ADR-206 決定5: 無変換/変換の単独タップも
+            // この経路で開くようになり、`false` 固定だと awase だけ AssumedRomaji に戻ってリテラルの `ka` が出る）。
+            let mode_retained = crate::state::eisu_recovery::gji_retains_tracked_eisu(
+                crate::state::ime_kind::ImeKindId::from(
+                    crate::tsf::observer::tsf_obs().active_ime_kind(),
+                ),
+                self.platform_state.ime.model().key_track().conv,
+            );
             if let Some(new_mode) = crate::state::eisu_recovery::eisu_reset_on_ime_on(
                 applied && new_ime_on,
                 self.platform_state.ime.input_mode(),
+                mode_retained,
             ) {
                 // 半角英数持続トグルON中は、通常のObservedEisu→AssumedRomaji書き戻しを
                 // スキップしてトグルOFF処理そのものを呼ぶ（E節、shadow_ime_toggle側の
                 // 2箇所と同じ理由）。
-                if self.platform_state.gate.half_width_alnum_toggle_active {
-                    log::info!(
+                if self.platform_state.gate.half_width_alnum.is_toggle_active() {
+                    tracing::info!(
                         "[post-decision] SetOpen(true)（半角英数トグルON中）→ トグルOFF処理へ委譲"
                     );
                     self.kp_restore_kana_from_half_width(false);
@@ -1238,7 +1519,7 @@ impl Runtime {
                         crate::state::ime_event::InputModeApplyStrategy::PostSetOpenEisuReset,
                         tick_ms,
                     );
-                    log::info!(
+                    tracing::info!(
                         "[post-decision] SetOpen(true) + ObservedEisu → AssumedRomaji にリセット \
                          (engine 即活性化)"
                     );
@@ -1251,8 +1532,12 @@ impl Runtime {
             && matches!(event.event_type, KeyEventType::KeyDown)
         {
             self.schedule_ime_refresh(20);
-            log::debug!("may_change_ime key passed through → IME refresh scheduled (20ms)");
+            tracing::debug!("may_change_ime key passed through → IME refresh scheduled (20ms)");
+            self.kp_arm_external_change_watch(event);
         }
+
+        self.kp_stage_mode_key_follow(decision, event);
+        self.kp_stage_key_effect_track(decision, event);
 
         self.kp_stage_shift_conv_guard(event);
     }
@@ -1276,9 +1561,9 @@ impl Runtime {
         // メインスレッド（フックスレッド）から呼んでいる。
         if unsafe { crate::ime::is_caps_lock_on() } {
             unsafe { crate::ime::toggle_caps_lock() };
-            log::info!("[ime-on-combo] IME 既に ON → Caps Lock を OFF に");
+            tracing::info!("[ime-on-combo] IME 既に ON → Caps Lock を OFF に");
         }
-        log::info!(
+        tracing::info!(
             "[ime-on-combo] IME 既に ON → ひらがな＋ローマ字入力へリセット \
              (NATIVE|FULLSHAPE|ROMAN を立て KATAKANA を落とす)"
         );
@@ -1301,7 +1586,7 @@ impl Runtime {
         // 効いて挙動が変わってしまうため、今回は見送る。
         win32_async::spawn_local(async move {
             let Some(target) = crate::ime::ActuationTarget::capture(focus_gen).await else {
-                log::debug!("[ime-on-combo] capture 失敗（フォーカス無し） → リセット中止");
+                tracing::debug!("[ime-on-combo] capture 失敗（フォーカス無し） → リセット中止");
                 return;
             };
             let current = crate::ime::get_ime_conv_for_target(target, 50).await;
@@ -1316,11 +1601,211 @@ impl Runtime {
             })
             .await;
             if !matches!(outcome, crate::ime::ActuationOutcome::Written) {
-                log::warn!(
+                tracing::warn!(
                     "[ime-on-combo] ひらがな＋ローマ字リセットの conv write に失敗: {outcome:?}"
                 );
             }
         });
+    }
+
+    /// ADR-205（BUG-172）: 外部プロセスが注入した IME キー（awase 自身の注入は含まない）は、BUG-14 によりユーザー意図に
+    /// 昇格させない。読めない窓では実状態の追随が観測に委ねられるが、この直後の refresh は打鍵中扱いで届かないため、
+    /// 短い監視窓を開いて prefetch 済みの読みの変化を拾う。
+    fn kp_arm_external_change_watch(&mut self, event: &RawKeyEvent) {
+        if event.injected && self.external_change_watch_applies() {
+            self.platform_state
+                .ime
+                .arm_external_change_watch(hook::current_tick_ms());
+        }
+    }
+
+    /// ADR-187 follow（ADR-191で全IMEモードキーへ一般化）: Engine OFF のとき、モードキーは FSM を通らず `PassThrough` 判定でそのまま OS へ渡る。
+    /// FSM 経由の送出（`executor::dispatch_effect` の `SendKeys`）と同じく、通過マークを立てて 20ms 後に
+    /// IME を読み直す（古い明示意図は観測の直後に捨てる、`ir_stage_observe`）。awase が既に IME キーとして
+    /// 扱う（`shadow_action` を持つ、opt-in の Toggle 等）キーは従来の経路に任せる。
+    /// `kp_stage_post_decision` の cognitive_complexity 上限のため別関数にしている。
+    fn kp_stage_mode_key_follow(
+        &mut self,
+        decision: &awase::engine::Decision,
+        event: &RawKeyEvent,
+    ) {
+        if decision.is_consumed()
+            || !matches!(event.event_type, KeyEventType::KeyDown)
+            || event.injected
+            || !crate::vk::is_followed_mode_key(event.vk_code)
+            || event.ime_relevance.shadow_action.is_some()
+            || event.ime_relevance.sync_direction.is_some()
+        {
+            return;
+        }
+        // Shift 押下中（Shift+無変換/変換 = ATOK ではかな⇔半角英数で開閉を変えない、ADR-186 残る問題2）は
+        // 通過マークを立てない（`mode_key_follow_admits_modifiers`、レビュー round3 N8）。立てると観測の直後に
+        // 明示意図を捨て、desired を観測へ書き換える。Ctrl/Alt/Win は見ない——Ctrl+無変換→Ctrl+変換
+        // （Ctrl 保持のまま、spike `--resync` のリセット操作）を追随の対象外にしてはならない。
+        if !crate::state::mode_key_pass::mode_key_follow_admits_modifiers(
+            event.modifier_snapshot.shift,
+        ) {
+            return;
+        }
+        let now = hook::current_tick_ms();
+        let readable = self.can_use_imm32_cross_process();
+        self.platform_state
+            .ime
+            .arm_mode_key_pass_mark(now, readable);
+        self.schedule_ime_refresh(20);
+        tracing::info!(
+            "[mode-key-follow] mode key PassThrough(vk=0x{:02X}): IME refresh scheduled (20ms)",
+            event.vk_code.0
+        );
+    }
+
+    /// 物理キーの押下ごとに、打鍵時点の予測と隠れ状態の追跡（`kp_predict_key_effect`）を呼ぶ。
+    /// 修飾キー付きの打鍵は予測・追跡しない（`modifiers_suppress_prediction`）。キーマップは
+    /// `KeymapCache`が版の変化時だけ読む（打鍵ごとにconfig1.dbを読まない）。
+    /// - 表が持つキー（モードキー、Space/Esc/Enter/BS等）: エンジンが消費せずIMEへ通したときだけ。
+    ///   ADR-189の固定セット（`shadow_action`）と同期キー（`sync_direction`）は従来の経路に任せる。
+    /// - 表に無いキー（文字キー）: エンジンが消費しても（ローマ字をIMEへ再注入して入力中にするため）
+    ///   変換中の段階を戻す追跡だけを更新する。修飾キー単体は対象外。
+    fn kp_stage_key_effect_track(
+        &mut self,
+        decision: &awase::engine::Decision,
+        event: &RawKeyEvent,
+    ) {
+        if !matches!(event.event_type, KeyEventType::KeyDown)
+            || event.injected
+            || crate::vk::classify_modifier(event.vk_code).is_some()
+        {
+            return;
+        }
+        let in_table =
+            crate::state::key_effect_predictor::TableKey::from_vk(event.vk_code.0).is_some();
+        let m = event.modifier_snapshot;
+        if crate::state::key_effect_predictor::modifiers_suppress_prediction(
+            in_table, m.ctrl, m.alt, m.shift, m.win,
+        ) {
+            // Shift+変換（ATOKで開閉トグルではない）やCtrl+文字（ショートカット）は「素のキー」の結果と違う。
+            return;
+        }
+        if in_table
+            && (decision.is_consumed()
+                || event.ime_relevance.shadow_action.is_some()
+                || event.ime_relevance.sync_direction.is_some())
+        {
+            return;
+        }
+        // ADR-211 決定2: 表に無い受動のキー（プリセットの F13）の規則を当ててよい打鍵。表のキーの除外（上）は`in_table`のときだけなので、
+        // 表に無いキーではここで明示する。自動リピート・エンジンが消費した打鍵・`shadow_action`/`sync_direction` 付き・修飾付き（Shift も）は当てない。
+        let passive_rule_eligible = !in_table
+            && !event.was_down
+            && !decision.is_consumed()
+            && event.ime_relevance.shadow_action.is_none()
+            && event.ime_relevance.sync_direction.is_none()
+            && !(m.ctrl || m.alt || m.shift || m.win);
+        self.kp_predict_key_effect(event.vk_code, passive_rule_eligible);
+    }
+
+    /// ADR-203 (ii): 確かな ON 系イベント（物理キー予測 ON・shadow toggle ON。`sync_direction` の on キーは
+    /// shadow toggle の2分岐に含まれ、独立した呼び出しは無い）で `GjiFsm` を開き直す（`GjiEvent::Reopen`）。awase は IME へ書かないので Unwarranted 経路では
+    /// `GjiFsmSync` の receipt が届かず、GjiFsm が OffCold/OnWarm に取り残されて毎打鍵 per-VK confirm →
+    /// StaleConfirm → ESC で未確定文字が消える（BUG-170、`c8bc1adc` 以降）。
+    ///
+    /// 発火は「GjiFsm 戦略のとき（`f2_warmup_owned`、種別推測ではなく戦略の実体。INV-42）」かつ
+    /// 候補窓が不可視のときだけ（`reopen_obligation`）。`GjiFsm` 側も `OnCold`/`OnComposing` では何もしない。
+    fn kp_reopen_gji_fsm(&mut self, source: crate::state::gji_direct_mechanism::ReopenSource) {
+        if !self.platform.output.f2_warmup_owned() {
+            return;
+        }
+        let Some(sync) = crate::state::gji_direct_mechanism::reopen_obligation(
+            crate::tsf::observer::gji_candidate_visible_now(),
+            source,
+        ) else {
+            return;
+        };
+        crate::state::gji_direct_mechanism::GjiSyncSink::sync_gji(&mut self.platform, sync);
+        for entry in self.platform.drain_journal_entries() {
+            self.platform_state.ime.journal.absorb(entry);
+        }
+    }
+
+    /// ADR-191 決定3・4: 通したキーの効果を、学習した表（`key_effect_predictor`）から**打鍵の時点で**予測して
+    /// beliefへ反映する（awaseはIMEへ書かない）。観測を待たないので、読めないアプリ（TsfNative等）でも
+    /// Engineが即追随する。後続の観測（`MODE_KEY_PASS_*`の読み直し）がsettle後に照合し、食い違えば観測が勝つ
+    /// （`ImeModel`のfence、`[key-effect-miss]`）。GJI/Microsoft IME本体（CLSID で同定できたもの）以外（ATOK等・未検出・IMM32 HKLのみ）・表に無い・非決定のセルは予測しない。
+    ///
+    /// 変換モード5種・変換中の段階は`ImeModel::key_track`（隠れ状態）で追跡する。モードキーだけでなく、
+    /// Space/Esc/Enter/BS・文字キーも通して追跡状態を更新する（変換中の出入りが打鍵履歴で決まるため）。
+    /// ADR-189の固定セット（半角/全角）は`shadow_action`を持つ間この関数に来ない（呼び出し側が除外）。
+    fn kp_predict_key_effect(&mut self, vk: awase::types::VkCode, passive_rule_eligible: bool) {
+        use crate::state::key_effect_predictor::PredictInput;
+        use crate::tsf::observer::{tsf_obs, ActiveImeKind};
+        let obs = tsf_obs();
+        let now_ms = hook::current_tick_ms();
+        // GJI: config1.db のキーマップ。Microsoft IME本体: **TIP の CLSID が Microsoft IME 本体と一致したときだけ**
+        // （`ms_ime_native_identified`）レジストリのキー割り当て。`active_ime_kind() == MicrosoftIme` は「GJI 以外」の
+        // 意味で ATOK・Japanist・未知の TIP・IMM32 HKL も含み、`ime_kind_detected()` も「CLSID 判定が一度でも走った」
+        // でしかないので、どちらも本体の表を当てる根拠にならない（レビュー round2 NB1）。
+        let keymap = match obs.active_ime_kind() {
+            ActiveImeKind::GoogleJapaneseInput => self.key_effect_keymap.get_gji(now_ms),
+            ActiveImeKind::MicrosoftIme if obs.ms_ime_native_identified() => {
+                self.key_effect_keymap_native.get_native(now_ms)
+            }
+            ActiveImeKind::MicrosoftIme => return,
+        };
+        let Some(keymap) = keymap else {
+            return;
+        };
+        // ADR-195段階4: 学習済み表（T3の永続化データ）が検証を通れば同梱表の代わりに使う。
+        // `KeyEffectPredicted`（belief更新）に使う。actuationの許可リストを広げる判定には使わない
+        // （半角/全角のToggleを外す縮小方向だけ`enrich_key_role`が役割判定の中で参照する、ADR-195追記・ADR-199決定6-2）。
+        let override_table = if self.use_learned_keymap_table {
+            self.key_effect_runtime_table.get_for_keymap(now_ms, keymap)
+        } else {
+            None
+        };
+        let ime = &self.platform_state.ime;
+        // ADR-209: 窓の種類の判定だけをここで行い、規則そのものは純関数（`predict_with_override`）にある。
+        let unreadable = self.predict_henkan_open_in_unreadable_windows && {
+            let profile = self.platform.current_app_profile();
+            profile.cannot_verify_real_ime_state(self.platform.focus.class_name())
+                && profile != crate::focus::class_names::AppImeProfile::InputRelay
+        };
+        let input = PredictInput {
+            open: ime.effective_open(),
+            mode: ime.input_mode(),
+            conv_raw: self.platform_state.ime.belief.prev_conversion_mode(),
+            composing: crate::tsf::observer::ime_composition_active_now(),
+            track: ime.model().key_track(),
+            unreadable,
+            passive_rule_eligible,
+        };
+        let Some(prediction) = keymap.predict_with_override(vk.0, &input, override_table) else {
+            tracing::debug!(
+                "[key-effect-predict] vk=0x{:02X} open={} composing={}: no prediction",
+                vk.0,
+                input.open,
+                input.composing
+            );
+            return;
+        };
+        tracing::info!(
+            "[key-effect-predict] vk=0x{:02X} open={:?} mode={:?} track={:?}",
+            vk.0,
+            prediction.effect.open,
+            prediction.effect.mode,
+            prediction.track
+        );
+        let tick = crate::state::TickMs(hook::current_tick_ms());
+        self.platform_state
+            .ime
+            .apply_key_effect_prediction(prediction, tick);
+        // ADR-203 (ii): 予測で ON になったら GjiFsm を開き直す（BUG-170）。
+        if prediction.effect.open == Some(true) {
+            self.kp_reopen_gji_fsm(crate::state::gji_direct_mechanism::ReopenSource::Predict);
+        }
+        // 予測をEngineへ即反映する（active遷移の検知）。
+        if !prediction.effect.is_noop() {
+            self.notify_engine_refresh();
+        }
     }
 
     /// 左Shift単独タップによる「IME-ON 半角英数」持続トグル判定
@@ -1347,8 +1832,9 @@ impl Runtime {
     /// # 左Shift単独タップの持続トグル（維持）
     ///
     /// 左Shift の押下→解放の間に他の非注入物理キーが一切来なかった場合のみ
-    /// 「単独タップ」と判定し、`half_width_alnum_toggle_active` を立てる
-    /// （IME-ON 半角英数の持続トグルへ移行）。**conv=0x0000 の実書き込みは
+    /// 「単独タップ」と判定し、`HalfWidthAlnumState::commit_enter_imc`/
+    /// `commit_enter_gji` でトグルを立てる（IME-ON 半角英数の持続トグルへ
+    /// 移行）。**conv=0x0000 の実書き込みは
     /// この確定した瞬間（`kp_shift_conv_guard_key_up`）に初めて行う** —
     /// 旧実装のように Shift down 時点で判別未確定のまま先書き込みはしない。
     /// もう一度単独タップしたら `kp_restore_kana_from_half_width` でかな入力へ
@@ -1358,7 +1844,8 @@ impl Runtime {
     /// 離す＝大文字入力の用途）もトグルを解除しない（BUG-25追補9・追補11）。
     ///
     /// ADR-097 の親指+小指シフト複合面は、この関数が `kp_stage_execute` より前に
-    /// 非 Shift の KeyDown で `left_shift_tap_candidate` を折る順序にも依存する。
+    /// 非 Shift の KeyDown で `HalfWidthAlnumState::note_physical_key_down` を
+    /// 呼び候補を折る順序にも依存する。
     /// この順序を変える場合は、Shift+親指+文字が左Shift単独タップとして
     /// 誤判定されないことを再確認すること。
     fn kp_stage_shift_conv_guard(&mut self, event: &RawKeyEvent) {
@@ -1371,12 +1858,10 @@ impl Runtime {
         // 追加）。自己注入は対象外（BUG-14 と同じ理由: 他プロセスの
         // SendInput をユーザーの物理操作として扱わない）。
         if matches!(event.event_type, KeyEventType::KeyDown) && !event.injected {
-            if event.vk_code != crate::vk::VK_LSHIFT {
-                self.platform_state.gate.left_shift_tap_candidate = false;
-            }
-            if event.vk_code != crate::vk::VK_RSHIFT {
-                self.platform_state.gate.right_shift_tap_candidate = false;
-            }
+            self.platform_state
+                .gate
+                .half_width_alnum
+                .note_physical_key_down(event.vk_code);
         }
 
         if event.modifier_key != Some(ModifierKey::Shift) || event.injected {
@@ -1396,9 +1881,15 @@ impl Runtime {
             && !event.modifier_snapshot.win
         {
             if event.vk_code == crate::vk::VK_LSHIFT {
-                self.platform_state.gate.left_shift_tap_candidate = true;
+                self.platform_state
+                    .gate
+                    .half_width_alnum
+                    .arm_tap(ShiftSide::Left);
             } else if event.vk_code == crate::vk::VK_RSHIFT {
-                self.platform_state.gate.right_shift_tap_candidate = true;
+                self.platform_state
+                    .gate
+                    .half_width_alnum
+                    .arm_tap(ShiftSide::Right);
             }
         }
 
@@ -1415,9 +1906,9 @@ impl Runtime {
         // 必要がある。立て忘れると KeyUp 側の `take()` が false になり、2回目の
         // 左Shiftタップも右Shift緊急解除も一切発火しなくなる
         // （2026-07-11 codex レビューで発覚）。
-        self.platform_state.gate.shift_conv_guard_pending = true;
+        self.platform_state.gate.half_width_alnum.arm_guard();
 
-        if self.platform_state.gate.half_width_alnum_toggle_active {
+        if self.platform_state.gate.half_width_alnum.is_toggle_active() {
             // 既に conv=0x0000 のはず。何もしない。
             return;
         }
@@ -1432,7 +1923,7 @@ impl Runtime {
             || !self.engine.is_user_enabled()
             || !self.platform.output.conv_mutation_allowed.get()
         {
-            self.platform_state.gate.shift_conv_guard_pending = false;
+            self.platform_state.gate.half_width_alnum.disarm_guard();
         }
 
         // NOTE（2026-08-09、known-bugs.md BUG-15 追補9）: 以前はここで
@@ -1452,43 +1943,28 @@ impl Runtime {
     }
 
     fn kp_shift_conv_guard_key_up(&mut self, event: &RawKeyEvent) {
-        if !std::mem::take(&mut self.platform_state.gate.shift_conv_guard_pending) {
+        if !self.platform_state.gate.half_width_alnum.take_guard() {
             return;
         }
         let active_ime_kind = crate::tsf::observer::tsf_obs().active_ime_kind();
         let uses_imc_conv_write =
             active_ime_kind == crate::tsf::observer::ActiveImeKind::MicrosoftIme;
-        let policy_allows_entry = match self.half_width_alnum_toggle_policy {
-            awase::config::HalfWidthAlnumTogglePolicy::Off => false,
-            awase::config::HalfWidthAlnumTogglePolicy::MsImeOnly => uses_imc_conv_write,
-            awase::config::HalfWidthAlnumTogglePolicy::All => true,
-        };
-        let toggle_entry_supported = policy_allows_entry
-            && self.platform_state.ime.effective_open()
+        // かな入力コンテキストのみ: IME ON・日本語IME・engine 有効の3条件
+        // （conv 書込権限は含まない——それは `kp_stage_shift_conv_guard` 側の
+        // disarm_guard 判定にのみ効く別軸の条件）。policy（entry_policy、
+        // `HalfWidthAlnumState`内部で判定）とは独立な外部条件をまとめて
+        // 1個のboolにする。
+        let entry_ime_ok = self.platform_state.ime.effective_open()
             && self.platform_state.ime.belief.is_japanese_ime()
             && self.engine.is_user_enabled();
 
         // `kp_stage_shift_conv_guard` はこの関数を Shift（左右いずれか）の
         // KeyUp でのみ呼ぶため、`event.vk_code` は VK_LSHIFT か VK_RSHIFT の
-        // いずれか。`left_shift_tap_candidate`/`right_shift_tap_candidate` は
-        // 対応する Shift 押下中に他の物理キーが一切来なかった場合のみ立った
-        // まま残る（他キーで折れる）ため、「押下していたが折れていた」＝
-        // チョードと「折れていない」＝単独タップを左右対称に区別できる
-        // （BUG-25追補11: 右Shiftチョードが常にExit扱いだった非対称を修正）。
-        let was_left_shift_tap_candidate =
-            std::mem::take(&mut self.platform_state.gate.left_shift_tap_candidate);
-        let was_right_shift_tap_candidate =
-            std::mem::take(&mut self.platform_state.gate.right_shift_tap_candidate);
-        let shift_up_kind = if event.vk_code == crate::vk::VK_LSHIFT {
-            if was_left_shift_tap_candidate {
-                ShiftKeyUpKind::LeftTap
-            } else {
-                ShiftKeyUpKind::LeftChord
-            }
-        } else if was_right_shift_tap_candidate {
-            ShiftKeyUpKind::RightTap
+        // いずれか。
+        let side = if event.vk_code == crate::vk::VK_LSHIFT {
+            ShiftSide::Left
         } else {
-            ShiftKeyUpKind::RightChord
+            ShiftSide::Right
         };
 
         // ADR-107 決定5は当初 Composition 中の GJI entry をブロックしていたが、
@@ -1496,102 +1972,102 @@ impl Runtime {
         // preedit 非破壊・成功が再現したため緩和した。MS-IME entry は元々
         // composition を一切見ていない（IMC write は non-invasive な conv
         // セットのため composition 中でも安全）。
-        match plan_half_width_alnum_action(
-            shift_up_kind,
-            self.platform_state.gate.half_width_alnum_toggle_active,
-            toggle_entry_supported,
+        //
+        // `HalfWidthAlnumEffect` は「MS-IME/GJI どちらのトグルへ移行するか」を
+        // `EnterViaImcWrite`/`EnterViaGjiSendInput` の2 variant として表現する
+        // （旧実装は単一の `Enter` variant 内で `uses_imc_conv_write` による
+        // if/else を書いていたが、`HalfWidthAlnumState::on_shift_up` へ計画
+        // ロジックを移すのに合わせ、呼び出し元がガード条件を再判定せず
+        // 網羅的に扱えるよう2 variant に分けた）。
+        match self.platform_state.gate.half_width_alnum.on_shift_up(
+            side,
+            entry_ime_ok,
+            uses_imc_conv_write,
         ) {
-            // Enter を「MS-IME/GJI どちらのトグルへ移行するか」で2つの独立した
-            // match arm に分けず、単一の Enter arm 内の if/else にしているのは
-            // 意図的（Opus敵対的コードレビュー2巡目で指摘）: ガード付きの
-            // `Enter if uses_imc_conv_write` と無条件の `Enter` を別の arm に
-            // すると、両方とも変異体名が同一 `Enter` のため、将来 arm を追加/
-            // 並べ替えた際にコンパイラの網羅性検査が効かずガード条件だけが
-            // 唯一の分岐点になり見落とされやすい。if/else なら1つの arm の
-            // 中に両方の分岐が並び、見落としの余地が小さい。
-            HalfWidthAlnumAction::Enter => {
-                if uses_imc_conv_write {
-                    // 本物の単独タップ、1回目 → 半角英数トグルへ移行。conv=0x0000 の
-                    // 実書き込みはここで初めて行う（2026-08-09、known-bugs.md BUG-15
-                    // 追補9: チョード安全網の先書き込み撤去に伴い、持続トグルの entry
-                    // write もここへ一本化した。旧実装は Shift down 時点で判別未確定の
-                    // まま先書きしていた）。
-                    self.platform_state.gate.half_width_alnum_toggle_active = true;
-                    log::info!(
-                "[shift-conv-guard] 左Shift単独タップ → 半角英数トグルON (conv=0x0000 書き込み)"
-            );
-                    let now_tick = crate::state::TickMs(hook::current_tick_ms());
-                    self.platform_state.ime.note_explicit_ime_action(now_tick);
-                    // ADR-084 P1/INV-1/INV-2: 書き込みと belief 無効化を
-                    // `Runtime::actuate_conv_mode` に集約（`runtime/conv_actuation.rs`）。
-                    let _ = self.actuate_conv_mode(
-                        crate::state::ConvModeTarget::HalfWidthAlnum,
-                        crate::state::ConvMutationReason::ShiftSoloTapCounter,
-                        now_tick,
-                    );
-                    // ADR-084（BUG-49 追補2）: confirm-then-transmit ゲート（BUG-13、
-                    // `Output::ms_ime_gate_defer`）の期限を、トグルON中は
-                    // `SHIFT_CONV_GUARD_ENTRY_SUSPEND_CAP_MS` 分だけ延長する（詳細は
-                    // 旧 entry 実装のコメントを参照、known-bugs.md BUG-15 追補9）。
-                    self.platform.output.confirm_gate_deadline_override_ms.set(
-                        hook::current_tick_ms()
-                            + crate::tuning::SHIFT_CONV_GUARD_ENTRY_SUSPEND_CAP_MS,
-                    );
-                    self.platform.output.bump_shift_conv_guard_gen();
-                    // 診断用: 送信直後に conv を読み取ってログに残す。
-                    win32_async::spawn_local(async {
-                        win32_async::sleep_ms(150).await;
-                        let conv = win32_async::offload(|| unsafe {
-                            crate::ime::get_ime_conversion_mode_raw_timeout(50)
-                        })
-                        .await;
-                        match conv {
-                            Some(c) => {
-                                let native = c & crate::imm::IME_CMODE_NATIVE != 0;
-                                log::info!(
-                                    "[shift-conv-guard] entry verify (150ms後): conv=0x{c:08X} \
+            HalfWidthAlnumEffect::EnterViaImcWrite => {
+                // 本物の単独タップ、1回目 → 半角英数トグルへ移行。conv=0x0000 の
+                // 実書き込みはここで初めて行う（2026-08-09、known-bugs.md BUG-15
+                // 追補9: チョード安全網の先書き込み撤去に伴い、持続トグルの entry
+                // write もここへ一本化した。旧実装は Shift down 時点で判別未確定の
+                // まま先書きしていた）。IMC経路は `actuate_conv_mode` の**前**に
+                // 無条件でlatchを立てる（§3原則2、挙動を変えないこと）。
+                self.platform_state.gate.half_width_alnum.commit_enter_imc();
+                tracing::info!(
+                    "[shift-conv-guard] 左Shift単独タップ → 半角英数トグルON (conv=0x0000 書き込み)"
+                );
+                let now_tick = crate::state::TickMs(hook::current_tick_ms());
+                self.platform_state.ime.note_explicit_ime_action(now_tick);
+                // ADR-084 P1/INV-1/INV-2: 書き込みと belief 無効化を
+                // `Runtime::actuate_conv_mode` に集約（`runtime/conv_actuation.rs`）。
+                let _ = self.actuate_conv_mode(
+                    crate::state::ConvModeTarget::HalfWidthAlnum,
+                    crate::state::ConvMutationReason::ShiftSoloTapCounter,
+                    now_tick,
+                );
+                // ADR-084（BUG-49 追補2）: confirm-then-transmit ゲート（BUG-13、
+                // `Output::ms_ime_gate_defer`）の期限を、トグルON中は
+                // `SHIFT_CONV_GUARD_ENTRY_SUSPEND_CAP_MS` 分だけ延長する（詳細は
+                // 旧 entry 実装のコメントを参照、known-bugs.md BUG-15 追補9）。
+                self.platform.output.confirm_gate_deadline_override_ms.set(
+                    hook::current_tick_ms() + crate::tuning::SHIFT_CONV_GUARD_ENTRY_SUSPEND_CAP_MS,
+                );
+                self.platform.output.bump_shift_conv_guard_gen();
+                // 診断用: 送信直後に conv を読み取ってログに残す。
+                win32_async::spawn_local(async {
+                    win32_async::sleep_ms(150).await;
+                    let conv = win32_async::offload(|| unsafe {
+                        crate::ime::get_ime_conversion_mode_raw_timeout(50)
+                    })
+                    .await;
+                    match conv {
+                        Some(c) => {
+                            let native = c & crate::imm::IME_CMODE_NATIVE != 0;
+                            tracing::info!(
+                                "[shift-conv-guard] entry verify (150ms後): conv=0x{c:08X} \
                              NATIVE={native} ({})",
-                                    if native {
-                                        "未だひらがな側 → 半角英数化は未反映"
-                                    } else {
-                                        "英数モードに変化した"
-                                    }
-                                );
-                            }
-                            None => {
-                                log::info!(
-                            "[shift-conv-guard] entry verify (150ms後): conv 読み取り失敗 (None)"
-                        );
-                            }
+                                if native {
+                                    "未だひらがな側 → 半角英数化は未反映"
+                                } else {
+                                    "英数モードに変化した"
+                                }
+                            );
                         }
-                    });
+                        None => {
+                            tracing::info!(
+                                "[shift-conv-guard] entry verify (150ms後): conv 読み取り失敗 (None)"
+                            );
+                        }
+                    }
+                });
+                self.apply_input_mode_correction(
+                    InputModeState::ObservedEisu,
+                    crate::state::ime_event::InputModeApplyStrategy::UserHalfWidthAlnumToggle,
+                    now_tick,
+                );
+            }
+            HalfWidthAlnumEffect::EnterViaGjiSendInput => {
+                let now_tick = crate::state::TickMs(hook::current_tick_ms());
+                // GJI経路はSendInput成功後のみcommitする（真のcommit-on-success、
+                // §3原則2）。
+                if self.platform.output.send_gji_half_width_alnum_toggle(
+                    HalfWidthAlnumAction::Enter,
+                    self.platform_state.ime.effective_open(),
+                    true,
+                ) {
+                    self.platform_state.gate.half_width_alnum.commit_enter_gji();
+                    tracing::info!(
+                        "[shift-conv-guard] 左Shift単独タップ → GJI 半角英数トグルON \
+                         (VK_DBE_ALPHANUMERIC)"
+                    );
+                    self.platform_state.ime.note_explicit_ime_action(now_tick);
                     self.apply_input_mode_correction(
                         InputModeState::ObservedEisu,
                         crate::state::ime_event::InputModeApplyStrategy::UserHalfWidthAlnumToggle,
                         now_tick,
                     );
-                } else {
-                    let now_tick = crate::state::TickMs(hook::current_tick_ms());
-                    if self.platform.output.send_gji_half_width_alnum_toggle(
-                        HalfWidthAlnumAction::Enter,
-                        self.platform_state.ime.effective_open(),
-                        true,
-                    ) {
-                        self.platform_state.gate.half_width_alnum_toggle_active = true;
-                        log::info!(
-                            "[shift-conv-guard] 左Shift単独タップ → GJI 半角英数トグルON \
-                         (VK_DBE_ALPHANUMERIC)"
-                        );
-                        self.platform_state.ime.note_explicit_ime_action(now_tick);
-                        self.apply_input_mode_correction(
-                        InputModeState::ObservedEisu,
-                        crate::state::ime_event::InputModeApplyStrategy::UserHalfWidthAlnumToggle,
-                        now_tick,
-                    );
-                    }
                 }
             }
-            HalfWidthAlnumAction::Exit => {
+            HalfWidthAlnumEffect::ExitRestoreKana => {
                 // 2回目の左Shiftタップ（トグルOFF）・右Shift（トグルの緊急解除）:
                 // 復元を実行する。
                 //
@@ -1609,7 +2085,7 @@ impl Runtime {
                 }
                 self.kp_restore_kana_from_half_width(true);
             }
-            HalfWidthAlnumAction::None => {}
+            HalfWidthAlnumEffect::Nothing => {}
         }
 
         // チョード（Shift+文字キー）でトグル非アクティブ: conv には一切
@@ -1651,15 +2127,18 @@ impl Runtime {
             return true;
         }
         if prepend_synthetic_shift_up {
-            self.platform_state.gate.half_width_alnum_toggle_active = true;
-            log::warn!(
+            self.platform_state
+                .gate
+                .half_width_alnum
+                .rearm_after_failed_gji_exit();
+            tracing::warn!(
                 "[shift-conv-guard] GJI 半角英数トグル exit の SendInput を見送った \
                  (Win/Alt押下中 or effective_open=false)。実GJIは半角英数のままの \
                  可能性が高いため belief を据え置き、ラッチを true に戻して再試行に備える"
             );
             false
         } else {
-            log::warn!(
+            tracing::warn!(
                 "[shift-conv-guard] GJI 半角英数トグル exit の SendInput を見送った \
                  (Win/Alt押下中 or effective_open=false、呼び出し元はフォーカス変更/\
                  shadow toggle/post-decision)。実GJIは半角英数のままの可能性が \
@@ -1682,10 +2161,11 @@ impl Runtime {
     /// IME-ON キー起点（E/F 節）から呼ぶ場合は物理 Shift が押されているとは
     /// 限らないため false。
     pub(crate) fn kp_restore_kana_from_half_width(&mut self, prepend_synthetic_shift_up: bool) {
-        let was_toggle_active = std::mem::replace(
-            &mut self.platform_state.gate.half_width_alnum_toggle_active,
-            false,
-        );
+        let was_toggle_active = self
+            .platform_state
+            .gate
+            .half_width_alnum
+            .begin_restore_kana();
         let now_tick = crate::state::TickMs(hook::current_tick_ms());
         // idle-conv-check が復元途中の conv=0x0000 を読んで ObservedEisu →
         // DirectInput に落とさないよう、明示的 IME 操作として抑止する。
@@ -1704,7 +2184,7 @@ impl Runtime {
         // GJI の非冪等トグル二重送信を防ぐ（INV-B）。
         let active_ime_kind = crate::tsf::observer::tsf_obs().active_ime_kind();
         if !was_toggle_active {
-            log::debug!(
+            tracing::debug!(
                 "[shift-conv-guard] 半角英数トグル復元 write をスキップ (already inactive)"
             );
         } else if active_ime_kind == crate::tsf::observer::ActiveImeKind::MicrosoftIme {
@@ -1785,16 +2265,16 @@ impl Runtime {
                     true,
                 ));
                 let _ = crate::win32::send_input_safe(&f2_inputs);
-                log::debug!(
+                tracing::debug!(
                     "[shift-conv-guard] VK_DBE_HIRAGANA (scan 付き) 注入 → ひらがなモード復元"
                 );
             } else if blocking_modifier_held {
-                log::debug!(
+                tracing::debug!(
                     "[shift-conv-guard] Win/Alt 押下中のため VK_DBE_HIRAGANA 注入をスキップ \
                      (IMC write のみ。Alt+かな誤発火/Win+F2のスタートメニュー起動を防ぐ)"
                 );
             } else {
-                log::debug!(
+                tracing::debug!(
                     "[shift-conv-guard] effective_open()=false のため VK_DBE_HIRAGANA 注入をスキップ \
                      (IMC write のみ、BUG-15 追補7の教訓)"
                 );
@@ -1806,7 +2286,7 @@ impl Runtime {
             let target_conv = crate::imm::IME_CMODE_NATIVE
                 | crate::imm::IME_CMODE_FULLSHAPE
                 | crate::imm::IME_CMODE_ROMAN;
-            log::info!("[shift-conv-guard] かな入力へ復元 (target=0x{target_conv:08X})");
+            tracing::info!("[shift-conv-guard] かな入力へ復元 (target=0x{target_conv:08X})");
 
             // pass-5 レビュー指摘（blocking）: このリトライタスクは detached
             // (`spawn_local`) で、完了は Shift タップ間隔より遅れうる。起動時点の
@@ -1835,7 +2315,7 @@ impl Runtime {
                 const RETRY_INTERVAL_MS: u32 = 160;
                 const MAX_TRIES: u32 = 4;
                 let Some(target) = crate::ime::ActuationTarget::capture(focus_gen).await else {
-                    log::debug!("[shift-conv-guard] capture 失敗（フォーカス無し） → 復元中止");
+                    tracing::debug!("[shift-conv-guard] capture 失敗（フォーカス無し） → 復元中止");
                     return;
                 };
                 for attempt in 0..MAX_TRIES {
@@ -1862,14 +2342,14 @@ impl Runtime {
                         // await 前・他の with_app のネスト無し）、万一 None が
                         // 返った場合に沈黙で猶予が更新されないと BUG-49 が
                         // 無警告で再発するため、痕跡を残す。
-                        log::warn!(
+                        tracing::warn!(
                             "[shift-conv-guard] 復元リトライ #{attempt}: with_app 再入 \
                              (None) により override 更新をスキップ"
                         );
                         false
                     });
                     if !still_owner {
-                        log::debug!(
+                        tracing::debug!(
                             "[shift-conv-guard] 復元リトライ #{attempt}: 新しい hold が \
                              開始された (gen 不一致) ため中断"
                         );
@@ -1886,7 +2366,7 @@ impl Runtime {
                     match outcome {
                         crate::ime::ActuationOutcome::Written => {}
                         crate::ime::ActuationOutcome::Failed => {
-                            log::warn!("[shift-conv-guard] conv 復元 write #{attempt} 失敗");
+                            tracing::warn!("[shift-conv-guard] conv 復元 write #{attempt} 失敗");
                         }
                         crate::ime::ActuationOutcome::Aborted(reason) => {
                             // GenStale はこの直前の still_owner チェックとほぼ同じ条件
@@ -1895,7 +2375,7 @@ impl Runtime {
                             // TargetMoved は capture 後にフォーカスだけが動いた
                             // （gen 更新が伴わない）ケースの検知。どちらも同じ
                             // capture 済み target のまま次の試行を続ける（write は冪等）。
-                            log::warn!(
+                            tracing::warn!(
                                 "[shift-conv-guard] conv 復元 write #{attempt}: Aborted({reason:?})"
                             );
                         }
@@ -1911,7 +2391,7 @@ impl Runtime {
                     let conv = crate::ime::get_ime_conv_for_target(target, 10).await;
                     if let Some(c) = conv {
                         if c & crate::imm::IME_CMODE_NATIVE != 0 {
-                            log::debug!(
+                            tracing::debug!(
                                 "[shift-conv-guard] conv=0x{c:08X} NATIVE 確認 (#{attempt}) → 復元完了"
                             );
                             // 復元完了。confirm-gate は通常どおり
@@ -1929,7 +2409,9 @@ impl Runtime {
                         }
                     }
                 }
-                log::warn!("[shift-conv-guard] conv 復元 {MAX_TRIES} 回で NATIVE 未確認のまま終了");
+                tracing::warn!(
+                    "[shift-conv-guard] conv 復元 {MAX_TRIES} 回で NATIVE 未確認のまま終了"
+                );
                 // 復元が最終的に失敗した場合は override を解除し、通常の安全弁
                 // （IMC 未確認なら give-up latch）へ戻す。延長したまま放置すると
                 // 本当に IMC が読めない環境でも give-up が永久に立たなくなる。
@@ -1973,7 +2455,8 @@ impl Runtime {
     /// journal 記録値との理論上の乖離窓があった）。判断ロジック自体は
     /// `PhysicalKeyDisposition::plan` のドキュメントコメント参照:
     /// - Imm32Unavailable (Chrome/Edge) / TsfNative (WezTerm/Windows Terminal) で GJI/MS-IME
-    ///   が actuate する場合: KeyDown は shadow_toggle 発火時のみ、KeyUp は常に Suppress。
+    ///   が actuate する場合: KeyDown は shadow_toggle 発火時のみ Suppress。KeyUp は `plan()` 上は常に
+    ///   Suppress だが、直前に `kp_latch_keyup_to_keydown_disposition` が最初の KeyDown の配送に揃える。
     ///   awase 自身が apply-ime で VK_IME_ON/OFF 等を SendInput 済みなので物理キーを
     ///   届けると二重制御になる（TsfNative + GJI の実例: BUG-46）。
     /// - ImmCross (LINE/Qt): Down/Up 共に Suppress。set_ime_open_cross_process で IME 制御済み。
@@ -1985,26 +2468,30 @@ impl Runtime {
         physical: crate::runtime::PhysicalKeyDisposition,
     ) -> CallbackResult {
         if let Some(reason) = physical.suppress_reason(event, profile) {
-            log::debug!(
+            tracing::debug!(
                 "[{reason}] key suppress vk={:#04x} {:?} (physical disposition)",
                 event.vk_code,
                 event.event_type
             );
         }
 
-        // F2 (VK_DBE_HIRAGANA) KeyDown: CompositionFsm に副作用を委譲。
-        // Suppress（TSF mode）・Allow（非 TSF mode）いずれの場合も mark_cold + eager warmup を実行。
+        // F2 (VK_DBE_HIRAGANA) KeyDown: cold 化・GjiFsm 通知（`composition_native_f2_down`）。
+        // 物理 F2 は常に Allow（BUG-173）。awase は代わりの `VK_IME_ON` を送らない。
+        // A5/A6（Opus レビュー）: auto-repeat では cold 化を繰り返さない。F2 を親指キーに
+        // 割り当てている構成では NICOLA の同時打鍵入力であって IME モードキーではない（BUG-115）。
         if event.vk_code == crate::vk::VK_DBE_HIRAGANA
             && matches!(event.event_type, KeyEventType::KeyDown)
+            && !event.was_down
+            && !crate::gji_charset_autodetect::is_configured_thumb_key(event.vk_code)
         {
-            // ADR-098 決定1-b: 生値ではなく warmup_ime_on()（`applied ?? belief`）。
-            let warmup_ime_on = self.platform_state.ime.warmup_ime_on();
-            self.platform.composition_native_f2_down(warmup_ime_on);
+            self.platform.composition_native_f2_down();
         }
+
+        self.kp_stage_kana_lock_warn(&decision);
 
         let result = self.executor.execute_from_hook(
             &mut self.platform,
-            &self.platform_state.ime,
+            &mut self.platform_state.ime,
             decision,
             event,
             physical,
@@ -2019,6 +2506,83 @@ impl Runtime {
 
         result.callback
     }
+
+    /// VK/TSF の romaji 送信直前に OS のかな入力ロックを読む。
+    fn kp_stage_kana_lock_warn(&mut self, decision: &awase::engine::Decision) {
+        // 生VK出力に影響する injection_mode は「Unicode 以外」という否定形
+        // イディオムで表現する（`output/mod.rs` 等の既存箇所と同じ）。肯定形の
+        // 許可リストだと、将来 Vk/Tsf 以外の生VK出力を伴う InjectionMode が
+        // 増えたときにこのゲートだけ黙って除外されうる。
+        if self.platform.output.injection_mode == crate::output::InjectionMode::Unicode
+            || !decision_contains_romaji_send(decision)
+        {
+            return;
+        }
+
+        let before = self.kana_lock_hysteresis.streak();
+        // SAFETY: key pipeline は Runtime のメッセージループスレッド上で実行される。
+        let reading = unsafe { crate::observer::kana_lock::read_kana_lock() };
+        let action = self.kana_lock_hysteresis.observe(reading);
+        let after = self.kana_lock_hysteresis.streak();
+        if streak_side(before) != streak_side(after) {
+            tracing::debug!("[kana-lock] streak transition: {before:?} -> {after:?}");
+        }
+
+        match action {
+            WarnAction::None => {}
+            WarnAction::Warn => {
+                // SAFETY: 診断ログ用の読み取りのみ。メッセージループスレッド上で呼ぶ。
+                let fg_class = unsafe { crate::observer::kana_lock::foreground_class_name() };
+                tracing::warn!(
+                    "[kana-lock] OS かな入力ロックを検知しました \
+                     (reading={reading:?} streak={after:?} fg_class={fg_class})"
+                );
+                post_to_main_thread(WM_KANA_LOCK_WARNING_CHANGED);
+            }
+            WarnAction::ClearWarned => {
+                tracing::warn!("[kana-lock] OS かな入力ロック解除を検知しました");
+                post_to_main_thread(WM_KANA_LOCK_WARNING_CHANGED);
+            }
+        }
+    }
+}
+
+fn decision_contains_romaji_send(decision: &awase::engine::Decision) -> bool {
+    let effects = match decision {
+        awase::engine::Decision::PassThrough => return false,
+        awase::engine::Decision::PassThroughWith { effects }
+        | awase::engine::Decision::Consume { effects } => effects,
+    };
+    effects.iter().any(|effect| {
+        matches!(
+            effect,
+            Effect::Input(InputEffect::SendKeys(actions)) if actions_contain_romaji(actions)
+        )
+    })
+}
+
+fn actions_contain_romaji(actions: &[KeyAction]) -> bool {
+    actions.iter().any(|action| match action {
+        // Char/KeySequence/Romajiに加えKeyも対象にする: `.yab`配列定義外のキーは
+        // nicola_fsm::resolve_pending_char_as_single が Key(vk_code) にフォール
+        // バックし、これも send_keys 経由で生VK押下として送信される(output/mod.rs)。
+        // ROMANビットが落ちていれば同じくJISかな解釈の対象になるため、KeyUp/
+        // CtrlChord/SpecialKey/Suppress とは違いサンプリング対象に含める。
+        KeyAction::Char(_)
+        | KeyAction::KeySequence(_)
+        | KeyAction::Romaji(_)
+        | KeyAction::Key(_) => true,
+        KeyAction::Sequence(items) => actions_contain_romaji(items),
+        _ => false,
+    })
+}
+
+const fn streak_side(streak: KanaLockStreak) -> Option<bool> {
+    match streak {
+        KanaLockStreak::None => None,
+        KanaLockStreak::Off(_) => Some(false),
+        KanaLockStreak::On(_) => Some(true),
+    }
 }
 
 /// フォーカスプローブの IME 更新抑制シグナルをまとめた値
@@ -2026,39 +2590,25 @@ impl Runtime {
 /// shadow_grace は probe_admission の FocusEpoch 照合に置き換え済みのため
 /// このフラグには含まれない。
 struct FocusProbeGraceFlags {
-    warmup_grace_active: bool,
     gji_grace_active: bool,
-    warmup_elapsed: u64,
     gji_idle_ms: u64,
 }
 
 impl FocusProbeGraceFlags {
     const fn any(&self) -> bool {
-        self.warmup_grace_active || self.gji_grace_active
+        self.gji_grace_active
     }
 
-    const fn primary_reason(&self) -> &'static str {
-        if self.warmup_grace_active {
-            "warmup"
-        } else {
-            "gji-io"
-        }
+    const fn primary_reason() -> &'static str {
+        "gji-io"
     }
 }
 
 const fn compute_focus_probe_grace(
     now_ms: u64,
-    warmup_ms: u64,
     gji_last_io_ms: u64,
     last_focus_change_ms: u64,
 ) -> FocusProbeGraceFlags {
-    let warmup_elapsed = if warmup_ms > 0 {
-        now_ms.saturating_sub(warmup_ms)
-    } else {
-        u64::MAX
-    };
-    let warmup_grace_active = warmup_elapsed < crate::tuning::WARMUP_GRACE_MS;
-
     let gji_active_after_focus = gji_last_io_ms > 0 && gji_last_io_ms >= last_focus_change_ms;
     let gji_idle_ms = if gji_last_io_ms > 0 {
         now_ms.saturating_sub(gji_last_io_ms)
@@ -2069,9 +2619,7 @@ const fn compute_focus_probe_grace(
         gji_active_after_focus && gji_idle_ms < crate::tuning::GJI_SETTLE_GRACE_MS;
 
     FocusProbeGraceFlags {
-        warmup_grace_active,
         gji_grace_active,
-        warmup_elapsed,
         gji_idle_ms,
     }
 }
@@ -2086,7 +2634,6 @@ fn build_ime_on_suffix(
 ) -> String {
     if let Some(reason) = suppressed_reason {
         let detail = match reason {
-            "warmup" => format!("warmup:{}ms", signals.warmup_elapsed),
             "gji-io" => format!("gji-io:{}ms", signals.gji_idle_ms),
             _ => format!("shadow:{probe_age_ms}ms"),
         };
@@ -2128,7 +2675,6 @@ impl Runtime {
         &mut self,
         probe: crate::ime::FastImeProbeResult,
         probe_started_ms: u64,
-        warmup_ms: u64,
         gji_last_io_ms: u64,
         last_focus_change_ms: u64,
         shadow_on: bool,
@@ -2143,8 +2689,7 @@ impl Runtime {
         let ime_on_before_probe = self.platform_state.ime.effective_open();
 
         let now_ms = now_tick_ms.0;
-        let signals =
-            compute_focus_probe_grace(now_ms, warmup_ms, gji_last_io_ms, last_focus_change_ms);
+        let signals = compute_focus_probe_grace(now_ms, gji_last_io_ms, last_focus_change_ms);
 
         // スリープ復帰後など grace 期間中は read_ime_state_fast が一時的に
         // is_japanese_ime=false を返すことがある。
@@ -2166,7 +2711,7 @@ impl Runtime {
             FocusProbeOpenStatus::NotObservable(_) => None,
         };
         if probe.ime_on.is_some() && probe_ime_on.is_none() {
-            log::debug!(
+            tracing::debug!(
                 "FocusProbe: profile={current_profile:?} は IMM32 open status 非対応のため \
                  probe.ime_on={:?} を破棄",
                 probe.ime_on
@@ -2187,7 +2732,7 @@ impl Runtime {
             status,
             probe.is_japanese_ime,
             signals.any(),
-            signals.primary_reason(),
+            FocusProbeGraceFlags::primary_reason(),
             shadow_on,
         ) {
             FocusProbeEffect::Record {
@@ -2221,10 +2766,11 @@ impl Runtime {
         // から巻き戻してしまうバグの温床だった）。同一ウィンドウ内でタスクバーからモードを
         // 変更した場合は idle-conv-check（TYPING_IDLE_MS 経過後の次キー入力で発火）が
         // 正当なユーザー操作として拾うため、そちらに一本化する。
-        if crate::focus::class_names::is_effectively_tsf_native(
-            self.platform.current_app_profile(),
-            self.platform.focus.class_name(),
-        ) && probe.is_japanese_ime
+        if self
+            .platform
+            .current_app_profile()
+            .is_effectively_tsf_native(self.platform.focus.class_name())
+            && probe.is_japanese_ime
         {
             let in_flight = self.platform.output_in_flight_ms();
             // cold start: ROMAN ビットが信頼できないためスキップ
@@ -2263,7 +2809,7 @@ impl Runtime {
                             accepted.fence,
                         );
                         self.platform_state.ime.set_prev_conversion_mode(Some(conv));
-                        log::debug!(
+                        tracing::debug!(
                             "[focus-conv-check] TsfNative: conv=0x{conv:08X} 読み取り（belief 更新なし、\
                              フォーカス変更直後の値はユーザー意図の signal ではないため idle-conv-check に一任）"
                         );
@@ -2271,7 +2817,9 @@ impl Runtime {
                 } else {
                     // warn: バグ報告に添付する awase.log（info レベル既定）に残す
                     // ため。BUG-34 横展開の切り分け材料。
-                    log::warn!("[focus-conv-check] SendHealth degrade で conv 読み取りを見送り");
+                    tracing::warn!(
+                        "[focus-conv-check] SendHealth degrade で conv 読み取りを見送り"
+                    );
                 }
             }
         }
@@ -2294,6 +2842,10 @@ impl Runtime {
                 fence: accepted.fence,
             };
             win32_async::spawn_local(async move {
+                // 読み取りの**開始時刻**を観測の時刻にする（レビュー指摘A-M2）。await の後に取ると、最大300msの
+                // 不応答窓を挟んだ場合に「届いた時刻」になり、打鍵直後（IMEがキーを処理する前）の古い読み取りが
+                // 予測の fence（`KEY_EFFECT_SETTLE_MS`）を通過して予測を誤って照合・上書きする。OsPoll 経路と同じ規律。
+                let read_started = crate::state::TickMs(hook::current_tick_ms());
                 // SAFETY: read_ime_state_full_async は offload 済み — メインスレッド不要。
                 let snap = crate::ime::read_ime_state_full_async().await;
                 if let Some(open) = snap.ime_on {
@@ -2303,11 +2855,11 @@ impl Runtime {
                             ticket,
                             "[ImmCrossProbe] epoch rejected (focus changed since probe spawn)",
                             |app, inner_accepted| {
-                                let tick_ms = crate::state::TickMs(hook::current_tick_ms());
+                                let tick_ms = read_started;
                                 let ime = &mut app.platform_state.ime;
                                 // ON/OFF: High confidence (ImmCrossProbe source)
                                 ime.write_imm_cross_probe(open, tick_ms, inner_accepted);
-                                log::debug!(
+                                tracing::debug!(
                                     "[ImmCrossProbe] child-hwnd IME={open} → High confidence 観測記録"
                                 );
                                 // input_mode: Observe → pure decision → belief
@@ -2321,6 +2873,7 @@ impl Runtime {
                                         ime.is_force_on_guard_active(),
                                         ime.input_mode(),
                                         ime.belief.prev_conversion_mode(),
+                                        app.platform.focus.process_name(),
                                     );
                                 if let Some(mode) = update.new_input_mode {
                                     use crate::state::ime_event::{
@@ -2339,60 +2892,6 @@ impl Runtime {
                             },
                         );
                     });
-                }
-
-                // MS-IME + ImmCross (LINE 等): かなモード (conv=0x09) で IME ON すると
-                // JIS かな直接入力になる。ImmCrossProcessStrategy は romaji 修正を
-                // 先行実行するが、async probe 完了時点で stale な conv を読む場合に備えて
-                // ここでも ROMAN ビットを補完する（二重補正は冪等なので無害）。
-                // ObservedKana はユーザーが意図的にかな入力に設定した状態なので上書きしない。
-                if let (Some(true), Some(conv)) = (snap.ime_on, snap.conversion_mode) {
-                    let mode = awase::engine::ConvMode::from_u32(conv);
-                    if !mode.is_eisu() && !mode.romaji {
-                        // opus レビュー指摘（2026-08-08）: `set_ime_romaji_mode_async`
-                        // （ライブクエリ版、ADR-086 削除対象の
-                        // `set_ime_romaji_mode_with_target_async` と同じ危険を持つ）
-                        // への呼び出しが未移行のまま残っていた。focus_gen も
-                        // should_restore と同じ with_app 呼び出しでまとめて読み、
-                        // ネストした spawn_local の**先頭**で capture する
-                        // （この外側ブロックは probe 読み取りが最初の await のため、
-                        // capture をここに直接置くと「ブロック先頭で capture」の
-                        // 規律から外れてしまう）。
-                        let (should_restore, focus_gen) = crate::with_app(|app| {
-                            let ime = &app.platform_state.ime;
-                            let should_restore = ime.effective_open()
-                                && !matches!(ime.input_mode(), InputModeState::ObservedKana);
-                            (should_restore, app.platform.output.ime_mode_focus_gen.get())
-                        })
-                        .unwrap_or((false, 0));
-                        if should_restore {
-                            log::debug!(
-                                "[ImmCrossProbe] kana mode (conv=0x{conv:08X}) + IME ON \
-                                 → romaji 修正 (MS-IME かなモード修正)"
-                            );
-                            win32_async::spawn_local(async move {
-                                let Some(target) =
-                                    crate::ime::ActuationTarget::capture(focus_gen).await
-                                else {
-                                    log::debug!(
-                                        "[ImmCrossProbe] romaji 修正: capture 失敗（フォーカス無し）"
-                                    );
-                                    return;
-                                };
-                                let outcome =
-                                    crate::ime::set_ime_conv_for_target(target, None, || {
-                                        crate::with_app(|runtime| {
-                                            runtime.platform.output.ime_mode_focus_gen.get()
-                                        })
-                                        .unwrap_or_else(|| focus_gen.wrapping_add(1))
-                                    })
-                                    .await;
-                                if !matches!(outcome, crate::ime::ActuationOutcome::Written) {
-                                    log::warn!("[ImmCrossProbe] romaji 修正に失敗: {outcome:?}");
-                                }
-                            });
-                        }
-                    }
                 }
             });
         }
@@ -2421,26 +2920,25 @@ impl Runtime {
             } else {
                 String::new()
             };
-        log::info!(
-            "FocusProbe +{}ms: ime_on={}{} mode={:?} [ime={:?} sig1={}{}]",
+        tracing::info!(
+            "FocusProbe +{}ms: ime_on={}{} mode={:?} [ime={:?}{}]",
             probe_age_ms,
             ime_on_after_probe,
             ime_on_suffix,
             input_mode_after_probe,
             active_ime_kind,
-            signals.warmup_grace_active,
             gji_fields,
         );
 
         match suppressed_reason {
-            Some(reason) => log::debug!(
+            Some(reason) => tracing::debug!(
                 "FocusProbe: imc_open=false を抑制 (reason={reason}) — Engine deactivation を防止"
             ),
-            None if used_shadow_fallback => log::debug!(
+            None if used_shadow_fallback => tracing::debug!(
                 "FocusProbe: TsfNative/Imm32Unavailable — 観測不能のため記録は行わず、shadow 値 \
                  {shadow_on} を guard 解除判定にのみ使用 [probe_age={probe_age_ms}ms]"
             ),
-            None if probe.ime_on.is_none() => log::warn!(
+            None if probe.ime_on.is_none() => tracing::warn!(
                 "FocusProbe: ime_on 未検出 — stale値 {ime_on_before_probe} \
                  [probe_age={probe_age_ms}ms]",
             ),
@@ -2456,6 +2954,7 @@ impl Runtime {
 mod tests {
     use super::*;
     use crate::focus::class_names::AppImeProfile;
+    use awase::engine::Decision;
 
     #[test]
     fn focus_probe_open_status_is_not_observable_for_imm32_unavailable() {
@@ -2470,6 +2969,14 @@ mod tests {
         assert!(matches!(
             FocusProbeOpenStatus::classify(Some(false), AppImeProfile::TsfNative),
             FocusProbeOpenStatus::NotObservable(AppImeProfile::TsfNative)
+        ));
+    }
+
+    #[test]
+    fn focus_probe_open_status_is_not_observable_for_input_relay() {
+        assert!(matches!(
+            FocusProbeOpenStatus::classify(Some(true), AppImeProfile::InputRelay),
+            FocusProbeOpenStatus::NotObservable(AppImeProfile::InputRelay)
         ));
     }
 
@@ -2490,5 +2997,54 @@ mod tests {
             FocusProbeOpenStatus::classify(None, AppImeProfile::Standard),
             FocusProbeOpenStatus::NotObservable(AppImeProfile::Standard)
         ));
+    }
+
+    fn send_keys_decision(actions: Vec<KeyAction>) -> Decision {
+        Decision::consumed_with(
+            [Effect::Input(InputEffect::SendKeys(actions))]
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn decision_contains_romaji_send_for_char_romaji_and_key_sequence() {
+        use awase::types::VkCode;
+
+        for action in [
+            KeyAction::Char('な'),
+            KeyAction::Romaji(String::from("na")),
+            KeyAction::KeySequence(String::from("1")),
+            // .yab配列定義外のキーはnicola_fsm::resolve_pending_char_as_singleが
+            // Key(vk_code)にフォールバックし、これも生VK押下として送信される
+            // (JISかな解釈の対象になりうる)。
+            KeyAction::Key(VkCode(0x41)),
+        ] {
+            assert!(decision_contains_romaji_send(&send_keys_decision(vec![
+                action
+            ])));
+        }
+    }
+
+    #[test]
+    fn decision_contains_romaji_send_recurses_into_sequence() {
+        let decision = send_keys_decision(vec![KeyAction::Sequence(vec![KeyAction::Char('な')])]);
+        assert!(decision_contains_romaji_send(&decision));
+    }
+
+    #[test]
+    fn decision_contains_romaji_send_ignores_non_romaji_vk_actions() {
+        use awase::types::{SpecialKey, VkCode};
+
+        for action in [
+            KeyAction::SpecialKey(SpecialKey::Enter),
+            KeyAction::KeyUp(VkCode(0x41)),
+            KeyAction::CtrlChord(VkCode(0x41)),
+            KeyAction::Suppress,
+        ] {
+            assert!(!decision_contains_romaji_send(&send_keys_decision(vec![
+                action
+            ])));
+        }
     }
 }

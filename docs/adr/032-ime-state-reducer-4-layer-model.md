@@ -1,4 +1,20 @@
+---
+id: ADR-032
+title: |-
+  IME 状態モデルの 4 階層 reducer アーキテクチャ
+status: |-
+  採用・実装済み(一部撤去、2026-10-04 確認)。shadow_model/ImeModel::reduce と ObserverReported 経由の観測は現存。旧 sideband の force_on_until_ms・shadow_toggle_suppressed_vks・PendingApplyEvent・set_open_request は現行コードに無い。旧: 採用済み
+related_adr:
+  - "ADR-021"
+  - "ADR-026"
+  - "ADR-027"
+  - "ADR-029"
+  - "ADR-030"
+---
+
 # ADR-032: IME 状態モデルの 4 階層 reducer アーキテクチャ
+
+> 状態更新(2026-10-04): 採用・実装済み(一部撤去、2026-10-04 確認)。shadow_model/ImeModel::reduce と ObserverReported 経由の観測は現存。旧 sideband の force_on_until_ms・shadow_toggle_suppressed_vks・PendingApplyEvent・set_open_request は現行コードに無い
 
 ## ステータス
 

@@ -258,6 +258,42 @@ code,.code-block{
   color:var(--text-secondary);
   margin-top:0.4rem;
 }
+.install-primary{
+  background:var(--bg);
+  border:2px solid var(--accent);
+  border-radius:12px;
+  padding:1.6rem 1.8rem;
+  box-shadow:var(--card-shadow);
+  margin-bottom:1.5rem;
+}
+.install-primary h3{margin-top:0}
+.install-alt{
+  border:1px solid var(--border);
+  border-radius:10px;
+  padding:0 1.2rem;
+}
+.install-alt summary{
+  cursor:pointer;
+  font-weight:600;
+  font-size:0.95rem;
+  color:var(--text-secondary);
+  padding:0.9rem 0;
+  list-style:none;
+}
+.install-alt summary::-webkit-details-marker{display:none}
+.install-alt summary::before{
+  content:"\25B8";
+  display:inline-block;
+  margin-right:0.5em;
+  transition:transform .15s;
+}
+.install-alt[open] summary::before{transform:rotate(90deg)}
+.install-alt[open] summary{
+  color:var(--text);
+  border-bottom:1px solid var(--border);
+  margin-bottom:0.5rem;
+}
+.install-alt[open]{padding-bottom:1.2rem}
 
 /* Modes */
 .modes-grid{
@@ -429,7 +465,7 @@ footer p{margin-bottom:0.3rem}
         <ul>
           <li>Rust 製で処理速度 1–5ms。入力遅延を感じさせない</li>
           <li>n-gram 統計モデルで「文脈に合う方」を予測し、同時打鍵を賢く判定</li>
-          <li>5 種類の確定モードからタイピングスタイルに合わせて選択</li>
+          <li>2 種類の確定モードからタイピングスタイルに合わせて選択</li>
           <li>AutoHotKey など他のフックソフトウェアとも共存可能</li>
         </ul>
       </div>
@@ -447,7 +483,6 @@ footer p{margin-bottom:0.3rem}
         <ul>
           <li>MIT / Apache 2.0 デュアルライセンス</li>
           <li>GitHub でソースコード公開</li>
-          <li>Scoop でのワンコマンドインストールに対応</li>
           <li>MSI インストーラーで簡単セットアップ</li>
         </ul>
       </div>
@@ -543,29 +578,64 @@ footer p{margin-bottom:0.3rem}
         awase は日本語 n-gram コーパスから学習した統計モデルを内蔵し、前後の文脈から「どちらが自然な日本語か」を判定します。速く打っても誤変換が少なく、長文入力でも快適です。
       </p>
 
-      <h3>5 種類の確定モード</h3>
+      <h3>2 種類の確定モード</h3>
       <div class="modes-grid">
         <div class="mode-row">
           <span class="mode-name">ngram_predictive</span>
-          <span class="mode-desc">n-gram 統計モデルで文脈予測。速度と精度のバランスが最も良い（推奨）</span>
-        </div>
-        <div class="mode-row">
-          <span class="mode-name">adaptive_timing</span>
-          <span class="mode-desc">直前のタイピング速度に応じて閾値を自動調整</span>
-        </div>
-        <div class="mode-row">
-          <span class="mode-name">two_phase</span>
-          <span class="mode-desc">投機出力で速度を確保しつつ、親指キーが来れば差し替え</span>
-        </div>
-        <div class="mode-row">
-          <span class="mode-name">speculative</span>
-          <span class="mode-desc">単独打鍵を即時出力。最速だが高速タイピング時は誤変換が増える場合あり</span>
+          <span class="mode-desc">n-gram 統計モデルで文脈予測。速度と精度のバランスを取る</span>
         </div>
         <div class="mode-row">
           <span class="mode-name">wait</span>
-          <span class="mode-desc">タイマーまで待機してから確定。最も正確で、ゆったり打つ方に向く</span>
+          <span class="mode-desc">タイマーまで待機してから確定。最も正確で、ゆったり打つ方に向く（既定・推奨）</span>
         </div>
       </div>
+    </div>
+  </div>
+</section>
+
+<!-- v2 -->
+<section id="v2">
+  <div class="container">
+    <div class="install-block" style="margin-bottom:1.2rem">
+      <p style="line-height:1.9;margin:0"><strong>v1（1.x）の保守は終了しました。</strong>最後の版は 1.21.2 で、今後 v1 には不具合修正も新機能も入りません。v2 への更新をおすすめします。
+        設定ファイルはそのまま引き継げますが、<strong>これまで効いていなかった設定が、更新すると効き始めることがあります。</strong>
+        <a href="https://github.com/cuzic/awase/blob/main/docs/migration-v1-to-v2.md">v1 から v2 への違いと移行ガイド</a>をご確認ください。
+        v1 のアプリ内更新通知では v2 は案内されないため、このページか <a href="https://github.com/cuzic/awase/releases">GitHub Releases</a> からダウンロードしてください。</p>
+    </div>
+    <h2 class="section-title">v2 の主な変更（v1 との違い）</h2>
+    <p class="section-lead">v2 は「IME の状態は IME 自身が正。awase は書かずに観測して追随する」方針に作り直した版です。</p>
+    <div class="install-block">
+      <div class="modes-grid">
+        <div class="mode-row">
+          <span class="mode-name">先回りの書き込みをやめた</span>
+          <span class="mode-desc">確定キーごと・フォーカス変更時・Ctrl を離したとき・エンジン ON/OFF 時の IME キー自動送信を撤去。IME の状態は観測して追随します</span>
+        </div>
+        <div class="mode-row">
+          <span class="mode-name">IME キーが必ず合う</span>
+          <span class="mode-desc">Ctrl+変換/無変換・かな・半角/全角などを押すと、内部状態によらず、絶対指定は 1 回、トグルは 2 回以内で実際の IME が一致します</span>
+        </div>
+        <div class="mode-row">
+          <span class="mode-name">キーの役割を IME 設定から逆算</span>
+          <span class="mode-desc">Google 日本語入力・MS-IME のキー設定を読み取り、半角/全角・無変換/変換・F13〜F24 の扱いを決めます（カスタム設定でも動く）</span>
+        </div>
+        <div class="mode-row">
+          <span class="mode-name">キー効果の学習</span>
+          <span class="mode-desc">カスタムキー設定の IME で、キーを押すと IME がどうなるかを実機で学習し表にします（設定画面から採用・再検証）</span>
+        </div>
+        <div class="mode-row">
+          <span class="mode-name">設定の診断</span>
+          <span class="mode-desc">キー名の書き方を全項目で寛容に解釈し、間違いは黙って無視せず警告します。設定画面の保存はコメントを保ちます</span>
+        </div>
+        <div class="mode-row">
+          <span class="mode-name">不具合修正</span>
+          <span class="mode-desc">Windows Terminal + Google 日本語入力のカタカナ固着、Chrome の高速打鍵での文字消失、外部から閉じられた IME への追随ほか 約 20 件（BUG 番号つき 18 件を移行ガイドに一覧）</span>
+        </div>
+      </div>
+      <p style="color:var(--text-secondary);font-size:0.95rem;line-height:1.9;margin-top:1rem">
+        設定ファイル（<code>config.toml</code>）は引き継げますが、一部の設定は変わります。
+        <a href="https://github.com/cuzic/awase/blob/main/docs/migration-v1-to-v2.md">v1 から v2 への違いと移行ガイド</a> と
+        <a href="changelog.html">更新履歴</a> を確認してください。
+      </p>
     </div>
   </div>
 </section>
@@ -576,10 +646,12 @@ footer p{margin-bottom:0.3rem}
     <h2 class="section-title">インストール</h2>
     <div class="install-block">
 
-      <h3>MSI インストーラー（推奨）</h3>
-      <p class="install-note" style="color:var(--text-secondary);font-size:0.95rem">ダブルクリックでセットアップ完了。スタートアップ登録も自動で行います。</p>
-      <a id="dl-msi" href="https://github.com/cuzic/awase/releases" class="btn btn-primary" style="display:inline-block;margin:0.8rem 0">最新版をダウンロード (MSI)</a>
-      <p style="color:var(--text-secondary);font-size:0.88rem">ダウンロードできない場合は <a href="https://github.com/cuzic/awase/releases">GitHub Releases</a> から手動でダウンロードしてください。</p>
+      <div class="install-primary">
+        <h3>MSI インストーラー</h3>
+        <p class="install-note" style="color:var(--text-secondary);font-size:0.95rem">ダブルクリックでセットアップ完了。スタートアップ登録も自動で行います。</p>
+        <a id="dl-msi" href="https://github.com/cuzic/awase/releases" class="btn btn-primary" style="display:inline-block;margin:0.8rem 0">最新版をダウンロード (MSI)</a>
+        <p style="color:var(--text-secondary);font-size:0.88rem">ダウンロードできない場合は <a href="https://github.com/cuzic/awase/releases">GitHub Releases</a> から手動でダウンロードしてください。</p>
+      </div>
 
       <!-- Scoop 未対応のため非表示
       <h3>Scoop（コマンドライン）</h3>
@@ -587,23 +659,27 @@ footer p{margin-bottom:0.3rem}
       <p class="install-note">Scoop がインストールされていない場合は <a href="https://scoop.sh">scoop.sh</a> を参照してください。</p>
       -->
 
-      <h3>ZIP 版（ポータブル）</h3>
-      <p style="color:var(--text-secondary);font-size:0.95rem;margin-bottom:0.5rem">インストール不要。解凍してすぐ使えます。</p>
-      <a id="dl-zip-btn" href="https://github.com/cuzic/awase/releases" class="btn btn-primary" style="display:inline-block;margin:0.3rem 0 0.8rem">最新版をダウンロード (ZIP)</a>
-      <ol>
-        <li><a id="dl-zip" href="https://github.com/cuzic/awase/releases">GitHub Releases</a> から <code id="zip-filename">awase-x.x.x-x64.zip</code> をダウンロードして解凍</li>
-        <li>解凍したフォルダ内の <code>install.ps1</code> を PowerShell で実行（スタートアップ登録）</li>
-        <li><code>awase.exe</code> を実行（トレイアイコンに常駐）</li>
-      </ol>
-      <p style="color:var(--text-secondary);font-size:0.88rem">
-        <strong>アップグレード時:</strong> 新しい ZIP を解凍し、同じフォルダへ
-        <code>install.ps1</code> を再度実行するだけで構いません（
-        <code>config.toml</code> と配列ファイルは既定で保持されます）。
-        <code>uninstall.ps1</code> を先に実行する必要はありません。
-      </p>
+      <details class="install-alt">
+        <summary>その他のインストール方法（ZIP版・ソースからビルド）</summary>
 
-      <h3>ソースからビルド</h3>
-      <div class="code-block">cargo build -p awase-windows --release</div>
+        <h3>ZIP 版（ポータブル）</h3>
+        <p style="color:var(--text-secondary);font-size:0.95rem;margin-bottom:0.5rem">インストール不要。解凍してすぐ使えます。</p>
+        <a id="dl-zip-btn" href="https://github.com/cuzic/awase/releases" class="btn btn-secondary" style="display:inline-block;margin:0.3rem 0 0.8rem">最新版をダウンロード (ZIP)</a>
+        <ol>
+          <li><a id="dl-zip" href="https://github.com/cuzic/awase/releases">GitHub Releases</a> から <code id="zip-filename">awase-x.x.x-x64.zip</code> をダウンロードして解凍</li>
+          <li>解凍したフォルダ内の <code>install.ps1</code> を PowerShell で実行（スタートアップ登録）</li>
+          <li><code>awase.exe</code> を実行（トレイアイコンに常駐）</li>
+        </ol>
+        <p style="color:var(--text-secondary);font-size:0.88rem">
+          <strong>アップグレード時:</strong> 新しい ZIP を解凍し、同じフォルダへ
+          <code>install.ps1</code> を再度実行するだけで構いません（
+          <code>config.toml</code> と配列ファイルは既定で保持されます）。
+          <code>uninstall.ps1</code> を先に実行する必要はありません。
+        </p>
+
+        <h3>ソースからビルド</h3>
+        <div class="code-block">cargo build -p awase-windows --release</div>
+      </details>
     </div>
   </div>
 </section>
@@ -625,15 +701,7 @@ footer p{margin-bottom:0.3rem}
       <table class="config-table">
         <tr>
           <th><code>confirm_mode</code></th>
-          <td>確定モードの選択。<code>ngram_predictive</code>（推奨）、<code>wait</code>（正確重視）、<code>speculative</code>（速度重視）など</td>
-        </tr>
-        <tr>
-          <th><code>output_mode</code></th>
-          <td>出力方式。<code>unicode</code> がデフォルト</td>
-        </tr>
-        <tr>
-          <th><code>hook_mode</code></th>
-          <td>フックの動作方式。<code>relay</code> がデフォルトで、安定性を重視した設計</td>
+          <td>確定モードの選択。<code>wait</code>（既定・推奨、正確重視）、<code>ngram_predictive</code></td>
         </tr>
       </table>
     </div>
@@ -683,7 +751,7 @@ footer p{margin-bottom:0.3rem}
       </div>
       <div class="faq-item">
         <p class="faq-q">速く打つとシフトが隣のキーに響いて濁点になることがありました</p>
-        <p class="faq-a">やまぶきR・紅皿など従来ツールで広く報告されていた問題です。親指シフトキーを離すタイミングが次のキー入力に重なると、意図しない同時打鍵と判定されて濁音や別の文字が出てしまいます。「ゆっくり打てば誤動作しない」という状況が生まれていました。awase は n-gram 統計モデルを使って「日本語として自然かどうか」を判断するため、タイミングが多少ずれても正しく判定できます。確定モードも 5 種類から選べるため、自分のタイピング速度に合わせた調整も可能です。</p>
+        <p class="faq-a">やまぶきR・紅皿など従来ツールで広く報告されていた問題です。親指シフトキーを離すタイミングが次のキー入力に重なると、意図しない同時打鍵と判定されて濁音や別の文字が出てしまいます。「ゆっくり打てば誤動作しない」という状況が生まれていました。awase は n-gram 統計モデルを使って「日本語として自然かどうか」を判断するため、タイミングが多少ずれても正しく判定できます。確定モードも 2 種類から選べるため、自分のタイピング速度に合わせた調整も可能です。</p>
       </div>
       <div class="faq-item">
         <p class="faq-q">高速タイピングで文字の順番がおかしくなることがありました</p>

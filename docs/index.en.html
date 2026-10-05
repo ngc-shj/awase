@@ -258,6 +258,42 @@ code,.code-block{
   color:var(--text-secondary);
   margin-top:0.4rem;
 }
+.install-primary{
+  background:var(--bg);
+  border:2px solid var(--accent);
+  border-radius:12px;
+  padding:1.6rem 1.8rem;
+  box-shadow:var(--card-shadow);
+  margin-bottom:1.5rem;
+}
+.install-primary h3{margin-top:0}
+.install-alt{
+  border:1px solid var(--border);
+  border-radius:10px;
+  padding:0 1.2rem;
+}
+.install-alt summary{
+  cursor:pointer;
+  font-weight:600;
+  font-size:0.95rem;
+  color:var(--text-secondary);
+  padding:0.9rem 0;
+  list-style:none;
+}
+.install-alt summary::-webkit-details-marker{display:none}
+.install-alt summary::before{
+  content:"\25B8";
+  display:inline-block;
+  margin-right:0.5em;
+  transition:transform .15s;
+}
+.install-alt[open] summary::before{transform:rotate(90deg)}
+.install-alt[open] summary{
+  color:var(--text);
+  border-bottom:1px solid var(--border);
+  margin-bottom:0.5rem;
+}
+.install-alt[open]{padding-bottom:1.2rem}
 
 /* Modes */
 .modes-grid{
@@ -429,7 +465,7 @@ footer p{margin-bottom:0.3rem}
         <ul>
           <li>Written in Rust with 1–5ms processing time, so you never feel input lag</li>
           <li>An n-gram statistical model predicts "the reading that fits the context," judging chords intelligently</li>
-          <li>Choose from five confirmation modes to match your typing style</li>
+          <li>Choose from two confirmation modes to match your typing style</li>
           <li>Coexists with other hook-based software such as AutoHotKey</li>
         </ul>
       </div>
@@ -447,7 +483,6 @@ footer p{margin-bottom:0.3rem}
         <ul>
           <li>Dual-licensed under MIT / Apache 2.0</li>
           <li>Source code published on GitHub</li>
-          <li>One-command installation via Scoop</li>
           <li>Easy setup with the MSI installer</li>
         </ul>
       </div>
@@ -543,29 +578,64 @@ footer p{margin-bottom:0.3rem}
         awase includes a built-in statistical model learned from a Japanese n-gram corpus, and judges "which is the natural Japanese" from the surrounding context. Even when you type fast there are few misconversions, and long-form input stays comfortable.
       </p>
 
-      <h3>Five Confirmation Modes</h3>
+      <h3>Two Confirmation Modes</h3>
       <div class="modes-grid">
         <div class="mode-row">
           <span class="mode-name">ngram_predictive</span>
-          <span class="mode-desc">Context prediction with an n-gram statistical model. The best balance of speed and accuracy (recommended)</span>
-        </div>
-        <div class="mode-row">
-          <span class="mode-name">adaptive_timing</span>
-          <span class="mode-desc">Automatically adjusts the threshold based on your recent typing speed</span>
-        </div>
-        <div class="mode-row">
-          <span class="mode-name">two_phase</span>
-          <span class="mode-desc">Uses speculative output to keep speed, then replaces it if a thumb key arrives</span>
-        </div>
-        <div class="mode-row">
-          <span class="mode-name">speculative</span>
-          <span class="mode-desc">Outputs single keystrokes immediately. Fastest, but misconversions may increase during fast typing</span>
+          <span class="mode-desc">Context prediction with an n-gram statistical model. Balances speed and accuracy</span>
         </div>
         <div class="mode-row">
           <span class="mode-name">wait</span>
-          <span class="mode-desc">Waits until the timer fires before committing. Most accurate, and suited to those who type at a relaxed pace</span>
+          <span class="mode-desc">Waits until the timer fires before committing. Most accurate, and suited to those who type at a relaxed pace (default, recommended)</span>
         </div>
       </div>
+    </div>
+  </div>
+</section>
+
+<!-- v2 -->
+<section id="v2">
+  <div class="container">
+    <div class="install-block" style="margin-bottom:1.2rem">
+      <p style="line-height:1.9;margin:0"><strong>Maintenance of v1 (1.x) has ended.</strong> The last version is 1.21.2; v1 will receive no more fixes or new features. We recommend updating to v2.
+        Your settings file carries over as is, but <strong>some settings that previously had no effect may start working after the update.</strong>
+        Please read the <a href="https://github.com/cuzic/awase/blob/main/docs/migration-v1-to-v2.md">v1 to v2 differences and migration guide</a> (Japanese).
+        The in-app update notice of v1 does not announce v2, so download it from this page or from <a href="https://github.com/cuzic/awase/releases">GitHub Releases</a>.</p>
+    </div>
+    <h2 class="section-title">What's new in v2 (differences from v1)</h2>
+    <p class="section-lead">v2 is rebuilt on one principle: the IME is the source of truth, and awase observes and follows it instead of writing to it.</p>
+    <div class="install-block">
+      <div class="modes-grid">
+        <div class="mode-row">
+          <span class="mode-name">No more preventive writes</span>
+          <span class="mode-desc">Automatic IME key sends on every Enter, on focus change, when Ctrl is released, or when the engine is toggled have been removed. awase observes the IME state and follows it</span>
+        </div>
+        <div class="mode-row">
+          <span class="mode-name">IME keys always converge</span>
+          <span class="mode-desc">Press Ctrl+Henkan/Muhenkan, Kana, Hankaku/Zenkaku, etc., and whatever awase believes internally, an absolute key takes one press and a toggle at most two for the real IME to match</span>
+        </div>
+        <div class="mode-row">
+          <span class="mode-name">Key roles derived from your IME settings</span>
+          <span class="mode-desc">awase reads the key settings of Google Japanese Input and MS-IME to decide how to treat Hankaku/Zenkaku, Muhenkan/Henkan and F13–F24, so custom bindings work too</span>
+        </div>
+        <div class="mode-row">
+          <span class="mode-name">Key-effect learning</span>
+          <span class="mode-desc">For an IME with custom key settings, awase learns on the real machine what each key does and builds a table (adopt or re-verify from the settings screen)</span>
+        </div>
+        <div class="mode-row">
+          <span class="mode-name">Settings diagnostics</span>
+          <span class="mode-desc">Key names are read with one tolerant rule everywhere, and mistakes produce warnings instead of being silently ignored. Saving from the settings screen keeps your comments</span>
+        </div>
+        <div class="mode-row">
+          <span class="mode-name">Bug fixes</span>
+          <span class="mode-desc">Katakana lock in Windows Terminal + Google Japanese Input, lost characters under fast typing in Chrome, following an IME closed from outside, and about 20 others (18 listed with BUG numbers in the migration guide)</span>
+        </div>
+      </div>
+      <p style="color:var(--text-secondary);font-size:0.95rem;line-height:1.9;margin-top:1rem">
+        Your <code>config.toml</code> carries over, but some settings change. See the
+        <a href="https://github.com/cuzic/awase/blob/main/docs/migration-v1-to-v2.md">v1 to v2 differences and migration guide</a> (Japanese) and the
+        <a href="changelog.en.html">changelog</a>.
+      </p>
     </div>
   </div>
 </section>
@@ -576,10 +646,12 @@ footer p{margin-bottom:0.3rem}
     <h2 class="section-title">Installation</h2>
     <div class="install-block">
 
-      <h3>MSI installer (recommended)</h3>
-      <p class="install-note" style="color:var(--text-secondary);font-size:0.95rem">Double-click to finish setup. It registers itself to start up automatically, too.</p>
-      <a id="dl-msi" href="https://github.com/cuzic/awase/releases" class="btn btn-primary" style="display:inline-block;margin:0.8rem 0">Download the latest version (MSI)</a>
-      <p style="color:var(--text-secondary);font-size:0.88rem">If the download doesn't work, download it manually from <a href="https://github.com/cuzic/awase/releases">GitHub Releases</a>.</p>
+      <div class="install-primary">
+        <h3>MSI installer</h3>
+        <p class="install-note" style="color:var(--text-secondary);font-size:0.95rem">Double-click to finish setup. It registers itself to start up automatically, too.</p>
+        <a id="dl-msi" href="https://github.com/cuzic/awase/releases" class="btn btn-primary" style="display:inline-block;margin:0.8rem 0">Download the latest version (MSI)</a>
+        <p style="color:var(--text-secondary);font-size:0.88rem">If the download doesn't work, download it manually from <a href="https://github.com/cuzic/awase/releases">GitHub Releases</a>.</p>
+      </div>
 
       <!-- Scoop 未対応のため非表示
       <h3>Scoop（コマンドライン）</h3>
@@ -587,23 +659,27 @@ footer p{margin-bottom:0.3rem}
       <p class="install-note">Scoop がインストールされていない場合は <a href="https://scoop.sh">scoop.sh</a> を参照してください。</p>
       -->
 
-      <h3>ZIP version (portable)</h3>
-      <p style="color:var(--text-secondary);font-size:0.95rem;margin-bottom:0.5rem">No installation needed. Unzip and use it right away.</p>
-      <a id="dl-zip-btn" href="https://github.com/cuzic/awase/releases" class="btn btn-primary" style="display:inline-block;margin:0.3rem 0 0.8rem">Download the latest version (ZIP)</a>
-      <ol>
-        <li>Download <code id="zip-filename">awase-x.x.x-x64.zip</code> from <a id="dl-zip" href="https://github.com/cuzic/awase/releases">GitHub Releases</a> and unzip it</li>
-        <li>Run <code>install.ps1</code> from the unzipped folder in PowerShell (registers startup)</li>
-        <li>Run <code>awase.exe</code> (it lives in the tray)</li>
-      </ol>
-      <p style="color:var(--text-secondary);font-size:0.88rem">
-        <strong>Upgrading:</strong> just unzip the new release and run
-        <code>install.ps1</code> again in the same folder (<code>config.toml</code>
-        and your layout files are preserved by default). There is no need to
-        run <code>uninstall.ps1</code> first.
-      </p>
+      <details class="install-alt">
+        <summary>Other installation methods (ZIP, build from source)</summary>
 
-      <h3>Build from source</h3>
-      <div class="code-block">cargo build -p awase-windows --release</div>
+        <h3>ZIP version (portable)</h3>
+        <p style="color:var(--text-secondary);font-size:0.95rem;margin-bottom:0.5rem">No installation needed. Unzip and use it right away.</p>
+        <a id="dl-zip-btn" href="https://github.com/cuzic/awase/releases" class="btn btn-secondary" style="display:inline-block;margin:0.3rem 0 0.8rem">Download the latest version (ZIP)</a>
+        <ol>
+          <li>Download <code id="zip-filename">awase-x.x.x-x64.zip</code> from <a id="dl-zip" href="https://github.com/cuzic/awase/releases">GitHub Releases</a> and unzip it</li>
+          <li>Run <code>install.ps1</code> from the unzipped folder in PowerShell (registers startup)</li>
+          <li>Run <code>awase.exe</code> (it lives in the tray)</li>
+        </ol>
+        <p style="color:var(--text-secondary);font-size:0.88rem">
+          <strong>Upgrading:</strong> just unzip the new release and run
+          <code>install.ps1</code> again in the same folder (<code>config.toml</code>
+          and your layout files are preserved by default). There is no need to
+          run <code>uninstall.ps1</code> first.
+        </p>
+
+        <h3>Build from source</h3>
+        <div class="code-block">cargo build -p awase-windows --release</div>
+      </details>
     </div>
   </div>
 </section>
@@ -625,15 +701,7 @@ footer p{margin-bottom:0.3rem}
       <table class="config-table">
         <tr>
           <th><code>confirm_mode</code></th>
-          <td>Selects the confirmation mode. <code>ngram_predictive</code> (recommended), <code>wait</code> (favors accuracy), <code>speculative</code> (favors speed), and more</td>
-        </tr>
-        <tr>
-          <th><code>output_mode</code></th>
-          <td>The output method. <code>unicode</code> is the default</td>
-        </tr>
-        <tr>
-          <th><code>hook_mode</code></th>
-          <td>How the hook operates. <code>relay</code> is the default, designed to prioritize stability</td>
+          <td>Selects the confirmation mode. <code>wait</code> (default, recommended, favors accuracy), <code>ngram_predictive</code></td>
         </tr>
       </table>
     </div>
@@ -683,7 +751,7 @@ footer p{margin-bottom:0.3rem}
       </div>
       <div class="faq-item">
         <p class="faq-q">When I typed fast, the shift would bleed into the neighboring key and add a dakuten.</p>
-        <p class="faq-a">This is a problem widely reported with traditional tools like YamabukiR and Benisara. If the moment you release the thumb-shift key overlaps with the next keystroke, it's judged as an unintended chord and a voiced sound or a different character comes out — creating a situation where "it only works if you type slowly." awase uses an n-gram statistical model to judge "whether it's natural Japanese," so it can decide correctly even if the timing is slightly off. You can also choose from five confirmation modes to tune it to your own typing speed.</p>
+        <p class="faq-a">This is a problem widely reported with traditional tools like YamabukiR and Benisara. If the moment you release the thumb-shift key overlaps with the next keystroke, it's judged as an unintended chord and a voiced sound or a different character comes out — creating a situation where "it only works if you type slowly." awase uses an n-gram statistical model to judge "whether it's natural Japanese," so it can decide correctly even if the timing is slightly off. You can also choose from two confirmation modes to tune it to your own typing speed.</p>
       </div>
       <div class="faq-item">
         <p class="faq-q">During fast typing, the character order sometimes came out wrong.</p>

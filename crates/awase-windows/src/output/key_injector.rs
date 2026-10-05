@@ -60,10 +60,6 @@ pub(crate) struct KeyInjector {
     pub(super) kana_table: KanaTable,
     /// Chrome VK モード用: 記号→VK コードマッピング
     pub(super) symbol_to_vk: HashMap<char, (VkCode, bool)>,
-    /// Unicode cold-start warmup: `send_unicode_char()` の送信を遅延させるフラグ
-    pub(super) unicode_cold_defer: std::sync::atomic::AtomicBool,
-    /// `unicode_cold_defer=true` 中に蓄積した Unicode 文字バッファ
-    pub(super) unicode_cold_deferred: std::cell::RefCell<Vec<char>>,
 }
 
 impl KeyInjector {
@@ -71,20 +67,7 @@ impl KeyInjector {
         Self {
             kana_table: KanaTable::build(),
             symbol_to_vk: crate::vk::build_symbol_to_vk(),
-            unicode_cold_defer: std::sync::atomic::AtomicBool::new(false),
-            unicode_cold_deferred: std::cell::RefCell::new(Vec::new()),
         }
-    }
-
-    /// `send_unicode_char()` の遅延モードを ON/OFF する。
-    pub(crate) fn set_unicode_cold_defer(&self, defer: bool) {
-        self.unicode_cold_defer
-            .store(defer, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// 蓄積した Unicode deferred 文字を取り出してバッファをクリアする。
-    pub(crate) fn take_unicode_cold_deferred(&self) -> Vec<char> {
-        std::mem::take(&mut *self.unicode_cold_deferred.borrow_mut())
     }
 
     // ── 文字解決 ───────────────────────────────────────────────────────────────
@@ -112,17 +95,36 @@ impl KeyInjector {
         let _ = crate::win32::send_input_safe(&[input]);
     }
 
+    /// Ctrl+VK の1チョードを、Ctrl↓/VK↓/VK↑/Ctrl↑ の4イベントとして
+    /// 1回の `SendInput` にバッチして送る（ADR-115 決定1）。
+    ///
+    /// 単一バッチにする理由: `send_key` を4回呼ぶ素朴な実装は4回の独立した
+    /// `SendInput` になり、その間に実ハードウェア入力が OS の入力キューへ
+    /// 割り込みうる（割り込んだキーは「Ctrl 押下中」として対象アプリに届く）。
+    /// 自己注入マーカーにより物理修飾キー状態は汚染されない（`make_key_input`
+    /// は常に `INJECTED_MARKER` を付与し、`hook.rs::is_self_injected` が
+    /// これを検出して `CallNextHookEx` で素通しするため、注入した Ctrl は
+    /// エンジンの `phys.modifiers.ctrl` を汚染せず `OsModifierHeld` バイパス
+    /// を誘発しない）。
+    ///
+    /// 押下中の物理修飾キー（Shift/Alt）との衝突は既知の限界として扱う
+    /// （ADR-115 決定1）——打鍵列セルは通常、修飾キーを押しながら打つ位置
+    /// には置かれない、という運用上の前提に留める。
+    #[expect(clippy::unused_self)]
+    pub(super) fn send_ctrl_chord(&self, vk: VkCode) {
+        let inputs = [
+            make_key_input(crate::vk::VK_CONTROL, false),
+            make_key_input(vk, false),
+            make_key_input(vk, true),
+            make_key_input(crate::vk::VK_CONTROL, true),
+        ];
+        let _ = crate::win32::send_input_safe(&inputs);
+    }
+
     /// Unicode 文字を直接送信する（`KEYEVENTF_UNICODE`）
     ///
-    /// `unicode_cold_defer` フラグが立っている場合は実送信せず `unicode_cold_deferred` に蓄積する。
+    #[expect(clippy::unused_self)]
     pub(super) fn send_unicode_char(&self, ch: char) {
-        if self
-            .unicode_cold_defer
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            self.unicode_cold_deferred.borrow_mut().push(ch);
-            return;
-        }
         let mut inputs = Vec::with_capacity(4);
         Self::push_unicode_char_inputs(&mut inputs, ch, INJECTED_MARKER);
         let _ = crate::win32::send_input_safe(&inputs);
@@ -240,7 +242,7 @@ impl KeyInjector {
         // 初回 composition 失敗を修正した経緯（`99f56a2`/`2d4d85c`）と同じ理屈。
         for run in Self::split_vk_runs(chars) {
             let n = Self::send_vk_run_batch(run, VkMarker::InjectedWithScan);
-            log::debug!("[vk-send] romaji={romaji:?} batch {n} inputs");
+            tracing::debug!("[vk-send] romaji={romaji:?} batch {n} inputs");
         }
     }
 
@@ -263,7 +265,7 @@ impl KeyInjector {
 
         for (run_idx, run) in runs.into_iter().enumerate() {
             let run_gji_idle = crate::tsf::observer::gji_idle_ms();
-            log::debug!(
+            tracing::debug!(
                 "[h1-run] cold={cold_seq} run={run_idx}/{total_runs} gji={run_gji_idle}ms vks=[{}]",
                 Self::format_vk_run(run),
                 cold_seq = cold_seq.value(),
@@ -277,7 +279,7 @@ impl KeyInjector {
         if vks.is_empty() {
             return;
         }
-        log::debug!(
+        tracing::debug!(
             "[tsf-probe] deferred {} VK(s) を romaji 直後に送出 ({marker:?})",
             vks.len()
         );

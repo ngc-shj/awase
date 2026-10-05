@@ -1,3 +1,12 @@
+---
+id: ADR-010
+title: |-
+  Option<Timestamp> による親指キー消費追跡
+status: |-
+  採用・実装済み(left/right_thumb_consumed: Option<Timestamp> は src/engine/input_tracker.rs に現存、2026-10-04 確認)。旧: 採用済み
+related_adr: []
+---
+
 # ADR-010: Option<Timestamp> による親指キー消費追跡
 
 ## ステータス

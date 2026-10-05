@@ -144,7 +144,7 @@ pub fn find_keyboard_device() -> anyhow::Result<PathBuf> {
         match Device::open(&path) {
             Ok(device) => {
                 if is_suitable_keyboard(&device) {
-                    log::info!(
+                    tracing::info!(
                         "Found keyboard device: {} ({})",
                         path.display(),
                         device.name().unwrap_or("unknown")
@@ -153,7 +153,7 @@ pub fn find_keyboard_device() -> anyhow::Result<PathBuf> {
                 }
             }
             Err(e) => {
-                log::debug!("Cannot open {}: {}", path.display(), e);
+                tracing::debug!("Cannot open {}: {}", path.display(), e);
             }
         }
     }
@@ -200,7 +200,7 @@ impl EvdevInput {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         let device =
             Device::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
-        log::info!(
+        tracing::info!(
             "Opened evdev device: {} ({})",
             path.display(),
             device.name().unwrap_or("unknown")
@@ -220,14 +220,14 @@ impl EvdevInput {
     /// イベントを受け取れなくなる。uinput で再注入する場合に使う。
     pub fn grab(&mut self) -> anyhow::Result<()> {
         self.device.grab().context("EVIOCGRAB failed")?;
-        log::info!("Exclusive grab acquired on device");
+        tracing::info!("Exclusive grab acquired on device");
         Ok(())
     }
 
     /// 排他取得を解除する
     pub fn ungrab(&mut self) -> anyhow::Result<()> {
         self.device.ungrab().context("EVIOCUNGRAB failed")?;
-        log::info!("Exclusive grab released");
+        tracing::info!("Exclusive grab released");
         Ok(())
     }
 
@@ -259,6 +259,9 @@ impl EvdevInput {
                     let (key_classification, physical_pos) = classify_key(keycode);
 
                     let raw_event = RawKeyEvent {
+                        was_down: false,
+                        // ADR-208 L1: 押下 ID は Windows のフックだけが振る（Linux の IME 制御は押下単位の予約を持たない）。
+                        press_id: None,
                         vk_code: vk,
                         scan_code: scan,
                         event_type,
@@ -269,12 +272,23 @@ impl EvdevInput {
                         ime_relevance: classify_ime_relevance(keycode),
                         modifier_key: classify_modifier(keycode),
                         modifier_snapshot: Default::default(),
+                        // ADR-129: Linux は `main.rs` 側で
+                        // `event.key_classification` から親指状態を自前で追跡しており
+                        // （案(d)相当、Windows と異なり deliver_key_event 相当の早期
+                        // return 網を持たないため成立する）、RawKeyEvent 経由でこの
+                        // スナップショットを運ぶ必要が無い。`None` 固定でよいが、将来
+                        // core がこのフィールドを消費するコードを追加した瞬間、Linux は
+                        // `None` 固定のまま静かに壊れる（コンパイルは通る）——
+                        // core側で消費コードを足す際は本ファイルと `main.rs` 側の
+                        // 親指トラッキングを必ず同時に見直すこと。
+                        left_thumb_down_snapshot: None,
+                        right_thumb_down_snapshot: None,
                         // evdev はハードウェアイベントのみ（uinput 注入は別デバイス経由で
                         // ここには来ない）
                         injected: false,
                     };
 
-                    log::trace!(
+                    tracing::trace!(
                         "evdev: code={} type={:?} classification={:?}",
                         keycode,
                         event_type,

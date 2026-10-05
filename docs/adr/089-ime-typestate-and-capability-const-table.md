@@ -1,3 +1,29 @@
+---
+id: ADR-089
+title: |-
+  IME 状態制御を Rust の型システムでどう表現するか — 型状態パターンの局所適用と capability const 表（trait 静的分岐の却下）
+summary: |-
+  IME 状態制御を Rust の型システムでどう表現するか — 型状態パターンの**局所適用**3箇所（`ObservationStore` の Actuating/BeliefOnly プール分離を関連型で排他化、`Actuation<Requested/Warranted/Verified>` チェーン、`ActuationReceipt` による `GjiFsm` 同期義務のアフィン型化）と、capability を **const 表 `caps(p,k)`** に据える決定。**trait 静的分岐は却下**（§4.1、再提案禁止）。ADR-088 の姉妹編（088=「何が壊れているか」／089=「型でどう表現するか」）。INV-38〜46
+status: |-
+  一部実装(Phase A/B/C 実装済み、2026-08-12。残課題は ADR-090 が引き取り、2026-10-04 コード確認)。`warrant_pending_adr087()` は ADR-090 A-1 で削除済み、`ConvergedReceipt`(state/ime_actuation.rs)は ADR-090 §2.B で読み戻し API へ配線済み、`record_belief` 等の観測ストア(state/observation_store.rs)は現存。非同期チェーンへの caps 適用(ADR-090 項D)は本文に実施記録なし。実機ソーク未実施。
+  旧(2026-10-04 更新前):
+  **ドラフト**（Fable×Opus pre-mortem 4ラウンド + 起票後 Opus レビュー(round5、指摘10件反映)で収束。**Phase A/B/C すべて実装済み**（2026-08-12）——ただし `record`/`record_belief` の本番呼び出し元はゼロ（§9-10）、`issue_open_warrant()` も未配線で `warrant_pending_adr087()` が 2 箇所（§9-12）、`ConvergedReceipt` は制御フロー未接続（§9-16）、非同期チェーンは `caps` 未適用（§9-20）。**実機ソーク未実施**（申し送りは §9-17）。残課題の詳細化は ADR-090 が引き取った）
+related_adr:
+  - "ADR-065"
+  - "ADR-078"
+  - "ADR-080"
+  - "ADR-081"
+  - "ADR-082"
+  - "ADR-084"
+  - "ADR-085"
+  - "ADR-086"
+  - "ADR-087"
+  - "ADR-088"
+  - "ADR-090"
+  - "ADR-163"
+  - "ADR-168"
+---
+
 # ADR-089: IME 状態制御を Rust の型システムでどう表現するか — 型状態パターンの局所適用と capability const 表（trait 静的分岐の却下）
 
 ## ステータス
@@ -696,6 +722,24 @@ Phase B での結論である:
 doctest（ケース1 とその「通る双子」）まで波及し、`caps(p, k).chain` を導入する
 Phase C（§2.8）が同じ場所をもう一度触る。§9-15 に残す。
 
+**2026-09-13追記（[ADR-168](168-actuation-boundary-small-cleanups.md)検討時の再評価、
+§9-15は据え置き・未実装のまま）**: Phase Cは実装済み（2026-08-12）なので上記の
+先送り理由のうち「Phase Cが同じ場所をもう一度触る」は解消しているが、もう一方の理由
+（writerトレイトのシグネチャ変更が§7の`compile_fail` doctestに波及する）はまだ解消して
+いない。トークン型を`AsyncMechanismWriter`実装（別モジュール`runtime/open_chain.rs`）から
+名前で参照できる必要があるため`pub`にせざるを得ず、モジュールprivateにする単純な案は
+成立しない（`pub` + privateフィールドでの外部構築不可、という形にすれば`compile_fail`
+doctestの「通る双子」を壊さずに済むが未検証）。加えて実際に削除できる対価も当初の見立てより
+小さい: `raw_mechanism_write_sites_are_confined_to_chain_writers`が固定している性質のうち
+「writer実装2つの**中**にあること」は型で代替できるが、「呼び出し元の**総数**が2つのまま
+増えていないこと」はトークンでは代替できない（3つ目の`MechanismWriter`実装を新設すれば
+正当にトークンを受け取れてしまうため）——`ActuationOrder`が既に守っている性質と同型の限界。
+さらに、`AsyncMechanismWriter`は[ADR-163](163-actuation-decision-io-separation-and-replay-harness.md)
+がTH1e（`.claude/rules/complexity-budget.md`発効条件の最初の1件）の対象に確定させている
+`AsyncChainWriter::is_applicable`と**同じトレイト**であり、先にシグネチャを変えるとTH1eの
+凍結コーパス再生をやり直す必要が生じる。**したがって§9-15は今回も実装せず据え置く**——
+対価が小さくTH1e作業と衝突しうる現状では、優先度は低い。TH1e完了後に改めて評価すること。
+
 ### 2.4 `GjiFsm` 同期義務 — legacy 等価（outcome 軸のみ）に戻す
 
 #### r2 の K 軸ゲートを全面撤回する
@@ -915,6 +959,10 @@ pub const fn caps(p: ImePolicyProfile, k: ImeKindId) -> Caps { /* match */ }
 | `Imm32Unavailable` | `MsIme` | `[MsImeDirect]` | `BLIND` | 500 |
 | `TsfNative` | `Gji` | `[GjiDirect]` | `BLIND` | 200 |
 | `TsfNative` | `MsIme` | `[MsImeDirect]` | `BLIND` | 200 |
+
+> **【2026-09-20 追記・ADR-190で覆す】** 下記の理由は「当時の実装の書き写し」で、この組(`ImmCross × MsIme`)で`VK_IME_ON/OFF`が危険という実測ではなかった。
+> 「入れない理由」は**削除せず経緯として残す**。CI実機E2Eで、この組の`KanjiToggle`(非冪等)が、ImmCross失敗時に物理F2が既に開いたIMEを閉じるバグ(BUG-152)を起こすと確認したため、
+> [ADR-190](190-msime-immcross-failure-fallback-idempotent-vk-ime-on.md)で`[ImmCross, MsImeDirect]`へ変更する(未実装、ドラフト)。
 
 **`ImmCross × MsIme` に `MsImeDirect` を入れない理由**:
 `MsImeDirectStrategy::is_applicable` の条件は

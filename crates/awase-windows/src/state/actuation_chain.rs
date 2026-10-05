@@ -11,11 +11,11 @@
 //!
 //! # 型が保証しないもの（INV-41、誤読防止）
 //!
-//! **回数制限は型ではなく [`decide_actuation_action`] の責務である。**
+//! **回数制限は型ではなく [`FeedbackPolicy::decide_action`] の責務である。**
 //! `FeedbackPolicy::Blind { max_attempts }` の下では、同一 warrant で最大
 //! `max_attempts` 回の成功 write が正常に起こりうる（[`DriftEpisode`] が
 //! attempt ごとに新しい `Actuation` を作る）。「型が回数を守っている」と
-//! 読み替えて `decide_actuation_action` の呼び出しを省くと ADR-080 / BUG-43 の
+//! 読み替えて `FeedbackPolicy::decide_action` の呼び出しを省くと ADR-080 / BUG-43 の
 //! give-up が無効化される。
 //!
 //! # ADR-089 の記述との差分（実装時の判断、2026-08-12）
@@ -28,7 +28,7 @@
 //!    受け、走査・フォールスルー判定・アフィン性だけを本モジュールが持つ。
 //!    これにより chain の走査規則は Linux で全数テストできる。
 //! 2. **同期版と非同期版の 2 本を提供する。** ADR は `run_chain` を async 1 本に
-//!    しているが、GJI / MS-IME / KanjiToggle は `SendInput` のみで非ブロッキング
+//!    しているが、GJI / MS-IME は `SendInput` のみで非ブロッキング
 //!    であり、これらを await 越しにすると打鍵ホットパスのレイテンシが変わる
 //!    （ADR-089 §8.2 が「Phase B の実機ソークでレイテンシを測ること」と書いて
 //!    いる軸）。実機ソークができない状態でホットパスの同期/非同期を変えないため、
@@ -116,18 +116,28 @@ use std::marker::PhantomData;
 use awase::platform::ImeOpenOutcome;
 
 use super::event_origin::EventOrigin;
-use super::ime_actuation::{decide_actuation_action, ActuationAction, FeedbackPolicy};
+use super::ime_actuation::{ActuationAction, FeedbackPolicy};
 use super::ime_event::HwndId;
-use super::open_warrant::{issue_open_warrant, OpenWarrant, WarrantContext};
+use super::open_warrant::{issue_open_warrant, issue_press_warrant, OpenWarrant, WarrantContext};
 
 // ── WriteMechanism ────────────────────────────────────────────────────────────
 
-/// IME open を実際に書き込む機構。`ime_controller.rs` の 4 戦略と 1:1。
+/// IME open を実際に書き込む機構。`ime_controller.rs` の 3 戦略と 1:1。
 ///
 /// **キー値（VK）は持たない**——`state/key_sequence_policy.rs::ime_key_for` が
 /// SSOT のままである（ADR-089 §2.8、INV-44。`docs/experiments.md` エントリ01 の
 /// 回帰検知点を分裂させない）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(
+    strum::IntoStaticStr,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum WriteMechanism {
     /// `ImmSetOpenStatus` のクロスプロセス呼び出し。VK を送らない。
     ImmCross,
@@ -135,8 +145,6 @@ pub enum WriteMechanism {
     GjiDirect,
     /// MS-IME 向けの冪等キー（`VK_IME_ON` / `VK_IME_OFF`）。
     MsImeDirect,
-    /// 非冪等な `VK_KANJI` トグル。最終フォールバック。
-    KanjiToggle,
 }
 
 impl WriteMechanism {
@@ -147,7 +155,6 @@ impl WriteMechanism {
             Self::ImmCross => "ImmCrossProcess",
             Self::GjiDirect => "GjiDirect",
             Self::MsImeDirect => "MsImeDirect",
-            Self::KanjiToggle => "KanjiToggle",
         }
     }
 
@@ -159,12 +166,7 @@ impl WriteMechanism {
     /// あり、`ALL` を直接 chain として使ってよいのは
     /// 「起案時点の (p, k) を固定できない経路」だけである
     /// （`runtime/open_chain.rs` の非同期チェーン。同モジュール doc 参照）。
-    pub const ALL: [Self; 4] = [
-        Self::ImmCross,
-        Self::GjiDirect,
-        Self::MsImeDirect,
-        Self::KanjiToggle,
-    ];
+    pub const ALL: [Self; 3] = [Self::ImmCross, Self::GjiDirect, Self::MsImeDirect];
 
     /// この機構が [`ImeOpenOutcome::Failed`] を返しうるか
     /// （= 後続要素へフォールスルーしうるか）。
@@ -176,7 +178,6 @@ impl WriteMechanism {
     /// | `ImmCross` | `Applied` / **`Failed`**（`set_ime_open_cross_process` の失敗） |
     /// | `GjiDirect` | `AlreadyMatched` / `Applied` / `UnsafeToToggle` |
     /// | `MsImeDirect` | `Applied` / `UnsafeToToggle` |
-    /// | `KanjiToggle` | `FallbackSent` のみ |
     ///
     /// **`caps(p, k).chain` の末尾以外の要素は、必ずこれが真でなければならない**
     /// ——偽の機構の後ろに要素を置くと、その要素は現行のフォールスルー述語
@@ -189,8 +190,8 @@ impl WriteMechanism {
     /// `ime_controller.rs::caps_chain_matches_legacy_all_scan` が
     /// （`is_applicable` × フォールスルー述語の実挙動と突き合わせる形で）固定する。
     /// 将来 `GjiDirectStrategy` / `MsImeDirectStrategy` が `Failed` を返すように
-    /// 変わったら、ここを更新したうえで `caps` の末尾に `KanjiToggle` を足すか
-    /// どうかを**実機ソーク付きで**判断すること
+    /// 変わったら、ここを更新したうえで `caps` の到達可能性を
+    /// **実機ソーク付きで**判断すること
     /// （`.claude/rules/fix-requires-evidence.md` の「キー選択」ファミリー）。
     #[must_use]
     pub const fn may_return_failed(self) -> bool {
@@ -204,56 +205,12 @@ impl WriteMechanism {
 /// `Failed` のときだけ。
 ///
 /// **`UnsafeToToggle` を含めてはならない。** `UnsafeToToggle` は「Win キー押下中で
-/// `send_ime_mode_key` が未送信」の意であり、ここでフォールスルーさせると
-/// **Win キー押下中に非冪等な `VK_KANJI` を送る新経路**が生まれる
-/// （ADR-089 §2.3・§4.9）。
+/// `send_ime_mode_key` が未送信」の意であり、`applied_snapshot` をラッチさせない
+/// ための未適用シグナルである。次の機構へ進む根拠にはならない
+/// （BUG-16 追補、ADR-089 §2.3・§4.9）。
 #[must_use]
 pub const fn falls_through(outcome: ImeOpenOutcome) -> bool {
     matches!(outcome, ImeOpenOutcome::Failed)
-}
-
-/// IME ON の直前に ROMAN ビットを補完する同期 IMC write が要るか
-/// （ADR-089 §6 Phase C item 12 = ADR-086 INV-14 の未移行分の是正）。
-///
-/// # なぜこの述語がここ（ungated）にあるのか
-///
-/// Phase C 以前、この条件は `ime_controller.rs` の 2 つの戦略の中に**別々に**
-/// 書かれていた（`ImmCrossProcessStrategy::apply` と
-/// `MsImeDirectStrategy::apply`。どちらも `crate::ime::set_ime_romaji_mode()` を
-/// 直接呼んでいた）。どちらも Win32 FFI と同居していたため Linux から
-/// 条件を検査できず、`output/conv_actuation.rs` の doc が
-/// 「ADR-086 Phase 1〜2 の『7 経路』の数え漏れ」と書いていた 2 経路そのもので
-/// あった。Phase C で **書き込み口を 1 箇所（`ime_controller::apply_mechanism`）に
-/// 統合**し、その発火条件だけをここへ純粋関数として切り出した。
-///
-/// # 条件（Phase C 以前と同値であること）
-///
-/// - `open == true` のときだけ（OFF 方向は ROMAN を触らない）。
-/// - 機構が `ImmCross` または `MsImeDirect` のときだけ
-///   （`GjiDirect` / `KanjiToggle` は元から ROMAN を書かない）。
-/// - `kind == MsIme` のときだけ。旧 `ImmCrossProcessStrategy` は
-///   `active_ime_kind == MicrosoftIme` を明示的に見ており、旧
-///   `MsImeDirectStrategy` は見ていなかったが、`MsImeDirect` の
-///   `is_applicable` 自体が `MicrosoftIme` を要求するため**同値**である
-///   （`apply_mechanism` は `is_applicable` が真の機構に対してしか呼ばれない）。
-/// - `belief_input_mode != ObservedKana` のときだけ——ユーザーが意図的に
-///   かな入力を選んでいる状態を ROMAN で上書きしない（既存の保護、
-///   `runtime/mod.rs::force_on_and_correct_romaji` の N2 も参照）。
-#[must_use]
-pub const fn needs_romaji_pre_write(
-    mechanism: WriteMechanism,
-    open: bool,
-    kind: crate::state::ime_kind::ImeKindId,
-    belief_input_mode: awase::engine::InputModeState,
-) -> bool {
-    open && matches!(
-        mechanism,
-        WriteMechanism::ImmCross | WriteMechanism::MsImeDirect
-    ) && matches!(kind, crate::state::ime_kind::ImeKindId::MsIme)
-        && !matches!(
-            belief_input_mode,
-            awase::engine::InputModeState::ObservedKana
-        )
 }
 
 // ── 型状態 ────────────────────────────────────────────────────────────────────
@@ -278,7 +235,7 @@ pub enum VerifiedTarget {
     /// 取り出せない」ことを型で保証しており（ADR-086 §6 段1）、その保証を
     /// 迂回するアクセサを生やさないため。
     Captured,
-    /// VK 送信機構（GjiDirect / MsImeDirect / KanjiToggle）はフォアグラウンドの
+    /// VK 送信機構（GjiDirect / MsImeDirect）はフォアグラウンドの
     /// フォーカスへ送るため hwnd を捕獲しない。
     ///
     /// **これは ADR-086 INV-14 の未移行分である**（ADR-089 §6 Phase C item 12）。
@@ -300,8 +257,8 @@ pub enum Authorization {
     /// 差分オラクル（`open_warrant.rs::differential_old_gate_vs_issue_open_warrant`）は
     /// 旧ゲートと新 warrant の判定が **9 通りで食い違う**ことを既に測っている
     /// （old-only 8 / new-only 1）。そのまま強制すると 9 通りの挙動が変わり、
-    /// うち `try_force_on_bootstrap` の消滅は「判明した中で最大の挙動変化」で
-    /// ある（ADR-090 §2.A 設計案 2 の表 old-1）。
+    /// うち `try_force_on_bootstrap` の消滅（`621bf93c` で実施済み）は「判明した中で最大の挙動変化」で
+    /// あった（ADR-090 §2.A 設計案 2 の表 old-1）。
     ///
     /// 差分オラクルが測っているのは **240 通りの組合せ**であって、
     /// **実機でどの組合せが実際に起きるか**は測っていない。A-1 はそれを
@@ -370,8 +327,18 @@ pub struct ActuationOrder {
     open: bool,
     /// `issue_open_warrant()` の結果。`None` = 授権が下りなかった。
     warrant: Option<OpenWarrant>,
+    /// 明示キー押下の order として授権した場合の warrant（ADR-208 決定2 D2・D3、`issue_press_warrant`）。
+    /// 押下 ID は order の発行後に [`Self::with_press`] で載るので、両方を発行時に評価しておき、`Some` が載ったら
+    /// `warrant` を差し替える（`is_japanese_ime`・`current_focus` を問わない授権）。
+    press_warrant: Option<OpenWarrant>,
     /// どの入口が起案したか（ADR-082 `EventOrigin` と journal を揃える）。
     origin: EventOrigin,
+    /// この order を起こしたユーザー打鍵（非リピート KeyDown）の押下 ID（ADR-208 決定2 D1）。
+    /// `Some` の order は明示キー押下の書き込みで、view の `shadow_on` を未知にして `applied` の already-matched
+    /// 省略を外す（Engine 経路の TsfNative は L3' まで除く）。ImmCross の書き込みの時間切れは診断ログ（`timed_out=`）に
+    /// 出すだけで、**追い送り（後続機構へのフォールスルー）は止めない**（INV-L1 の二重は向きが同じで冪等。止めると
+    /// 応答しない窓の収束経路を失う）。`None` はリピート・drift correction 等（従来どおり）。
+    press: Option<awase::types::PressId>,
 }
 
 impl ActuationOrder {
@@ -391,8 +358,27 @@ impl ActuationOrder {
         Self {
             open,
             warrant: issue_open_warrant(open, target, ctx),
+            press_warrant: issue_press_warrant(open, target, ctx),
             origin,
+            press: None,
         }
+    }
+
+    /// この order を起こしたユーザー打鍵の押下 ID を載せる（ADR-208 決定2 D1）。`None` は何も変えない。
+    /// 押下 ID の予約（`ImeStateHub::claim_press_write`）は order の**発行前**に済ませること。
+    pub fn with_press(mut self, press: Option<awase::types::PressId>) -> Self {
+        self.press = press;
+        if press.is_some() {
+            // ADR-208 D2・D3: 押下の order は押下の授権（`is_japanese_ime`・`current_focus` を問わない）に差し替える。
+            self.warrant = self.press_warrant.take();
+        }
+        self
+    }
+
+    /// この order を起こした押下の ID（`None` = リピート・drift correction 等）。
+    #[must_use]
+    pub const fn press(&self) -> Option<awase::types::PressId> {
+        self.press
     }
 
     /// この actuation が目指す open 値。
@@ -439,7 +425,7 @@ impl ActuationOrder {
     /// 授権が下りていれば `Warranted`、下りていなければ `None`。
     /// 入口ごとに A-1 の shadow ログで `would_have_blocked` の実発火頻度を
     /// 測ってから、1 つずつこちらへ倒す（ADR-090 §6 ステップ 7）。
-    /// `try_force_on_bootstrap` は**最後**に回すこと（§4.9）。
+    /// `try_force_on_bootstrap` は**最後**に回す方針だった（§4.9、`621bf93c` で撤去済み）。
     #[must_use]
     pub fn into_actuation(self) -> Option<Actuation<Warranted>> {
         Actuation::request(self.open).warrant(self.warrant?)
@@ -575,7 +561,7 @@ impl Actuation<Verified> {
             match act.classify(outcome) {
                 Ok(terminal) => return terminal,
                 Err(WriteErr::Retryable(next, _)) => {
-                    log::debug!(
+                    tracing::debug!(
                         "[apply-ime] {} failed, trying next fallback",
                         mechanism.name()
                     );
@@ -606,7 +592,7 @@ impl Actuation<Verified> {
             match act.classify(outcome) {
                 Ok(terminal) => return terminal,
                 Err(WriteErr::Retryable(next, _)) => {
-                    log::debug!(
+                    tracing::debug!(
                         "[apply-ime] {} failed, trying next fallback (async)",
                         mechanism.name()
                     );
@@ -648,7 +634,7 @@ pub trait AsyncMechanismWriter {
 /// 再試行 episode。attempt ごとに新しい [`Actuation<Warranted>`] を作る。
 ///
 /// **warrant の有効性は episode 単位**であり、`Actuation` 値のアフィン性
-/// （1 値 = 高々 1 回の成功 write）と、[`decide_actuation_action`] による
+/// （1 値 = 高々 1 回の成功 write）と、[`FeedbackPolicy::decide_action`] による
 /// 回数制限がここで組み合わさる（INV-41）。
 #[derive(Debug, Clone)]
 pub struct DriftEpisode {
@@ -686,13 +672,13 @@ impl DriftEpisode {
         self.warrant.target
     }
 
-    /// 次の attempt を払い出す。`decide_actuation_action` が `GiveUp` を返したら
+    /// 次の attempt を払い出す。`FeedbackPolicy::decide_action` が `GiveUp` を返したら
     /// `None`（**回数制限は型ではなくこの関数の責務**、INV-41）。
     ///
     /// `Actuation` 値を使い回さないこと——毎回ここで新規に作るのが
     /// アフィン性の実効条件である。
     pub fn next_attempt(&mut self) -> Option<Actuation<Warranted>> {
-        if decide_actuation_action(self.policy, self.attempts) == ActuationAction::GiveUp {
+        if self.policy.decide_action(self.attempts) == ActuationAction::GiveUp {
             return None;
         }
         self.attempts += 1;
@@ -706,13 +692,57 @@ mod tests {
     use crate::state::ime_event::ObservationSource;
     use crate::state::open_warrant::WarrantBasis;
 
-    const ALL_OUTCOMES: [ImeOpenOutcome; 5] = [
+    const ALL_OUTCOMES: [ImeOpenOutcome; 6] = [
         ImeOpenOutcome::Applied,
-        ImeOpenOutcome::FallbackSent,
+        ImeOpenOutcome::AppliedWithoutSendInput,
         ImeOpenOutcome::AlreadyMatched,
         ImeOpenOutcome::Failed,
         ImeOpenOutcome::UnsafeToToggle,
+        ImeOpenOutcome::NotOwned,
     ];
+
+    /// ADR-208 D2・D3: `with_press(Some)` が載ると、`is_japanese_ime` が偽でも授権される（`ExplicitPress`）。`press=None`
+    /// （リピート・drift correction 等）と `with_press(None)` は従来どおり `is_japanese_ime` を問う。
+    #[test]
+    fn with_press_swaps_in_the_explicit_press_warrant() {
+        use crate::state::app_ime_policy::AppImePolicy;
+        use crate::state::event_origin::{EventOrigin, EventSource, Generation};
+        use crate::state::force_guard::ForceGuardSet;
+        use crate::state::ime_event::{HwndId, ImePolicyProfile};
+        use crate::state::intent_store::IntentStore;
+        use crate::state::observation_store::ObservationStore;
+        use crate::state::open_warrant::WarrantContext;
+        use crate::state::TickMs;
+
+        let store = IntentStore::default();
+        let obs = ObservationStore::default();
+        let guards = ForceGuardSet::default();
+        let policy = AppImePolicy::from_profile(ImePolicyProfile::Plain);
+        let ctx = WarrantContext {
+            intent_store: &store,
+            obs: &obs,
+            guards: &guards,
+            policy: &policy,
+            desired_open: false,
+            is_japanese_ime: false,
+            now: std::time::Instant::now(),
+            now_ms: TickMs(0),
+        };
+        let origin = EventOrigin::new(EventSource::Physical, Generation::new(1));
+        let issue = || ActuationOrder::issue(true, HwndId::NULL, &ctx, origin);
+
+        assert!(
+            issue().would_have_blocked(),
+            "press なしは is_japanese_ime=false で未授権"
+        );
+        assert!(issue().with_press(None).would_have_blocked());
+        let order = issue().with_press(Some(awase::types::PressId::new(1)));
+        assert!(
+            !order.would_have_blocked(),
+            "押下の order は授権される（D2・D3）"
+        );
+        assert_eq!(order.press(), Some(awase::types::PressId::new(1)));
+    }
 
     fn warrant(target: bool) -> OpenWarrant {
         OpenWarrant {
@@ -790,15 +820,16 @@ mod tests {
         }
     }
 
-    /// **`UnsafeToToggle` はフォールスルーしない**（§2.3・§4.9: Win キー押下中に
-    /// 非冪等な `VK_KANJI` を送る新経路を作らない）。
+    /// **`UnsafeToToggle` はフォールスルーしない**（§2.3・§4.9: 未送信なので
+    /// 次の機構へ進む根拠にならない）。
     #[test]
-    fn unsafe_to_toggle_stops_the_chain_before_kanji_toggle() {
+    fn unsafe_to_toggle_stops_the_chain_before_next_mechanism() {
         let mut writer = FakeWriter::new(
-            &[WriteMechanism::GjiDirect, WriteMechanism::KanjiToggle],
+            &[WriteMechanism::GjiDirect, WriteMechanism::MsImeDirect],
             &[ImeOpenOutcome::UnsafeToToggle],
         );
-        let outcome = verified(true).run_chain(&WriteMechanism::ALL, &mut writer);
+        let chain = [WriteMechanism::GjiDirect, WriteMechanism::MsImeDirect];
+        let outcome = verified(true).run_chain(&chain, &mut writer);
         assert_eq!(outcome, ImeOpenOutcome::UnsafeToToggle);
         assert_eq!(writer.calls, vec![(WriteMechanism::GjiDirect, true)]);
     }
@@ -824,13 +855,11 @@ mod tests {
     /// 適用不能な機構は呼ばれない（`apply_iter` の `is_applicable` と同値）。
     #[test]
     fn inapplicable_mechanisms_are_skipped() {
-        let mut writer = FakeWriter::new(
-            &[WriteMechanism::KanjiToggle],
-            &[ImeOpenOutcome::FallbackSent],
-        );
+        let mut writer =
+            FakeWriter::new(&[WriteMechanism::MsImeDirect], &[ImeOpenOutcome::Applied]);
         let outcome = verified(true).run_chain(&WriteMechanism::ALL, &mut writer);
-        assert_eq!(outcome, ImeOpenOutcome::FallbackSent);
-        assert_eq!(writer.calls, vec![(WriteMechanism::KanjiToggle, true)]);
+        assert_eq!(outcome, ImeOpenOutcome::Applied);
+        assert_eq!(writer.calls, vec![(WriteMechanism::MsImeDirect, true)]);
     }
 
     /// 適用可能な機構が無ければ `Failed`（現行 `apply_iter` の末尾と同じ）。
@@ -847,12 +876,12 @@ mod tests {
     /// 全機構が `Failed` を返したら `Failed`。
     #[test]
     fn all_failed_yields_failed() {
-        let mut writer = FakeWriter::new(&WriteMechanism::ALL, &[ImeOpenOutcome::Failed; 4]);
+        let mut writer = FakeWriter::new(&WriteMechanism::ALL, &[ImeOpenOutcome::Failed; 3]);
         assert_eq!(
             verified(true).run_chain(&WriteMechanism::ALL, &mut writer),
             ImeOpenOutcome::Failed
         );
-        assert_eq!(writer.calls.len(), 4);
+        assert_eq!(writer.calls.len(), 3);
     }
 
     /// 非同期版と同期版の走査結果が全 outcome 組み合わせで一致すること
@@ -880,7 +909,7 @@ mod tests {
     }
 
     /// `DriftEpisode` は `Blind` の `max_attempts` で払い出しを止める
-    /// （**回数制限は型ではなく `decide_actuation_action`**、INV-41）。
+    /// （**回数制限は型ではなく `FeedbackPolicy::decide_action`**、INV-41）。
     #[test]
     fn drift_episode_stops_at_blind_max_attempts() {
         let policy = FeedbackPolicy::Blind {
@@ -897,7 +926,7 @@ mod tests {
         assert_eq!(episode.attempts(), 3, "GiveUp では attempts を進めない");
     }
 
-    /// `Read` は試行回数では打ち切らない（`decide_actuation_action` と同じ挙動）。
+    /// `Read` は試行回数では打ち切らない（`FeedbackPolicy::decide_action` と同じ挙動）。
     #[test]
     fn drift_episode_never_gives_up_under_read_policy() {
         let policy = FeedbackPolicy::Read {
@@ -968,83 +997,12 @@ mod tests {
         }
     }
 
-    // ── needs_romaji_pre_write（ADR-089 Phase C item 12 / ADR-086 INV-14）──
-
-    use crate::state::ime_kind::ImeKindId;
-    use awase::engine::{AssumedReason, InputModeState};
-
-    const ALL_INPUT_MODES: [InputModeState; 5] = [
-        InputModeState::ObservedRomaji,
-        InputModeState::ObservedKana,
-        InputModeState::ObservedEisu,
-        InputModeState::AssumedRomaji {
-            reason: AssumedReason::ImmBridgeBroken,
-        },
-        InputModeState::Unknown,
-    ];
-
-    /// Phase C 以前の 2 戦略の条件と同値であることを全数で固定する。
-    ///
-    /// 旧条件:
-    /// - `ImmCrossProcessStrategy::apply`:
-    ///   `open && active_ime_kind == MicrosoftIme && belief != ObservedKana`
-    /// - `MsImeDirectStrategy::apply`: `open && belief != ObservedKana`
-    ///   （`is_applicable` が `MicrosoftIme` を要求するため kind 条件は暗黙）
-    #[test]
-    fn romaji_pre_write_condition_matches_the_pre_phase_c_strategies() {
-        for mechanism in WriteMechanism::ALL {
-            for open in [true, false] {
-                for kind in ImeKindId::ALL {
-                    for mode in ALL_INPUT_MODES {
-                        let expected =
-                            open && matches!(
-                                mechanism,
-                                WriteMechanism::ImmCross | WriteMechanism::MsImeDirect
-                            ) && kind == ImeKindId::MsIme
-                                && mode != InputModeState::ObservedKana;
-                        assert_eq!(
-                            needs_romaji_pre_write(mechanism, open, kind, mode),
-                            expected,
-                            "{mechanism:?} open={open} {kind:?} {mode:?}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// GJI 経路では ROMAN 補完を一切行わない（Phase C 以前も同じ）。
-    #[test]
-    fn romaji_pre_write_never_fires_for_gji_mechanisms() {
-        for mechanism in [WriteMechanism::GjiDirect, WriteMechanism::KanjiToggle] {
-            for kind in ImeKindId::ALL {
-                assert!(!needs_romaji_pre_write(
-                    mechanism,
-                    true,
-                    kind,
-                    InputModeState::Unknown
-                ));
-            }
-        }
-    }
-
-    /// `ObservedKana`（ユーザーが意図的にかな入力を選んだ状態）は上書きしない。
-    #[test]
-    fn romaji_pre_write_respects_observed_kana() {
-        assert!(!needs_romaji_pre_write(
-            WriteMechanism::MsImeDirect,
-            true,
-            ImeKindId::MsIme,
-            InputModeState::ObservedKana
-        ));
-    }
-
     /// 機構名は golden（`tests/ime_key_sequence_golden.rs`）の綴りと一致する。
     #[test]
     fn mechanism_names_match_strategy_names() {
         assert_eq!(
             WriteMechanism::ALL.map(WriteMechanism::name),
-            ["ImmCrossProcess", "GjiDirect", "MsImeDirect", "KanjiToggle"]
+            ["ImmCrossProcess", "GjiDirect", "MsImeDirect"]
         );
     }
 }

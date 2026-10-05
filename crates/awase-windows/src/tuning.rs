@@ -9,6 +9,7 @@
 /// 開始するまでの静止時間 (ms)。
 ///
 /// タイピング中は IMM との SendMessage を一切行わない。
+#[measured_macro::measured(pending = true)]
 pub const TYPING_IDLE_MS: u64 = 500;
 
 /// 明示的 IME 操作（Ctrl+変換/無変換 等）後に idle-conv-check を抑制する時間 (ms)。
@@ -17,23 +18,36 @@ pub const TYPING_IDLE_MS: u64 = 500;
 /// 確立するまでの猶予。この間は conv mode が JISかな (0x00000009) のままなので
 /// idle-conv-check が誤って belief を ObservedKana に上書きしないようスキップする。
 /// GJI probe budget (350ms) + warmup完了マージン を考慮して 1500ms に設定。
+#[measured_macro::measured(pending = true)]
 pub const EXPLICIT_IME_SUPPRESS_MS: u64 = 1500;
 
 /// GJI I/O が静止したと判断するまでの時間 (ms)。
 ///
 /// warmup 後に GJI I/O が発生した場合、この時間以上静止したら settled と判断する。
+#[measured_macro::measured(pending = true)]
 pub const GJI_IDLE_MS: u64 = 80;
 
 /// GJI 静止確認後の余裕マージン (ms)。
 ///
 /// settled 検出後にさらにこの時間だけ待機してから送信する。
+#[measured_macro::measured(pending = true)]
 pub const POST_IDLE_MARGIN_MS: u64 = 30;
 
 /// GJI I/O を IME ON の証拠として認める判定ウィンドウ (ms)。
 ///
 /// 直近この時間以内に GJI I/O が観測された場合、Chrome 等の broken IMM
 /// アプリでも IME が ON であると判断する。
+#[measured_macro::measured(pending = true)]
 pub const GJI_CONFIRM_WINDOW_MS: u64 = 500;
+
+/// `ObservationStore::derive_any` / `derive_actuating` が観測を鮮度ありと見なす窓 (ms)。
+///
+/// この時間を超えた観測は無視する。フォーカス変更時に `clear_on_focus_change()` が
+/// 呼ばれるため通常は問題にならないが、稀に残留する古い観測を排除するためのガード。
+/// 元は `state/observation_store.rs::derive_filtered` にローカル定数として埋め込まれて
+/// いたものをここへ移設した（値は 3000ms のまま変更なし、実測根拠は未取得のため pending）。
+#[measured_macro::measured(pending = true)]
+pub const OBSERVATION_FRESH_WINDOW_MS: u64 = 3_000;
 
 // === TSF warmup タイミング ===
 
@@ -44,6 +58,7 @@ pub const GJI_CONFIRM_WINDOW_MS: u64 = 500;
 /// 10s 以上の長期 idle（矢印キーナビゲーション等）では GJI セッションリセットが確実。
 ///
 /// Chrome VK パス固有のアイドル判定は `CHROME_LONG_IDLE_MS` を参照のこと。
+#[measured_macro::measured(pending = true)]
 pub const LONG_IDLE_MS: u64 = 10_000;
 
 /// Chrome VK パスでの「長期 idle」判定閾値 (ms)。
@@ -58,17 +73,20 @@ pub const LONG_IDLE_MS: u64 = 10_000;
 /// `ColdKind` 分岐の cutoff として引き続き使われている。
 ///
 /// TSF/GJI パス（WezTerm 等）は GJI セッション生存期間に依存するため `LONG_IDLE_MS` を使用する。
+#[measured_macro::measured(pending = true)]
 pub const CHROME_LONG_IDLE_MS: u64 = 5_000;
 
 /// Composition タイムアウト (ms): 変換確定待機の最大時間。
 ///
 /// warm 状態で elapsed がこれを超えた場合、composition が終了したと判断する。
+#[measured_macro::measured(pending = true)]
 pub const COMPOSITION_TIMEOUT_MS: u64 = 2000;
 
 /// RAW TSF リテラル検出ウィンドウ (ms)。
 ///
 /// warmup_sent_ms からこの時間内に TSF リテラル文字が来た場合、
 /// RAW TSF リテラルとして回収する。
+#[measured_macro::measured(pending = true)]
 pub const RAW_TSF_LITERAL_DETECT_MS: u64 = 300;
 
 /// GJI long idle + TSF mode (WezTerm 等) での RAW TSF リテラル検出ウィンドウ (ms)。
@@ -77,6 +95,7 @@ pub const RAW_TSF_LITERAL_DETECT_MS: u64 = 300;
 /// 表示するまで最大 ~370ms かかる実測がある（通常 300ms 以内に収まる）。
 /// FreshF2 パス (eager_elapsed > eager_settle_ms) では NameChangeWait を経由しないため
 /// LiteralDetect のタイムアウトで補う必要がある。500ms = 実測最大 ~370ms + 130ms マージン。
+#[measured_macro::measured(value_ms = 500, margin_ms = 130, commit = "a6b4c0dd")]
 pub const RAW_TSF_LITERAL_DETECT_MS_LONG_IDLE: u64 = 500;
 
 /// 候補ウィンドウ可視 veto の上限保留時間 (ms)。
@@ -89,10 +108,11 @@ pub const RAW_TSF_LITERAL_DETECT_MS_LONG_IDLE: u64 = 500;
 /// 異常系でタイマーが永久に止まらないための安全弁）。
 ///
 /// **実測未了 — 暫定値**: 「候補ウィンドウ可視 → I/O/SHOW 確定」までの実測遅延データが
-/// まだ無い。300ms は `CHROME_GJI_REINIT_CONFIRM_MS`（IME ON→NATIVE確認 300ms）等、
+/// まだ無い。300ms は IME ON→NATIVE 確認の 300ms 等、
 /// 同程度の「確認待ち」定数から類推した仮値であり、`tuning-constants.md` が要求する
 /// 実測根拠を満たしていない。実機（Windows, Chrome/Teams/WezTerm 等）で計測してから
 /// 本番投入すること。
+#[measured_macro::measured(pending = true)]
 pub const GJI_CANDIDATE_VETO_CAP_MS: u64 = 300;
 
 /// GJI セッションが「中程度の idle」と判断する GJI アイドル閾値 (ms)。
@@ -101,27 +121,8 @@ pub const GJI_CANDIDATE_VETO_CAP_MS: u64 = 300;
 /// ~325ms かかる実測がある（cold=7: gji_idle=8719ms 後 GJI が 325ms 後に起動）。
 /// 300ms 程度の短い待機では間に合わないため、gji_long_idle_probe（GJI I/O 応答監視）
 /// をこの閾値以上でも有効にする。
+#[measured_macro::measured(pending = true)]
 pub const MEDIUM_IDLE_PROBE_MS: u64 = 7_000;
-
-/// Chrome/Unicode-mode GJI 再初期化（VK_IME_OFF→VK_IME_ON）後、`IMC_GETCONVERSIONMODE`
-/// で Hiragana を確認するまでの最大待機時間 (ms)。
-///
-/// `Output::send_f22_f21_reinit`（Unicode injection mode の long-cold GJI 再起動）が
-/// `send_chrome_gji_reinit_and_poll` 経由で使う。GJI は VK_IME_ON 受信後 ~50-100ms 以内に
-/// IME ON 状態に移行する実測値が多い。300ms あれば十分な余裕を確保できる。タイムアウト時は
-/// 強制再送する。
-///
-/// BUG-33（2026-07-22）: `probe_io.rs` の `RawTsfLiteralRecovery` give-up 分岐
-/// （per-VK confirm が2連続で literal 化を検出した場合）からも `send_chrome_gji_reinit_and_poll`
-/// を呼ぶようになった。この窓は同時に「連続 give-up による reinit 多重発火」のレート制限
-/// （`Output::last_gji_reinit_ms`）にも使われる。
-pub const CHROME_GJI_REINIT_CONFIRM_MS: u64 = 300;
-
-/// [`CHROME_GJI_REINIT_CONFIRM_MS`] のポーリング間隔 (ms)。
-///
-/// `IMC_GETCONVERSIONMODE` を async でこの間隔ごとに発行する。
-/// 10ms 間隔で最大 30 回 = 300ms（`CHROME_GJI_REINIT_CONFIRM_MS` に対応）。
-pub const CHROME_GJI_REINIT_POLL_INTERVAL_MS: u64 = 10;
 
 /// MS-IME confirm-then-transmit ゲート（BUG-13）の確認期限 (ms)。
 ///
@@ -135,9 +136,11 @@ pub const CHROME_GJI_REINIT_POLL_INTERVAL_MS: u64 = 10;
 /// - +281ms: conv=0x00000009（準備完了。「で」が正常に compose）
 ///
 /// 準備完了の実測上限 ~281ms + マージン ~120ms = 400ms。
+#[measured_macro::measured(pending = true)]
 pub const MS_IME_READY_CONFIRM_MS: u64 = 400;
 
 /// MS-IME confirm-then-transmit ゲートの IMC ポーリング間隔 (ms)。
+#[measured_macro::measured(pending = true)]
 pub const MS_IME_READY_POLL_INTERVAL_MS: u64 = 10;
 
 /// `shift-conv-guard`（BUG-15）の hold 終了（復元開始）ごとに confirm-then-transmit
@@ -175,6 +178,7 @@ pub const MS_IME_READY_POLL_INTERVAL_MS: u64 = 10;
 /// を決める根拠であり、この定数の根拠ではない（Opus pass-5 レビュー指摘: 旧版の
 /// コメントは 478ms/960ms を根拠として引用していたが、ループが自己延長する
 /// 設計に変わった後はそれらは無関係な数値になっていた）。
+#[measured_macro::measured(pending = true)]
 pub const SHIFT_CONV_GUARD_RELEASE_CONFIRM_MS: u64 = 800;
 
 /// `shift-conv-guard` の entry（Shift 押下、`kp_shift_conv_guard_key_down`）で
@@ -189,6 +193,7 @@ pub const SHIFT_CONV_GUARD_RELEASE_CONFIRM_MS: u64 = 800;
 /// ではなくこの上限を過ぎれば通常の安全弁（IMC 未確認なら give-up latch）へ
 /// 自動的に復帰する。通常の hold 所要時間（~620ms）に対して十分大きく、かつ
 /// 「固着したまま気づかれない」時間を有限に抑えることを優先した。
+#[measured_macro::measured(pending = true)]
 pub const SHIFT_CONV_GUARD_ENTRY_SUSPEND_CAP_MS: u64 = 5_000;
 
 // === キャッシュ有効期限 ===
@@ -197,11 +202,13 @@ pub const SHIFT_CONV_GUARD_ENTRY_SUSPEND_CAP_MS: u64 = 5_000;
 ///
 /// awase がすべての IME 状態変化をフックしているため、キャッシュは原則的に正確に保たれる。
 /// ただし 1 時間を超えると "昨日の設定" の復元になりユーザーが混乱するため上限を設ける。
+#[measured_macro::measured(pending = true)]
 pub const HWND_CACHE_MAX_AGE_MS: u64 = 3_600_000;
 
 /// フォーカスがこの時間（ms）未満しか滞在しなかったウィンドウの IME 状態はキャッシュに保存しない。
 ///
 /// 通知ポップアップ等の瞬間フォーカスが正常な状態を上書きするのを防ぐ。
+#[measured_macro::measured(pending = true)]
 pub const MIN_FOCUS_DURATION_MS: u64 = 100;
 
 // === 観測失敗カウント ===
@@ -210,6 +217,7 @@ pub const MIN_FOCUS_DURATION_MS: u64 = 100;
 ///
 /// ポーリング間隔 500ms × 3 = 1.5秒。一時的な検出失敗は許容しつつ、
 /// 長時間の乖離（実際は IME OFF なのにキャッシュが ON のまま）を防ぐ。
+#[measured_macro::measured(pending = true)]
 pub const IME_DETECT_MISS_THRESHOLD: u32 = 3;
 
 // === ドリフト補正 ===
@@ -219,11 +227,13 @@ pub const IME_DETECT_MISS_THRESHOLD: u32 = 3;
 /// ポーリング間隔 500ms より小さい値にすると、ドリフト検出後の次のポーリング
 /// （drift_duration ≈ 500ms）で確実に補正が発動する。
 /// 短すぎるとフォーカス変化直後の一時的なズレで誤発動するため 400ms とする。
+#[measured_macro::measured(pending = true)]
 pub const DRIFT_CORRECTION_THRESHOLD_MS: u64 = 400;
 
 /// ドリフト補正の「信頼できる観測」として許可する最大観測年齢 (ms)。
 ///
 /// この時間より古い観測値は stale とみなしてドリフト補正の根拠として使わない。
+#[measured_macro::measured(pending = true)]
 pub const DRIFT_CORRECTION_OBS_MAX_AGE_MS: u64 = 1_500;
 
 /// `Blind` drift correction が `GiveUp` した後、次の再武装判定を許可するまでの
@@ -286,65 +296,8 @@ pub const DRIFT_CORRECTION_OBS_MAX_AGE_MS: u64 = 1_500;
 ///   バースト**内**の最大5回の送信自体は無間隔（本クールダウンが効くのは
 ///   バースト**間**のみ）。本クールダウンとは独立した別の改善余地として
 ///   記録しておく（本 BUG では対処しない）。
+#[measured_macro::measured(pending = true)]
 pub const DRIFT_CORRECTION_BLIND_REARM_COOLDOWN_MS: u64 = 3_000;
-
-/// `apply_force_on_for_imm_broken` の再試行クールダウン (ms)（ADR-098 決定1-c、BUG-69）。
-///
-/// ADR-098 決定1-a により TsfNative の `applied` はフォーカス入場後 `Unknown`
-/// のまま残るようになる。従来のスパムガード（`applied` が ON 相当なら送らない）
-/// は、strategy chain が `Failed` を返した場合に生成される `Confirmed{open:false}`
-/// を素通ししてしまい、`post_ime_refresh()` が outcome によらず無条件に張る
-/// 20ms タイマーと、TsfNative ではそれを上書きする周期ポーリングが無いことが
-/// 組み合わさって、実効 50Hz の無限再試行ループ（打鍵中かどうかを問わず
-/// `mark_composition_cold` を伴う、BUG-31 族の最悪形）を開く。
-///
-/// # 実測値ではなくレート制限ポリシーである
-///
-/// `DRIFT_CORRECTION_BLIND_REARM_COOLDOWN_MS`（直上）と同じ位置づけであり、
-/// `.claude/rules/tuning-constants.md` の実測義務は「OS の準備が整うまで何 ms
-/// 待つか」という待機定数に対するもので、本定数は「壊れた再試行を何 Hz に
-/// 制限するか」という上限——値を変えても機能の成否（初回 force-ON が飛ぶか）
-/// は変わらず、変わるのは再試行の密度だけである。
-///
-/// # なぜ試行回数の上限を設けず、クールダウンのみにするのか
-///
-/// `FocusChanged` はプロセス変更時にしか発火しない（`focus_tracking.rs` の
-/// PID 比較）。同一プロセス内のウィンドウ/タブ切替では 1 フォーカスセッションが
-/// 数十分続きうる。その間 `applied` は drift correction・ユーザー明示操作等で
-/// 繰り返し blocking 状態から外れる。1 フォーカスあたりの試行回数に上限を
-/// 設けると、observer の揺れ（実測: GJI VK 受付 181ms・Chrome TSF 再初期化
-/// 326ms・F22 コールド ~750ms）がクールダウン窓より長く続いた場合に予算を
-/// 使い切り、そのプロセスに居る限り force-ON が二度と飛ばなくなる——BUG-16
-/// の原症状（settle 明け再試行の恒久 no-op）を作り直すことになる（設計討議
-/// ラウンド3のレビューで発見・rejected）。止めるべきは再試行そのものではなく
-/// 再試行密度であり、クールダウン単独で十分（50Hz → 1/3Hz 未満に落ちれば
-/// cold-mark の連打は消える）。
-///
-/// # 再武装はイベント駆動であり周期的ではない（2026-08-21 追記）
-///
-/// 上記「1/3Hz 未満に落ちる」という表現は周期ポーリングを連想させるが、
-/// 実態は違う。TsfNative では `reschedule_ime_refresh`（`runtime/mod.rs`）が
-/// 早期 return するため、cooldown 満了後の次回試行は「`may_change_ime` キー
-/// の passthrough」（`key_pipeline.rs` の `schedule_ime_refresh(20)`）または
-/// BUG-51 の `ReportOpenInference` 経由の同呼び出しでのみ再武装される。
-/// **ユーザーが打鍵を止めている間は自動的な再試行が発生しない。** これは
-/// 修正前（`mirror_applied_open` の偽装により force-ON が実質恒久的に不発
-/// だった状態）からの後退ではなく厳密な改善だが、継続的な打鍵がある限り
-/// 「最短 cooldown 間隔」であって「cooldown 間隔ちょうどに周期実行される」
-/// わけではない点に注意（詳細は ADR-098「既知の限界・未検証事項」）。
-///
-/// # 値の根拠
-///
-/// `DRIFT_CORRECTION_BLIND_REARM_COOLDOWN_MS` と同値・同根拠を援用した。新規の
-/// 未実測値を発明せず、既存 in-tree の前例（同種のランナウェイ再試行対策）に
-/// 揃えることを優先した。
-///
-/// # ソークで測ること（値を改訂する条件）
-///
-/// `force-ON (ImmBrokenForceOn): apply_ime_open(true) → Failed` の連続回数と
-/// 間隔。安定して収束するなら短縮を検討してよいが、実測を伴わない短縮は
-/// 行わないこと。
-pub const FORCE_ON_RETRY_COOLDOWN_MS: u64 = 3_000;
 
 /// `PHYSICAL_KEY_STATE[VK_LWIN/VK_RWIN]` が「押されたまま」と信頼できる最大保持時間 (ms)。
 ///
@@ -358,34 +311,33 @@ pub const FORCE_ON_RETRY_COOLDOWN_MS: u64 = 3_000;
 /// **未実測**: 実機での Win キー保持時間の分布は未計測。人間が Win+何かの
 /// チョードを行う際の保持時間は通常数百ms 以内で完了するという定性的な
 /// 推論に基づく暫定値。実機ソークでの調整余地がある。
+#[measured_macro::measured(pending = true)]
 pub const WIN_KEY_HELD_STALE_MS: u64 = 2_000;
 
 // === グレース・マージン ===
-
-/// TSF warmup 完了直後のグレース期間 (ms)。
-///
-/// warmup から WARMUP_GRACE_MS 以内に probe 結果が届いた場合、
-/// IME 状態変化によるフリップを抑制する。
-pub const WARMUP_GRACE_MS: u64 = 300;
 
 /// GJI 静止直後のグレース期間 (ms)。
 ///
 /// フォーカス変更後に GJI I/O が発生し、最後の I/O からこの時間内なら
 /// probe 結果による IME 状態フリップを抑制する。
+#[measured_macro::measured(pending = true)]
 pub const GJI_SETTLE_GRACE_MS: u64 = 300;
 
 /// 出力送信後の後続キー保護期間 (ms)。
 ///
 /// SendInput 直後この時間は OS キューに出力イベントが残っているため、
 /// passthrough キーや ReinjectKey の処理を遅延させて race を防ぐ。
+#[measured_macro::measured(pending = true)]
 pub const OUTPUT_GUARD_MS: u64 = 50;
 
 // === TSF GJI モニタ ===
 
 /// GJI I/O モニタスレッドのサンプリング間隔 (ms)。
+#[measured_macro::measured(pending = true)]
 pub const GJI_SAMPLE_INTERVAL_MS: u32 = 10;
 
 /// GJI モニタが切断後に再アタッチを試みる間隔 (ms)。
+#[measured_macro::measured(pending = true)]
 pub const GJI_REATTACH_INTERVAL_MS: u64 = 3_000;
 
 // === IntentStore（ADR-087 §2.3 P15 / §4 INV-24） ===
@@ -401,6 +353,7 @@ pub const GJI_REATTACH_INTERVAL_MS: u64 = 3_000;
 /// 同じ 10 秒を仮に採用した。ON/OFF で TTL を非対称にする理由は
 /// `EXPLICIT_OFF_INTENT_TTL_MS`（下記）を参照。値を変更する場合は
 /// `.claude/rules/tuning-constants.md` に従い実測根拠を示すこと。
+#[measured_macro::measured(pending = true)]
 pub const EXPLICIT_ON_INTENT_TTL_MS: u64 = 10_000;
 
 /// `IntentStore` に記録された **OFF 意図**の保持窓 (ms)。ON より意図的に
@@ -434,7 +387,30 @@ pub const EXPLICIT_ON_INTENT_TTL_MS: u64 = 10_000;
 /// 残存リスク参照——`effective_open()` の結果を洗浄済みの値として保存し、
 /// `HwndCacheRestored` で `desired_open` へ再注入するため、この30秒 TTL の
 /// 外側で最大1時間 IntentStore 由来の値が生き残る経路が別途存在する）。
+#[measured_macro::measured(pending = true)]
 pub const EXPLICIT_OFF_INTENT_TTL_MS: u64 = 30_000;
+
+/// 無変換/変換の生キーを GJI へ通過させた後、再読み取りを続け、最初の観測の直後に古い明示意図を
+/// 破棄する窓 (ms)（ADR-187）。窓が切れたら止まる（マークは一回で消費しない）。
+///
+/// **実測**（CI `e2e-ime`、ATOK パススルー、GitHub-hosted Windows ランナー、6 実行×8 押下=48 押下）:
+/// 生キー通過（awase のフック到達）から、実 IME の変化が IMM の再読み取り（`IME snapshot`）に現れるまで
+/// min 21ms / median 33ms / p90 33ms / max 62ms。別の 1 回で、通過から 11ms 後の最初の再読み取りが
+/// GJI の処理前の古い状態を読んだ（この回は追随できなかった）。
+/// **導出**: 実測最大 62ms の約 5 倍の 300ms を窓とする（再読み取りが数回走り、フォーカス移動等で長引いても覆う）。
+/// 窓が長すぎると通過より後の無関係な観測までバイパスされるため、無限にはしない。
+/// 計測はランナー環境のもの。実機での再測定と、`commit` 紐付け（`#[measured(value_ms, commit)]`）は未了のため `pending`。
+#[measured_macro::measured(pending = true)]
+pub const MODE_KEY_PASS_MARK_WINDOW_MS: u64 = 300;
+
+/// 無変換/変換の生キー通過後、窓が有効な間の再読み取り間隔 (ms)（ADR-187）。
+///
+/// 最初の再読み取り（20ms）は、GJI の処理前の古い状態を読むことがある（上記、11ms 後の 1 回）。
+/// **導出**: 上記の実測最大 62ms に相当する 60ms を間隔とする。古い状態を読んだ回（例: 通過から 11ms 後）でも、
+/// 次の読み取り（約 71ms 後）が実測の最大反応時間（62ms）を覆う。窓（300ms）の間に最大 5 回程度。
+/// 実機での再測定は未了のため `pending`。
+#[measured_macro::measured(pending = true)]
+pub const MODE_KEY_PASS_REREAD_MS: u64 = 60;
 
 /// `ImeModel.pending`（`ImeApplyRequested` で立てる apply transaction）の
 /// タイムアウト（BUG-34 横展開 D-prep、2026-08-19）。
@@ -453,6 +429,7 @@ pub const EXPLICIT_OFF_INTENT_TTL_MS: u64 = 30_000;
 /// BUG-34 実測（~5741ms）に安全マージンを載せた
 /// `IDLE_CONV_CHECK_IN_FLIGHT_STALE_MS`（`state/platform_state.rs`、8000ms）と
 /// 同じ根拠・同じ値を採用する。
+#[measured_macro::measured(pending = true)]
 pub const IME_APPLY_PENDING_TIMEOUT_MS: u64 = 8_000;
 
 /// フォーカス復帰後 resync（report `01M0VGJ2M5KQHD1D9V7HAMBHNT`）のハード期限 (ms)。
@@ -469,4 +446,26 @@ pub const IME_APPLY_PENDING_TIMEOUT_MS: u64 = 8_000;
 /// この定数を変更する場合は、必ず実機ソークで arm→drain の実測分布を取り、
 /// その分布に基づいて調整すること（`.claude/rules/tuning-constants.md`）。
 /// 「効かないので増やした」は禁止——分布の p99 等の実測根拠を残すこと。
+#[measured_macro::measured(pending = true)]
 pub const FOCUS_RESYNC_DEADLINE_MS: u64 = 100;
+
+/// 物理モードキーの打鍵時点の予測（ADR-191 決定3、`ImeModel::key_effect`）に対する fence の settle 時間 (ms)。
+/// 最新の打鍵からこの時間より前に来た観測は、IME がキーを処理する前の古い状態を読んでいる恐れがあるため、
+/// 予測を上書きも消しもしない。これ以降の観測だけが予測と照合され、観測が勝つ。
+///
+/// **実測 1**（`MODE_KEY_PASS_MARK_WINDOW_MS` の実測と同じ、CI `e2e-ime`、ATOK パススルー、48 押下）:
+/// 生キー通過から実 IME の変化が IMM の再読み取りに現れるまで min 21ms / median 33ms / p90 33ms / max 62ms。
+/// **実測 2**（2026-09-24、windows-latest、`ci/a2-mode-key-pass-timeline`、ランダムウォーク 150 手×5 シード×2 回×3 構成
+/// 〈MS-IME 本体 / GJI+MS-IME プリセット / GJI+ATOK〉、通過 1,116 押下のうち窓内で値が変わって見えた 10 押下）:
+/// 最初の成功観測が処理前の古い値だった押下が 10 件あり、古い値を最後に読んだ時刻の最大は 131ms
+/// （100ms 以降が 7 件: 109 / 113 / 114 / 119 / 124 / 126 / 131ms）。それらで新しい値が最初に見えたのは最大 212ms（読み取りの間隔で粗い）。
+/// 再読み取りの間隔が CI ランナーの負荷で 60ms を超えて揺れるため、実測 1 の max 62ms は分布の裾を取り逃していた。
+/// 値が変わった押下（553 件）全体の「新しい値が最初に見えた時刻」は P50/P90/P99/max = 47/85/102/208ms。
+/// 解析は `tools/e2e/ime_key_matrix/mode_key_pass_timeline.py`。
+/// **導出**: 実測最大（古い値を読んだ最も遅い時刻）131ms + マージン 39ms = 170ms（実測 1 と同じ約 +38ms のマージン）。
+/// fence 内の古い観測は予測を訂正しないだけなので、長くしても Engine への影響は無く、照合が遅れるだけ。
+/// follow の再読み取り（通過から約 33/96/159/222/285ms）のうち約 222ms 時点の読み取りが最初の照合対象になり、
+/// 窓 `MODE_KEY_PASS_MARK_WINDOW_MS`=300ms 内に 2 回収まる。
+/// 実機（GitHub-hosted 以外）での再測定は未了のため `pending`。
+#[measured_macro::measured(pending = true)]
+pub const KEY_EFFECT_SETTLE_MS: u64 = 170;

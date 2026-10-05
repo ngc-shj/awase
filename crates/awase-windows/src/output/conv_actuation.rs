@@ -53,23 +53,23 @@
 //!
 //! 到達可能性（ADR-089 §6 Phase C 実施記録 C-7 と §9-21 の訂正）:
 //! `executor.rs`/`key_pipeline.rs` は `imm_cross_is_first_applicable` で async
-//! 分岐、`apply_force_on_for_imm_broken` と `arm_force_open_pending` は
+//! 分岐、（当時の）`apply_force_on_for_imm_broken` と `arm_force_open_pending` は
 //! `!can_use_imm32_cross_process()` を要求、`ir_apply_drift_correction` は
 //! ImmCross なら `set_ime_open` を使う分岐、`ime_refresh.rs` の GJI TsfNative
 //! 強制 ON と `key_pipeline.rs` の idle-conv-check は TsfNative 限定——
 //! **ただしこれで全部ではない**。
 //!
-//! **`runtime/mod.rs::try_force_on_bootstrap`（`:892`）から
-//! `ImmCrossProcessStrategy::apply` に同期で到達する。**
+//! **（当時の）`runtime/mod.rs::try_force_on_bootstrap`（`:892`、`621bf93c` で撤去済み）から
+//! `ImmCrossProcessStrategy::apply` に同期で到達していた。**
 //! 同関数のガードは `detect_miss_count()` / `is_user_enabled()` /
 //! `is_eligible_for_ime_force_on()`（`is_japanese_ime() && effective_open()`）/
 //! `!is_force_on_guard_active()` だけで、上記 2 経路が持つ
 //! `!can_use_imm32_cross_process()` の**プロファイルガードを持たない**。
 //! したがって Standard（LINE / Qt 等）で IME 検出ミスが閾値回連続したときの
-//! bootstrap force-ON は `caps` chain の先頭 `ImmCross` に入る
+//! bootstrap force-ON（撤去済み）は `caps` chain の先頭 `ImmCross` に入っていた
 //! （`state/open_warrant.rs:1166`/`:1187` のテストコメントも
 //! 「`try_force_on_bootstrap` 呼び出し元は ImmCross プロファイル側で
-//! 到達する」と記録している）。2026-08-12 の Phase C 記録は当初これを
+//! 到達する」と記録していた）。2026-08-12 の Phase C 記録は当初これを
 //! 数え落として「同期経路からは到達しない」と書いていた（ADR-089 §9-21 で訂正）。
 //!
 //! **残る穴**: 同期 ImmCross の open write（`set_ime_open_cross_process`）は
@@ -137,6 +137,7 @@ impl Output {
     /// 既存の分離を維持）。確定した mode 主張を伴う呼び出し元を移行する際は、
     /// 引数に `Option<(InputModeState, InputModeApplyStrategy)>` を追加し
     /// `Runtime::apply_input_mode_correction` を呼ぶこと。
+    #[tracing::instrument(level = "debug", skip_all, fields(?target, ?reason))]
     pub(crate) fn actuate_conv_mode(
         &self,
         target: ConvModeTarget,
@@ -144,7 +145,7 @@ impl Output {
         _tick_ms: TickMs,
     ) -> ConvActuationOutcome {
         if !self.conv_mutation_allowed.get() {
-            log::debug!(
+            tracing::debug!(
                 "[conv-actuate] {reason:?} → conv_mutation_allowed=false のため却下 \
                  (target={target:?})"
             );
@@ -157,7 +158,7 @@ impl Output {
         self.ms_ime_gate_give_up.set(false);
 
         let raw_target = target.imm_conv_value();
-        log::info!("[conv-actuate] {reason:?} → target=0x{raw_target:08X} 書き込み (spawn)");
+        tracing::info!("[conv-actuate] {reason:?} → target=0x{raw_target:08X} 書き込み (spawn)");
         // ADR-086 INV-14: 起案時点（＝今、unconfirm と同一トランザクション内）の
         // hwnd を capture してから spawn_local へ渡す。フォーカス世代
         // （ime_mode_focus_gen）は `with_app` 経由でしか読めない（`ime.rs` は
@@ -169,7 +170,7 @@ impl Output {
         let focus_gen = self.ime_mode_focus_gen.get();
         win32_async::spawn_local(async move {
             let Some(target) = crate::ime::ActuationTarget::capture(focus_gen).await else {
-                log::debug!("[conv-actuate] {reason:?} → capture 失敗（フォーカス無し）");
+                tracing::debug!("[conv-actuate] {reason:?} → capture 失敗（フォーカス無し）");
                 return;
             };
             let outcome = crate::ime::set_ime_conv_for_target(target, Some(raw_target), || {
@@ -177,7 +178,7 @@ impl Output {
                     .unwrap_or_else(|| focus_gen.wrapping_add(1))
             })
             .await;
-            log::info!("[conv-actuate] {reason:?} → 結果: {outcome:?}");
+            tracing::info!("[conv-actuate] {reason:?} → 結果: {outcome:?}");
         });
 
         ConvActuationOutcome::Actuated

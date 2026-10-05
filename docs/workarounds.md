@@ -113,16 +113,8 @@ GJI の composition 動作の実際の挙動に依存した最適化。削除す
 
 ## カテゴリ 4: IME 戦略フォールバック
 
-### 4-1. `post_kanji_toggle_to_focused`（VK_KANJI フォールバック）
-
-**場所:** `crates/awase-windows/src/ime.rs:156-175`
-
-**内容:** GJI 非稼働時（MS-IME 等）の最終フォールバック。旧実装は候補ウィンドウ表示中に `Ctrl+Enter` で候補を確定してから `VK_KANJI` を送っていたが、Chrome フォームを submit させる副作用があり廃止（`1d7315e`）。現在は bare `VK_KANJI` のみを送り、候補ウィンドウへの吸われは許容する。
-
-**判定: 削除不可（すでにクリーン）**  
-コメントは「Ctrl+Enter 廃止済みの経緯」として適切。コードも現在の仕様を正確に反映している。
-
----
+ADR-190 で `post_kanji_toggle_to_focused`（VK_KANJI フォールバック）は撤去済み。
+MS-IME 系の ImmCross 失敗後は冪等な `MsImeDirect`（VK_IME_ON/OFF）へ落とす。
 
 ### 4-2. GJI 全プロファイル共通戦略
 
@@ -165,15 +157,15 @@ GJI の composition 動作の実際の挙動に依存した最適化。削除す
 
 ## カテゴリ 6: アプリ固有バグ対応系
 
-### 6-A. Ctrl↑ で `eager_warmup_sent_ms` をリセット
+### 6-A. Ctrl↑ で `eager_warmup_sent_ms` をリセット(**撤去済み・BUG-174**)
 
-**場所:** `crates/awase-windows/src/runtime/executor.rs:467-479`
+**場所:** 撤去済み(最終版は `14d162f8` の `runtime/executor.rs::handle_ctrl_up_recovery`)
 
 **内容:** Ctrl が WezTerm に届いている間、GJI TSF 初期化が中断される可能性がある。Ctrl↑ 後に composition が cold 状態であれば `eager_warmup_sent_ms` をリセットし、GJI recovery 時間（500ms）を Ctrl↑ 起点で再計測する。
 
 **症状:** Ctrl を離した直後にひらがなを入力すると「この → kおの」になる。
 
-**判定: 削除不可**（WezTerm × GJI の実際の挙動への対応）
+**判定: 撤去済み**（2026-09-29、[BUG-174](known-bugs/BUG-174.md)）。前提の 500ms 待機は 2026-07-18 に既に撤去されており（`output/vk_send.rs`）、Ctrl↑ の `VK_IME_ON` は「Ctrl 押下中に注入される」ため「@」の被疑箇所になった。WezTerm での「この→kおの」再発は未検証。再発したら、書き戻す前に BUG-174 を読むこと。
 
 ---
 
@@ -191,7 +183,7 @@ GJI の composition 動作の実際の挙動に依存した最適化。削除す
 
 **場所:** `crates/awase-windows/src/runtime/executor.rs:800-840`
 
-**内容:** フォーカス変更直後や起動時に実 IME 状態が unknown になり、`applied_snapshot=None` のまま IME が ON になっていることがある。この状態で `KanjiToggle/GjiDirect` が「`shadow=desired` → スキップ」してしまい Ctrl+無変換 が効かなくなる。ユーザーの明示的操作（`EngineIntent`）では shadow desync を無視して必ず送信することで対処する。
+**内容:** フォーカス変更直後や起動時に実 IME 状態が unknown になり、`applied_snapshot=None` のまま IME が ON になっていることがある。この状態で `GjiDirect` が「`shadow=desired` → スキップ」してしまい Ctrl+無変換 が効かなくなる。ユーザーの明示的操作（`EngineIntent`）では shadow desync を無視して必ず送信することで対処する。
 
 スキップ判定は方向で異なる:
 - `SetOpen(false)` 方向: `applied_at_ms > 0`（実 apply 確認済み）なら永続スキップ → 定常状態での VK_KANJI 二重送信防止
@@ -215,7 +207,7 @@ GJI の composition 動作の実際の挙動に依存した最適化。削除す
 
 **場所:** `crates/awase-windows/src/runtime/mod.rs:498-504`
 
-**内容:** 物理 KANJI キーは `apply_ime_open` を経由しないため `last_applied` が更新されない。このまま Engine が activate → `SetOpen(true)` → `KanjiToggleStrategy` が `last_applied(false) != desired(true)` と判定して VK_KANJI を余分に送信し、Chrome で IME が逆転する。`process_deferred_effects` 完了後に OS 観測値で `mirror_applied_open` を呼び同期する。
+**内容:** 物理 KANJI キーは `apply_ime_open` を経由しないため `last_applied` が更新されない。このまま Engine が activate → `SetOpen(true)` へ進むと、直後の force-on / focus-resync が古い状態を根拠に動く。`process_deferred_effects` 完了後に OS 観測値で `mirror_applied_open` を呼び同期する。
 
 **判定: 削除不可**（物理 KANJI キーが `apply_ime_open` を迂回することへの対応）
 

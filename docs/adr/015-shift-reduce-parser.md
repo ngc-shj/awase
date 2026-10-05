@@ -1,3 +1,12 @@
+---
+id: ADR-015
+title: |-
+  NicolaFsm のシフト-リデュースパーサーモデル
+status: |-
+  採用・実装済み(ShiftReduceParser/ParseAction は crates/timed-fsm/src/parser.rs、decide_and_transition は src/engine/nicola_fsm.rs に現存、2026-10-04 確認)。旧: 採用済み
+related_adr: []
+---
+
 # ADR-015: NicolaFsm のシフト-リデュースパーサーモデル
 
 ## ステータス

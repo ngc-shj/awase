@@ -85,9 +85,9 @@ fn find_gji_pid() -> Option<(u32, String)> {
     let _ = unsafe { CloseHandle(snapshot) };
 
     match &found {
-        Some((pid, name)) => log::debug!("[gji-monitor] found GJI process: {name} pid={pid}"),
+        Some((pid, name)) => tracing::debug!("[gji-monitor] found GJI process: {name} pid={pid}"),
         None => {
-            log::debug!(
+            tracing::debug!(
                 "[gji-monitor] no GJI process found (searched prefixes: {GJI_PROCESS_PREFIXES:?}), google/japanese procs: {google_procs:?}",
             );
         }
@@ -114,6 +114,8 @@ struct GjiIoDelta {
     read_bytes: u64,
     /// 前回ポーリングからの WriteTransferCount 差分（バイト数）
     write_bytes: u64,
+    /// 前回ポーリングからの OtherTransferCount 差分（バイト数、2026-09-07 実験追加）
+    other_bytes: u64,
 }
 
 impl GjiIoDelta {
@@ -132,6 +134,8 @@ struct GjiMonitor {
     last_read_bytes: u64,
     /// GJI プロセスの累積 WriteTransferCount（バイト数）
     last_write_bytes: u64,
+    /// GJI プロセスの累積 OtherTransferCount（バイト数、2026-09-07 実験追加）
+    last_other_bytes: u64,
     /// 最後に I/O 変化を検出した時刻 (GetTickCount64 ms)
     last_change_ms: u64,
     /// 最後に WriteOperationCount が変化した時刻 (GetTickCount64 ms)。0 = 未観測。
@@ -159,6 +163,7 @@ impl GjiMonitor {
             last_other_ops: 0,
             last_read_bytes: 0,
             last_write_bytes: 0,
+            last_other_bytes: 0,
             last_change_ms: now_ms,
             last_write_change_ms: 0,
         };
@@ -194,6 +199,9 @@ impl GjiMonitor {
             write_bytes: counters
                 .WriteTransferCount
                 .saturating_sub(self.last_write_bytes),
+            other_bytes: counters
+                .OtherTransferCount
+                .saturating_sub(self.last_other_bytes),
         };
         if delta.any() {
             let now_ms = crate::hook::current_tick_ms();
@@ -202,6 +210,7 @@ impl GjiMonitor {
             self.last_other_ops = counters.OtherOperationCount;
             self.last_read_bytes = counters.ReadTransferCount;
             self.last_write_bytes = counters.WriteTransferCount;
+            self.last_other_bytes = counters.OtherTransferCount;
             self.last_change_ms = now_ms;
             if delta.write_ops > 0 {
                 self.last_write_change_ms = now_ms;
@@ -236,6 +245,11 @@ impl GjiMonitor {
     const fn last_other_ops(&self) -> u64 {
         self.last_other_ops
     }
+
+    /// 累積 `OtherTransferCount`（バイト数）。診断専用（2026-09-07 実験追加）。
+    const fn last_other_bytes(&self) -> u64 {
+        self.last_other_bytes
+    }
 }
 
 impl Drop for GjiMonitor {
@@ -266,12 +280,20 @@ impl Drop for GjiMonitor {
 ///
 /// 同じ新しい種別が 2 回連続（= 前回ポーリングでも候補になっていた）観測されて初めて
 /// 確定として扱う。誤検出が単発なら次の tick で元の種別に戻り `candidate` がクリアされる。
-struct ImeKindDebounce {
-    /// 直近 tick で観測された「まだ確定していない」新種別。
-    candidate: Option<ActiveImeKind>,
+/// `T`（`ActiveImeKind` または `TipIdentity`）を単位にデバウンスする。両者は独立したデバウンスインスタンスを
+/// 持つこと（`monitor_loop` の `kind_debounce`/`identity_debounce`。レビュー round3 NR1: 1つの `query_active_kind`
+/// 呼び出しから得られる2つの値〈`ActiveImeKind`・`TipIdentity`〉のうち、`TipIdentity`だけをデバウンスせず
+/// 即時に書いていたため、ATOK と Microsoft IME本体がどちらも`ActiveImeKind::MicrosoftIme`になる
+/// この軸だけ単発フリップに無防備だった。同じ入力に同じデバウンスの規律を適用するのが筋）。
+struct Debounce<T> {
+    /// 直近 tick で観測された「まだ確定していない」新値。
+    candidate: Option<T>,
 }
 
-impl ImeKindDebounce {
+type ImeKindDebounce = Debounce<ActiveImeKind>;
+type TipIdentityDebounce = Debounce<crate::state::ime_kind::TipIdentity>;
+
+impl<T: Copy + PartialEq> Debounce<T> {
     const fn new() -> Self {
         Self { candidate: None }
     }
@@ -279,13 +301,9 @@ impl ImeKindDebounce {
     /// 新しい観測値を投入する。`current` は `TSF_OBS` に確定済みの現在値。
     ///
     /// `observed == current`（変化なし）なら候補をクリアして `None`。
-    /// `observed` が前回も候補だった（2 回連続で同じ新種別）なら確定として `Some` を返す。
-    /// それ以外（初めて見る新種別）は候補として保持し `None` を返す。
-    fn observe(
-        &mut self,
-        observed: ActiveImeKind,
-        current: ActiveImeKind,
-    ) -> Option<ActiveImeKind> {
+    /// `observed` が前回も候補だった（2 回連続で同じ新値）なら確定として `Some` を返す。
+    /// それ以外（初めて見る新値）は候補として保持し `None` を返す。
+    fn observe(&mut self, observed: T, current: T) -> Option<T> {
         if observed == current {
             self.candidate = None;
             return None;
@@ -300,10 +318,259 @@ impl ImeKindDebounce {
     }
 }
 
+// ── バックグラウンドモニタースレッド ──
+
+/// GJI I/O モニタースレッドを起動する。
+///
+/// 常駐し、`TSF_OBS.gji_last_io_ms` と `TSF_OBS.gji_monitor_ok` を更新し続ける。
+/// GJI が再起動した場合は自動的に再接続する。
+/// 起動時に呼ぶこと（1 回のみ）。戻り値の [`win32_worker::WorkerThread`] を
+/// アプリ終了まで保持すること（drop 時にスレッドが停止・join される）。
+#[must_use]
+pub fn start_monitor_thread() -> win32_worker::WorkerThread {
+    win32_worker::WorkerThread::spawn("gji-io-monitor", move |token| {
+        monitor_loop(&token);
+    })
+}
+
+#[expect(clippy::cognitive_complexity)]
+fn monitor_loop(token: &win32_worker::ShutdownToken) {
+    tracing::info!("[gji-monitor] thread started");
+
+    // COM STA 初期化 (TSF プロファイル API に必要)
+    // S_FALSE (既に初期化済み) も含めて無視する。
+    let _ = unsafe {
+        windows::Win32::System::Com::CoInitializeEx(
+            None,
+            windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+        )
+    };
+
+    // TSF プロファイル COM オブジェクトを生成（失敗しても GJI モニタリングは継続）
+    let tsf_ctx = super::tip_detector::create_profile_ctx();
+    if let Some((ref mgr, ref profiles)) = tsf_ctx {
+        super::tip_detector::dump_profiles(mgr, profiles);
+        super::tip_detector::discover_and_cache_gji_clsid(mgr, profiles);
+        // 起動時点の IME 種別を即時取得し、WM_IME_KIND_CHANGED を必ず発行して
+        // warmup 戦略（GjiFsm vs MsImeStrategy）を初期化する。
+        // ポーリングループは「変化時のみ」発行するため、MS-IME 環境では起動後に
+        // WM_IME_KIND_CHANGED が届かず GjiFsm が残り続けるバグを防ぐ。
+        if let Some((kind, identity)) = super::tip_detector::query_active_kind(mgr) {
+            TSF_OBS.set_tsf_active_kind(kind);
+            TSF_OBS.set_ms_ime_native_identified(
+                identity == crate::state::ime_kind::TipIdentity::MsImeNative,
+            );
+            tracing::info!("[tip-detect] initial IME kind: {kind:?} ({identity:?})");
+            crate::win32::post_to_main_thread(crate::WM_IME_KIND_CHANGED);
+        }
+    } else {
+        tracing::warn!("[tip-detect] TSF COM 初期化失敗 — CLSID ベース IME 判定を無効化");
+    }
+
+    let mut monitor: Option<GjiMonitor> = None;
+    let mut next_attach_ms: u64 = 0;
+    // CLSID ベース IME 種別ポーリング次回時刻
+    let mut next_clsid_check_ms: u64 = 0;
+    // 単発フリップで warmup 戦略を破棄しないためのデバウンス（`ImeKindDebounce` 参照）。
+    let mut kind_debounce = ImeKindDebounce::new();
+    let mut identity_debounce = TipIdentityDebounce::new();
+
+    loop {
+        let now = crate::hook::current_tick_ms();
+
+        // CLSID ベース IME 種別を 2 秒ごとにポーリングして更新する。
+        // WM_IME_KIND_CHANGED はここだけから発行する（プロセス存在ではなく API で判定）。
+        // 同じ新種別が 2 tick 連続で観測されるまでは `TSF_OBS` を更新せず
+        // 通知も発行しない（`ImeKindDebounce` — 単発の誤検出で warmup 戦略
+        // (`GjiFsm`/`MsImeStrategy`) が丸ごと再構築され、確立済みの
+        // OnWarm/OnComposing が失われるのを防ぐ）。
+        if let Some((ref mgr, _)) = tsf_ctx {
+            if now >= next_clsid_check_ms {
+                next_clsid_check_ms = now + 2_000;
+                if let Some((kind, identity)) = super::tip_detector::query_active_kind(mgr) {
+                    let current = TSF_OBS.active_ime_kind();
+                    if let Some(confirmed) = kind_debounce.observe(kind, current) {
+                        if TSF_OBS.set_tsf_active_kind(confirmed) {
+                            tracing::info!("[tip-detect] IME kind → {confirmed:?}");
+                            crate::win32::post_to_main_thread(crate::WM_IME_KIND_CHANGED);
+                        }
+                    } else if kind != current {
+                        tracing::debug!(
+                            "[tip-detect] IME kind candidate {kind:?} (current={current:?}), \
+                             awaiting confirmation next tick"
+                        );
+                    }
+                    // TipIdentity も同じデバウンスの規律で確定させる（NR1）。ATOK と Microsoft IME 本体は
+                    // どちらも上の ActiveImeKind では MicrosoftIme のため、こちらが単発フリップの唯一の防御。
+                    let current_identity = TSF_OBS.current_tip_identity();
+                    if let Some(confirmed) = identity_debounce.observe(identity, current_identity) {
+                        if TSF_OBS.set_ms_ime_native_identified(
+                            confirmed == crate::state::ime_kind::TipIdentity::MsImeNative,
+                        ) {
+                            tracing::info!("[tip-detect] TIP identity → {confirmed:?}");
+                        }
+                    } else if identity != current_identity {
+                        tracing::debug!(
+                            "[tip-detect] TIP identity candidate {identity:?} \
+                             (current={current_identity:?}), awaiting confirmation next tick"
+                        );
+                    }
+                }
+            }
+        }
+
+        if monitor.is_none() && now >= next_attach_ms {
+            if let Some(m) = GjiMonitor::try_attach() {
+                tracing::info!("[gji-monitor] attached to GJI process (I/O monitoring enabled)");
+                // 接続時刻を先に記録する（`last_change_ms` は累積カウンタの初回読みで立つ接続時点の値で、実 I/O ではない。BUG-176）。
+                TSF_OBS
+                    .gji_attach_ms
+                    .store(crate::hook::current_tick_ms(), Ordering::Relaxed);
+                TSF_OBS
+                    .gji_last_io_ms
+                    .store(m.last_change_ms(), Ordering::Relaxed);
+                TSF_OBS.gji_monitor_ok.store(true, Ordering::Release);
+                monitor = Some(m);
+                // GJI プロセスにアタッチした時点で CLSID を即時確認する。
+                // プロセス存在だけでは「GJI がアクティブ IME」とは限らないため、
+                // WM_IME_KIND_CHANGED はプロセス存在ではなく CLSID 結果の変化時のみ発行する。
+                if let Some((ref mgr, _)) = tsf_ctx {
+                    if let Some((kind, identity)) = super::tip_detector::query_active_kind(mgr) {
+                        if TSF_OBS.set_tsf_active_kind(kind) {
+                            tracing::info!("[tip-detect] IME kind → {kind:?} (on GJI attach)");
+                            crate::win32::post_to_main_thread(crate::WM_IME_KIND_CHANGED);
+                        }
+                        // 変化をログに残す（レビュー round3 B-NR3: 取りこぼして識別が黙って止まると
+                        // triage できない。CLSID を取りこぼした形跡は起動時の `dump_profiles`〈info、全CLSID
+                        // 列挙〉と突き合わせる）。
+                        if TSF_OBS.set_ms_ime_native_identified(
+                            identity == crate::state::ime_kind::TipIdentity::MsImeNative,
+                        ) {
+                            tracing::info!(
+                                "[tip-detect] TIP identity → {identity:?} (on GJI attach)"
+                            );
+                        }
+                    }
+                    next_clsid_check_ms = now + 2_000;
+                }
+            } else {
+                TSF_OBS.gji_monitor_ok.store(false, Ordering::Relaxed);
+                next_attach_ms = now + crate::tuning::GJI_REATTACH_INTERVAL_MS;
+                tracing::debug!("[gji-monitor] GJI process not found (I/O monitoring unavailable)");
+                // プロセス非検出時は WM_IME_KIND_CHANGED を発行しない。
+                // CLSID ポーリングが IME 種別を管理する。
+            }
+        }
+
+        if let Some(ref mut m) = monitor {
+            match m.sample() {
+                None => {
+                    tracing::info!("[gji-monitor] GJI process exited, will re-attach");
+                    TSF_OBS.gji_monitor_ok.store(false, Ordering::Relaxed);
+                    monitor = None;
+                    next_attach_ms = now + crate::tuning::GJI_REATTACH_INTERVAL_MS;
+                    // プロセス消失時も WM_IME_KIND_CHANGED は発行しない。
+                    // CLSID ポーリングが次のサイクルで MicrosoftIme を検出して発行する。
+                }
+                Some(delta) => {
+                    TSF_OBS
+                        .gji_last_io_ms
+                        .store(m.last_change_ms(), Ordering::Relaxed);
+                    TSF_OBS
+                        .gji_write_bytes
+                        .store(m.last_write_bytes(), Ordering::Relaxed);
+                    // 診断専用（BUG-75）。判定ロジックからは参照されない。
+                    TSF_OBS
+                        .gji_write_ops
+                        .store(m.last_write_ops(), Ordering::Relaxed);
+                    TSF_OBS
+                        .gji_read_ops
+                        .store(m.last_read_ops(), Ordering::Relaxed);
+                    TSF_OBS
+                        .gji_other_ops
+                        .store(m.last_other_ops(), Ordering::Relaxed);
+                    TSF_OBS
+                        .gji_other_bytes
+                        .store(m.last_other_bytes(), Ordering::Relaxed);
+                    if delta.write_ops > 0 {
+                        TSF_OBS
+                            .gji_last_write_ms
+                            .store(m.last_write_change_ms(), Ordering::Relaxed);
+                        tracing::debug!(
+                            "[gji-io] WRITE: w_ops=+{} w_KB=+{:.1} \
+                             (r_ops=+{} x_ops=+{} x_KB=+{:.1})",
+                            delta.write_ops,
+                            delta.write_bytes as f64 / 1024.0,
+                            delta.read_ops,
+                            delta.other_ops,
+                            delta.other_bytes as f64 / 1024.0,
+                        );
+                    } else if delta.any() {
+                        tracing::debug!(
+                            "[gji-io] r_ops=+{} w_ops=+{} x_ops=+{} read_KB=+{:.1} x_KB=+{:.1}",
+                            delta.read_ops,
+                            delta.write_ops,
+                            delta.other_ops,
+                            delta.read_bytes as f64 / 1024.0,
+                            delta.other_bytes as f64 / 1024.0,
+                        );
+                    }
+                    if delta.read_bytes >= 512 * 1024 {
+                        tracing::info!(
+                            "[gji-io] HEAVY read: +{:.1}KB \
+                             (possible cold-start dictionary reload)",
+                            delta.read_bytes as f64 / 1024.0,
+                        );
+                    }
+                }
+            }
+        }
+
+        if token
+            .sleep_ms(crate::tuning::GJI_SAMPLE_INTERVAL_MS)
+            .is_break()
+        {
+            tracing::info!("[gji-monitor] shutdown signal received, exiting");
+            break;
+        }
+    }
+}
+
 #[cfg(test)]
-#[allow(clippy::items_after_test_module)]
 mod ime_kind_debounce_tests {
-    use super::{ActiveImeKind, ImeKindDebounce};
+    use super::{ActiveImeKind, ImeKindDebounce, TipIdentityDebounce};
+    use crate::state::ime_kind::TipIdentity;
+
+    /// レビュー round3 NR1 の再現: ATOK 定常状態（`TipIdentity::Other`）で `MsImeNative` が単発で混入しても、
+    /// `TipIdentityDebounce`（`ActiveImeKind` のデバウンスとは独立）は確定させない。
+    /// `ActiveImeKind` 側は ATOK も Microsoft IME 本体も `MicrosoftIme` で区別できない
+    /// （`observed == current` に落ちて `ImeKindDebounce` が無防備になる、これが NR1 の核心）ので、
+    /// `TipIdentity` を単位にする専用のデバウンスが要る。
+    #[test]
+    fn single_tick_ms_ime_native_flip_on_atok_is_filtered_out() {
+        let mut d = TipIdentityDebounce::new();
+        // ATOK が定常状態。単発で Microsoft IME 本体の CLSID が混入する（実測: ImeKindDebounce の doc 参照）。
+        assert_eq!(
+            d.observe(TipIdentity::MsImeNative, TipIdentity::Other),
+            None
+        );
+        // 次 tick で ATOK に戻る → 候補クリア、確定させない。
+        assert_eq!(d.observe(TipIdentity::Other, TipIdentity::Other), None);
+    }
+
+    /// 2 tick 連続で `MsImeNative` なら確定する（実際に Microsoft IME 本体へ切り替わった場合）。
+    #[test]
+    fn two_consecutive_ms_ime_native_confirms() {
+        let mut d = TipIdentityDebounce::new();
+        assert_eq!(
+            d.observe(TipIdentity::MsImeNative, TipIdentity::Other),
+            None
+        );
+        assert_eq!(
+            d.observe(TipIdentity::MsImeNative, TipIdentity::Other),
+            Some(TipIdentity::MsImeNative)
+        );
+    }
 
     #[test]
     fn stable_same_kind_never_confirms() {
@@ -397,185 +664,5 @@ mod ime_kind_debounce_tests {
             ),
             None
         );
-    }
-}
-
-// ── バックグラウンドモニタースレッド ──
-
-/// GJI I/O モニタースレッドを起動する。
-///
-/// 常駐し、`TSF_OBS.gji_last_io_ms` と `TSF_OBS.gji_monitor_ok` を更新し続ける。
-/// GJI が再起動した場合は自動的に再接続する。
-/// 起動時に呼ぶこと（1 回のみ）。戻り値の [`win32_worker::WorkerThread`] を
-/// アプリ終了まで保持すること（drop 時にスレッドが停止・join される）。
-#[must_use]
-pub fn start_monitor_thread() -> win32_worker::WorkerThread {
-    win32_worker::WorkerThread::spawn("gji-io-monitor", move |token| {
-        monitor_loop(&token);
-    })
-}
-
-#[expect(clippy::cognitive_complexity)]
-fn monitor_loop(token: &win32_worker::ShutdownToken) {
-    log::info!("[gji-monitor] thread started");
-
-    // COM STA 初期化 (TSF プロファイル API に必要)
-    // S_FALSE (既に初期化済み) も含めて無視する。
-    let _ = unsafe {
-        windows::Win32::System::Com::CoInitializeEx(
-            None,
-            windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
-        )
-    };
-
-    // TSF プロファイル COM オブジェクトを生成（失敗しても GJI モニタリングは継続）
-    let tsf_ctx = super::tip_detector::create_profile_ctx();
-    if let Some((ref mgr, ref profiles)) = tsf_ctx {
-        super::tip_detector::dump_profiles(mgr, profiles);
-        super::tip_detector::discover_and_cache_gji_clsid(mgr, profiles);
-        // 起動時点の IME 種別を即時取得し、WM_IME_KIND_CHANGED を必ず発行して
-        // warmup 戦略（GjiFsm vs MsImeStrategy）を初期化する。
-        // ポーリングループは「変化時のみ」発行するため、MS-IME 環境では起動後に
-        // WM_IME_KIND_CHANGED が届かず GjiFsm が残り続けるバグを防ぐ。
-        if let Some(kind) = super::tip_detector::query_active_kind(mgr) {
-            TSF_OBS.set_tsf_active_kind(kind);
-            log::info!("[tip-detect] initial IME kind: {kind:?}");
-            crate::win32::post_to_main_thread(crate::WM_IME_KIND_CHANGED);
-        }
-    } else {
-        log::warn!("[tip-detect] TSF COM 初期化失敗 — CLSID ベース IME 判定を無効化");
-    }
-
-    let mut monitor: Option<GjiMonitor> = None;
-    let mut next_attach_ms: u64 = 0;
-    // CLSID ベース IME 種別ポーリング次回時刻
-    let mut next_clsid_check_ms: u64 = 0;
-    // 単発フリップで warmup 戦略を破棄しないためのデバウンス（`ImeKindDebounce` 参照）。
-    let mut kind_debounce = ImeKindDebounce::new();
-
-    loop {
-        let now = crate::hook::current_tick_ms();
-
-        // CLSID ベース IME 種別を 2 秒ごとにポーリングして更新する。
-        // WM_IME_KIND_CHANGED はここだけから発行する（プロセス存在ではなく API で判定）。
-        // 同じ新種別が 2 tick 連続で観測されるまでは `TSF_OBS` を更新せず
-        // 通知も発行しない（`ImeKindDebounce` — 単発の誤検出で warmup 戦略
-        // (`GjiFsm`/`MsImeStrategy`) が丸ごと再構築され、確立済みの
-        // OnWarm/OnComposing が失われるのを防ぐ）。
-        if let Some((ref mgr, _)) = tsf_ctx {
-            if now >= next_clsid_check_ms {
-                next_clsid_check_ms = now + 2_000;
-                if let Some(kind) = super::tip_detector::query_active_kind(mgr) {
-                    let current = TSF_OBS.active_ime_kind();
-                    if let Some(confirmed) = kind_debounce.observe(kind, current) {
-                        if TSF_OBS.set_tsf_active_kind(confirmed) {
-                            log::info!("[tip-detect] IME kind → {confirmed:?}");
-                            crate::win32::post_to_main_thread(crate::WM_IME_KIND_CHANGED);
-                        }
-                    } else if kind != current {
-                        log::debug!(
-                            "[tip-detect] IME kind candidate {kind:?} (current={current:?}), \
-                             awaiting confirmation next tick"
-                        );
-                    }
-                }
-            }
-        }
-
-        if monitor.is_none() && now >= next_attach_ms {
-            if let Some(m) = GjiMonitor::try_attach() {
-                log::info!("[gji-monitor] attached to GJI process (I/O monitoring enabled)");
-                TSF_OBS
-                    .gji_last_io_ms
-                    .store(m.last_change_ms(), Ordering::Relaxed);
-                TSF_OBS.gji_monitor_ok.store(true, Ordering::Release);
-                monitor = Some(m);
-                // GJI プロセスにアタッチした時点で CLSID を即時確認する。
-                // プロセス存在だけでは「GJI がアクティブ IME」とは限らないため、
-                // WM_IME_KIND_CHANGED はプロセス存在ではなく CLSID 結果の変化時のみ発行する。
-                if let Some((ref mgr, _)) = tsf_ctx {
-                    if let Some(kind) = super::tip_detector::query_active_kind(mgr) {
-                        if TSF_OBS.set_tsf_active_kind(kind) {
-                            log::info!("[tip-detect] IME kind → {kind:?} (on GJI attach)");
-                            crate::win32::post_to_main_thread(crate::WM_IME_KIND_CHANGED);
-                        }
-                    }
-                    next_clsid_check_ms = now + 2_000;
-                }
-            } else {
-                TSF_OBS.gji_monitor_ok.store(false, Ordering::Relaxed);
-                next_attach_ms = now + crate::tuning::GJI_REATTACH_INTERVAL_MS;
-                log::debug!("[gji-monitor] GJI process not found (I/O monitoring unavailable)");
-                // プロセス非検出時は WM_IME_KIND_CHANGED を発行しない。
-                // CLSID ポーリングが IME 種別を管理する。
-            }
-        }
-
-        if let Some(ref mut m) = monitor {
-            match m.sample() {
-                None => {
-                    log::info!("[gji-monitor] GJI process exited, will re-attach");
-                    TSF_OBS.gji_monitor_ok.store(false, Ordering::Relaxed);
-                    monitor = None;
-                    next_attach_ms = now + crate::tuning::GJI_REATTACH_INTERVAL_MS;
-                    // プロセス消失時も WM_IME_KIND_CHANGED は発行しない。
-                    // CLSID ポーリングが次のサイクルで MicrosoftIme を検出して発行する。
-                }
-                Some(delta) => {
-                    TSF_OBS
-                        .gji_last_io_ms
-                        .store(m.last_change_ms(), Ordering::Relaxed);
-                    TSF_OBS
-                        .gji_write_bytes
-                        .store(m.last_write_bytes(), Ordering::Relaxed);
-                    // 診断専用（BUG-75）。判定ロジックからは参照されない。
-                    TSF_OBS
-                        .gji_write_ops
-                        .store(m.last_write_ops(), Ordering::Relaxed);
-                    TSF_OBS
-                        .gji_read_ops
-                        .store(m.last_read_ops(), Ordering::Relaxed);
-                    TSF_OBS
-                        .gji_other_ops
-                        .store(m.last_other_ops(), Ordering::Relaxed);
-                    if delta.write_ops > 0 {
-                        TSF_OBS
-                            .gji_last_write_ms
-                            .store(m.last_write_change_ms(), Ordering::Relaxed);
-                        log::debug!(
-                            "[gji-io] WRITE: w_ops=+{} w_KB=+{:.1} \
-                             (r_ops=+{} x_ops=+{})",
-                            delta.write_ops,
-                            delta.write_bytes as f64 / 1024.0,
-                            delta.read_ops,
-                            delta.other_ops,
-                        );
-                    } else if delta.any() {
-                        log::debug!(
-                            "[gji-io] r_ops=+{} w_ops=+{} x_ops=+{} read_KB=+{:.1}",
-                            delta.read_ops,
-                            delta.write_ops,
-                            delta.other_ops,
-                            delta.read_bytes as f64 / 1024.0,
-                        );
-                    }
-                    if delta.read_bytes >= 512 * 1024 {
-                        log::info!(
-                            "[gji-io] HEAVY read: +{:.1}KB \
-                             (possible cold-start dictionary reload)",
-                            delta.read_bytes as f64 / 1024.0,
-                        );
-                    }
-                }
-            }
-        }
-
-        if token
-            .sleep_ms(crate::tuning::GJI_SAMPLE_INTERVAL_MS)
-            .is_break()
-        {
-            log::info!("[gji-monitor] shutdown signal received, exiting");
-            break;
-        }
     }
 }

@@ -105,6 +105,6 @@ pub fn check_accessibility_permission() -> bool {
 #[cfg(not(target_os = "macos"))]
 #[must_use]
 pub fn check_accessibility_permission() -> bool {
-    log::warn!("Accessibility permission check is macOS only");
+    tracing::warn!("Accessibility permission check is macOS only");
     false
 }

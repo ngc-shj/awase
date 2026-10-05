@@ -118,8 +118,8 @@ fn make_speculative_engine() -> TestHarness {
             VK_NONCONVERT,
             VK_CONVERT,
             100,
-            ConfirmMode::Speculative,
-            30,
+            ConfirmMode::NgramPredictive,
+            0,
         ),
     }
 }
@@ -135,6 +135,8 @@ impl Ev {
             event_type: KeyEventType::KeyDown,
             injected: false,
             sync_direction: None,
+            was_down: false,
+            press: None,
         }
     }
     fn up(vk: VkCode) -> EvBuilder {
@@ -145,6 +147,8 @@ impl Ev {
             event_type: KeyEventType::KeyUp,
             injected: false,
             sync_direction: None,
+            was_down: false,
+            press: None,
         }
     }
 }
@@ -156,9 +160,22 @@ struct EvBuilder {
     event_type: KeyEventType,
     injected: bool,
     sync_direction: Option<crate::types::ShadowImeAction>,
+    was_down: bool,
+    /// フックが振る押下 ID（ADR-208 D1。非リピート KeyDown のみ Some）。
+    press: Option<crate::types::PressId>,
 }
 
 impl EvBuilder {
+    /// 押下 ID `n` を持つ（フックが非リピート KeyDown に振る値の体）。
+    fn press(mut self, n: u64) -> Self {
+        self.press = Some(crate::types::PressId::new(n));
+        self
+    }
+    /// 自動リピートの Down（`RawKeyEvent::was_down`）にする。
+    fn repeat(mut self) -> Self {
+        self.was_down = true;
+        self
+    }
     fn at(mut self, ts: Timestamp) -> Self {
         self.ts = ts;
         self
@@ -181,6 +198,8 @@ impl EvBuilder {
     fn build(self) -> RawKeyEvent {
         let (kc, pos) = classify_test_key(self.vk, self.scan);
         RawKeyEvent {
+            was_down: self.was_down,
+            press_id: self.press,
             vk_code: self.vk,
             scan_code: self.scan,
             event_type: self.event_type,
@@ -194,6 +213,8 @@ impl EvBuilder {
             },
             modifier_key: classify_test_modifier(self.vk),
             modifier_snapshot: Default::default(),
+            left_thumb_down_snapshot: None,
+            right_thumb_down_snapshot: None,
             injected: self.injected,
         }
     }
@@ -341,6 +362,35 @@ fn test_pattern3_char_timeout() {
     result.assert_consumed();
     assert_eq!(result.actions.len(), 1);
     assert!(matches!(result.actions[0], KeyAction::Char('う')));
+}
+
+#[test]
+fn test_sequence_cell_confirms_as_multiple_flattened_actions() {
+    // ADR-115 決定5: `YabValue::Sequence` セルが単発キーとして確定された
+    // とき、`flatten_actions` により出口（この場合は timeout_pending_char
+    // からの build_response）で複数の KeyAction へ平坦化されて出力される
+    // ことを Engine 経由（NicolaFsm 単体呼び出しではなく on_event/on_timeout
+    // 経由）で確認する（Opus実装後レビュー M3: 決定5の中核 end-to-end
+    // テストが無かった）。
+    let mut engine = make_engine();
+    engine
+        .layout
+        .normal
+        .insert(POS_A, YabValue::Sequence(vec![lit('う'), lit('い')]));
+
+    let result = engine.on_event(Ev::down(VK_A).build());
+    assert_pending(&result);
+
+    let result = engine.on_timeout(TIMER_PENDING);
+    result.assert_consumed();
+    assert_eq!(
+        result.actions.len(),
+        2,
+        "Sequence cell must flatten into 2 separate actions, got {:?}",
+        result.actions
+    );
+    assert!(matches!(result.actions[0], KeyAction::Char('う')));
+    assert!(matches!(result.actions[1], KeyAction::Char('い')));
 }
 
 #[test]
@@ -496,7 +546,15 @@ fn test_muhenkan_thumb_emits_while_composing_when_guard_enabled() {
     let result = engine.on_event(Ev::down(VK_NONCONVERT).build());
     assert_pending(&result);
 
-    let result = engine.on_timeout_composing(TIMER_PENDING, true);
+    // ADR-182 決定1c: 無変換/変換のPassthrough単独タップはタイムアウトでは単独確定せず、親指を離した
+    // 時点で生VKを送出する（タイムアウト後に文字が来たとき生VKと親指面のかなを二重に出さないため）。
+    let timeout_result = engine.on_timeout_composing(TIMER_PENDING, true);
+    assert!(
+        timeout_result.actions.is_empty(),
+        "タイムアウトでは単独確定しない（親指を離すまで保留）: {:?}",
+        timeout_result.actions
+    );
+    let result = engine.on_event(Ev::up(VK_NONCONVERT).build());
     assert!(
         result
             .actions
@@ -515,7 +573,15 @@ fn test_henkan_thumb_emits_while_composing_when_guard_enabled() {
     let result = engine.on_event(Ev::down(VK_CONVERT).build());
     assert_pending(&result);
 
-    let result = engine.on_timeout_composing(TIMER_PENDING, true);
+    // ADR-182 決定1c: 無変換/変換のPassthrough単独タップはタイムアウトでは単独確定せず、親指を離した
+    // 時点で生VKを送出する（タイムアウト後に文字が来たとき生VKと親指面のかなを二重に出さないため）。
+    let timeout_result = engine.on_timeout_composing(TIMER_PENDING, true);
+    assert!(
+        timeout_result.actions.is_empty(),
+        "タイムアウトでは単独確定しない（親指を離すまで保留）: {:?}",
+        timeout_result.actions
+    );
+    let result = engine.on_event(Ev::up(VK_CONVERT).build());
     assert!(
         result
             .actions
@@ -574,7 +640,15 @@ fn test_muhenkan_always_suppress_false_preserves_legacy_passthrough() {
     let result = engine.on_event(Ev::down(VK_NONCONVERT).build());
     assert_pending(&result);
 
-    let result = engine.on_timeout_composing(TIMER_PENDING, false);
+    // ADR-182 決定1c: 無変換/変換のPassthrough単独タップはタイムアウトでは単独確定せず、親指を離した
+    // 時点で生VKを送出する（タイムアウト後に文字が来たとき生VKと親指面のかなを二重に出さないため）。
+    let timeout_result = engine.on_timeout_composing(TIMER_PENDING, false);
+    assert!(
+        timeout_result.actions.is_empty(),
+        "タイムアウトでは単独確定しない（親指を離すまで保留）: {:?}",
+        timeout_result.actions
+    );
+    let result = engine.on_event(Ev::up(VK_NONCONVERT).build());
     assert!(
         result
             .actions
@@ -665,7 +739,15 @@ fn test_muhenkan_solo_tap_dedicated_fn_key_does_not_affect_henkan() {
     let result = engine.on_event(Ev::down(VK_CONVERT).build());
     assert_pending(&result);
 
-    let result = engine.on_timeout_composing(TIMER_PENDING, false);
+    // ADR-182 決定1c: 無変換/変換のPassthrough単独タップはタイムアウトでは単独確定せず、親指を離した
+    // 時点で生VKを送出する（タイムアウト後に文字が来たとき生VKと親指面のかなを二重に出さないため）。
+    let timeout_result = engine.on_timeout_composing(TIMER_PENDING, false);
+    assert!(
+        timeout_result.actions.is_empty(),
+        "タイムアウトでは単独確定しない（親指を離すまで保留）: {:?}",
+        timeout_result.actions
+    );
+    let result = engine.on_event(Ev::up(VK_CONVERT).build());
     assert!(
         result
             .actions
@@ -763,7 +845,15 @@ fn test_henkan_always_suppress_false_preserves_legacy_passthrough() {
     let result = engine.on_event(Ev::down(VK_CONVERT).build());
     assert_pending(&result);
 
-    let result = engine.on_timeout_composing(TIMER_PENDING, false);
+    // ADR-182 決定1c: 無変換/変換のPassthrough単独タップはタイムアウトでは単独確定せず、親指を離した
+    // 時点で生VKを送出する（タイムアウト後に文字が来たとき生VKと親指面のかなを二重に出さないため）。
+    let timeout_result = engine.on_timeout_composing(TIMER_PENDING, false);
+    assert!(
+        timeout_result.actions.is_empty(),
+        "タイムアウトでは単独確定しない（親指を離すまで保留）: {:?}",
+        timeout_result.actions
+    );
+    let result = engine.on_event(Ev::up(VK_CONVERT).build());
     assert!(
         result
             .actions
@@ -816,6 +906,8 @@ fn test_ctrl_alt_win_thumb_key_never_enters_pending_due_to_os_modifier_bypass() 
         };
 
         let down = RawKeyEvent {
+            was_down: false,
+            press_id: None,
             vk_code: vk,
             scan_code: scan,
             event_type: KeyEventType::KeyDown,
@@ -826,6 +918,8 @@ fn test_ctrl_alt_win_thumb_key_never_enters_pending_due_to_os_modifier_bypass() 
             ime_relevance: ImeRelevance::default(),
             modifier_key: Some(mk),
             modifier_snapshot: ModifierState::default(),
+            left_thumb_down_snapshot: None,
+            right_thumb_down_snapshot: None,
             injected: false,
         };
 
@@ -861,6 +955,8 @@ fn test_thumb_alone_timeout_suppressed_when_thumb_is_os_modifier() {
     };
 
     let down = RawKeyEvent {
+        was_down: false,
+        press_id: None,
         vk_code: VK_LSHIFT,
         scan_code: vk_to_scan(VK_LSHIFT),
         event_type: KeyEventType::KeyDown,
@@ -871,6 +967,8 @@ fn test_thumb_alone_timeout_suppressed_when_thumb_is_os_modifier() {
         ime_relevance: ImeRelevance::default(),
         modifier_key: Some(ModifierKey::Shift),
         modifier_snapshot: ModifierState::default(),
+        left_thumb_down_snapshot: None,
+        right_thumb_down_snapshot: None,
         injected: false,
     };
 
@@ -955,7 +1053,7 @@ fn test_space_thumb_suppressed_while_composing_when_guard_disabled() {
 }
 
 /// flush 経路でも、composing 値を「保留キーと同一コンテキスト」だと呼び出し元が
-/// `ComposingHint::Trusted` で明示保証した場合は、composing 中の Space フォールバックが
+/// `ThumbRawVkEmission::Allowed` で明示保証した場合は、composing 中の Space フォールバックが
 /// タイムアウト経路と一貫している（従来 flush は無条件 suppress だった不整合の回帰防止）。
 /// `EngineDisabled`/`LayoutSwapped`/`BypassKey` 等、同一イベント処理内で完結する
 /// flush がこれに当たる（`NicolaFsm::toggle_enabled`/`swap_layout`/`handle_bypass` 参照）。
@@ -966,7 +1064,10 @@ fn test_space_thumb_flush_consistent_with_timeout_when_composing_trusted() {
     let result = engine.on_event(Ev::down(VK_SPACE).build());
     assert_pending(&result);
 
-    let result = engine.flush_pending(ContextChange::EngineDisabled, ComposingHint::Trusted(true));
+    let result = engine.flush_pending(
+        ContextChange::EngineDisabled,
+        ThumbRawVkEmission::Allowed(true),
+    );
     assert!(
         result
             .actions
@@ -976,7 +1077,7 @@ fn test_space_thumb_flush_consistent_with_timeout_when_composing_trusted() {
     );
 }
 
-/// `ComposingHint::Unknown`（フォーカス変更等、コンテキスト境界を跨ぐフラッシュ）では、
+/// `ThumbRawVkEmission::Denied`（フォーカス変更等、コンテキスト境界を跨ぐフラッシュ）では、
 /// `space_thumb_ignore_composing_guard=true` であっても Space フォールバック例外を
 /// 一切適用せず、無条件 suppress する。
 ///
@@ -994,11 +1095,11 @@ fn test_space_thumb_flush_suppressed_when_composing_hint_unknown() {
     let result = engine.on_event(Ev::down(VK_SPACE).build());
     assert_pending(&result);
 
-    let result = engine.flush_pending(ContextChange::FocusChanged, ComposingHint::Unknown);
+    let result = engine.flush_pending(ContextChange::FocusChanged, ThumbRawVkEmission::Denied);
     assert_eq!(
         result.actions.len(),
         0,
-        "ComposingHint::Unknown では Space 例外を含め無条件 suppress すべき\
+        "ThumbRawVkEmission::Denied では Space 例外を含め無条件 suppress すべき\
          （コンテキスト境界を跨ぐため composing の新鮮さを保証できない）"
     );
 }
@@ -1093,6 +1194,8 @@ fn make_engine_with_enter_thumb(ignore_composing_guard: bool, shift_literal: boo
 fn enter_thumb_down_event(ts: Timestamp) -> RawKeyEvent {
     use crate::types::{ImeRelevance, KeyClassification, KeyEventType, ModifierState};
     RawKeyEvent {
+        was_down: false,
+        press_id: None,
         vk_code: VK_RETURN,
         scan_code: vk_to_scan(VK_RETURN),
         event_type: KeyEventType::KeyDown,
@@ -1103,6 +1206,8 @@ fn enter_thumb_down_event(ts: Timestamp) -> RawKeyEvent {
         ime_relevance: ImeRelevance::default(),
         modifier_key: None,
         modifier_snapshot: ModifierState::default(),
+        left_thumb_down_snapshot: None,
+        right_thumb_down_snapshot: None,
         injected: false,
     }
 }
@@ -1766,6 +1871,782 @@ fn test_three_key_d1_greater_equal_d2() {
 }
 
 #[test]
+fn test_three_key_char1_released_tight_d1_still_prefers_char1() {
+    // Regression test for issue #140 / BUG-105 (report 01M1GDQVBET5DBX3MY4BRGQFW1,
+    // "しょうにん" -> "しいゔにん"). char1 is released well before char2 arrives,
+    // but d1 (char1->thumb) is far tighter than d2 (thumb->char2): Phase 1
+    // timing alone must still prefer char1+thumb. The old compute_prefer_char1()
+    // unconditionally punished any char1_released_at.is_some() by discarding
+    // char1+thumb regardless of timing -- this is exactly that case, with the
+    // reported timestamps (d1=11.7ms, d2=100.8ms).
+    let mut engine = make_engine();
+    engine.set_ngram_model(make_ngram_model());
+
+    let result = engine.on_event(Ev::down(VK_A).at(0).build());
+    assert_pending(&result);
+
+    let result = engine.on_event(Ev::down(VK_CONVERT).at(11_700).build());
+    assert_pending(&result); // PendingCharThumb, d1 = 11.7ms
+
+    // char1 (A) released well before char2 arrives.
+    let result = engine.on_event(Ev::up(VK_A).at(106_550).build());
+    result.assert_consumed();
+    assert!(
+        result.actions.is_empty(),
+        "char1 KeyUp alone should not resolve yet"
+    );
+
+    // char2 arrives 100.8ms after thumb went down (d2), vs d1=11.7ms.
+    let result = engine.on_event(Ev::down(VK_S).at(112_474).build());
+    result.assert_consumed();
+    assert_eq!(
+        result.actions.len(),
+        1,
+        "char1+thumb should resolve as a single chord, char2 reprocessed separately: got {:?}",
+        result.actions
+    );
+    assert!(
+        matches!(result.actions[0], KeyAction::Char('ゔ')),
+        "tight d1 must win via Phase 1 timing even though char1 was already released: got {:?}",
+        result.actions
+    );
+
+    // char2 (S) was reprocessed as a fresh solo char; confirm via timeout.
+    let result = engine.on_timeout(TIMER_PENDING);
+    result.assert_consumed();
+    assert_eq!(result.actions.len(), 1);
+    assert!(matches!(result.actions[0], KeyAction::Char('し')));
+}
+
+#[test]
+fn test_three_key_char1_released_close_timing_ngram_phase2_prefers_char1() {
+    // When d1/d2 are close (within the 30% timing margin), Phase 2 n-gram
+    // scoring decides -- the bigram/trigram tiebreak requested in issue #140.
+    // Verifies compute_prefer_char1() actually reaches three_key_pairing()'s
+    // Phase 2 and picks the higher-scoring candidate, even though char1 was
+    // already released before char2 arrived (the early return removed by this
+    // fix used to skip Phase 2 entirely in this situation).
+    //
+    // d1(60ms) is deliberately made GREATER than d2(50ms) so the raw timing
+    // tiebreak (`d1 < d2`, timing.rs:166-170, used when the n-gram score diff
+    // is ~0) would pick char2 ('あ'). Only Phase 2's n-gram score actually
+    // running -- and preferring the higher-scoring char1 candidate -- can
+    // produce char1 ('を') here, so this pins Phase 2 rather than merely
+    // agreeing with it by coincidence.
+    let mut engine = make_engine();
+    engine.set_ngram_model(make_ngram_model());
+    engine.output_history.push(OutputEntry {
+        scan_code: SCAN_S,
+        romaji: String::new(),
+        kana: Some('し'),
+        action: KeyAction::Char('し'),
+    });
+
+    let result = engine.on_event(Ev::down(VK_A).at(0).build());
+    assert_pending(&result);
+
+    let result = engine.on_event(Ev::down(VK_NONCONVERT).at(60_000).build());
+    assert_pending(&result); // PendingCharThumb, d1 = 60ms
+
+    let result = engine.on_event(Ev::up(VK_A).at(80_000).build());
+    result.assert_consumed();
+    assert!(
+        result.actions.is_empty(),
+        "char1 release should not emit immediately"
+    );
+
+    // d1=60_000, d2=110_000-60_000=50_000, gap=10_000 <= margin(30_000) -> Phase 2.
+    // Raw d1<d2 tiebreak would say false (char2), but bigram "しを"=2.0
+    // (char1+thumb candidate 'を') beats the unscored "うあ" (char2+thumb
+    // candidate 'あ'; no matching n-gram entry -> neutral 0.0), so Phase 2
+    // overrides the raw tiebreak and picks char1.
+    let result = engine.on_event(Ev::down(VK_S).at(110_000).build());
+    result.assert_consumed();
+    assert_eq!(
+        result.actions.len(),
+        1,
+        "char1+thumb should resolve as a single chord: got {:?}",
+        result.actions
+    );
+    assert!(
+        matches!(result.actions[0], KeyAction::Char('を')),
+        "n-gram Phase 2 should prefer char1+thumb ('を') even though char1 released first: got {:?}",
+        result.actions
+    );
+}
+
+// ── ADR-120 決定0a: RetroEvalStats 集計のユニットテスト ──
+//
+// これらは実際の変換結果（IME へ送る打鍵列）には一切影響しない、集計専用
+// カウンタの正しさだけを検証する。`make_layout()`（A=う/し, 左親指A=を/S=あ,
+// 右親指A=ゔ/S=じ）+ `make_ngram_model()`（bigram "しを"=2.0, "しゔ"=-2.0）を
+// 使い、既存の3鍵ngramテスト（`test_three_key_char1_released_*`）と同じ
+// フィクスチャを再利用する。
+
+#[test]
+fn test_retro_eval_stats_phase1_counters() {
+    // Phase 1（タイミングのみで決定、n-gram未到達）のケースで
+    // three_key_total/phase1_reached/phase1_decisions_totalが正しく
+    // 加算され、phase2_reached/no_ngram_countは増えないことを確認する。
+    let mut engine = make_engine();
+    engine.set_ngram_model(make_ngram_model());
+
+    engine.on_event(Ev::down(VK_A).at(0).build());
+    engine.on_event(Ev::down(VK_CONVERT).at(11_700).build());
+    engine.on_event(Ev::up(VK_A).at(106_550).build());
+    let result = engine.on_event(Ev::down(VK_S).at(112_474).build());
+    result.assert_consumed();
+
+    let stats = engine.retro_eval_stats();
+    assert_eq!(stats.three_key_total, 1);
+    assert_eq!(stats.phase1_reached, 1);
+    assert_eq!(stats.phase2_reached, 0);
+    assert_eq!(stats.no_ngram_count, 0);
+    assert_eq!(stats.phase1_decisions_total, 1);
+    assert_eq!(stats.phase2_decisions_total, 0);
+    // 所見S5の回帰ガード: Phase1決定「自身の出力」がBaselineへ混入しない
+    // （以前はPhase2決定にしか自前出力の除外が効かず、対照群にPhase1の
+    // 曖昧決定が混入していた）。
+    assert_eq!(
+        stats.baseline_decisions_total, 0,
+        "Phase1決定自身の出力はBaseline計上から除外されるはず（所見S5の回帰ガード）"
+    );
+}
+
+#[test]
+fn test_retro_eval_stats_no_ngram_counter() {
+    // ngram_model を設定しない（None）場合は DecisionPhase::NoNgram に
+    // 分類され、no_ngram_countのみが増える。
+    let mut engine = make_engine();
+
+    engine.on_event(Ev::down(VK_A).at(0).build());
+    engine.on_event(Ev::down(VK_CONVERT).at(11_700).build());
+    engine.on_event(Ev::up(VK_A).at(106_550).build());
+    let result = engine.on_event(Ev::down(VK_S).at(112_474).build());
+    result.assert_consumed();
+
+    let stats = engine.retro_eval_stats();
+    assert_eq!(stats.three_key_total, 1);
+    assert_eq!(stats.no_ngram_count, 1);
+    assert_eq!(stats.phase1_reached, 0);
+    assert_eq!(stats.phase2_reached, 0);
+}
+
+#[test]
+fn test_retro_eval_stats_phase2_score_buckets_and_char2_hiragana() {
+    // Phase 2 (d1/d2 が接近) かつ右親指を使うケース: score_a は bigram
+    // "しゔ"=-2.0 (finite, 負値でも finite バケットに入ることを確認)、
+    // score_b は未定義の "しうじ" で 0.0 (zero バケット) になる
+    // -- これは issue #140 / BUG-105 の実際の誤変換パターン
+    // (score_a<score_b で char2 側=右親指 が誤って優先される) と同型。
+    let mut engine = make_engine();
+    engine.set_ngram_model(make_ngram_model());
+    engine.output_history.push(OutputEntry {
+        scan_code: SCAN_S,
+        romaji: String::new(),
+        kana: Some('し'),
+        action: KeyAction::Char('し'),
+    });
+
+    engine.on_event(Ev::down(VK_A).at(0).build());
+    // 右親指（CONVERT）: d1 = 60ms
+    engine.on_event(Ev::down(VK_CONVERT).at(60_000).build());
+    // d1=60_000, d2=110_000-60_000=50_000, margin(30%*100ms)=30_000 -> Phase 2
+    let result = engine.on_event(Ev::down(VK_S).at(110_000).build());
+    result.assert_consumed();
+    assert_eq!(
+        result.actions.len(),
+        2,
+        "char1単独+char2+thumbが同一ターンで2出力されるはず: got {:?}",
+        result.actions
+    );
+    assert!(
+        matches!(result.actions[0], KeyAction::Char('う')),
+        "score_a(-2.0) < score_b(0.0) で char2 側優先のはず: got {:?}",
+        result.actions
+    );
+    assert!(matches!(result.actions[1], KeyAction::Char('じ')));
+
+    let stats = engine.retro_eval_stats();
+    assert_eq!(stats.phase2_reached, 1);
+    assert_eq!(stats.phase2_decisions_total, 1);
+    assert_eq!(
+        stats.score_a_finite_count, 1,
+        "score_a=-2.0 は finite のはず"
+    );
+    assert_eq!(stats.score_a_neg_infinity_count, 0);
+    assert_eq!(stats.score_a_zero_count, 0);
+    assert_eq!(
+        stats.score_b_zero_count, 1,
+        "score_b=0.0(未定義trigram)のはず"
+    );
+    assert_eq!(stats.score_b_finite_count, 0);
+    assert_eq!(stats.score_b_neg_infinity_count, 0);
+    assert_eq!(
+        stats.char2_normal_hiragana_count, 1,
+        "char2(S)の通常面'し'はひらがな"
+    );
+    // 所見S1/S2の回帰ガード: PairWithChar2の決定自身の出力2回（う、じ）が
+    // いずれもBaseline計上から除外されているはず。
+    assert_eq!(
+        stats.baseline_decisions_total, 0,
+        "決定自身の出力2回はどちらもBaseline計上から除外されるはず"
+    );
+}
+
+#[test]
+fn test_retro_eval_stats_followup_thumb_window_and_correction_survives_baseline() {
+    // ADR-120 決定0a 項目2c/4/7 の統合テスト。項目7については
+    // Opusレビュー blocker 所見2（単一スロット上書きで Phase2 の訂正
+    // シグナルが直後の Baseline 決定に上書きされて消える）の回帰ガードを
+    // 兼ねる: Phase2決定(t=110_000) の後に Baseline決定(t=200_000) を挟んでも、
+    // その後の訂正操作(t=350_000)が両方に正しく計上されることを確認する。
+    let mut engine = make_engine();
+    engine.set_ngram_model(make_ngram_model());
+    engine.set_backspace_vk(Some(VK_BACK));
+    engine.output_history.push(OutputEntry {
+        scan_code: SCAN_S,
+        romaji: String::new(),
+        kana: Some('し'),
+        action: KeyAction::Char('し'),
+    });
+
+    // Phase2決定（PairWithChar2、skip=2）: t=110_000
+    engine.on_event(Ev::down(VK_A).at(0).build());
+    engine.on_event(Ev::down(VK_CONVERT).at(60_000).build());
+    let result = engine.on_event(Ev::down(VK_S).at(110_000).build());
+    assert_eq!(result.actions.len(), 2); // 決定自身の出力(う, じ)
+
+    // 項目2c: 決定直後の1打鍵目（非親指）。窓 remaining 2->1。
+    let result = engine.on_event(Ev::down(VK_A).at(200_000).build());
+    assert_pending(&result); // PendingChar、まだ出力なし
+    assert_eq!(
+        engine.retro_eval_stats().no_thumb_followup_count,
+        0,
+        "窓はまだ残っている"
+    );
+
+    // 項目4: 決定自身の出力2回分をスキップし終えた後、初めての「後続かな確定」。
+    // ただしこれはタイムアウト経由（`update_history_imprecise`）なので、
+    // 所見B2対応により経過ms計測は記録されない（不正確な `now` で
+    // elapsed≈0msに丸め込まれるのを防ぐため、意図的に欠測として扱う）。
+    // 同時に項目7: このBaseline決定（last_baseline_at）は Phase2 決定の
+    // last_phase2_at を上書きしない（別スロットのため）。
+    let result = engine.on_timeout(TIMER_PENDING);
+    result.assert_consumed();
+    assert!(matches!(result.actions[0], KeyAction::Char('う')));
+    let stats = engine.retro_eval_stats();
+    assert_eq!(
+        stats.followup_elapsed_ms_histogram.iter().sum::<u64>(),
+        0,
+        "タイムアウト経由(imprecise)の完了は所見B2対応により記録されないはず"
+    );
+    assert_eq!(stats.baseline_decisions_total, 1);
+
+    // 項目2c: 決定後2打鍵目（非親指）。窓 remaining 1->0、窓を使い切る。
+    let result = engine.on_event(Ev::down(VK_S).at(300_000).build());
+    assert_pending(&result);
+    assert_eq!(engine.retro_eval_stats().no_thumb_followup_count, 1);
+
+    // 項目7(a): 物理BACKSPACE（訂正操作）。Phase2決定(t=110_000)からの経過msと
+    // Baseline決定(t=200_000)からの経過msの両方に計上される
+    // （間に挟まったBaseline決定がPhase2の帰属を破壊していないことの確認）。
+    let result = engine.on_event(Ev::down(VK_BACK).at(350_000).build());
+    result.assert_pass_through();
+
+    let stats = engine.retro_eval_stats();
+    // elapsed = 350_000 - 110_000 = 240ms → bucket 3 (200<=x<400)（所見N4対応、
+    // sumだけでなくバケット位置まで固定してoff-by-oneを検出可能にする）。
+    assert_eq!(
+        stats.phase2_correction_histogram,
+        [0, 0, 0, 1, 0, 0, 0],
+        "Phase2決定への訂正帰属が、間に挟まったBaseline決定で消えていないはず: {:?}",
+        stats.phase2_correction_histogram
+    );
+    // elapsed = 350_000 - 200_000 = 150ms → bucket 2 (100<=x<200)。
+    assert_eq!(
+        stats.baseline_correction_histogram,
+        [0, 0, 1, 0, 0, 0, 0],
+        "{:?}",
+        stats.baseline_correction_histogram
+    );
+    assert_eq!(
+        stats.phase1_correction_histogram.iter().sum::<u64>(),
+        0,
+        "Phase1決定は一度も発生していない"
+    );
+    // 所見S3の回帰ガード: record_user_correction は計上したスロットを
+    // クリアするため、直後にもう一度BACKSPACEを押しても同じ決定へ
+    // 二重計上されない（BS連打で1回の訂正が複数回計上されるバグの修正）。
+    engine.on_event(Ev::up(VK_BACK).at(351_000).build());
+    let result = engine.on_event(Ev::down(VK_BACK).at(352_000).build());
+    result.assert_pass_through();
+    let stats2 = engine.retro_eval_stats();
+    assert_eq!(
+        stats2.phase2_correction_histogram.iter().sum::<u64>(),
+        1,
+        "直近のPhase2決定は既にクリア済みなので、2回目のBACKSPACEでは加算されないはず"
+    );
+}
+
+#[test]
+fn test_retro_eval_stats_pair_with_char1_followup_completes_precisely_via_next_keydown() {
+    // 所見S7対応: PairWithChar1(skip=1)分岐を通し、後続1かな確定が実際の
+    // KeyDown経由（on_reduce、正確なタイムスタンプ）で完了することを確認する
+    // （既存テストは全てPairWithChar2分岐のみを通しており、B2/S1/S2の欠陥は
+    // すべてこちら側/サブ分岐に潜んでいた）。所見N4対応でバケットインデックス
+    // まで固定する（sumだけでは境界off-by-oneを検出できないため）。
+    let mut engine = make_engine();
+    engine.set_ngram_model(make_ngram_model());
+    engine.output_history.push(OutputEntry {
+        scan_code: SCAN_S,
+        romaji: String::new(),
+        kana: Some('し'),
+        action: KeyAction::Char('し'),
+    });
+
+    // Phase2決定（PairWithChar1、skip=1）: t=110_000
+    // (test_three_key_char1_released_close_timing_ngram_phase2_prefers_char1 と
+    // 同じ左親指シナリオ: d1=60_000/d2=50_000で接近しPhase2、
+    // score_a=2.0(bigram "しを")がscore_b=0.0を上回りchar1優先)
+    engine.on_event(Ev::down(VK_A).at(0).build());
+    engine.on_event(Ev::down(VK_NONCONVERT).at(60_000).build());
+    let result = engine.on_event(Ev::down(VK_S).at(110_000).build());
+    assert_eq!(
+        result.actions.len(),
+        1,
+        "PairWithChar1は決定自身の出力1回のみのはず: got {:?}",
+        result.actions
+    );
+    assert!(matches!(result.actions[0], KeyAction::Char('を')));
+    let stats = engine.retro_eval_stats();
+    assert_eq!(stats.phase2_reached, 1);
+    assert_eq!(
+        stats.baseline_decisions_total, 0,
+        "決定自身の出力(を)はBaseline計上から除外されるはず"
+    );
+
+    // char2(S)は再処理されPendingCharになる。250ms後に別の文字キーが実際に
+    // KeyDownすることで、Sが正確なタイムスタンプ(on_reduce経由)で単独確定し、
+    // 後続1かな確定の計測が完了する。
+    let result = engine.on_event(Ev::down(VK_A).at(360_000).build());
+    result.assert_consumed();
+    assert!(
+        result
+            .actions
+            .iter()
+            .any(|a| matches!(a, KeyAction::Char('し'))),
+        "保留中のS('し')が単独確定して再処理されるはず: got {:?}",
+        result.actions
+    );
+
+    let stats = engine.retro_eval_stats();
+    // elapsed = 360_000us - 110_000us = 250ms。
+    // ELAPSED_MS_BUCKETS=[50,100,200,400,800,1600,MAX] → 250 は bucket 3 (200<=x<400)。
+    assert_eq!(
+        stats.followup_elapsed_ms_histogram,
+        [0, 0, 0, 1, 0, 0, 0],
+        "250msはbucket 3に入るはず: {:?}",
+        stats.followup_elapsed_ms_histogram
+    );
+    assert_eq!(
+        stats.baseline_decisions_total, 1,
+        "後続の単独確定(し)自体はBaseline計上されるはず(own_decision_outputは既に消化済み)"
+    );
+}
+
+#[test]
+fn test_retro_eval_stats_thumb_arrival_discards_window_without_counting() {
+    // 項目2c: 決定直後の観測窓内に親指キーが来た場合は窓を破棄し、
+    // no_thumb_followup_count を増やさない。
+    let mut engine = make_engine();
+    engine.set_ngram_model(make_ngram_model());
+    engine.output_history.push(OutputEntry {
+        scan_code: SCAN_S,
+        romaji: String::new(),
+        kana: Some('し'),
+        action: KeyAction::Char('し'),
+    });
+
+    engine.on_event(Ev::down(VK_A).at(0).build());
+    engine.on_event(Ev::down(VK_CONVERT).at(60_000).build());
+    engine.on_event(Ev::down(VK_S).at(110_000).build());
+    assert_eq!(engine.retro_eval_stats().phase2_reached, 1);
+
+    // 決定直後、最初のKeyDownが親指（NONCONVERT）。
+    engine.on_event(Ev::down(VK_NONCONVERT).at(150_000).build());
+    let stats = engine.retro_eval_stats();
+    assert_eq!(
+        stats.no_thumb_followup_count, 0,
+        "親指キーが窓内に来たら破棄するだけで、no_thumb_followup_countは増えない"
+    );
+    // 所見N2対応: 項目2cの正しい分母カウンタが増える
+    // （no_thumb_followup_count自体は分母ではない）。
+    assert_eq!(stats.thumb_watch_window_thumb_arrived_count, 1);
+}
+
+#[test]
+fn test_retro_eval_stats_backspace_with_ctrl_modifier_is_not_counted_as_correction() {
+    // 所見B1対応の回帰ガード: `Ctrl+BS`（単語削除、日本語入力中の一般的な
+    // 操作）は訂正操作として計上してはならない。`bypass_reason` は
+    // `KeyClass::Passthrough` を修飾キーの有無より優先して返すため
+    // （VK_BACKはscanmap.rsに物理位置が無く常にPassthrough）、
+    // `BypassReason::OsModifierHeld` では判定できず、`handle_bypass`側で
+    // 明示的にmodifier状態を見て除外する必要がある。
+    let mut engine = make_engine();
+    engine.set_backspace_vk(Some(VK_BACK));
+    engine.set_ngram_model(make_ngram_model());
+    engine.output_history.push(OutputEntry {
+        scan_code: SCAN_S,
+        romaji: String::new(),
+        kana: Some('し'),
+        action: KeyAction::Char('し'),
+    });
+    // Phase2決定を1つ作っておく（PairWithChar2、score_a=-2.0<score_b=0.0）。
+    engine.on_event(Ev::down(VK_A).at(0).build());
+    engine.on_event(Ev::down(VK_CONVERT).at(60_000).build());
+    engine.on_event(Ev::down(VK_S).at(110_000).build());
+    assert_eq!(engine.retro_eval_stats().phase2_reached, 1);
+
+    // Ctrl+BS（単語削除）。
+    engine.on_event(Ev::down(VK_CTRL).at(200_000).build());
+    let result = engine.on_event(Ev::down(VK_BACK).at(210_000).build());
+    result.assert_pass_through();
+
+    let stats = engine.retro_eval_stats();
+    assert_eq!(
+        stats.phase2_correction_histogram.iter().sum::<u64>(),
+        0,
+        "Ctrl+BSは単語削除であり訂正操作として計上してはならない"
+    );
+    assert_eq!(stats.baseline_correction_histogram.iter().sum::<u64>(), 0);
+}
+
+#[test]
+fn test_retro_eval_stats_backspace_with_shift_modifier_is_counted_as_correction() {
+    // `/code-review` 指摘の回帰ガード: `Shift+BS` は `Ctrl+BS`/`Alt+BS`
+    // （単語削除）とは異なり、Windowsのテキスト入力では通常の1文字削除と
+    // 同義なので除外してはならない（除外すると Shift 保持中の訂正だけが
+    // 系統的に取りこぼされる）。
+    let mut engine = make_engine();
+    engine.set_backspace_vk(Some(VK_BACK));
+    engine.set_ngram_model(make_ngram_model());
+    engine.output_history.push(OutputEntry {
+        scan_code: SCAN_S,
+        romaji: String::new(),
+        kana: Some('し'),
+        action: KeyAction::Char('し'),
+    });
+    engine.on_event(Ev::down(VK_A).at(0).build());
+    engine.on_event(Ev::down(VK_CONVERT).at(60_000).build());
+    engine.on_event(Ev::down(VK_S).at(110_000).build());
+    assert_eq!(engine.retro_eval_stats().phase2_reached, 1);
+
+    engine.on_event(Ev::down(VK_SHIFT).at(150_000).build());
+    let result = engine.on_event(Ev::down(VK_BACK).at(160_000).build());
+    result.assert_pass_through();
+
+    let stats = engine.retro_eval_stats();
+    assert_eq!(
+        stats.phase2_correction_histogram.iter().sum::<u64>(),
+        1,
+        "Shift+BSは通常の1文字削除であり訂正操作として計上されるはず"
+    );
+}
+
+#[test]
+fn test_retro_eval_stats_injected_backspace_not_counted_as_correction() {
+    // `/code-review` 指摘の回帰ガード: 外部ツール・マクロ・IME内部補正機構
+    // 等が `SendInput` 等で合成した（`injected=true`）BACKSPACEはユーザーの
+    // 実訂正操作ではないため除外する（BUG-14/ADR-119 の `event.injected`
+    // 除外原則、`engine.rs::is_bare_thumb` 参照）。
+    let mut engine = make_engine();
+    engine.set_backspace_vk(Some(VK_BACK));
+    engine.set_ngram_model(make_ngram_model());
+    engine.output_history.push(OutputEntry {
+        scan_code: SCAN_S,
+        romaji: String::new(),
+        kana: Some('し'),
+        action: KeyAction::Char('し'),
+    });
+    engine.on_event(Ev::down(VK_A).at(0).build());
+    engine.on_event(Ev::down(VK_CONVERT).at(60_000).build());
+    engine.on_event(Ev::down(VK_S).at(110_000).build());
+    assert_eq!(engine.retro_eval_stats().phase2_reached, 1);
+
+    let result = engine.on_event(Ev::down(VK_BACK).injected(true).at(200_000).build());
+    result.assert_pass_through();
+
+    let stats = engine.retro_eval_stats();
+    assert_eq!(
+        stats.phase2_correction_histogram.iter().sum::<u64>(),
+        0,
+        "合成(injected)されたBACKSPACEは訂正操作として計上してはならない"
+    );
+}
+
+#[test]
+fn test_retro_eval_stats_focus_change_resets_last_decision_attribution() {
+    // `/code-review` 指摘の回帰ガード: フォーカス変更（コンテキスト喪失）を
+    // またいで `last_decision`（項目7の帰属状態）を持ち越してはならない。
+    // 別アプリで打たれた訂正操作が、直前アプリのPhase2決定に誤帰属する
+    // （STALE_ATTRIBUTION_MSの1600ms窓には時間的な上限があるだけで、
+    // コンテキストの区別が無いため）ことを防ぐ。
+    let mut engine = make_engine();
+    engine.set_backspace_vk(Some(VK_BACK));
+    engine.set_ngram_model(make_ngram_model());
+    engine.output_history.push(OutputEntry {
+        scan_code: SCAN_S,
+        romaji: String::new(),
+        kana: Some('し'),
+        action: KeyAction::Char('し'),
+    });
+    engine.on_event(Ev::down(VK_A).at(0).build());
+    engine.on_event(Ev::down(VK_CONVERT).at(60_000).build());
+    engine.on_event(Ev::down(VK_S).at(110_000).build());
+    assert_eq!(engine.retro_eval_stats().phase2_reached, 1);
+
+    // フォーカス変更（コンテキスト喪失）。
+    engine.flush_pending(ContextChange::FocusChanged, ThumbRawVkEmission::Denied);
+
+    // 190ms後（STALE_ATTRIBUTION_MSの1600ms窓内）、別コンテキストでの
+    // BACKSPACE。リセットされていなければ誤って計上されてしまうタイミング。
+    let result = engine.on_event(Ev::down(VK_BACK).at(300_000).build());
+    result.assert_pass_through();
+
+    let stats = engine.retro_eval_stats();
+    assert_eq!(
+        stats.phase2_correction_histogram.iter().sum::<u64>(),
+        0,
+        "フォーカス変更後はlast_decisionがリセットされ、別コンテキストの操作は誤帰属しないはず"
+    );
+}
+
+#[test]
+fn test_retro_eval_stats_genuine_double_tap_of_same_key_closes_window() {
+    // `/code-review` 指摘の回帰ガード: 同じ物理キーを間を置かず
+    // （KeyUpを挟んで）2回連続で「本当に」タップした場合は、単純なVK等値
+    // 比較だけのオートリピート判定だと1回のオートリピートと誤認され、
+    // 窓が正しく閉じない。KeyUpで押下状態をクリアすることで区別する。
+    let mut engine = make_engine();
+    engine.set_ngram_model(make_ngram_model());
+    engine.output_history.push(OutputEntry {
+        scan_code: SCAN_S,
+        romaji: String::new(),
+        kana: Some('し'),
+        action: KeyAction::Char('し'),
+    });
+    engine.on_event(Ev::down(VK_A).at(0).build());
+    engine.on_event(Ev::down(VK_CONVERT).at(60_000).build());
+    engine.on_event(Ev::down(VK_S).at(110_000).build());
+    assert_eq!(engine.retro_eval_stats().phase2_reached, 1);
+
+    // 同じキー(A)を、KeyUpを挟んで2回連続で本当にタップする。
+    engine.on_event(Ev::down(VK_A).at(150_000).build());
+    engine.on_event(Ev::up(VK_A).at(155_000).build());
+    engine.on_event(Ev::down(VK_A).at(160_000).build());
+
+    let stats = engine.retro_eval_stats();
+    assert_eq!(
+        stats.no_thumb_followup_count, 1,
+        "KeyUpを挟んだ2回の本当のタップは窓を正しく消費し終えるはず（オートリピートと誤認しない）"
+    );
+}
+
+#[test]
+fn test_retro_eval_stats_backspace_self_heals_after_missed_keyup() {
+    // 所見NB1の回帰ガード: 物理BACKSPACEのKeyUpが取りこぼされても
+    // （例: エンジン非活性化でon_key_upに到達しない）、他キーのKeyDownが
+    // `backspace_down` を自己修復的にクリアするため、次のBACKSPACE押下は
+    // 新規タップとして正しく計上される（`true` のまま永久固着しない）。
+    let mut engine = make_engine();
+    engine.set_backspace_vk(Some(VK_BACK));
+    engine.set_ngram_model(make_ngram_model());
+    engine.output_history.push(OutputEntry {
+        scan_code: SCAN_S,
+        romaji: String::new(),
+        kana: Some('し'),
+        action: KeyAction::Char('し'),
+    });
+    engine.on_event(Ev::down(VK_A).at(0).build());
+    engine.on_event(Ev::down(VK_CONVERT).at(60_000).build());
+    engine.on_event(Ev::down(VK_S).at(110_000).build());
+    assert_eq!(engine.retro_eval_stats().phase2_reached, 1);
+
+    // BACKSPACE押下（1回目）。KeyUpは意図的に送らない（取りこぼしを模擬——
+    // 実機ではエンジン非活性化中にKeyUpがEngine::on_inputのPhase2で
+    // pass_throughとして捨てられ、on_key_upに一切到達しないケースに相当）。
+    engine.on_event(Ev::down(VK_BACK).at(200_000).build());
+    assert_eq!(
+        engine
+            .retro_eval_stats()
+            .phase2_correction_histogram
+            .iter()
+            .sum::<u64>(),
+        1
+    );
+
+    // 他キーのKeyDownが backspace_down を自己修復的にクリアする。同時に
+    // 次のPhase2決定の1鍵目にもなる。
+    engine.on_event(Ev::down(VK_A).at(210_000).build());
+    engine.output_history.push(OutputEntry {
+        scan_code: SCAN_S,
+        romaji: String::new(),
+        kana: Some('し'),
+        action: KeyAction::Char('し'),
+    });
+    engine.on_event(Ev::down(VK_CONVERT).at(270_000).build());
+    engine.on_event(Ev::down(VK_S).at(320_000).build());
+    assert_eq!(engine.retro_eval_stats().phase2_reached, 2);
+
+    // KeyUp取りこぼし後でも、新規タップとして正しく計上される
+    // （`backspace_down` が固着していれば、ここは加算されないはず）。
+    engine.on_event(Ev::down(VK_BACK).at(400_000).build());
+    let stats = engine.retro_eval_stats();
+    assert_eq!(
+        stats.phase2_correction_histogram.iter().sum::<u64>(),
+        2,
+        "KeyUp取りこぼし後も、他キーのKeyDownによる自己修復で新規タップとして計上されるはず"
+    );
+}
+
+#[test]
+fn test_retro_eval_stats_backspace_auto_repeat_does_not_credit_self_inflicted_baseline() {
+    // 所見NN1対応: 既存の `..._backspace_auto_repeat_counted_once` は
+    // S3のスロットクリアだけでgreenになってしまい、S4のオートリピート
+    // ガード自体を隔離できていなかった（`backspace_down` を丸ごと削除
+    // してもそちらのテストは通る）。BACKSPACE押下時に保留中の文字キーが
+    // あると、`handle_bypass` 内の `flush_pending` がその出力を新しい
+    // Baseline決定として計上する——このBS自身が作り出したBaseline決定に、
+    // オートリピートの2発目が誤って計上されないことを確認する。
+    let mut engine = make_engine();
+    engine.set_backspace_vk(Some(VK_BACK));
+
+    // 保留中の文字キーを作っておく。
+    engine.on_event(Ev::down(VK_A).at(0).build());
+
+    // 1回目のBACKSPACE: 保留中のAがflush_pending経由でBaseline決定として
+    // 計上される。
+    engine.on_event(Ev::down(VK_BACK).at(50_000).build());
+    assert_eq!(
+        engine.retro_eval_stats().baseline_decisions_total,
+        1,
+        "保留中のAがBaseline決定として計上されるはず"
+    );
+
+    // KeyUpを挟まず2回目のBACKSPACE（オートリピートを模擬）。
+    engine.on_event(Ev::down(VK_BACK).at(80_000).build());
+    let stats = engine.retro_eval_stats();
+    assert_eq!(
+        stats.baseline_correction_histogram.iter().sum::<u64>(),
+        0,
+        "オートリピートの2発目が、自分自身が作ったBaseline決定に誤って計上されてはならない"
+    );
+}
+
+#[test]
+fn test_retro_eval_stats_backspace_auto_repeat_counted_once() {
+    // 所見S4対応の回帰ガード: OSオートリピートによる物理BACKSPACEの連続
+    // KeyDown再送（KeyUpを挟まない）は、押下1回につき1回だけ計上される。
+    let mut engine = make_engine();
+    engine.set_backspace_vk(Some(VK_BACK));
+    engine.set_ngram_model(make_ngram_model());
+    engine.output_history.push(OutputEntry {
+        scan_code: SCAN_S,
+        romaji: String::new(),
+        kana: Some('し'),
+        action: KeyAction::Char('し'),
+    });
+    engine.on_event(Ev::down(VK_A).at(0).build());
+    engine.on_event(Ev::down(VK_CONVERT).at(60_000).build());
+    engine.on_event(Ev::down(VK_S).at(110_000).build());
+    assert_eq!(engine.retro_eval_stats().phase2_reached, 1);
+
+    // KeyUpを挟まずに3回連続KeyDown（オートリピートを模擬）。
+    engine.on_event(Ev::down(VK_BACK).at(200_000).build());
+    engine.on_event(Ev::down(VK_BACK).at(230_000).build());
+    engine.on_event(Ev::down(VK_BACK).at(260_000).build());
+    let stats = engine.retro_eval_stats();
+    assert_eq!(
+        stats.phase2_correction_histogram.iter().sum::<u64>(),
+        1,
+        "オートリピートによる再送は新規タップとして二重計上してはならない"
+    );
+
+    // KeyUpで解放後、新規タップは改めて1回計上される。
+    engine.on_event(Ev::up(VK_BACK).at(270_000).build());
+    // 新しいPhase2決定を作ってから2回目の物理タップを送る。
+    engine.output_history.push(OutputEntry {
+        scan_code: SCAN_S,
+        romaji: String::new(),
+        kana: Some('し'),
+        action: KeyAction::Char('し'),
+    });
+    engine.on_event(Ev::down(VK_A).at(300_000).build());
+    engine.on_event(Ev::down(VK_CONVERT).at(360_000).build());
+    engine.on_event(Ev::down(VK_S).at(410_000).build());
+    engine.on_event(Ev::down(VK_BACK).at(500_000).build());
+    let stats2 = engine.retro_eval_stats();
+    assert_eq!(
+        stats2.phase2_correction_histogram.iter().sum::<u64>(),
+        2,
+        "KeyUpを挟んだ新規タップは改めて1回計上されるはず"
+    );
+}
+
+#[test]
+fn test_retro_eval_stats_passthrough_key_does_not_close_thumb_watch_window() {
+    // 所見S6対応の回帰ガード: Shift等のPassthroughキーは項目2cの観測窓を
+    // 1打鍵として消費してはならない（Charキーだけが対象）。
+    let mut engine = make_engine();
+    engine.set_ngram_model(make_ngram_model());
+    engine.output_history.push(OutputEntry {
+        scan_code: SCAN_S,
+        romaji: String::new(),
+        kana: Some('し'),
+        action: KeyAction::Char('し'),
+    });
+    engine.on_event(Ev::down(VK_A).at(0).build());
+    engine.on_event(Ev::down(VK_CONVERT).at(60_000).build());
+    engine.on_event(Ev::down(VK_S).at(110_000).build());
+    assert_eq!(engine.retro_eval_stats().phase2_reached, 1);
+
+    // 決定後、Shiftキー（Passthrough）が2回来ても窓は閉じない。
+    engine.on_event(Ev::down(VK_SHIFT).at(150_000).build());
+    engine.on_event(Ev::down(VK_SHIFT).at(160_000).build());
+    assert_eq!(
+        engine.retro_eval_stats().no_thumb_followup_count,
+        0,
+        "Passthroughキーは観測窓を消費してはならない"
+    );
+
+    // Charキーが1回来ても、まだ窓は閉じない（remaining 2->1）。
+    engine.on_event(Ev::down(VK_A).at(170_000).build());
+    assert_eq!(engine.retro_eval_stats().no_thumb_followup_count, 0);
+    // Charキーがもう1回来て、窓を使い切る（remaining 1->0）。
+    engine.on_event(Ev::down(VK_S).at(180_000).build());
+    assert_eq!(engine.retro_eval_stats().no_thumb_followup_count, 1);
+}
+
+#[test]
+fn test_retro_eval_stats_escape_output_counted_separately_from_baseline() {
+    // 項目7(c): 配列セル由来のEscape出力はescape_output_countに計上され、
+    // Baseline決定（訂正の分母）としては計上されない。
+    use crate::types::SpecialKey;
+    let mut engine = make_engine();
+    engine.update_history(
+        OutputUpdate::record(SCAN_A, &KeyAction::SpecialKey(SpecialKey::Escape), None),
+        0,
+    );
+    let stats = engine.retro_eval_stats();
+    assert_eq!(stats.escape_output_count, 1);
+    assert_eq!(
+        stats.baseline_decisions_total, 0,
+        "Escape出力自体はBaseline決定として計上しない"
+    );
+}
+
+#[test]
 fn test_three_key_timeout_resolves_as_simultaneous() {
     // char1(t=0) → thumb(t=30ms) → タイムアウト（char2 来ない）
     // → char1+thumb を同時打鍵として確定
@@ -2197,6 +3078,8 @@ fn test_nicola_state_stores_scan_code() {
 
     // Create a key event with a specific scan code
     let event = RawKeyEvent {
+        was_down: false,
+        press_id: None,
         vk_code: VK_A,
         scan_code: ScanCode(0x1E), // A key scan code
         event_type: KeyEventType::KeyDown,
@@ -2207,6 +3090,8 @@ fn test_nicola_state_stores_scan_code() {
         key_classification: crate::types::KeyClassification::Char,
         physical_pos: Some(PhysicalPos::new(2, 0)),
         modifier_snapshot: Default::default(),
+        left_thumb_down_snapshot: None,
+        right_thumb_down_snapshot: None,
         injected: false,
     };
 
@@ -2230,6 +3115,8 @@ fn test_pending_char_thumb_stores_char_scan() {
     let mut engine = make_engine();
 
     let char_event = RawKeyEvent {
+        was_down: false,
+        press_id: None,
         vk_code: VK_A,
         scan_code: ScanCode(0x1E),
         event_type: KeyEventType::KeyDown,
@@ -2240,11 +3127,15 @@ fn test_pending_char_thumb_stores_char_scan() {
         key_classification: crate::types::KeyClassification::Char,
         physical_pos: Some(PhysicalPos::new(2, 0)),
         modifier_snapshot: Default::default(),
+        left_thumb_down_snapshot: None,
+        right_thumb_down_snapshot: None,
         injected: false,
     };
     engine.on_event(char_event);
 
     let thumb_event = RawKeyEvent {
+        was_down: false,
+        press_id: None,
         vk_code: VK_CONVERT,
         scan_code: ScanCode(0x79), // Convert key scan code
         event_type: KeyEventType::KeyDown,
@@ -2255,6 +3146,8 @@ fn test_pending_char_thumb_stores_char_scan() {
         key_classification: crate::types::KeyClassification::RightThumb,
         physical_pos: None,
         modifier_snapshot: Default::default(),
+        left_thumb_down_snapshot: None,
+        right_thumb_down_snapshot: None,
         injected: false,
     };
     let result = engine.on_event(thumb_event);
@@ -2295,7 +3188,7 @@ fn test_yab_value_to_action_literal_empty() {
 
 #[test]
 fn test_yab_value_to_action_special() {
-    use crate::yab::SpecialKey;
+    use crate::types::SpecialKey;
     let action = yab_value_to_action(&YabValue::Special(SpecialKey::Backspace));
     assert!(matches!(
         action,
@@ -2332,12 +3225,12 @@ fn test_toggle_enabled_returns_state() {
 #[test]
 fn test_flush_pending_from_idle_is_noop() {
     let mut engine = make_engine();
-    let r = engine.flush_pending(ContextChange::ImeOff, ComposingHint::Trusted(false));
+    let r = engine.flush_pending(ContextChange::ImeOff, ThumbRawVkEmission::Allowed(false));
     // Idle → no-op, consume with no actions
     assert!(r.actions.is_empty());
     assert!(r.consumed);
     // 再入しても no-op
-    let r2 = engine.flush_pending(ContextChange::ImeOff, ComposingHint::Trusted(false));
+    let r2 = engine.flush_pending(ContextChange::ImeOff, ThumbRawVkEmission::Allowed(false));
     assert!(r2.actions.is_empty());
 }
 
@@ -2348,10 +3241,13 @@ fn test_flush_pending_from_pending_char() {
     // PendingChar 状態にする
     let _ = engine.on_event(Ev::down(VK_A).at(t0).build());
     // flush → 通常面で単独確定
-    let r = engine.flush_pending(ContextChange::EngineDisabled, ComposingHint::Trusted(false));
+    let r = engine.flush_pending(
+        ContextChange::EngineDisabled,
+        ThumbRawVkEmission::Allowed(false),
+    );
     assert!(!r.actions.is_empty(), "should emit the pending char");
     // Idle に戻っている
-    let r2 = engine.flush_pending(ContextChange::ImeOff, ComposingHint::Trusted(false));
+    let r2 = engine.flush_pending(ContextChange::ImeOff, ThumbRawVkEmission::Allowed(false));
     assert!(r2.actions.is_empty(), "should be idle after flush");
 }
 
@@ -2366,7 +3262,7 @@ fn test_flush_pending_from_pending_thumb() {
     // composing 中の抑制（無変換/変換のかな/カタカナ切替誤爆防止）を確認する。
     let r = engine.flush_pending(
         ContextChange::InputLanguageChanged,
-        ComposingHint::Trusted(true),
+        ThumbRawVkEmission::Allowed(true),
     );
     // 単独親指打鍵は composing 中は IME 副作用を防ぐため suppress される
     assert!(
@@ -2383,7 +3279,10 @@ fn test_flush_pending_from_pending_char_thumb() {
     let _ = engine.on_event(Ev::down(VK_A).at(t0).build());
     let _ = engine.on_event(Ev::down(VK_NONCONVERT).at(t0 + 30_000).build());
     // flush → 同時打鍵として確定
-    let r = engine.flush_pending(ContextChange::LayoutSwapped, ComposingHint::Trusted(false));
+    let r = engine.flush_pending(
+        ContextChange::LayoutSwapped,
+        ThumbRawVkEmission::Allowed(false),
+    );
     assert!(!r.actions.is_empty(), "should emit simultaneous result");
 }
 
@@ -2395,7 +3294,7 @@ fn test_flush_pending_from_speculative_char() {
     let r1 = engine.on_event(Ev::down(VK_A).at(t0).build());
     assert!(!r1.actions.is_empty(), "speculative output");
     // flush → 既に出力済みなので追加出力なし
-    let r = engine.flush_pending(ContextChange::ImeOff, ComposingHint::Trusted(false));
+    let r = engine.flush_pending(ContextChange::ImeOff, ThumbRawVkEmission::Allowed(false));
     assert!(
         r.actions.is_empty(),
         "speculative was already output, no additional actions"
@@ -2407,7 +3306,7 @@ fn test_flush_pending_cancels_timers() {
     let mut engine = make_engine();
     let t0 = 1_000_000;
     let _ = engine.on_event(Ev::down(VK_A).at(t0).build());
-    let r = engine.flush_pending(ContextChange::ImeOff, ComposingHint::Trusted(false));
+    let r = engine.flush_pending(ContextChange::ImeOff, ThumbRawVkEmission::Allowed(false));
     // タイマー停止命令が含まれる（assert_timer_kill ヘルパーを使用）
     r.assert_timer_kill(TIMER_PENDING);
     r.assert_timer_kill(TIMER_SPECULATIVE);
@@ -2504,7 +3403,11 @@ fn test_pending_thumb_then_char_after_threshold() {
     // 無変換/変換は「Windows 全般での無変換/変換キー機能」として生 VK が emit される
     // （timeout_pending_thumb と同じ判定を flush 経路にも統一した挙動、composing 中の
     // suppress は resolve_pending_thumb_as_single 参照）。
-    let r = engine.on_event(Ev::down(VK_A).at(200_000).build());
+    //
+    // ADR-182 決定1b: 到着文字に親指面のかなが存在する（`make_layout`ではAは左親指面あり）場合は、
+    // 親指がshiftとして消費されるので生VKを二重に出さない（別テストで固定）。ここでは親指面が
+    // 無い文字（Dは`make_layout`のどの面にも無い）で、従来どおり生VKが出ることを固定する。
+    let r = engine.on_event(Ev::down(VK_D).at(200_000).build());
     r.assert_consumed();
     assert!(
         r.actions
@@ -2659,6 +3562,44 @@ fn test_key_up_active_suppress_action() {
     r.assert_pass_through();
 }
 
+// ── OS修飾キー保持中のKeyUpでもpending_releasesを掃除する (ADR-112コードレビュー指摘) ──
+
+#[test]
+fn test_key_up_with_os_modifier_held_still_cleans_up_pending_release_entry() {
+    // is_os_modifier_held() ガードは以前「output_historyの中身に反応せず
+    // pass_throughする」という独自ロジックだったが、/code-review指摘を経て
+    // release_onlyへ完全委譲するよう単純化した（決定0でpending_releasesを
+    // n-gram文脈と分離した後は、この分岐に来る時点のscan_codeエントリが
+    // 「この物理キー自身のもの」以外にあり得ず、release_onlyと同じ安全性で
+    // 掃除できるため）。Aの出力はChar/Romaji型なので、通常のKeyUpと同じく
+    // Suppressが返る。
+    let mut engine = make_engine();
+
+    engine.on_event(Ev::down(VK_A).at(0).build());
+    engine.on_timeout(TIMER_PENDING);
+    assert!(
+        engine.output_history.find_action_by_scan(SCAN_A).is_some(),
+        "Aの出力がoutput_historyへ記録されているはず"
+    );
+
+    // Ctrl保持中にA KeyUpが届く: is_os_modifier_held()ガードに入る。
+    engine.tracker.set_modifiers(ModifierState {
+        ctrl: true,
+        ..Default::default()
+    });
+    let r = engine.on_event(Ev::up(VK_A).at(50_000).build());
+    assert!(
+        r.actions.iter().any(|a| matches!(a, KeyAction::Suppress)),
+        "Char/RomajiエントリはSuppressとして解放されるはず（release_only委譲）: {:?}",
+        r.actions
+    );
+
+    assert!(
+        engine.output_history.find_action_by_scan(SCAN_A).is_none(),
+        "OS修飾キー保持中のKeyUpでもpending_releasesのエントリは掃除されるべき"
+    );
+}
+
 // ── KeyUp during PendingCharThumb resolving Key action (line 580) ──
 
 #[test]
@@ -2731,6 +3672,10 @@ fn test_insufficient_overlap_with_no_thumb_face_still_forwards_thumb_solo() {
     // 無いのではなく、単独打鍵そのものとして確定するため、その解決結果
     // （ここでは変換パススルー）を尊重する。
     let mut engine = make_engine_with_thumb_key_solo_tap_config_ex(false, true, false, false);
+    // ADR-112決定1: 本番既定は0%(常に重なり十分)だが、このテストは
+    // 「重なり不足→単独打鍵×2」というアルゴリズム自体を検証するため
+    // MIN_OVERLAP_MARGIN_PERCENT相当(15%)を明示的に指定する。
+    engine.set_min_overlap_margin_percent_for_test(15);
     engine.layout.normal.insert(POS_D, lit('て'));
     // D は left_thumb にも right_thumb にも一切定義しない
 
@@ -2875,7 +3820,7 @@ fn test_romaji_value_in_layout() {
 
 #[test]
 fn test_special_value_in_layout() {
-    use crate::yab::SpecialKey;
+    use crate::types::SpecialKey;
     let mut layout = make_layout();
     layout
         .normal
@@ -2962,6 +3907,10 @@ fn test_key_up_thumb_during_pending_char_thumb() {
 #[test]
 fn test_pending_char_thumb_insufficient_overlap_resolves_as_two_solos_on_thumb_key_up() {
     let mut engine = make_engine_with_thumb_key_solo_tap_config_ex(false, true, false, false);
+    // ADR-112決定1: 本番既定は0%(常に重なり十分)だが、このテストは
+    // 「重なり不足→単独打鍵×2」というアルゴリズム自体を検証するため
+    // MIN_OVERLAP_MARGIN_PERCENT相当(15%)を明示的に指定する。
+    engine.set_min_overlap_margin_percent_for_test(15);
 
     // char1(A) → thumb(右親指=VK_CONVERT, t=30ms) → PendingCharThumb
     engine.on_event(Ev::down(VK_A).at(0).build());
@@ -2997,6 +3946,7 @@ fn test_pending_char_thumb_insufficient_overlap_resolves_as_two_solos_on_thumb_k
 #[test]
 fn test_pending_char_thumb_insufficient_overlap_resolves_as_two_solos_on_timeout() {
     let mut engine = make_engine_with_thumb_key_solo_tap_config_ex(false, true, false, false);
+    engine.set_min_overlap_margin_percent_for_test(15);
 
     // char1(A) → thumb(右親指=VK_CONVERT, t=30ms) → PendingCharThumb
     engine.on_event(Ev::down(VK_A).at(0).build());
@@ -3025,6 +3975,72 @@ fn test_pending_char_thumb_insufficient_overlap_resolves_as_two_solos_on_timeout
     );
 }
 
+// ── min_overlap_margin_percent の配線（NicolaFsm::set_timing_margins →
+// TimingJudge::with_margins → overlap_only_verdict）を検証する。2026-08-30
+// コードレビュー指摘: timing_margin_percent と min_overlap_margin_percent が
+// 常に同じ既定値(30/15)でしかテストされておらず、5層の配線経路
+// （config.rs → EngineCommand::UpdateFsmParams → Engine → FsmAdapter →
+// NicolaFsm）のどこかで2引数が入れ替わっても既存スイートでは検出できな
+// かった（対になる timing_margin_percent 側のテストは
+// engine_integration_tests::update_fsm_params_timing_margin_percent_
+// actually_gates_three_key_arbitration にある）。ここでは意図的に両者へ
+// 離れた値(90/10)を与え、char1_released_at 後の重なり判定が正しい方
+// （min_overlap_margin_percent=10）を使っていることを確認する。
+
+#[test]
+fn set_timing_margins_min_overlap_margin_percent_actually_gates_chord_confirmation() {
+    let mut engine = make_engine();
+    engine.set_timing_margins(90, 10);
+
+    // char1(S) → thumb(左, t=30ms) → PendingCharThumb
+    engine.on_event(Ev::down(VK_S).at(0).build());
+    engine.on_event(Ev::down(VK_NONCONVERT).at(30_000).build());
+
+    // char1 KeyUp: thumb 押下から20ms後 → 重なり=20ms。
+    // min_overlap_margin_percent=10 なら最小重なり=threshold(100ms)*10%=10ms、
+    // 20ms >= 10ms → 同時打鍵確定('あ')のはず。
+    // もし timing_margin_percent(=90)がここに紛れ込んでいたら最小重なり=90ms、
+    // 20ms < 90ms → 重なり不足 → n-gram 未設定なので単独打鍵×2('し')に倒れる。
+    engine.on_event(Ev::up(VK_S).at(50_000).build());
+    let r = engine.on_timeout(TIMER_PENDING);
+    r.assert_consumed();
+    assert!(
+        r.actions.iter().any(|a| matches!(a, KeyAction::Char('あ'))),
+        "min_overlap_margin_percent=10 なら20msの重なりで同時打鍵確定('あ')のはず: {:?}",
+        r.actions
+    );
+    assert!(
+        !r.actions.iter().any(|a| matches!(a, KeyAction::Char('し'))),
+        "timing_margin_percent(90)が誤って重なり判定に使われていないか \
+         ('し'が出ていたら値が入れ替わっている): {:?}",
+        r.actions
+    );
+}
+
+#[test]
+fn test_default_min_overlap_margin_percent_treats_insufficient_overlap_as_chord() {
+    // ADR-112決定1: min_overlap_margin_percentの本番既定値は一時的に0%
+    // (RUNTIME_MIN_OVERLAP_MARGIN_PERCENT)。set_min_overlap_margin_percent_for_test
+    // を呼ばない限り、上のテスト群と全く同じ物理的重なり(2ms、閾値の2%)でも
+    // 「重なり十分」として同時打鍵確定に倒れる——これは決定2(Phase 0修正で
+    // char1_released_atが実際に埋まるようになる)着地直後の実運用を、決定3
+    // (実測付きで引き締める)まで意図的に「経路修正前と同じ見た目の挙動」に
+    // 保つための値であり、バグではない。この値を変える場合は本テストと
+    // ADR-112決定1/3を必ず更新すること。
+    let mut engine = make_engine_with_thumb_key_solo_tap_config_ex(false, true, false, false);
+
+    engine.on_event(Ev::down(VK_A).at(0).build());
+    engine.on_event(Ev::down(VK_CONVERT).at(30_000).build());
+    engine.on_event(Ev::up(VK_A).at(32_000).build());
+    let r = engine.on_timeout(TIMER_PENDING);
+    r.assert_consumed();
+    assert!(
+        r.actions.iter().any(|a| matches!(a, KeyAction::Char('ゔ'))),
+        "既定(0%)では重なり不足でもchord確定になるはず: {:?}",
+        r.actions
+    );
+}
+
 #[test]
 fn test_pending_char_thumb_insufficient_overlap_timeout_consumes_thumb_to_prevent_reuse() {
     // 重なり不足で char1+thumb を単独打鍵×2として確定した後も、thumb はまだ物理的に
@@ -3034,6 +4050,7 @@ fn test_pending_char_thumb_insufficient_overlap_timeout_consumes_thumb_to_preven
     // が left/right_thumb_consumed を更新し忘れると、次のキーが active_thumb_side() 経由で
     // 同じ thumb 押下と誤って同時打鍵になってしまう）。
     let mut engine = make_engine_with_thumb_key_solo_tap_config_ex(false, true, false, false);
+    engine.set_min_overlap_margin_percent_for_test(15);
 
     engine.on_event(Ev::down(VK_A).at(0).build());
     engine.on_event(Ev::down(VK_CONVERT).at(30_000).build());
@@ -3517,8 +4534,8 @@ fn test_speculative_simultaneous_with_romaji() {
             VK_NONCONVERT,
             VK_CONVERT,
             100,
-            ConfirmMode::Speculative,
-            30,
+            ConfirmMode::NgramPredictive,
+            0,
         ),
     };
     let t0 = 1_000_000;
@@ -3641,7 +4658,7 @@ fn make_two_phase_engine() -> TestHarness {
             VK_NONCONVERT,
             VK_CONVERT,
             100,
-            ConfirmMode::TwoPhase,
+            ConfirmMode::NgramPredictive,
             30,
         ),
     }
@@ -3800,127 +4817,6 @@ fn test_two_phase_char_sequence() {
     );
 }
 
-// ── AdaptiveTiming モード テスト ──
-
-fn make_adaptive_engine() -> TestHarness {
-    TestHarness {
-        tracker: input_tracker::InputTracker::new(),
-        engine: NicolaFsm::new(
-            make_layout(),
-            VK_NONCONVERT,
-            VK_CONVERT,
-            100,
-            ConfirmMode::AdaptiveTiming,
-            30,
-        ),
-    }
-}
-
-/// 最初のキー（前キーなし）→ TwoPhase 動作（PendingChar + TIMER_SPECULATIVE）
-#[test]
-fn test_adaptive_first_key_uses_two_phase() {
-    let mut engine = make_adaptive_engine();
-    let r = engine.on_event(Ev::down(VK_A).at(1_000_000).build());
-
-    // TwoPhase: PendingChar 状態 + TIMER_SPECULATIVE が設定される
-    r.assert_consumed();
-    assert!(
-        r.actions.is_empty(),
-        "TwoPhase Phase 1 should have no actions"
-    );
-    assert!(
-        matches!(engine.state, EngineState::PendingChar(_)),
-        "state should be PendingChar, got {:?}",
-        engine.state
-    );
-    r.assert_timer_set(TIMER_SPECULATIVE);
-}
-
-/// 連続打鍵（50ms 間隔）→ Wait 動作（PendingChar + TIMER_PENDING）
-#[test]
-fn test_adaptive_rapid_typing_uses_wait() {
-    let mut engine = make_adaptive_engine();
-
-    // 1 文字目（TwoPhase 動作）
-    let t0 = 1_000_000;
-    let _ = engine.on_event(Ev::down(VK_A).at(t0).build());
-    // タイムアウトで確定させて Idle に戻す
-    let _ = engine.on_timeout(TIMER_SPECULATIVE);
-    let _ = engine.on_timeout(TIMER_PENDING);
-
-    // 2 文字目: 50ms 後（< 80ms → continuous → Wait）
-    let t1 = t0 + 50_000;
-    let r = engine.on_event(Ev::down(VK_S).at(t1).build());
-
-    r.assert_consumed();
-    assert!(
-        r.actions.is_empty(),
-        "Wait mode should have no immediate actions"
-    );
-    assert!(
-        matches!(engine.state, EngineState::PendingChar(_)),
-        "state should be PendingChar, got {:?}",
-        engine.state
-    );
-    r.assert_timer_set(TIMER_PENDING);
-}
-
-/// ポーズ後（200ms 間隔）→ TwoPhase 動作（PendingChar + TIMER_SPECULATIVE）
-#[test]
-fn test_adaptive_after_pause_uses_two_phase() {
-    let mut engine = make_adaptive_engine();
-
-    // 1 文字目
-    let t0 = 1_000_000;
-    let _ = engine.on_event(Ev::down(VK_A).at(t0).build());
-    let _ = engine.on_timeout(TIMER_SPECULATIVE);
-    let _ = engine.on_timeout(TIMER_PENDING);
-
-    // 2 文字目: 200ms 後（>= 80ms → paused → TwoPhase）
-    let t1 = t0 + 200_000;
-    let r = engine.on_event(Ev::down(VK_S).at(t1).build());
-
-    r.assert_consumed();
-    assert!(
-        r.actions.is_empty(),
-        "TwoPhase Phase 1 should have no actions"
-    );
-    assert!(
-        matches!(engine.state, EngineState::PendingChar(_)),
-        "state should be PendingChar, got {:?}",
-        engine.state
-    );
-    r.assert_timer_set(TIMER_SPECULATIVE);
-}
-
-/// 連続打鍵 → ポーズ → 最後のキーは TwoPhase を使用
-#[test]
-fn test_adaptive_continuous_then_pause() {
-    let mut engine = make_adaptive_engine();
-
-    // 1 文字目 t=1000ms
-    let t0 = 1_000_000;
-    let _ = engine.on_event(Ev::down(VK_A).at(t0).build());
-    let _ = engine.on_timeout(TIMER_SPECULATIVE);
-    let _ = engine.on_timeout(TIMER_PENDING);
-
-    // 2 文字目 t=1050ms (50ms gap → continuous → Wait)
-    let t1 = t0 + 50_000;
-    let r1 = engine.on_event(Ev::down(VK_S).at(t1).build());
-    r1.assert_timer_set(TIMER_PENDING); // Wait mode
-    let _ = engine.on_timeout(TIMER_PENDING);
-
-    // 3 文字目 t=1300ms (250ms gap → paused → TwoPhase)
-    let t2 = t1 + 250_000;
-    let r2 = engine.on_event(Ev::down(VK_A).at(t2).build());
-    r2.assert_consumed();
-    assert!(
-        r2.actions.is_empty(),
-        "TwoPhase Phase 1 should have no actions"
-    );
-    r2.assert_timer_set(TIMER_SPECULATIVE);
-}
-
 // ── NgramPredictive confirm mode tests ──
 
 fn make_ngram_predictive_engine() -> TestHarness {
@@ -4068,18 +4964,21 @@ fn test_ngram_predictive_no_history_uses_wait() {
 // depends on context history.
 
 /// Modes to include in cross-mode comparison tests.
-const CROSS_MODES: [ConfirmMode; 4] = [
-    ConfirmMode::Wait,
-    ConfirmMode::Speculative,
-    ConfirmMode::TwoPhase,
-    ConfirmMode::AdaptiveTiming,
+///
+/// v2 で公開される確定モードは Wait / NgramPredictive の2択。n-gram モデル未設定の
+/// NgramPredictive は `speculative_delay_ms` が 0 なら即時投機出力、0 超なら
+/// 短い待機→投機出力になるため、その2通りを含めて比較する。
+const CROSS_MODES: [(ConfirmMode, u32); 3] = [
+    (ConfirmMode::Wait, 30),
+    (ConfirmMode::NgramPredictive, 0),
+    (ConfirmMode::NgramPredictive, 30),
 ];
 
-fn make_engine_with_mode(mode: ConfirmMode) -> TestHarness {
+fn make_engine_with_mode(mode: ConfirmMode, delay_ms: u32) -> TestHarness {
     let layout = make_layout();
     TestHarness {
         tracker: input_tracker::InputTracker::new(),
-        engine: NicolaFsm::new(layout, VK_NONCONVERT, VK_CONVERT, 100, mode, 30),
+        engine: NicolaFsm::new(layout, VK_NONCONVERT, VK_CONVERT, 100, mode, delay_ms),
     }
 }
 
@@ -4115,8 +5014,8 @@ fn collect_chars(responses: &[Resp]) -> Vec<char> {
 #[test]
 fn test_all_modes_single_char_same_output() {
     let mut reference: Option<Vec<char>> = None;
-    for mode in CROSS_MODES {
-        let mut engine = make_engine_with_mode(mode);
+    for (mode, delay) in CROSS_MODES {
+        let mut engine = make_engine_with_mode(mode, delay);
         let mut responses = vec![];
 
         // Press A key
@@ -4154,8 +5053,8 @@ fn test_all_modes_single_char_same_output() {
 #[test]
 fn test_all_modes_simultaneous_same_final_output() {
     let mut reference: Option<Vec<char>> = None;
-    for mode in CROSS_MODES {
-        let mut engine = make_engine_with_mode(mode);
+    for (mode, delay) in CROSS_MODES {
+        let mut engine = make_engine_with_mode(mode, delay);
         let mut responses = vec![];
         let t = 1_000_000u64;
 
@@ -4190,8 +5089,8 @@ fn test_all_modes_simultaneous_same_final_output() {
 #[test]
 fn test_all_modes_simultaneous_right_thumb_same_final_output() {
     let mut reference: Option<Vec<char>> = None;
-    for mode in CROSS_MODES {
-        let mut engine = make_engine_with_mode(mode);
+    for (mode, delay) in CROSS_MODES {
+        let mut engine = make_engine_with_mode(mode, delay);
         let mut responses = vec![];
         let t = 1_000_000u64;
 
@@ -4226,12 +5125,8 @@ fn test_all_modes_simultaneous_right_thumb_same_final_output() {
 #[test]
 fn test_all_modes_rapid_sequence_same_output() {
     let mut reference: Option<Vec<char>> = None;
-    for mode in [
-        ConfirmMode::Wait,
-        ConfirmMode::Speculative,
-        ConfirmMode::TwoPhase,
-    ] {
-        let mut engine = make_engine_with_mode(mode);
+    for (mode, delay) in CROSS_MODES {
+        let mut engine = make_engine_with_mode(mode, delay);
         let mut responses = vec![];
 
         // Type A, S rapidly (50ms apart), well outside threshold for simultaneous
@@ -4267,8 +5162,8 @@ fn test_all_modes_rapid_sequence_same_output() {
 #[test]
 fn test_all_modes_thumb_first_then_char_same_output() {
     let mut reference: Option<Vec<char>> = None;
-    for mode in CROSS_MODES {
-        let mut engine = make_engine_with_mode(mode);
+    for (mode, delay) in CROSS_MODES {
+        let mut engine = make_engine_with_mode(mode, delay);
         let mut responses = vec![];
         let t = 1_000_000u64;
 
@@ -4303,8 +5198,8 @@ fn test_all_modes_thumb_first_then_char_same_output() {
 fn test_all_modes_char_alone_after_threshold_same_output() {
     // Char is pressed, thumb arrives after threshold → char confirmed as normal face
     let mut reference: Option<Vec<char>> = None;
-    for mode in CROSS_MODES {
-        let mut engine = make_engine_with_mode(mode);
+    for (mode, delay) in CROSS_MODES {
+        let mut engine = make_engine_with_mode(mode, delay);
         let mut responses = vec![];
         let t = 1_000_000u64;
 
@@ -4341,7 +5236,7 @@ fn test_all_modes_char_alone_after_threshold_same_output() {
 
 #[test]
 fn test_speculative_has_immediate_output() {
-    let mut engine = make_engine_with_mode(ConfirmMode::Speculative);
+    let mut engine = make_engine_with_mode(ConfirmMode::NgramPredictive, 0);
     let r = engine.on_event(Ev::down(VK_A).at(1_000_000).build());
     assert!(
         !r.actions.is_empty(),
@@ -4356,7 +5251,7 @@ fn test_speculative_has_immediate_output() {
 
 #[test]
 fn test_wait_has_no_immediate_output() {
-    let mut engine = make_engine_with_mode(ConfirmMode::Wait);
+    let mut engine = make_engine_with_mode(ConfirmMode::Wait, 30);
     let r = engine.on_event(Ev::down(VK_A).at(1_000_000).build());
     assert!(
         r.actions.is_empty(),
@@ -4366,7 +5261,7 @@ fn test_wait_has_no_immediate_output() {
 
 #[test]
 fn test_two_phase_no_output_before_speculative_timer() {
-    let mut engine = make_engine_with_mode(ConfirmMode::TwoPhase);
+    let mut engine = make_engine_with_mode(ConfirmMode::NgramPredictive, 30);
     let r = engine.on_event(Ev::down(VK_A).at(1_000_000).build());
     assert!(
         r.actions.is_empty(),
@@ -4386,28 +5281,12 @@ fn test_two_phase_no_output_before_speculative_timer() {
 }
 
 #[test]
-fn test_adaptive_first_key_behaves_like_two_phase() {
-    // AdaptiveTiming with no prior key history should use TwoPhase behavior
-    let mut engine = make_engine_with_mode(ConfirmMode::AdaptiveTiming);
-    let r = engine.on_event(Ev::down(VK_A).at(1_000_000).build());
-    assert!(
-        r.actions.is_empty(),
-        "AdaptiveTiming first key should not output immediately (TwoPhase Phase 1)"
-    );
-    let r = engine.on_timeout(TIMER_SPECULATIVE);
-    assert!(
-        !r.actions.is_empty(),
-        "AdaptiveTiming first key should output after speculative timer"
-    );
-}
-
-#[test]
 fn test_speculative_retraction_on_simultaneous() {
     // Verify that Speculative mode resolves to thumb face when thumb arrives
     // within threshold.  The engine emits the speculative char immediately,
     // then when thumb arrives it retracts (BS) and emits the thumb face.
     // collect_output neutralises the BS+original pair.
-    let mut engine = make_engine_with_mode(ConfirmMode::Speculative);
+    let mut engine = make_engine_with_mode(ConfirmMode::NgramPredictive, 0);
     let t = 1_000_000u64;
 
     let r1 = engine.on_event(Ev::down(VK_A).at(t).build());
@@ -4551,12 +5430,15 @@ fn test_update_history_record() {
     let mut engine = make_engine();
     assert!(engine.output_history.is_empty());
 
-    engine.update_history(OutputUpdate::Record(OutputEntry {
-        scan_code: SCAN_A,
-        romaji: "ka".to_string(),
-        kana: Some('か'),
-        action: KeyAction::Romaji("ka".to_string()),
-    }));
+    engine.update_history(
+        OutputUpdate::Record(OutputEntry {
+            scan_code: SCAN_A,
+            romaji: "ka".to_string(),
+            kana: Some('か'),
+            action: KeyAction::Romaji("ka".to_string()),
+        }),
+        0,
+    );
     assert_eq!(engine.output_history.len(), 1);
     assert_eq!(engine.output_history.recent_kana(1), vec!['か']);
 }
@@ -4566,21 +5448,27 @@ fn test_update_history_retract_and_record() {
     let mut engine = make_engine();
 
     // First, record an entry
-    engine.update_history(OutputUpdate::Record(OutputEntry {
-        scan_code: SCAN_A,
-        romaji: "u".to_string(),
-        kana: Some('う'),
-        action: KeyAction::Romaji("u".to_string()),
-    }));
+    engine.update_history(
+        OutputUpdate::Record(OutputEntry {
+            scan_code: SCAN_A,
+            romaji: "u".to_string(),
+            kana: Some('う'),
+            action: KeyAction::Romaji("u".to_string()),
+        }),
+        0,
+    );
     assert_eq!(engine.output_history.len(), 1);
 
     // Now retract and record a new entry
-    engine.update_history(OutputUpdate::RetractAndRecord(OutputEntry {
-        scan_code: SCAN_A,
-        romaji: "vu".to_string(),
-        kana: Some('ゔ'),
-        action: KeyAction::Romaji("vu".to_string()),
-    }));
+    engine.update_history(
+        OutputUpdate::RetractAndRecord(OutputEntry {
+            scan_code: SCAN_A,
+            romaji: "vu".to_string(),
+            kana: Some('ゔ'),
+            action: KeyAction::Romaji("vu".to_string()),
+        }),
+        1000,
+    );
     assert_eq!(
         engine.output_history.len(),
         1,
@@ -4724,6 +5612,10 @@ fn test_engine_off_counts_solo_resolved_via_insufficient_overlap_separate_solos(
     // 最後に明示的に KeyUp を送って物理状態を正常化してから次の周回へ進む）。
     let mut engine = make_engine();
     engine.set_engine_off_solo_repeat_vk(VK_NONCONVERT);
+    // ADR-112決定1: 本番既定は0%(常に重なり十分)だが、このテストは
+    // 「重なり不足→単独打鍵×2」というアルゴリズム自体を検証するため
+    // MIN_OVERLAP_MARGIN_PERCENT相当(15%)を明示的に指定する。
+    engine.set_min_overlap_margin_percent_for_test(15);
 
     let gap = 150_000u64; // 150ms < SOLO_OFF_TIMEOUT_US (400ms)
 
@@ -5044,7 +5936,10 @@ mod fsm_adapter_tests {
     #[test]
     fn flush_returns_decision() {
         let mut adapter = make_adapter();
-        let decision = adapter.flush(ContextChange::FocusChanged, ComposingHint::Trusted(false));
+        let decision = adapter.flush(
+            ContextChange::FocusChanged,
+            ThumbRawVkEmission::Allowed(false),
+        );
         // Flush on idle should return a Decision without panicking
         let _ = decision.is_consumed();
     }
@@ -5052,8 +5947,10 @@ mod fsm_adapter_tests {
     #[test]
     fn flush_to_effects_returns_vec() {
         let mut adapter = make_adapter();
-        let effects =
-            adapter.flush_to_effects(ContextChange::FocusChanged, ComposingHint::Trusted(false));
+        let effects = adapter.flush_to_effects(
+            ContextChange::FocusChanged,
+            ThumbRawVkEmission::Allowed(false),
+        );
         // Verify it returns a Vec (may or may not be empty depending on FSM internals)
         let _ = effects.len();
     }
@@ -5111,7 +6008,7 @@ mod fsm_adapter_tests {
     fn set_confirm_mode_updates() {
         let mut adapter = make_adapter();
         // Should not panic
-        adapter.set_confirm_mode(ConfirmMode::Speculative, 50);
+        adapter.set_confirm_mode(ConfirmMode::NgramPredictive, 50);
         adapter.set_confirm_mode(ConfirmMode::Wait, 30);
     }
 
@@ -5195,7 +6092,10 @@ mod fsm_adapter_tests {
         let _ = adapter.on_event(event, &phys);
 
         // Flush should resolve the pending key
-        let decision = adapter.flush(ContextChange::FocusChanged, ComposingHint::Trusted(false));
+        let decision = adapter.flush(
+            ContextChange::FocusChanged,
+            ThumbRawVkEmission::Allowed(false),
+        );
         // The flush should produce some output (consumed with effects)
         let _ = decision;
     }
@@ -5242,6 +6142,29 @@ mod engine_integration_tests {
         engine
     }
 
+    /// `EngineCommand::UpdateFsmParams` テスト既定のマージン値
+    /// （複数テストで `timing_margin_percent: 30, min_overlap_margin_percent: 15`
+    /// がコピペされていたのを一本化、/code-review指摘 PR #127 6回目）。
+    const TEST_TIMING_MARGIN_PERCENT: u32 = 30;
+    const TEST_MIN_OVERLAP_MARGIN_PERCENT: u32 = 15;
+
+    /// `EngineCommand::UpdateFsmParams` を構築する。`timing_margin_percent`/
+    /// `min_overlap_margin_percent` はテスト既定値で固定し、それ以外の
+    /// テストごとに変化する引数だけを受け取る。
+    fn update_fsm_params(
+        threshold_ms: u32,
+        confirm_mode: ConfirmMode,
+        speculative_delay_ms: u32,
+    ) -> EngineCommand {
+        EngineCommand::UpdateFsmParams {
+            threshold_ms,
+            confirm_mode,
+            speculative_delay_ms,
+            timing_margin_percent: TEST_TIMING_MARGIN_PERCENT,
+            min_overlap_margin_percent: TEST_MIN_OVERLAP_MARGIN_PERCENT,
+        }
+    }
+
     fn ime_on_ctx() -> InputContext {
         InputContext {
             ime_on: true,
@@ -5259,7 +6182,7 @@ mod engine_integration_tests {
         }
     }
 
-    /// BUG-106 追補: 非活性中に素通しした押下は、活性化後の auto-repeat でも
+    /// BUG-192 追補: 非活性中に素通しした押下は、活性化後の auto-repeat でも
     /// FSM に入らない。
     ///
     /// auto-repeat は新しい物理押下ではないので、途中で Consume に変えると
@@ -5293,7 +6216,7 @@ mod engine_integration_tests {
         );
     }
 
-    /// BUG-106 追補2: 素通し中の押下の repeat でも活性化遷移は検知する。
+    /// BUG-192 追補2: 素通し中の押下の repeat でも活性化遷移は検知する。
     ///
     /// Phase 0.5 が素の `PassThrough` で帰ると、押しっぱなしのキーの repeat しか
     /// 届かない間 `prev_activation`・UI 通知・ActivationSync が更新されず、
@@ -5318,13 +6241,13 @@ mod engine_integration_tests {
         );
     }
 
-    /// BUG-103: 親指キーが IME 切替キーを兼ねる構成（macOS の 英数/かな）で、
+    /// BUG-189: 親指キーが IME 切替キーを兼ねる構成（macOS の 英数/かな）で、
     /// 親指を押したまま engine が非活性化しても切替キーが消えないこと。
     ///
     /// これが落ちると「ON を押したのに IME が ON にならず、次の打鍵が生キーで
     /// 出る」に戻る。実機では 英数 の直後（`simultaneous_threshold_ms` の内側）に
     /// かな を押すと、かな が同時打鍵判定に consume され、非活性化フラッシュの
-    /// `ComposingHint::Unknown` で捨てられていた。
+    /// `ThumbRawVkEmission::Denied` で捨てられていた。
     #[test]
     fn deactivation_keeps_a_held_thumb_key_when_it_is_the_ime_switch() {
         let mut engine = make_test_engine();
@@ -5353,7 +6276,7 @@ mod engine_integration_tests {
 
     /// 既定（親指キーが IME 切替キーではない = Windows/Linux）では従来どおり
     /// 抑制する。ここが緩むと、フォーカス変更に伴う非活性化で保留中の親指キーが
-    /// 別ウィンドウへ生送出される（`ComposingHint::Unknown` が防いでいる事故）。
+    /// 別ウィンドウへ生送出される（`ThumbRawVkEmission::Denied` が防いでいる事故）。
     #[test]
     fn deactivation_still_suppresses_a_held_thumb_key_by_default() {
         let mut engine = make_test_engine();
@@ -5576,6 +6499,32 @@ mod engine_integration_tests {
         )));
     }
 
+    /// ADR-214 決定0 P1: belief が OFF のとき、`ForceEngineOn`(トレイの「状態をリセット」)は押下 ID を持たない
+    /// `SetOpen{true}` を出す。逆に belief が ON で既に active なら `SetOpen` を出さない。
+    /// 打鍵起点の `SetOpen` は `stamp_set_open_press` で `press` が載るが、コマンド起点には載らない。
+    #[test]
+    fn on_command_force_engine_on_emits_set_open_without_press_only_when_belief_is_off() {
+        let mut engine = make_test_engine();
+        let d = engine.on_command(EngineCommand::ForceEngineOn, &ime_off_ctx());
+        assert!(
+            has_effect(&d, |e| matches!(
+                e,
+                Effect::Ime(ImeEffect::SetOpen {
+                    open: true,
+                    press: None
+                })
+            )),
+            "belief OFF: SetOpen{{true}} が press=None で出る"
+        );
+
+        let mut engine = make_test_engine();
+        let d = engine.on_command(EngineCommand::ForceEngineOn, &ime_on_ctx());
+        assert!(
+            !has_effect(&d, |e| matches!(e, Effect::Ime(ImeEffect::SetOpen { .. }))),
+            "belief ON で既に active: SetOpen は出ない(書き込みの省略以前に、そもそも送らない)"
+        );
+    }
+
     #[test]
     fn on_command_force_engine_on_is_noop_when_already_on() {
         // トグルと違い、既に ON のときは OFF に反転させない（冪等）。
@@ -5657,11 +6606,7 @@ mod engine_integration_tests {
     fn on_command_update_fsm_params() {
         let mut engine = make_test_engine();
         let d = engine.on_command(
-            EngineCommand::UpdateFsmParams {
-                threshold_ms: 200,
-                confirm_mode: ConfirmMode::Speculative,
-                speculative_delay_ms: 50,
-            },
+            update_fsm_params(200, ConfirmMode::NgramPredictive, 50),
             &ime_on_ctx(),
         );
         assert!(!d.is_consumed());
@@ -5694,6 +6639,36 @@ mod engine_integration_tests {
         let mut engine = Engine::new(fsm, special);
         engine.set_prev_active(true);
         engine
+    }
+
+    /// ADR-199 決定8: 無修飾の ime_on/off/toggle に書かれたキーだけが「明示 config と重なる」と答える。
+    /// 修飾付きの同じ VK・engine_on/off のコンボは重なりに数えない
+    /// （役割由来の `shadow_action` と Engine の照合が両方開閉を書いて打ち消し合うのは前者だけ）。
+    #[test]
+    fn has_bare_ime_combo_only_counts_unmodified_ime_combos() {
+        let combo = |vk, ctrl| ParsedKeyCombo {
+            ctrl,
+            shift: false,
+            alt: false,
+            vk,
+        };
+        let f13 = VkCode(0x7C);
+        let hz = VkCode(0xF3);
+        let special = SpecialKeyCombos {
+            engine_on: vec![combo(VK_CONVERT, false)],
+            engine_off: vec![],
+            ime_on: vec![combo(f13, false)],
+            ime_off: vec![combo(hz, true)],
+            ime_toggle: vec![],
+        };
+        let engine = make_engine_with_special(special);
+        assert!(engine.has_bare_ime_combo(f13), "無修飾の ime_on");
+        assert!(!engine.has_bare_ime_combo(hz), "Ctrl 付きは重ならない");
+        assert!(
+            !engine.has_bare_ime_combo(VK_CONVERT),
+            "engine_on は IME 制御でない"
+        );
+        assert!(!engine.has_bare_ime_combo(VkCode(0xF4)));
     }
 
     #[test]
@@ -5948,7 +6923,7 @@ mod engine_integration_tests {
     /// 【/code-review 指摘の回帰テスト】`event.injected`な合成イベントは
     /// bare-thumbガードの対象外。手動設定の`keys.ime_off`はユーザーが
     /// マクロツール等から意図的に注入する運用を妨げてはならない
-    /// （`match_ime_on_off_auto`のdoc、BUG-14と同じ原則）。engine活性中に
+    /// （`match_ime_toggle_auto`のdoc、BUG-14と同じ原則）。engine活性中に
     /// 無変換の`injected=true`なKeyDownが来ても、`is_bare_thumb`が
     /// falseを返しPhase 1の`keys.ime_off`が従来どおりマッチすること。
     #[test]
@@ -6114,30 +7089,9 @@ mod engine_integration_tests {
         )));
     }
 
-    // ── ADR-092 決定D Step4c: GJI config1.db 由来の自動検出 IME ON/OFF/
-    //    トグルキー（`ime_on_auto`/`ime_off_auto`/`ime_toggle_auto`） ──
-
-    /// 手動設定（`keys.ime_on`）が空でも、自動検出リスト（`ime_on_auto`）が
-    /// 効く（`ime_on_auto_still_fires_when_manual_ime_on_non_empty` が
-    /// 非空側を担当する）。
-    #[test]
-    fn ime_on_auto_fires_when_manual_ime_on_empty() {
-        let combo = ParsedKeyCombo {
-            ctrl: false,
-            shift: false,
-            alt: false,
-            vk: VK_F21,
-        };
-        let mut engine = make_engine_with_special(empty_special_keys());
-        engine.set_ime_on_auto_keys(vec![combo]);
-
-        let d = engine.on_input(Ev::down(VK_F21).at(100).build(), &ime_off_ctx());
-        assert!(d.is_consumed());
-        assert!(has_effect(&d, |e| matches!(
-            e,
-            Effect::Ime(ImeEffect::SetOpen { open: true, .. })
-        )));
-    }
+    // ── ADR-092 決定D Step4a: MS-IMEレジストリ由来の自動検出 IME トグル
+    //    キー（`ime_toggle_auto`）。GJI側の自動検出（旧Step4c、
+    //    `ime_on_auto`/`ime_off_auto`）はADR-179で撤去した ──
 
     /// bare-thumbガード(`is_bare_thumb`)は`engine_active &&`という条件付きで
     /// しか`suppress_ime_combos`をtrueにしない。engine非活性(IME OFF)中は
@@ -6175,73 +7129,297 @@ mod engine_integration_tests {
         );
     }
 
+    // ── ADR-206: エンジン非活性側の役割由来（IME 設定由来のトグル）の親指単独押下 ──
+
+    /// IME 設定由来の役割（トグル）を持つ無変換。単独タップの `ModeKeyConfig` は Passthrough
+    /// （役割由来の開閉は Passthrough のときだけ発火する、ADR-206 の訂正）。
+    fn engine_with_role_toggle_on_muhenkan() -> Engine {
+        let mut engine = make_test_engine();
+        engine.set_thumb_key_solo_tap_config(
+            Some(VK_NONCONVERT),
+            ModeKeyConfig::from_legacy_bools(true, false),
+            None,
+            ModeKeyConfig::from_legacy_bools(false, true),
+        );
+        engine.set_thumb_role_open_actions(Some(ShadowImeAction::Toggle), None);
+        engine
+    }
+
+    fn set_open_effects(d: &Decision) -> Vec<bool> {
+        effects_of(d)
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Ime(ImeEffect::SetOpen { open, .. }) => Some(*open),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// belief OFF（エンジン非活性）: 生キーは Consume し、絶対指定の `SetOpen(true)` をちょうど1つ積む。
+    /// KeyUp も Consume で、追加の `SetOpen` は無い。
+    #[test]
+    fn role_toggle_thumb_while_ime_off_consumes_and_opens_once() {
+        let mut engine = engine_with_role_toggle_on_muhenkan();
+        let down = engine.on_input(Ev::down(VK_NONCONVERT).at(100).build(), &ime_off_ctx());
+        assert!(down.is_consumed(), "生キーは IME に通さない");
+        assert_eq!(set_open_effects(&down), vec![true]);
+        let up = engine.on_input(Ev::up(VK_NONCONVERT).at(200).build(), &ime_on_ctx());
+        assert!(up.is_consumed(), "KeyUp も Down と対で Consume");
+        assert!(set_open_effects(&up).is_empty(), "KeyUp では書かない");
+    }
+
+    /// 開いていても英数等で `NotRomajiInput`（エンジン非活性）なら、Toggle は閉じる方向の `SetOpen(false)`。
+    #[test]
+    fn role_toggle_thumb_while_not_romaji_closes() {
+        let mut engine = engine_with_role_toggle_on_muhenkan();
+        let eisu_ctx = InputContext {
+            input_mode: InputModeState::ObservedEisu,
+            ..ime_on_ctx()
+        };
+        let down = engine.on_input(Ev::down(VK_NONCONVERT).at(100).build(), &eisu_ctx);
+        assert!(down.is_consumed());
+        assert_eq!(set_open_effects(&down), vec![false]);
+    }
+
+    /// 押しっぱなしの自動リピート: 最初の Down で書いた後にエンジンが活性化しても、リピートは FSM に入らず
+    /// 指令を作らない。離したときにもう一度トグルしない（押して開き離して閉じる二重トグルの防止）。
+    #[test]
+    fn role_toggle_thumb_repeat_and_release_never_write_again() {
+        let mut engine = engine_with_role_toggle_on_muhenkan();
+        let down = engine.on_input(Ev::down(VK_NONCONVERT).at(100).build(), &ime_off_ctx());
+        assert_eq!(set_open_effects(&down), vec![true]);
+        for i in 0..3 {
+            let rep = engine.on_input(
+                Ev::down(VK_NONCONVERT).at(600 + i * 30).repeat().build(),
+                &ime_on_ctx(),
+            );
+            assert!(rep.is_consumed(), "リピートも Consume");
+            assert!(
+                set_open_effects(&rep).is_empty(),
+                "リピートは指令を作らない"
+            );
+        }
+        let up = engine.on_input(Ev::up(VK_NONCONVERT).at(900).build(), &ime_on_ctx());
+        assert!(up.is_consumed());
+        assert!(
+            set_open_effects(&up).is_empty(),
+            "離したときに逆向きの SetOpen を出してはならない, got {:?}",
+            effects_of(&up)
+        );
+    }
+
+    /// 印（`phase1_held`）が無い状態のリピート（flush 後など）でも、エンジン非活性なら指令を作らず Consume だけ。
+    #[test]
+    fn role_toggle_thumb_repeat_without_held_mark_only_consumes() {
+        let mut engine = engine_with_role_toggle_on_muhenkan();
+        let rep = engine.on_input(
+            Ev::down(VK_NONCONVERT).at(100).repeat().build(),
+            &ime_off_ctx(),
+        );
+        assert!(rep.is_consumed());
+        assert!(set_open_effects(&rep).is_empty());
+    }
+
+    /// 対象外（受動＝素通し）: ユーザーによるエンジン無効化中・日本語 IME でない・`keys.ime_detect` と重なる・
+    /// 修飾付き・専用 Fn キー設定済み。
+    #[test]
+    fn role_toggle_thumb_is_passive_when_guards_do_not_hold() {
+        // エンジン無効化中
+        let mut engine = engine_with_role_toggle_on_muhenkan();
+        engine.on_command(EngineCommand::ToggleEngine, &ime_on_ctx());
+        let d = engine.on_input(Ev::down(VK_NONCONVERT).at(100).build(), &ime_off_ctx());
+        assert!(!d.is_consumed(), "エンジン無効中は受動");
+        assert!(set_open_effects(&d).is_empty());
+
+        // 日本語 IME でない
+        let mut engine = engine_with_role_toggle_on_muhenkan();
+        let not_ja = InputContext {
+            is_japanese_ime: false,
+            ..ime_off_ctx()
+        };
+        let d = engine.on_input(Ev::down(VK_NONCONVERT).at(100).build(), &not_ja);
+        assert!(!d.is_consumed());
+
+        // keys.ime_detect と重なるキー
+        let mut engine = engine_with_role_toggle_on_muhenkan();
+        let d = engine.on_input(
+            Ev::down(VK_NONCONVERT)
+                .at(100)
+                .sync_direction(ShadowImeAction::Toggle)
+                .build(),
+            &ime_off_ctx(),
+        );
+        assert!(!d.is_consumed());
+
+        // 修飾付き
+        let mut engine = engine_with_role_toggle_on_muhenkan();
+        let shift_ctx = InputContext {
+            modifiers: ModifierState {
+                shift: true,
+                ..ime_off_ctx().modifiers
+            },
+            ..ime_off_ctx()
+        };
+        let d = engine.on_input(Ev::down(VK_NONCONVERT).at(100).build(), &shift_ctx);
+        assert!(!d.is_consumed());
+
+        // 専用 Fn キー設定済みの無変換
+        let mut engine = engine_with_role_toggle_on_muhenkan();
+        engine.set_muhenkan_solo_tap_dedicated_fn_key(Some(VkCode(0x7C)));
+        let d = engine.on_input(Ev::down(VK_NONCONVERT).at(100).build(), &ime_off_ctx());
+        assert!(!d.is_consumed());
+    }
+
+    /// 訂正（所有者 2026-09-29）: 単独タップが Suppress のときは役割があっても IME を動かさない
+    /// （エンジン非活性側では従来どおり生キーが IME に届く=受動、エンジン活性側では生キーを飲み込むだけ）。
+    #[test]
+    fn role_toggle_thumb_never_writes_when_solo_tap_is_suppress() {
+        let mut engine = make_test_engine();
+        engine.set_thumb_key_solo_tap_config(
+            Some(VK_NONCONVERT),
+            ModeKeyConfig::from_legacy_bools(false, true), // Suppress
+            None,
+            ModeKeyConfig::from_legacy_bools(false, true),
+        );
+        engine.set_thumb_role_open_actions(Some(ShadowImeAction::Toggle), None);
+        // エンジン非活性: 受動（awase は書かない、生キーは IME へ）
+        let d = engine.on_input(Ev::down(VK_NONCONVERT).at(100).build(), &ime_off_ctx());
+        assert!(!d.is_consumed());
+        assert!(
+            !set_open_effects(&d).contains(&true),
+            "Suppress では役割由来の ON を書かない（test 用 prev_active による活性→非活性の同期 OFF は別物）"
+        );
+        // エンジン活性: 単独タップ確定でも書かない（生キーも出さない）
+        let _ = engine.on_input(Ev::down(VK_NONCONVERT).at(300).build(), &ime_on_ctx());
+        let up = engine.on_input(Ev::up(VK_NONCONVERT).at(400).build(), &ime_on_ctx());
+        assert!(
+            set_open_effects(&up).is_empty(),
+            "Suppress は IME を動かさない"
+        );
+    }
+
+    /// エンジン活性側: Passthrough なら単独タップ確定で役割由来の絶対指定 `SetOpen(false)`（生キーは出さない）。
+    #[test]
+    fn role_toggle_thumb_writes_on_confirmed_solo_tap_when_passthrough() {
+        let mut engine = engine_with_role_toggle_on_muhenkan();
+        let _ = engine.on_input(Ev::down(VK_NONCONVERT).at(100).build(), &ime_on_ctx());
+        let up = engine.on_input(Ev::up(VK_NONCONVERT).at(200).build(), &ime_on_ctx());
+        assert_eq!(set_open_effects(&up), vec![false]);
+    }
+
+    /// bare `keys.ime_*`（S1）は単独タップの設定に関係なく発火する（従来どおり）。
+    #[test]
+    fn bare_forced_action_fires_regardless_of_solo_tap_suppress() {
+        let mut engine = make_test_engine_with_muhenkan_forced_turn_off(); // Suppress + forced TurnOff
+        let _ = engine.on_input(Ev::down(VK_NONCONVERT).at(100).build(), &ime_on_ctx());
+        let up = engine.on_input(Ev::up(VK_NONCONVERT).at(200).build(), &ime_on_ctx());
+        assert_eq!(set_open_effects(&up), vec![false]);
+    }
+
+    /// Ctrl↑ では awase は IME を書かない（BUG-174）。エンジン非活性で役割由来の親指を単独で押して開いた（Phase 1）後に、
+    /// Ctrl を押し、親指を離し、Ctrl を離しても、KeyUp 側の決定に IME 効果が載らない（開閉は最初の Down の1回だけ）。
+    #[test]
+    fn ctrl_release_after_role_thumb_open_never_emits_ime_effects() {
+        let mut engine = engine_with_role_toggle_on_muhenkan();
+        let down = engine.on_input(Ev::down(VK_NONCONVERT).at(100).build(), &ime_off_ctx());
+        assert_eq!(set_open_effects(&down), vec![true]);
+        let with_ctrl = InputContext {
+            modifiers: ModifierState {
+                ctrl: true,
+                ..ime_on_ctx().modifiers
+            },
+            ..ime_on_ctx()
+        };
+        let ctrl_down = engine.on_input(Ev::down(VK_LCTRL).at(150).build(), &with_ctrl);
+        let thumb_up = engine.on_input(Ev::up(VK_NONCONVERT).at(200).build(), &with_ctrl);
+        let ctrl_up = engine.on_input(Ev::up(VK_LCTRL).at(300).build(), &ime_on_ctx());
+        for d in [&ctrl_down, &thumb_up, &ctrl_up] {
+            assert!(
+                !has_effect(d, |e| matches!(e, Effect::Ime(_))),
+                "Ctrl 押下・親指の KeyUp・Ctrl↑ の決定に IME 効果を載せてはならない, got {:?}",
+                effects_of(d)
+            );
+        }
+    }
+
+    /// `phase1_held` は `release_pending_and_reinject`（flush: 活性→非活性の遷移）で消える。
+    /// 消えた後は、エンジンが活性に戻っていても同じ親指のリピートは Phase 1 の早期 Consume には入らない
+    /// （FSM が新しい押下として扱う）。印が残り続けないこと（B14 型の恒久残留がない）の直接確認。
+    #[test]
+    fn phase1_held_is_cleared_by_flush() {
+        let mut engine = engine_with_role_toggle_on_muhenkan();
+        let _ = engine.on_input(Ev::down(VK_NONCONVERT).at(100).build(), &ime_off_ctx());
+        // 印がある間: 活性のままのリピートは Phase 1 で Consume され FSM の状態は Idle のまま。
+        let before = engine.debug_state_label();
+        let rep = engine.on_input(
+            Ev::down(VK_NONCONVERT).at(400).repeat().build(),
+            &ime_on_ctx(),
+        );
+        assert!(rep.is_consumed());
+        assert_eq!(
+            engine.debug_state_label(),
+            before,
+            "印がある間は FSM に入らない"
+        );
+        // 別キーの到着で活性→非活性（flush）。
+        let _ = engine.on_input(Ev::down(VK_A).at(500).build(), &ime_off_ctx());
+        // 印が消えた後: 活性に戻ったリピートは FSM に入る（状態が Idle から変わる）。
+        let _ = engine.on_input(Ev::down(VK_A).at(600).build(), &ime_on_ctx());
+        let rep2 = engine.on_input(
+            Ev::down(VK_NONCONVERT).at(700).repeat().build(),
+            &ime_on_ctx(),
+        );
+        assert!(rep2.is_consumed());
+        assert_ne!(
+            engine.debug_state_label(),
+            before,
+            "flush で印が消え、リピートが FSM に渡る"
+        );
+    }
+
+    /// 役割が無い親指は従来どおり（エンジン非活性なら素通し）。
+    #[test]
+    fn thumb_without_role_still_passes_through_while_ime_off() {
+        let mut engine = make_test_engine();
+        let d = engine.on_input(Ev::down(VK_NONCONVERT).at(100).build(), &ime_off_ctx());
+        assert!(!d.is_consumed());
+    }
+
+    /// OFF 方向（bare `keys.ime_off` の親指）は belief OFF でも常に絶対指定の `SetOpen(false)` を積む
+    /// （抑止のみにすると、実 IME が開いたままのとき何度押しても閉じられない固着になる。ADR-206 決定3・7）。
+    #[test]
+    fn bare_ime_off_thumb_writes_close_even_when_belief_is_off() {
+        let combo = ParsedKeyCombo {
+            ctrl: false,
+            shift: false,
+            alt: false,
+            vk: VK_NONCONVERT,
+        };
+        let special = SpecialKeyCombos {
+            engine_on: vec![],
+            engine_off: vec![],
+            ime_on: vec![],
+            ime_off: vec![combo],
+            ime_toggle: vec![],
+        };
+        let mut engine = make_engine_with_special(special);
+        let d = engine.on_input(Ev::down(VK_NONCONVERT).at(100).build(), &ime_off_ctx());
+        assert!(d.is_consumed());
+        assert_eq!(set_open_effects(&d), vec![false]);
+        // bare の親指の自動リピートは、印がある間は指令を作らない
+        let rep = engine.on_input(
+            Ev::down(VK_NONCONVERT).at(600).repeat().build(),
+            &ime_off_ctx(),
+        );
+        assert!(rep.is_consumed());
+        assert!(set_open_effects(&rep).is_empty());
+    }
+
     /// 【bare-thumbガード回帰テスト、旧P-9】`match_event`内だけにガードを
-    /// 置くと`.or_else()`で連結される自動検出リスト（`ime_on_auto`）を
+    /// 置くと`.or_else()`で連結される自動検出リスト（`ime_toggle_auto`）を
     /// 素通りしてしまう。`match_special_keys`レベルで一括適用した
     /// `is_bare_thumb`ガードが、手動リストだけでなく自動検出リストにも
-    /// 効いていることを固定する。engine活性中は無変換+Aがチョードとして
-    /// 解決され、`ime_on_auto`にVK_NONCONVERTが入っていても`SetOpen`は
-    /// 出ない。
-    #[test]
-    fn bare_thumb_ime_on_auto_combo_is_suppressed_while_engine_active() {
-        let combo = ParsedKeyCombo {
-            ctrl: false,
-            shift: false,
-            alt: false,
-            vk: VK_NONCONVERT,
-        };
-        let mut engine = make_engine_with_special(empty_special_keys());
-        engine.set_ime_on_auto_keys(vec![combo]);
-
-        let d1 = engine.on_input(Ev::down(VK_NONCONVERT).at(0).build(), &ime_on_ctx());
-        let d2 = engine.on_input(Ev::down(VK_A).at(50).build(), &ime_on_ctx());
-
-        assert!(d1.is_consumed());
-        assert!(d2.is_consumed());
-        assert!(
-            has_effect(&d2, |e| matches!(
-                e,
-                Effect::Input(InputEffect::SendKeys(actions))
-                    if actions.iter().any(|a| matches!(a, KeyAction::Char('を')))
-            )),
-            "bare 無変換+A should be handled as a left-thumb chord even with ime_on_auto set, got {:?}",
-            effects_of(&d2)
-        );
-        assert!(
-            !has_effect(&d1, |e| matches!(e, Effect::Ime(ImeEffect::SetOpen { .. })))
-                && !has_effect(&d2, |e| matches!(e, Effect::Ime(ImeEffect::SetOpen { .. }))),
-            "auto ime_on list must not bypass the bare-thumb guard, d1={:?} d2={:?}",
-            effects_of(&d1),
-            effects_of(&d2)
-        );
-    }
-
-    /// 上記の`ime_off_auto`版。engine活性中はチョード判定を優先し、
-    /// `ime_off_auto`にbare親指キーが入っていても`SetOpen`は出ない。
-    #[test]
-    fn bare_thumb_ime_off_auto_combo_is_suppressed_while_engine_active() {
-        let combo = ParsedKeyCombo {
-            ctrl: false,
-            shift: false,
-            alt: false,
-            vk: VK_NONCONVERT,
-        };
-        let mut engine = make_engine_with_special(empty_special_keys());
-        engine.set_ime_off_auto_keys(vec![combo]);
-
-        let d1 = engine.on_input(Ev::down(VK_NONCONVERT).at(0).build(), &ime_on_ctx());
-        let d2 = engine.on_input(Ev::down(VK_A).at(50).build(), &ime_on_ctx());
-
-        assert!(
-            !has_effect(&d1, |e| matches!(e, Effect::Ime(ImeEffect::SetOpen { .. })))
-                && !has_effect(&d2, |e| matches!(e, Effect::Ime(ImeEffect::SetOpen { .. }))),
-            "auto ime_off list must not bypass the bare-thumb guard, d1={:?} d2={:?}",
-            effects_of(&d1),
-            effects_of(&d2)
-        );
-    }
-
-    /// 上記の`ime_toggle_auto`版。
+    /// 効いていることを固定する。
     #[test]
     fn bare_thumb_ime_toggle_auto_combo_is_suppressed_while_engine_active() {
         let combo = ParsedKeyCombo {
@@ -6263,28 +7441,6 @@ mod engine_integration_tests {
             effects_of(&d1),
             effects_of(&d2)
         );
-    }
-
-    /// 手動設定（`keys.ime_off`）が空でも、自動検出リスト（`ime_off_auto`）が
-    /// 効く（`ime_off_auto_still_fires_when_manual_ime_off_non_empty` が
-    /// 非空側を担当する）。
-    #[test]
-    fn ime_off_auto_fires_when_manual_ime_off_empty() {
-        let combo = ParsedKeyCombo {
-            ctrl: false,
-            shift: false,
-            alt: false,
-            vk: VK_F21,
-        };
-        let mut engine = make_engine_with_special(empty_special_keys());
-        engine.set_ime_off_auto_keys(vec![combo]);
-
-        let d = engine.on_input(Ev::down(VK_F21).at(100).build(), &ime_on_ctx());
-        assert!(d.is_consumed());
-        assert!(has_effect(&d, |e| matches!(
-            e,
-            Effect::Ime(ImeEffect::SetOpen { open: false, .. })
-        )));
     }
 
     /// 手動設定（`keys.ime_toggle`）が空でも、自動検出リスト
@@ -6310,34 +7466,10 @@ mod engine_integration_tests {
         )));
     }
 
-    /// BUG-14 同種のリスク対策（Opus コードレビュー指摘）: `ime_on_auto`/
-    /// `ime_off_auto`は`event.injected`な合成イベントにマッチしない。
-    /// 手動設定の `ime_on`/`ime_off` と異なり、自動検出リストはユーザーが
-    /// 存在を意識せず追加されるため、注入イベントへの露出を正当化する
-    /// 根拠が無い。
-    #[test]
-    fn ime_on_auto_ignores_injected_event() {
-        let combo = ParsedKeyCombo {
-            ctrl: false,
-            shift: false,
-            alt: false,
-            vk: VK_F21,
-        };
-        let mut engine = make_engine_with_special(empty_special_keys());
-        engine.set_ime_on_auto_keys(vec![combo]);
-
-        let d = engine.on_input(
-            Ev::down(VK_F21).at(100).injected(true).build(),
-            &ime_on_ctx(),
-        );
-        assert!(
-            !has_effect(&d, |e| matches!(e, Effect::Ime(_))),
-            "injected event must not trigger ime_on_auto, got {:?}",
-            effects_of(&d)
-        );
-    }
-
-    /// 上記の `ime_toggle_auto` 版。
+    /// BUG-14 同種のリスク対策（Opus コードレビュー指摘）: `ime_toggle_auto`
+    /// は`event.injected`な合成イベントにマッチしない。手動設定の
+    /// `ime_toggle` と異なり、自動検出リストはユーザーが存在を意識せず
+    /// 追加されるため、注入イベントへの露出を正当化する根拠が無い。
     #[test]
     fn ime_toggle_auto_ignores_injected_event() {
         let combo = ParsedKeyCombo {
@@ -6360,74 +7492,9 @@ mod engine_integration_tests {
         );
     }
 
-    /// 2026-08-16 ユーザー判断: `keys.ime_on` が非空でも `ime_on_auto`
-    /// （GJI config1.db 宣言等）は追加のキーとして併用され続ける（旧・決定C
-    /// R1「明示>自動」の排他仕様から「明示 ∪ 自動」の union へ変更。既定で
-    /// `ime_on`/`ime_off` が非空（`Ctrl+変換`/`Ctrl+無変換`）なため、旧仕様
-    /// のままだと自動検出が既定設定のユーザーには永久に効かなかった）。
-    /// 手動リストと自動リストに**別のキー**を割り当て、自動側キーの押下でも
-    /// 期待通り `ImeOn` が発火する（consume され `SetOpen{open:true}` が
-    /// 出る）ことを確認する。
-    #[test]
-    fn ime_on_auto_still_fires_when_manual_ime_on_non_empty() {
-        let manual_combo = ParsedKeyCombo {
-            ctrl: true,
-            shift: false,
-            alt: false,
-            vk: VK_SPACE,
-        };
-        let auto_combo = ParsedKeyCombo {
-            ctrl: false,
-            shift: false,
-            alt: false,
-            vk: VK_F21,
-        };
-        let special = SpecialKeyCombos {
-            ime_on: vec![manual_combo],
-            ..empty_special_keys()
-        };
-        let mut engine = make_engine_with_special(special);
-        engine.set_ime_on_auto_keys(vec![auto_combo]);
-
-        let d = engine.on_input(Ev::down(VK_F21).at(100).build(), &ime_off_ctx());
-        assert!(d.is_consumed());
-        assert!(has_effect(&d, |e| matches!(
-            e,
-            Effect::Ime(ImeEffect::SetOpen { open: true, .. })
-        )));
-    }
-
-    /// `ime_on_auto_still_fires_when_manual_ime_on_non_empty` の `ime_off` 版。
-    #[test]
-    fn ime_off_auto_still_fires_when_manual_ime_off_non_empty() {
-        let manual_combo = ParsedKeyCombo {
-            ctrl: true,
-            shift: false,
-            alt: false,
-            vk: VK_SPACE,
-        };
-        let auto_combo = ParsedKeyCombo {
-            ctrl: false,
-            shift: false,
-            alt: false,
-            vk: VK_F21,
-        };
-        let special = SpecialKeyCombos {
-            ime_off: vec![manual_combo],
-            ..empty_special_keys()
-        };
-        let mut engine = make_engine_with_special(special);
-        engine.set_ime_off_auto_keys(vec![auto_combo]);
-
-        let d = engine.on_input(Ev::down(VK_F21).at(100).build(), &ime_on_ctx());
-        assert!(d.is_consumed());
-        assert!(has_effect(&d, |e| matches!(
-            e,
-            Effect::Ime(ImeEffect::SetOpen { open: false, .. })
-        )));
-    }
-
-    /// `ime_on_auto_still_fires_when_manual_ime_on_non_empty` の `ime_toggle` 版。
+    /// 2026-08-16 ユーザー判断: `keys.ime_toggle` が非空でも `ime_toggle_auto`
+    /// （MS-IMEレジストリ宣言等）は追加のキーとして併用され続ける（旧・決定C
+    /// R1「明示>自動」の排他仕様から「明示 ∪ 自動」の union へ変更）。
     #[test]
     fn ime_toggle_auto_still_fires_when_manual_ime_toggle_non_empty() {
         let manual_combo = ParsedKeyCombo {
@@ -6517,24 +7584,30 @@ mod engine_integration_tests {
         assert!(!has_effect(&d, |e| matches!(e, Effect::Ime(_))));
     }
 
-    // ── ADR-092 決定D Step4b: 無変換/変換単独タップの IME open 軸への肩代わり ──
-    //
-    // 重要な前提（テスト設計時に判明）: `Engine::compute_active` は
-    // `ctx.ime_on` を判定条件に含むため（判定順: user_enabled → is_japanese_ime →
-    // ime_on → is_romaji）、`ime_on=false` の間は Phase 2 で無条件
-    // `Decision::pass_through()` を返し Phase 3（NicolaFsm、
-    // `resolve_pending_thumb_as_single` を含む）に到達しない。つまり
-    // `DelegateToOpenAxis` は **IME が既に ON の状態からの操作**でしか
-    // 発火し得ない（`TurnOff`/`Toggle(ime_on=true→false)` は届くが、
-    // `TurnOn`（IME OFF から ON へ）は届かない）。これは実装のバグではなく
-    // ADR-092 背景節が明記する既存の構造的な穴（Step3 の対象、本ADRでは
-    // 意図的に対象外）——engine が非活性（＝IME OFF）の間は awase がそもそも
-    // 無変換/変換の生 VK を横取りしないため、MS-IME/GJI 自身のネイティブな
-    // キー割当て処理（`KeyAssignmentHenkan=1` 等）にそのまま委ねられる形に
-    // なる。以下のテストは全て `ime_on_ctx()`（engine active）を前提にする。
+    /// `muhenkan_vk` を設定し、単独タップ設定を「常に送出する（パススルー）」
+    /// にした `Engine` を返す（`always_suppress=false`,
+    /// `ignore_composing_guard=true` — 設定画面の`SoloTapSuppressMode::
+    /// PassThrough`が生成する値と同一）。
+    fn make_test_engine_with_muhenkan_passthrough() -> Engine {
+        let mut engine = make_test_engine();
+        engine.set_thumb_key_solo_tap_config(
+            Some(VK_NONCONVERT),
+            ModeKeyConfig::from_legacy_bools(true, false),
+            None,
+            ModeKeyConfig::from_legacy_bools(false, true),
+        );
+        engine
+    }
 
-    /// `muhenkan_vk` を設定した `Engine` を返す（`delegate_to_open_axis` テスト用）。
-    fn make_test_engine_with_muhenkan() -> Engine {
+    // ── M2 回帰防止（`discard_ime_open_request`）: 明示config `muhenkan_solo_tap_ime_action`
+    //    （優先順位2、ADR-191で残した唯一の open 軸 actuation 供給元）が立てた
+    //    `ime_open_requested` が、ToggleEngine/SwapLayout の内部 flush 経由で後続キーへ漏れない ──
+    //    撤去コミット 983a6bdf の本文が「後続で書き直す」と宣言していたテスト（レビュー指摘C-M1）。
+    //    旧テストは撤去済みの `set_muhenkan_delegate_to_open_axis` を使っていたので、
+    //    残った setter `set_muhenkan_solo_tap_ime_action` に置き換えた。
+
+    /// `muhenkan_vk` を設定し、無変換の単独タップに明示config `TurnOff` を持たせた `Engine`。
+    fn make_test_engine_with_muhenkan_solo_tap_turn_off() -> Engine {
         let mut engine = make_test_engine();
         engine.set_thumb_key_solo_tap_config(
             Some(VK_NONCONVERT),
@@ -6542,220 +7615,351 @@ mod engine_integration_tests {
             None,
             ModeKeyConfig::from_legacy_bools(false, true),
         );
+        engine.set_thumb_forced_open_actions(Some(ShadowImeAction::TurnOff), None);
         engine
     }
 
-    /// `henkan_vk` を設定した `Engine` を返す（`delegate_to_open_axis` テスト用、
-    /// `make_test_engine_with_muhenkan` の対称版。Opus コードレビュー指摘:
-    /// 既存の `delegate_to_open_axis_*` 系テストは全て無変換のみで、変換側の
-    /// `resolve_pending_thumb_as_single` の分岐が未検証だった）。
-    fn make_test_engine_with_henkan() -> Engine {
+    /// ADR-192 決定3bの bare `keys.ime_off` 相当を持つEngine。
+    fn make_test_engine_with_muhenkan_forced_turn_off() -> Engine {
         let mut engine = make_test_engine();
         engine.set_thumb_key_solo_tap_config(
+            Some(VK_NONCONVERT),
+            ModeKeyConfig::from_legacy_bools(false, true),
             None,
             ModeKeyConfig::from_legacy_bools(false, true),
-            Some(VK_CONVERT),
-            ModeKeyConfig::from_legacy_bools(false, true),
         );
+        engine.set_thumb_forced_open_actions(Some(ShadowImeAction::TurnOff), None);
         engine
     }
 
-    /// 無変換単独タップが**確定**（timeout）した時点で `DelegateToOpenAxis` が
-    /// 発火し、`Effect::Ime(SetOpen)` が生成され、かつ生 VK_NONCONVERT は
-    /// 送出されない。
+    /// ADR-199 決定16: config 由来と合成される側の入力（`bare_ime_action`）。方向固定を toggle より優先し、
+    /// on を off より先に評価し、修飾付きのコンボは含めない。
     #[test]
-    fn delegate_to_open_axis_fires_on_confirmed_muhenkan_solo_tap() {
-        let mut engine = make_test_engine_with_muhenkan();
-        engine.set_muhenkan_delegate_to_open_axis(Some(ShadowImeAction::TurnOff));
-
-        let d = engine.on_input(Ev::down(VK_NONCONVERT).at(100).build(), &ime_on_ctx());
-        assert!(
-            d.is_consumed(),
-            "solo tap should be pending, not passthrough"
+    fn bare_ime_action_prefers_direction_and_ignores_modified_combos() {
+        let combo = |vk, ctrl| ParsedKeyCombo {
+            ctrl,
+            shift: false,
+            alt: false,
+            vk,
+        };
+        let special = SpecialKeyCombos {
+            engine_on: vec![combo(VK_CONVERT, false)],
+            engine_off: vec![],
+            ime_on: vec![combo(VK_NONCONVERT, false)],
+            ime_off: vec![combo(VK_NONCONVERT, false), combo(VK_CONVERT, true)],
+            ime_toggle: vec![combo(VK_NONCONVERT, false), combo(VK_CONVERT, false)],
+        };
+        assert_eq!(
+            special.bare_ime_action(VK_NONCONVERT),
+            Some(ShadowImeAction::TurnOn)
         );
-        assert!(
-            !has_effect(&d, |e| matches!(e, Effect::Ime(_))),
-            "IME effect must not fire before solo tap is confirmed"
+        // 変換は Ctrl 付きの ime_off しか無いので、無修飾の toggle が残る。engine_on は IME 制御でない。
+        assert_eq!(
+            special.bare_ime_action(VK_CONVERT),
+            Some(ShadowImeAction::Toggle)
         );
+        assert_eq!(special.bare_ime_action(VkCode(0x20)), None);
+    }
 
-        let d = engine.on_timeout(TIMER_PENDING, &ime_on_ctx());
-        assert!(has_effect(&d, |e| matches!(
+    /// ADR-199 決定16: Platform 層は押した側だけを更新する（もう一方の押下中の値を巻き込まない）ため、現在値を読める。
+    #[test]
+    fn thumb_forced_open_actions_getter_reflects_setter_per_side() {
+        let mut engine = make_test_engine();
+        assert_eq!(engine.thumb_forced_open_actions(), (None, None));
+        engine.set_thumb_forced_open_actions(Some(ShadowImeAction::Toggle), None);
+        let (muhenkan, henkan) = engine.thumb_forced_open_actions();
+        engine.set_thumb_forced_open_actions(muhenkan, Some(ShadowImeAction::TurnOn));
+        assert_eq!(
+            engine.thumb_forced_open_actions(),
+            (Some(ShadowImeAction::Toggle), Some(ShadowImeAction::TurnOn)),
+            "変換側だけを更新しても無変換側の値は残る（henkan={henkan:?} を上書きしただけ）"
+        );
+    }
+
+    /// ADR-199 決定16: 役割由来の操作は打鍵ごとに設定し直される。役割が消えたら（IME 切替・設定変更）、
+    /// 次の打鍵からは単独タップで IME を動かさず従来どおり受動に戻る（古い役割が残らない）。
+    #[test]
+    fn role_derived_thumb_action_is_replaced_per_keystroke_and_can_vanish() {
+        let mut engine = make_test_engine_with_muhenkan_forced_turn_off();
+        // 役割（Toggle）が付いた打鍵 → 単独タップで belief を反転（IME ON→OFF）。
+        engine.set_thumb_forced_open_actions(Some(ShadowImeAction::Toggle), None);
+        let _ = engine.on_input(Ev::down(VK_NONCONVERT).at(100).build(), &ime_on_ctx());
+        let up = engine.on_input(Ev::up(VK_NONCONVERT).at(200).build(), &ime_on_ctx());
+        assert!(has_effect(&up, |e| matches!(
             e,
             Effect::Ime(ImeEffect::SetOpen { open: false, .. })
         )));
+        // 次の打鍵で役割が無くなった（None, None）→ 単独タップは IME を動かさない。
+        engine.set_thumb_forced_open_actions(None, None);
+        let _ = engine.on_input(Ev::down(VK_NONCONVERT).at(400).build(), &ime_on_ctx());
+        let up = engine.on_input(Ev::up(VK_NONCONVERT).at(500).build(), &ime_on_ctx());
         assert!(
-            !has_effect(&d, |e| matches!(
-                e,
-                Effect::Input(InputEffect::SendKeys(actions))
-                    if actions.iter().any(|a| matches!(a, KeyAction::Key(x) if *x == VK_NONCONVERT))
-            )),
-            "raw VK_NONCONVERT must not be sent when delegated to open axis, got {:?}",
-            effects_of(&d)
+            !has_effect(&up, |e| matches!(e, Effect::Ime(_))),
+            "役割が消えた打鍵では単独タップで IME を動かさない"
         );
     }
 
-    /// T-10: engine 活性中でも composing=true なら `DelegateToOpenAxis` は発火せず、
-    /// `ModeKeyConfig.composing`（既定 Suppress）へ落ちる。MS-IME の
-    /// `KeyAssignmentMuhenkan=1` 相当で、変換中の無変換単独タップが
-    /// `SetOpen(false)` に化けて composition を破棄しないことを固定する。
     #[test]
-    fn delegate_to_open_axis_suppressed_while_composing() {
-        let mut engine = make_test_engine_with_muhenkan();
-        engine.set_muhenkan_delegate_to_open_axis(Some(ShadowImeAction::TurnOff));
+    fn forced_thumb_open_action_fires_on_key_up_and_consumes_both_events() {
+        let mut engine = make_test_engine_with_muhenkan_forced_turn_off();
+        let down = engine.on_input(Ev::down(VK_NONCONVERT).at(100).build(), &ime_on_ctx());
+        assert!(down.is_consumed(), "physical KeyDown must not reach the OS");
+        assert!(!has_effect(&down, |e| matches!(e, Effect::Ime(_))));
 
-        let d = engine.on_input(
-            Ev::down(VK_NONCONVERT).at(100).build(),
-            &ime_on_composing_ctx(),
-        );
-        assert!(
-            d.is_consumed(),
-            "solo tap should be pending, not passthrough"
-        );
-        assert!(
-            !has_effect(&d, |e| matches!(e, Effect::Ime(_))),
-            "IME effect must not fire before solo tap is confirmed"
-        );
-
-        let d = engine.on_timeout(TIMER_PENDING, &ime_on_composing_ctx());
-        assert!(
-            !has_effect(&d, |e| matches!(e, Effect::Ime(_))),
-            "composing=true must not request IME open-axis action, got {:?}",
-            effects_of(&d)
-        );
-        assert!(
-            !has_effect(&d, |e| matches!(
-                e,
-                Effect::Input(InputEffect::SendKeys(actions))
-                    if actions.iter().any(|a| matches!(a, KeyAction::Key(x) if *x == VK_NONCONVERT))
-            )),
-            "ModeKeyConfig.composing default Suppress must not send raw VK_NONCONVERT, got {:?}",
-            effects_of(&d)
-        );
+        let up = engine.on_input(Ev::up(VK_NONCONVERT).at(200).build(), &ime_on_ctx());
+        assert!(up.is_consumed(), "physical KeyUp must not reach the OS");
+        assert!(has_effect(&up, |e| matches!(
+            e,
+            Effect::Ime(ImeEffect::SetOpen { open: false, .. })
+        )));
     }
 
-    /// **chord のタイミングウィンドウ内の誤確定では発火しない**（ADR-092
-    /// リスク節が明記する回帰テスト要件）。無変換キーの直後、閾値内に文字キーが
-    /// 来た場合は同時打鍵として確定し、`DelegateToOpenAxis`（単独タップ確定
-    /// 専用の経路）は一切発火しない。
     #[test]
-    fn delegate_to_open_axis_does_not_fire_during_chord_timing_window() {
-        let mut engine = make_test_engine_with_muhenkan();
-        engine.set_muhenkan_delegate_to_open_axis(Some(ShadowImeAction::TurnOff));
-
-        let d1 = engine.on_input(Ev::down(VK_NONCONVERT).at(0).build(), &ime_on_ctx());
-        assert!(d1.is_consumed());
-        // 同時打鍵の閾値内（make_test_engine の threshold_ms=100）に文字キーが来る
-        // → 同時打鍵として確定し、単独タップの delegate_to_open_axis 経路には
-        // 一切到達しない。
-        let d2 = engine.on_input(Ev::down(VK_A).at(50).build(), &ime_on_ctx());
-        assert!(
-            !has_effect(&d1, |e| matches!(e, Effect::Ime(_)))
-                && !has_effect(&d2, |e| matches!(e, Effect::Ime(_))),
-            "chord confirmation must not trigger IME open axis delegation, d1={:?} d2={:?}",
-            effects_of(&d1),
-            effects_of(&d2)
-        );
-    }
-
-    /// `ShadowImeAction::Toggle` は確定時点の `ctx.ime_on`（belief）を見て
-    /// 反転方向を決める。
-    #[test]
-    fn delegate_to_open_axis_toggle_resolves_via_ctx_ime_on() {
-        let mut engine = make_test_engine_with_muhenkan();
-        engine.set_muhenkan_delegate_to_open_axis(Some(ShadowImeAction::Toggle));
-
+    fn forced_thumb_toggle_resolves_current_belief_on_key_up() {
+        let mut engine = make_test_engine_with_muhenkan_forced_turn_off();
+        engine.set_thumb_forced_open_actions(Some(ShadowImeAction::Toggle), None);
         let _ = engine.on_input(Ev::down(VK_NONCONVERT).at(100).build(), &ime_on_ctx());
-        let d = engine.on_timeout(TIMER_PENDING, &ime_on_ctx());
+        let up = engine.on_input(Ev::up(VK_NONCONVERT).at(200).build(), &ime_on_ctx());
+        assert!(has_effect(&up, |e| matches!(
+            e,
+            Effect::Ime(ImeEffect::SetOpen { open: false, .. })
+        )));
+    }
+
+    /// ADR-199 T10（所有者決定A）: 文字→親指の順で重なりが足りず `PendingCharThumb` がタイムアウトしても、
+    /// forced の開閉は親指を押している間は発火せず、親指の KeyUp で初めて発火する。文字は単独確定される。
+    #[test]
+    fn forced_thumb_open_action_after_char_thumb_timeout_waits_for_thumb_key_up() {
+        let mut engine = make_test_engine_with_muhenkan_forced_turn_off();
+        engine.set_min_overlap_margin_percent_for_test(15);
+        let _ = engine.on_input(Ev::down(VK_S).at(0).build(), &ime_on_ctx());
+        let _ = engine.on_input(Ev::down(VK_NONCONVERT).at(30_000).build(), &ime_on_ctx());
+        let _ = engine.on_input(Ev::up(VK_S).at(32_000).build(), &ime_on_ctx());
+
+        let timeout = engine.on_timeout(TIMER_PENDING, &ime_on_ctx());
+        assert!(
+            !has_effect(&timeout, |e| matches!(e, Effect::Ime(_))),
+            "親指を押したままのタイムアウトで IME を動かさない"
+        );
+
+        let up = engine.on_input(Ev::up(VK_NONCONVERT).at(400_000).build(), &ime_on_ctx());
+        assert!(has_effect(&up, |e| matches!(
+            e,
+            Effect::Ime(ImeEffect::SetOpen { open: false, .. })
+        )));
+    }
+
+    #[test]
+    fn forced_thumb_open_action_waits_past_timeout_for_key_up() {
+        let mut engine = make_test_engine_with_muhenkan_forced_turn_off();
+        let _ = engine.on_input(Ev::down(VK_NONCONVERT).at(100).build(), &ime_on_ctx());
+        let timeout = engine.on_timeout(TIMER_PENDING, &ime_on_ctx());
+        assert!(timeout.is_consumed());
+        assert!(
+            !has_effect(&timeout, |e| matches!(e, Effect::Ime(_))),
+            "100ms timeout must not actuate the forced action"
+        );
+
+        let up = engine.on_input(Ev::up(VK_NONCONVERT).at(250).build(), &ime_on_ctx());
+        assert!(has_effect(&up, |e| matches!(
+            e,
+            Effect::Ime(ImeEffect::SetOpen { open: false, .. })
+        )));
+    }
+
+    #[test]
+    fn forced_thumb_open_action_does_not_fire_for_chord() {
+        let mut engine = make_test_engine_with_muhenkan_forced_turn_off();
+        let d1 = engine.on_input(Ev::down(VK_NONCONVERT).at(100).build(), &ime_on_ctx());
+        let d2 = engine.on_input(Ev::down(VK_A).at(120).build(), &ime_on_ctx());
+        let d3 = engine.on_input(Ev::up(VK_NONCONVERT).at(180).build(), &ime_on_ctx());
+        assert!(d1.is_consumed() && d2.is_consumed() && d3.is_consumed());
+        assert!(
+            [&d1, &d2, &d3]
+                .into_iter()
+                .all(|d| !has_effect(d, |e| matches!(e, Effect::Ime(_)))),
+            "a completed chord must not actuate the solo forced action"
+        );
+    }
+
+    #[test]
+    fn forced_thumb_open_action_fires_while_composing() {
+        let mut engine = make_test_engine_with_muhenkan_forced_turn_off();
+        let composing_ctx = InputContext {
+            composing: true,
+            ..ime_on_ctx()
+        };
+        let _ = engine.on_input(Ev::down(VK_NONCONVERT).at(100).build(), &composing_ctx);
+        let up = engine.on_input(Ev::up(VK_NONCONVERT).at(200).build(), &composing_ctx);
+        assert!(has_effect(&up, |e| matches!(
+            e,
+            Effect::Ime(ImeEffect::SetOpen { open: false, .. })
+        )));
+    }
+
+    /// 対照: 上の設定で無変換が単独タップ確定すると `SetOpen(false)` が出る（＝以下の
+    /// 「漏れない」テストが、そもそも ime_open_requested が立つ設定で走っていることの裏付け）。
+    #[test]
+    fn forced_open_action_fires_set_open_on_confirmed_solo_tap() {
+        let mut engine = make_test_engine_with_muhenkan_solo_tap_turn_off();
+        let _ = engine.on_input(Ev::down(VK_NONCONVERT).at(100).build(), &ime_on_ctx());
+        let d = engine.on_input(Ev::up(VK_NONCONVERT).at(200).build(), &ime_on_ctx());
         assert!(
             has_effect(&d, |e| matches!(
                 e,
                 Effect::Ime(ImeEffect::SetOpen { open: false, .. })
             )),
-            "Toggle while ime_on=true must resolve to SetOpen(false), got {:?}",
+            "confirmed solo tap with forced_open_action=TurnOff must emit SetOpen(false), got {:?}",
             effects_of(&d)
         );
     }
 
-    /// 専用Fnキー（`muhenkan_solo_tap_dedicated_fn_key`）は `delegate_to_open_axis`
-    /// より優先される。
+    /// ADR-186 残る問題2（レビュー round2 C-N1）: Shift を押したままの無変換/変換は、GJI(ATOK)では
+    /// 「かな⇔半角英数」のトグルで開閉トグルではない（実機で確認）。明示config forced_open_action
+    /// を持つユーザーでも、Shift 押下中は単独タップとして扱わず（→`SetOpen`を発火させず）素通しにする。
+    /// Shift なしなら従来どおり明示configが発火する（対照）。
     #[test]
-    fn dedicated_fn_key_takes_priority_over_delegate_to_open_axis() {
-        let mut engine = make_test_engine_with_muhenkan();
-        engine.set_muhenkan_solo_tap_dedicated_fn_key(Some(VK_F21));
-        engine.set_muhenkan_delegate_to_open_axis(Some(ShadowImeAction::TurnOff));
-
-        let _ = engine.on_input(Ev::down(VK_NONCONVERT).at(100).build(), &ime_on_ctx());
-        let d = engine.on_timeout(TIMER_PENDING, &ime_on_ctx());
+    fn forced_open_action_not_fired_when_shift_held() {
+        let mut engine = make_test_engine_with_muhenkan_solo_tap_turn_off();
+        let shift_ctx = InputContext {
+            modifiers: ModifierState {
+                shift: true,
+                ..ime_on_ctx().modifiers
+            },
+            ..ime_on_ctx()
+        };
+        let d = engine.on_input(Ev::down(VK_NONCONVERT).at(100).build(), &shift_ctx);
+        assert!(
+            !d.is_consumed(),
+            "Shift+無変換は保留に入れず素通しにするべき, got {:?}",
+            effects_of(&d)
+        );
+        let d = engine.on_input(Ev::up(VK_NONCONVERT).at(300).build(), &shift_ctx);
         assert!(
             !has_effect(&d, |e| matches!(e, Effect::Ime(_))),
-            "dedicated_fn_key must take priority, no IME effect expected, got {:?}",
+            "Shift+無変換のKeyUpで明示configのSetOpenを発火してはならない, got {:?}",
             effects_of(&d)
         );
-        assert!(has_effect(&d, |e| matches!(
-            e,
-            Effect::Input(InputEffect::SendKeys(actions))
-                if actions.iter().any(|a| matches!(a, KeyAction::Key(x) if *x == VK_F21))
-        )));
     }
 
-    /// M1 回帰防止（Opus コードレビュー指摘、実機テストプローブで実証済み）:
-    /// `apply_ime_open_request` が `ime_set_open_effects`（`prev_activation`を
-    /// 推進する）を経由せず直接 `push_effect` していたため、確定した単独タップ
-    /// による `SetOpen(false)` の**次の**打鍵で `ActivationSync` 起点の重複
-    /// `SetOpen` + 不要な `EngineStateChanged{send_ime_key:true}` が再発火して
-    /// いた。`ime_off_combo_does_not_double_emit_set_open_on_next_input`
-    /// と同型のテスト。
+    /// ユーザー指摘2026-09-22「パススルー設定ならパススルーされるべき」: `*_solo_tap_ime_action`
+    /// を設定せず `ModeKeyConfig::Passthrough` だけを設定したユーザーでも、Shift+無変換は
+    /// `PendingThumb` へ入れず即座に素通しにする（`is_mode_key_thumb_shift_passthrough` の拡張）。
+    /// 拡張前は`explicit_ime_action`だけを見ていたため、この構成には効かず、Shift+無変換が
+    /// チョード保留に入ってしまっていた。
     #[test]
-    fn delegate_to_open_axis_confirmed_tap_does_not_double_emit_set_open_on_next_input() {
-        let mut engine = make_test_engine_with_muhenkan();
-        engine.set_muhenkan_delegate_to_open_axis(Some(ShadowImeAction::TurnOff));
-
-        let _ = engine.on_input(Ev::down(VK_NONCONVERT).at(100).build(), &ime_on_ctx());
-        let d1 = engine.on_timeout(TIMER_PENDING, &ime_on_ctx());
-        assert_eq!(
-            count_set_open_effects(&d1),
-            1,
-            "confirmed solo tap should emit exactly 1 SetOpen, got {:?}",
-            effects_of(&d1)
-        );
-
-        // Platform 層は SetOpen(false) を見て preconditions.ime_on=false を反映する。
-        // 次の on_input は新しい ctx (ime_on=false) で呼ばれる。
-        let d2 = engine.on_input(Ev::up(VK_NONCONVERT).at(110).build(), &ime_off_ctx());
-        assert_eq!(
-            count_set_open_effects(&d2),
-            0,
-            "next on_input must NOT re-emit SetOpen (prev_activation should have been \
-             advanced by ime_set_open_effects), got {:?}",
-            effects_of(&d2)
+    fn shift_muhenkan_with_mode_key_config_passthrough_is_not_captured_as_thumb() {
+        let mut engine = make_test_engine_with_muhenkan_passthrough();
+        let shift_ctx = InputContext {
+            modifiers: ModifierState {
+                shift: true,
+                ..ime_on_ctx().modifiers
+            },
+            ..ime_on_ctx()
+        };
+        let d = engine.on_input(Ev::down(VK_NONCONVERT).at(100).build(), &shift_ctx);
+        assert!(
+            !d.is_consumed(),
+            "ModeKeyConfig::PassthroughのShift+無変換は保留に入れず素通しにするべき, got {:?}",
+            effects_of(&d)
         );
     }
 
-    /// M2 回帰防止（Opus コードレビュー指摘、実機テストプローブで実証済み）:
+    /// レビュー2026-09-23 C-1: bare `keys.ime_*`（`forced_open_action`）を設定した
+    /// 無変換でも、Shift+無変換は保留に入れず素通しにする（強制操作を発火させない）。
+    #[test]
+    fn shift_muhenkan_with_forced_open_action_is_passed_through_without_ime_effect() {
+        let mut engine = make_test_engine_with_muhenkan_forced_turn_off();
+        engine.set_thumb_forced_open_actions(Some(ShadowImeAction::Toggle), None);
+        let shift_ctx = InputContext {
+            modifiers: ModifierState {
+                shift: true,
+                ..ime_on_ctx().modifiers
+            },
+            ..ime_on_ctx()
+        };
+        let down = engine.on_input(Ev::down(VK_NONCONVERT).at(100).build(), &shift_ctx);
+        let up = engine.on_input(Ev::up(VK_NONCONVERT).at(200).build(), &shift_ctx);
+        assert!(!down.is_consumed(), "Shift+無変換の押下はOSへ届けるべき");
+        assert!(!up.is_consumed(), "Shift+無変換の解放はOSへ届けるべき");
+        assert!(
+            [&down, &up]
+                .into_iter()
+                .all(|d| !has_effect(d, |e| matches!(e, Effect::Ime(_)))),
+            "Shift併用では強制IME操作を発火しない"
+        );
+    }
+
+    /// C-1追補: 無変換を先に押し（保留に入る）、その後Shiftが押された状態で離しても
+    /// 強制IME操作を発火しない。
+    #[test]
+    fn forced_open_action_does_not_fire_when_shift_pressed_after_key_down() {
+        let mut engine = make_test_engine_with_muhenkan_forced_turn_off();
+        engine.set_thumb_forced_open_actions(Some(ShadowImeAction::Toggle), None);
+        let shift_ctx = InputContext {
+            modifiers: ModifierState {
+                shift: true,
+                ..ime_on_ctx().modifiers
+            },
+            ..ime_on_ctx()
+        };
+        let _ = engine.on_input(Ev::down(VK_NONCONVERT).at(100).build(), &ime_on_ctx());
+        let _ = engine.on_input(Ev::down(VK_LSHIFT).at(150).build(), &shift_ctx);
+        let up = engine.on_input(Ev::up(VK_NONCONVERT).at(200).build(), &shift_ctx);
+        assert!(
+            !has_effect(&up, |e| matches!(e, Effect::Ime(_))),
+            "Shift押下中の解放では強制IME操作を発火しない"
+        );
+    }
+
+    /// 対照: `ModeKeyConfig::Suppress`（既定）のキーは、Shift併用でも従来どおり
+    /// `PendingThumb` に入る（即座の素通しは Passthrough 設定のときだけ）。Suppress は
+    /// 最終的に何も送らない設定なので、チョードに巻き込まれても実害は無いが、
+    /// このガードの適用範囲を Passthrough のときだけに限定していることの固定。
+    #[test]
+    fn shift_muhenkan_with_mode_key_config_suppress_is_still_captured_as_thumb() {
+        let mut engine = make_test_engine();
+        engine.set_thumb_key_solo_tap_config(
+            Some(VK_NONCONVERT),
+            ModeKeyConfig::from_legacy_bools(false, true),
+            None,
+            ModeKeyConfig::from_legacy_bools(false, true),
+        );
+        let shift_ctx = InputContext {
+            modifiers: ModifierState {
+                shift: true,
+                ..ime_on_ctx().modifiers
+            },
+            ..ime_on_ctx()
+        };
+        let d = engine.on_input(Ev::down(VK_NONCONVERT).at(100).build(), &shift_ctx);
+        assert!(
+            d.is_consumed(),
+            "ModeKeyConfig::SuppressのShift+無変換は従来どおりPendingThumbへ入るべき, got {:?}",
+            effects_of(&d)
+        );
+    }
+
     /// 無変換が物理的に押下中（`PendingThumb`、まだ単独タップ確定前）に
-    /// `EngineCommand::ToggleEngine` が届くと、`toggle_enabled()` 内部の
-    /// flush が `ComposingHint::Trusted` で保留キーを強制的に単独タップ
-    /// 確定させ、`ime_open_requested` をセットしうる。この「確定」は
-    /// ユーザーが実際に無変換をタップしたのではなくトレイ操作等の無関係な
-    /// 外部イベントによる強制解決であり、`apply_ime_open_request` を素通り
-    /// させると（当時のバグ）無関係な次の打鍵でスプリアスな `SetOpen` が
-    /// 発火していた。`discard_ime_open_request` で捨てることを固定する。
+    /// `EngineCommand::ToggleEngine` が届くと、`toggle_enabled()` 内部の flush が
+    /// `ThumbRawVkEmission::Allowed` で保留キーを強制的に単独タップ確定させ、
+    /// `ime_open_requested` をセットしうる。この「確定」はユーザーが実際に無変換をタップした
+    /// のではなくトレイ操作等の無関係な外部イベントによる強制解決であり、素通りさせると
+    /// 無関係な次の打鍵でスプリアスな `SetOpen` が発火する。`discard_ime_open_request`
+    /// （`engine.rs`）で捨てることを固定する。
     #[test]
     fn toggle_engine_discards_pending_ime_open_request_not_leak_to_later_key() {
-        let mut engine = make_test_engine_with_muhenkan();
-        engine.set_muhenkan_delegate_to_open_axis(Some(ShadowImeAction::TurnOff));
+        let mut engine = make_test_engine_with_muhenkan_solo_tap_turn_off();
 
         // 無変換を物理的に押下（まだ単独タップ確定前、PendingThumb）。
         let _ = engine.on_input(Ev::down(VK_NONCONVERT).at(100).build(), &ime_on_ctx());
 
-        // トレイ操作等で ToggleEngine が届く → 内部 flush で強制的に単独タップ
-        // 確定 → ime_open_requested がセットされうる。もう一度 ToggleEngine を
-        // 呼んで元の enabled 状態へ戻す（Idle 状態での2回目の flush は no-op）。
+        // トレイ操作等で ToggleEngine が届く → 内部 flush で強制的に単独タップ確定 →
+        // ime_open_requested がセットされうる。もう一度 ToggleEngine を呼んで元の enabled へ戻す。
         let _ = engine.on_command(EngineCommand::ToggleEngine, &ime_on_ctx());
         let _ = engine.on_command(EngineCommand::ToggleEngine, &ime_on_ctx());
 
-        // 無関係な後続キー入力に、捨てられたはずの ime_open_requested に由来する
-        // SetOpen が漏れ出さないこと。
+        // 無関係な後続キー入力に、捨てられたはずの ime_open_requested に由来する SetOpen が漏れないこと。
         let d = engine.on_input(Ev::down(VK_A).at(9000).build(), &ime_on_ctx());
         assert!(
             !has_effect(&d, |e| matches!(e, Effect::Ime(_))),
@@ -6768,8 +7972,7 @@ mod engine_integration_tests {
     /// M2 回帰防止（`SwapLayout` 版、上記 `ToggleEngine` 版と対称）。
     #[test]
     fn swap_layout_discards_pending_ime_open_request_not_leak_to_later_key() {
-        let mut engine = make_test_engine_with_muhenkan();
-        engine.set_muhenkan_delegate_to_open_axis(Some(ShadowImeAction::TurnOff));
+        let mut engine = make_test_engine_with_muhenkan_solo_tap_turn_off();
 
         let _ = engine.on_input(Ev::down(VK_NONCONVERT).at(100).build(), &ime_on_ctx());
 
@@ -6785,37 +7988,272 @@ mod engine_integration_tests {
         );
     }
 
-    /// `delegate_to_open_axis_fires_on_confirmed_muhenkan_solo_tap` の変換
-    /// （henkan）版。`resolve_pending_thumb_as_single`のhenkan分岐
-    /// （`dedicated_fn_key`は常に`None`、`ModeKeyConfig`のみ）を固定する
-    /// （テストカバレッジ欠落の指摘への対応）。
+    // ── ADR-182 決定1: 文字→親指の押下間隔が閾値を超えて`PendingChar`が単独確定された直後に
+    //    親指が`PendingThumb`になり、単独タップとして生の親指VKが出る不具合の回帰テスト ──
+
+    /// `decisions`のいずれかが、生の`VK_NONCONVERT`（`Key(VK_NONCONVERT)`）を`SendKeys`で
+    /// 送出しているか。
+    fn any_raw_nonconvert_sent(decisions: &[Decision]) -> bool {
+        decisions.iter().any(|d| {
+            has_effect(d, |e| {
+                matches!(
+                    e,
+                    Effect::Input(InputEffect::SendKeys(actions))
+                        if actions.iter().any(|a| matches!(a, KeyAction::Key(x) if *x == VK_NONCONVERT))
+                )
+            })
+        })
+    }
+
+    /// 文字先押し: `D↓(0) → 無変換↓(108ms、閾値100ms超) → D↑ → 無変換↑`。実機で失敗した
+    /// 打鍵（間隔80〜109ms、重なり0.8〜88ms）の再現。ADR-182以前は文字が単独確定された後、
+    /// 無変換が単独タップとして`Key(VK_NONCONVERT)`を送出していた（GJIが半角英数化する）。
     #[test]
-    fn delegate_to_open_axis_fires_on_confirmed_henkan_solo_tap() {
-        let mut engine = make_test_engine_with_henkan();
-        engine.set_henkan_delegate_to_open_axis(Some(ShadowImeAction::TurnOff));
-
-        let d = engine.on_input(Ev::down(VK_CONVERT).at(100).build(), &ime_on_ctx());
+    fn char_then_thumb_after_threshold_does_not_leak_raw_nonconvert() {
+        let mut engine = make_test_engine_with_muhenkan_passthrough();
+        let ctx = ime_on_ctx();
+        let ds = [
+            engine.on_input(Ev::down(VK_A).at(0).build(), &ctx),
+            engine.on_input(Ev::down(VK_NONCONVERT).at(108_000).build(), &ctx),
+            engine.on_input(Ev::up(VK_A).at(109_000).build(), &ctx),
+            engine.on_input(Ev::up(VK_NONCONVERT).at(116_000).build(), &ctx),
+        ];
         assert!(
-            d.is_consumed(),
-            "solo tap should be pending, not passthrough"
+            !any_raw_nonconvert_sent(&ds),
+            "文字先押しで閾値を超えたチョードの無変換は、生のVK_NONCONVERTとして送出してはならない: {:?}",
+            ds.iter().map(effects_of).collect::<Vec<_>>()
+        );
+    }
+
+    /// 対照: Idle起点の通常の単独タップ（文字が関与しない）は、従来どおり生の
+    /// `VK_NONCONVERT`を送出する（ADR-179のPassthrough実験の意図した動作）。
+    #[test]
+    fn idle_origin_solo_tap_still_sends_raw_nonconvert() {
+        let mut engine = make_test_engine_with_muhenkan_passthrough();
+        let ctx = ime_on_ctx();
+        let ds = [
+            engine.on_input(Ev::down(VK_NONCONVERT).at(0).build(), &ctx),
+            engine.on_input(Ev::up(VK_NONCONVERT).at(60_000).build(), &ctx),
+        ];
+        assert!(
+            any_raw_nonconvert_sent(&ds),
+            "Idle起点の無変換単独タップは生のVK_NONCONVERTを送出するはず: {:?}",
+            ds.iter().map(effects_of).collect::<Vec<_>>()
+        );
+    }
+
+    /// 対照: 閾値内（30ms）の文字先押しチョードは従来どおり成立し、生の無変換は出ない。
+    #[test]
+    fn char_then_thumb_within_threshold_is_chord_without_raw_nonconvert() {
+        let mut engine = make_test_engine_with_muhenkan_passthrough();
+        let ctx = ime_on_ctx();
+        let ds = [
+            engine.on_input(Ev::down(VK_A).at(0).build(), &ctx),
+            engine.on_input(Ev::down(VK_NONCONVERT).at(30_000).build(), &ctx),
+            engine.on_input(Ev::up(VK_A).at(80_000).build(), &ctx),
+            engine.on_input(Ev::up(VK_NONCONVERT).at(90_000).build(), &ctx),
+        ];
+        assert!(
+            !any_raw_nonconvert_sent(&ds),
+            "閾値内のチョードは生のVK_NONCONVERTを送出しない: {:?}",
+            ds.iter().map(effects_of).collect::<Vec<_>>()
+        );
+    }
+
+    /// フラグ寿命（決定1）: 失敗した文字先押しの直後に、Idle起点の通常の単独タップを行っても、
+    /// フラグが残って抑止されてはならない（立てっぱなしで以後の単独タップを殺さない）。
+    #[test]
+    fn after_char_flush_flag_does_not_leak_into_next_solo_tap() {
+        let mut engine = make_test_engine_with_muhenkan_passthrough();
+        let ctx = ime_on_ctx();
+        let _ = [
+            engine.on_input(Ev::down(VK_A).at(0).build(), &ctx),
+            engine.on_input(Ev::down(VK_NONCONVERT).at(108_000).build(), &ctx),
+            engine.on_input(Ev::up(VK_A).at(109_000).build(), &ctx),
+            engine.on_input(Ev::up(VK_NONCONVERT).at(116_000).build(), &ctx),
+        ];
+        let ds = [
+            engine.on_input(Ev::down(VK_NONCONVERT).at(1_000_000).build(), &ctx),
+            engine.on_input(Ev::up(VK_NONCONVERT).at(1_060_000).build(), &ctx),
+        ];
+        assert!(
+            any_raw_nonconvert_sent(&ds),
+            "直後のIdle起点の単独タップは従来どおり生のVK_NONCONVERTを送出するはず: {:?}",
+            ds.iter().map(effects_of).collect::<Vec<_>>()
+        );
+    }
+
+    /// ADR-182 決定1b（親指先押し）: `無変換↓(0) → A↓(108ms、閾値100ms超、Aには左親指面のかな`を`
+    /// がある)`。ADR-182以前は親指が単独タップとして`Key(VK_NONCONVERT)`を送出した後、文字が
+    /// 再ディスパッチされ`reduce_active_thumb`が親指面のかなを出して親指を消費していた
+    /// （同じ押下がsolo tapとshiftの両方に使われる二重使用）。生の無変換だけを抑止し、
+    /// 親指面のかな（`を`）は変わらない。
+    #[test]
+    fn thumb_then_char_after_threshold_keeps_thumb_face_kana_without_raw_nonconvert() {
+        let mut engine = make_test_engine_with_muhenkan_passthrough();
+        let ctx = ime_on_ctx();
+        // 親指が押下中であることをプラットフォームのスナップショットとして渡す
+        // （実機のhookは`InputContext.left_thumb_down`にこれを載せる）。
+        let held = InputContext {
+            left_thumb_down: Some(0),
+            ..ime_on_ctx()
+        };
+        let ds = [
+            engine.on_input(Ev::down(VK_NONCONVERT).at(0).build(), &ctx),
+            engine.on_input(Ev::down(VK_A).at(108_000).build(), &held),
+            engine.on_input(Ev::up(VK_A).at(180_000).build(), &held),
+            engine.on_input(Ev::up(VK_NONCONVERT).at(200_000).build(), &ctx),
+        ];
+        assert!(
+            !any_raw_nonconvert_sent(&ds),
+            "親指面のかなが出る打鍵で、生のVK_NONCONVERTを二重に送出してはならない: {:?}",
+            ds.iter().map(effects_of).collect::<Vec<_>>()
         );
         assert!(
-            !has_effect(&d, |e| matches!(e, Effect::Ime(_))),
-            "IME effect must not fire before solo tap is confirmed"
-        );
-
-        let d = engine.on_timeout(TIMER_PENDING, &ime_on_ctx());
-        assert!(has_effect(&d, |e| matches!(
-            e,
-            Effect::Ime(ImeEffect::SetOpen { open: false, .. })
-        )));
-        assert!(
-            !has_effect(&d, |e| matches!(
+            ds.iter().any(|d| has_effect(d, |e| matches!(
                 e,
                 Effect::Input(InputEffect::SendKeys(actions))
-                    if actions.iter().any(|a| matches!(a, KeyAction::Key(x) if *x == VK_CONVERT))
-            )),
-            "raw VK_CONVERT must not be sent when delegated to open axis, got {:?}",
+                    if actions.iter().any(|a| matches!(a, KeyAction::Char('を')))
+            ))),
+            "親指面のかな（を）は従来どおり出力される: {:?}",
+            ds.iter().map(effects_of).collect::<Vec<_>>()
+        );
+    }
+
+    /// 決定1bの対照: 到着文字に親指面のかなが無い（Dは`make_layout`のどの面にも無い）場合は
+    /// `reduce_active_thumb`に入らず親指がshiftとして使われないので、従来どおり生の
+    /// `Key(VK_NONCONVERT)`が出る（二重使用ではない）。
+    #[test]
+    fn thumb_then_char_without_thumb_face_after_threshold_still_sends_raw_nonconvert() {
+        let mut engine = make_test_engine_with_muhenkan_passthrough();
+        let ctx = ime_on_ctx();
+        let ds = [
+            engine.on_input(Ev::down(VK_NONCONVERT).at(0).build(), &ctx),
+            engine.on_input(Ev::down(VK_D).at(108_000).build(), &ctx),
+            engine.on_input(Ev::up(VK_D).at(180_000).build(), &ctx),
+            engine.on_input(Ev::up(VK_NONCONVERT).at(200_000).build(), &ctx),
+        ];
+        assert!(
+            any_raw_nonconvert_sent(&ds),
+            "親指面のかなが無い文字では従来どおり生のVK_NONCONVERTが出る: {:?}",
+            ds.iter().map(effects_of).collect::<Vec<_>>()
+        );
+    }
+
+    /// 決定1bの対照: 閾値内（30ms）の親指先押しは従来どおりチョード成立で、生の無変換は出ない。
+    #[test]
+    fn thumb_then_char_within_threshold_is_chord_without_raw_nonconvert() {
+        let mut engine = make_test_engine_with_muhenkan_passthrough();
+        let ctx = ime_on_ctx();
+        let ds = [
+            engine.on_input(Ev::down(VK_NONCONVERT).at(0).build(), &ctx),
+            engine.on_input(Ev::down(VK_A).at(30_000).build(), &ctx),
+            engine.on_input(Ev::up(VK_A).at(100_000).build(), &ctx),
+            engine.on_input(Ev::up(VK_NONCONVERT).at(120_000).build(), &ctx),
+        ];
+        assert!(
+            !any_raw_nonconvert_sent(&ds),
+            "閾値内の親指先押しチョードは生のVK_NONCONVERTを送出しない: {:?}",
+            ds.iter().map(effects_of).collect::<Vec<_>>()
+        );
+    }
+
+    // ── ADR-182 決定1c: 無変換/変換（Passthrough、delegate無し）はタイムアウトでは単独確定しない ──
+
+    /// タイマー経路: `無変換↓ → 100msタイムアウト → A↓（左親指面のかなあり、親指押下中）`。
+    /// ADR-182以前は、タイムアウトで生の`Key(VK_NONCONVERT)`が先に出た後、文字が`ActiveThumb`で
+    /// 親指面のかなを出して親指を消費していた（同じ押下がsolo tapとshiftの両方に使われる）。
+    #[test]
+    fn timer_path_thumb_then_char_keeps_thumb_face_kana_without_raw_nonconvert() {
+        let mut engine = make_test_engine_with_muhenkan_passthrough();
+        let ctx = ime_on_ctx();
+        let held = InputContext {
+            left_thumb_down: Some(0),
+            ..ime_on_ctx()
+        };
+        let ds = [
+            engine.on_input(Ev::down(VK_NONCONVERT).at(0).build(), &ctx),
+            engine.on_timeout(TIMER_PENDING, &held),
+            engine.on_input(Ev::down(VK_A).at(150_000).build(), &held),
+            engine.on_input(Ev::up(VK_A).at(220_000).build(), &held),
+            engine.on_input(Ev::up(VK_NONCONVERT).at(260_000).build(), &ctx),
+        ];
+        assert!(
+            !any_raw_nonconvert_sent(&ds),
+            "タイマー経路でも生のVK_NONCONVERTを二重に送出してはならない: {:?}",
+            ds.iter().map(effects_of).collect::<Vec<_>>()
+        );
+        assert!(
+            ds.iter().any(|d| has_effect(d, |e| matches!(
+                e,
+                Effect::Input(InputEffect::SendKeys(actions))
+                    if actions.iter().any(|a| matches!(a, KeyAction::Char('を')))
+            ))),
+            "親指面のかな（を）は従来どおり出力される: {:?}",
+            ds.iter().map(effects_of).collect::<Vec<_>>()
+        );
+    }
+
+    /// タイムアウト後に文字が来ないまま親指を離した場合: 生の`[Key, KeyUp]`は親指を離した時点で出る
+    /// （タイムアウトの時点では出ない）。
+    #[test]
+    fn timer_path_solo_hold_sends_raw_nonconvert_on_release_not_on_timeout() {
+        let mut engine = make_test_engine_with_muhenkan_passthrough();
+        let ctx = ime_on_ctx();
+        let _ = engine.on_input(Ev::down(VK_NONCONVERT).at(0).build(), &ctx);
+        let d_timeout = engine.on_timeout(TIMER_PENDING, &ctx);
+        assert!(
+            !any_raw_nonconvert_sent(std::slice::from_ref(&d_timeout)),
+            "タイムアウトでは生VKを送出しない: {:?}",
+            effects_of(&d_timeout)
+        );
+        let d_up = engine.on_input(Ev::up(VK_NONCONVERT).at(300_000).build(), &ctx);
+        assert!(
+            any_raw_nonconvert_sent(std::slice::from_ref(&d_up)),
+            "親指を離した時点で生のVK_NONCONVERTを送出する: {:?}",
+            effects_of(&d_up)
+        );
+    }
+
+    /// OSオートリピート: タイムアウト後に同じ親指のKeyDownが繰り返し届いても、生キーを連射せず、
+    /// 親指を離した時点で1回だけ出す（`observe_thumb_watch_window`は統計専用で抑止しない）。
+    #[test]
+    fn timer_path_auto_repeat_keydowns_do_not_emit_raw_nonconvert_until_release() {
+        let mut engine = make_test_engine_with_muhenkan_passthrough();
+        let ctx = ime_on_ctx();
+        let mut ds = vec![
+            engine.on_input(Ev::down(VK_NONCONVERT).at(0).build(), &ctx),
+            engine.on_timeout(TIMER_PENDING, &ctx),
+            engine.on_input(Ev::down(VK_NONCONVERT).at(500_000).build(), &ctx),
+            engine.on_input(Ev::down(VK_NONCONVERT).at(533_000).build(), &ctx),
+            engine.on_input(Ev::down(VK_NONCONVERT).at(566_000).build(), &ctx),
+        ];
+        assert!(
+            !any_raw_nonconvert_sent(&ds),
+            "オートリピート中は生のVK_NONCONVERTを送出しない: {:?}",
+            ds.iter().map(effects_of).collect::<Vec<_>>()
+        );
+        ds.push(engine.on_input(Ev::up(VK_NONCONVERT).at(600_000).build(), &ctx));
+        assert!(
+            any_raw_nonconvert_sent(&ds[ds.len() - 1..]),
+            "親指を離した時点で生のVK_NONCONVERTを送出する: {:?}",
+            effects_of(&ds[ds.len() - 1])
+        );
+    }
+
+    /// フォーカス移動（コンテキスト境界）: タイムアウトを保留した`PendingThumb`は、
+    /// `flush_pending(.., Denied)`で黙って消える（生キーは出ない）。今日のタイマー経路は100msで
+    /// 送出済みだったので存在しなかった取りこぼし窓（決定1cの既知の副作用、ADR-182）。
+    #[test]
+    fn timer_path_pending_thumb_is_dropped_silently_on_focus_change() {
+        let mut engine = make_test_engine_with_muhenkan_passthrough();
+        let ctx = ime_on_ctx();
+        let _ = engine.on_input(Ev::down(VK_NONCONVERT).at(0).build(), &ctx);
+        let _ = engine.on_timeout(TIMER_PENDING, &ctx);
+        let d = engine.on_command(EngineCommand::FocusChanged, &ctx);
+        assert!(
+            !any_raw_nonconvert_sent(std::slice::from_ref(&d)),
+            "フォーカス移動で生のVK_NONCONVERTが別ウィンドウへ出てはならない: {:?}",
             effects_of(&d)
         );
     }
@@ -7420,7 +8858,9 @@ mod engine_integration_tests {
         let mut engine = make_test_engine();
         assert!(engine.compute_active(&ime_on_ctx()));
 
-        let d = engine.on_command(EngineCommand::RefreshState, &ime_off_ctx());
+        // ADR-213 P2b: 観測由来(RefreshState)の遷移は SetOpen を出さないので、
+        // 明示操作(ToggleEngine)の遷移で検証する。
+        let d = engine.on_command(EngineCommand::ToggleEngine, &ime_on_ctx());
         assert!(
             has_effect(&d, |e| matches!(
                 e,
@@ -7431,18 +8871,78 @@ mod engine_integration_tests {
         );
     }
 
-    // 2026-08-04: 「IME OFF・Engine ON」再発対策（`SetOpenOrigin` 導入）の回帰テスト。
-    //
-    // `EngineCommand::RefreshState`（Platform 層が `ctx.ime_on` を再評価するたびに叩く
-    // 経路。IME ポーリング/idle-conv-check 由来で毎キー入力とは無関係に発火しうる）が
-    // 引き起こす active/inactive 遷移は `check_active_transition` を経由するため、
-    // 発行される `SetOpen` は必ず `SetOpenOrigin::ActivationSync` でなければならない。
-    // ここが誤って `ExplicitUserAction` になると、awase-windows 側の
-    // `kp_stage_post_decision` がユーザーの明示的な IME OFF 意図（`last_intent`）を
-    // 「観測駆動の echo」で上書きしてしまい、ユーザーが IME を OFF にした直後でも
-    // Engine が勝手に ON へ戻る（`docs/known-bugs.md` 参照）。
     #[test]
-    fn refresh_state_transition_emits_activation_sync_origin_not_explicit_user_action() {
+    fn active_to_inactive_transition_reinjects_keyup_for_phase1_consumed_key_lifecycle_duty() {
+        // /code-review指摘（PR #126、5回目）: check_active_transition の
+        // active→inactive分岐は KeyLifecycle::flush_pending_key_ups の戻り値を
+        // `let _ = ...` で握りつぶしていた。Phase 1（特殊キー、
+        // `match_special_keys`）でのみ consume され output_history に一切
+        // 触れないキー（IMEトグルコンボ等）は release_all_pending_output では
+        // 救えないため、handle_focus_changed と同じく flush_pending_key_ups の
+        // 戻り値を明示的に ReinjectKey として再注入しないと、そのキーの実物理
+        // KeyUp が後で来ても誰も面倒を見ず素通りしてしまう（stuck key）。
+        let combo = ParsedKeyCombo {
+            ctrl: true,
+            shift: false,
+            alt: false,
+            vk: VK_SPACE,
+        };
+        let special = SpecialKeyCombos {
+            engine_on: vec![],
+            engine_off: vec![],
+            ime_on: vec![combo],
+            ime_off: vec![],
+            ime_toggle: vec![],
+        };
+        let mut engine = make_engine_with_special(special);
+
+        // IME ON コンボを、IME が既に ON の状態で押す（実機でも起きる冗長操作）。
+        // `ime_set_open_effects` の pseudo_ctx（ime_on=true）は現在の
+        // prev_activation（Active）と一致するため `transition_activation` は
+        // no-op——つまりこの Phase 1 消費は prev_activation を一切動かさない。
+        // それでも Decision は consumed なので KeyLifecycle には VK_SPACE の
+        // Consume 義務が登録される。
+        let ctrl_ctx = InputContext {
+            modifiers: ModifierState {
+                ctrl: true,
+                ..ime_on_ctx().modifiers
+            },
+            ..ime_on_ctx()
+        };
+        let down = engine.on_input(Ev::down(VK_SPACE).at(0).build(), &ctrl_ctx);
+        assert!(
+            down.is_consumed(),
+            "special key combo should be consumed by Phase 1"
+        );
+        assert!(
+            engine.compute_active(&ime_on_ctx()),
+            "sanity: engine should still be active before the later transition"
+        );
+
+        // ここまでで output_history には一切触れていない（Phase 1 の Decision は
+        // SendKeys を含まない）。KeyLifecycle には VK_SPACE の Consume 義務だけが
+        // 登録されている。VK_SPACE を離す前に、別要因（RefreshState）で
+        // コンテキストが inactive へ遷移する（FocusChanged を経由しない
+        // check_active_transition 単独の遷移経路）。
+        let d = engine.on_command(EngineCommand::RefreshState, &ime_off_ctx());
+        assert!(
+            has_effect(&d, |e| matches!(
+                e,
+                Effect::Input(InputEffect::ReinjectKey(evt)) if evt.vk_code == VK_SPACE
+            )),
+            "active→inactive遷移で Phase 1 consumed キーの KeyUp 義務は\
+             ReinjectKey として再注入されるべき（stuck key修正）: {:?}",
+            effects_of(&d)
+        );
+    }
+
+    // ADR-213 P2b: `EngineCommand::RefreshState`（観測駆動。IME ポーリング/idle-conv-check 由来で
+    // 毎キー入力と無関係に発火しうる）が引き起こす active/inactive 遷移は `SetOpen` を出さない
+    // （UI 更新のみ）。ユーザーの明示操作に応答する書き込みは明示操作の経路が担う。
+    // 以前の `SetOpenOrigin::ActivationSync` はこの条件が破れたとき last_intent を汚染する
+    // 再発（2026-08-04 「IME OFF・Engine ON」）を避けるための区別だったが、SetOpen 自体が出なくなった。
+    #[test]
+    fn refresh_state_transition_emits_no_set_open() {
         let mut engine = make_test_engine();
         // make_test_engine() は prev_active=true から始まるため、まず ime_off_ctx() で
         // Inactive に落としてから、本題の Inactive→Active 遷移を起こす。
@@ -7451,34 +8951,23 @@ mod engine_integration_tests {
 
         let d = engine.on_command(EngineCommand::RefreshState, &ime_on_ctx());
         assert!(
-            has_effect(&d, |e| matches!(
-                e,
-                Effect::Ime(ImeEffect::SetOpen {
-                    open: true,
-                    origin: SetOpenOrigin::ActivationSync
-                })
-            )),
-            "RefreshState 由来の SetOpen は ActivationSync でなければならない \
-             (ExplicitUserAction だと belief の last_intent が観測駆動の echo で \
-             汚染される), got {:?}",
+            !has_effect(&d, |e| matches!(e, Effect::Ime(ImeEffect::SetOpen { .. }))),
+            "RefreshState 由来の遷移は SetOpen を出してはならない, got {:?}",
             effects_of(&d)
         );
         assert!(
-            !has_effect(&d, |e| matches!(
+            has_effect(&d, |e| matches!(
                 e,
-                Effect::Ime(ImeEffect::SetOpen {
-                    origin: SetOpenOrigin::ExplicitUserAction,
-                    ..
-                })
+                Effect::Ui(UiEffect::EngineStateChanged { enabled: true })
             )),
-            "RefreshState 由来の SetOpen に ExplicitUserAction が混ざってはならない, got {:?}",
+            "EngineStateChanged は従来どおり出る, got {:?}",
             effects_of(&d)
         );
     }
 
-    // 対照テスト: IME-ON コンボ（本物のユーザー操作）は ExplicitUserAction を使う。
+    // 対照テスト: IME-ON コンボ（本物のユーザー操作）は SetOpen を出す。
     #[test]
-    fn ime_on_combo_emits_explicit_user_action_origin() {
+    fn ime_on_combo_emits_set_open() {
         let combo = ParsedKeyCombo {
             ctrl: false,
             shift: false,
@@ -7498,23 +8987,213 @@ mod engine_integration_tests {
         assert!(
             has_effect(&d, |e| matches!(
                 e,
-                Effect::Ime(ImeEffect::SetOpen {
-                    open: true,
-                    origin: SetOpenOrigin::ExplicitUserAction
-                })
+                Effect::Ime(ImeEffect::SetOpen { open: true, .. })
             )),
-            "IME-ON コンボは ExplicitUserAction を使わなければならない, got {:?}",
+            "IME-ON コンボは SetOpen(true) を出さなければならない, got {:?}",
             effects_of(&d)
         );
     }
 
-    /// `transition_activation` の `EngineStateChanged.send_ime_key: !suppress_ime_key`
-    /// 自体は上の `active_to_inactive_transition_emits_set_open_false`（`suppress_set_open`
-    /// の `!` を検証）とは別の変異体で、これまで `send_ime_key` フィールドを直接見る
-    /// テストが無かった。通常の ImeOff 遷移（NotRomajiInput ではない）では
-    /// `send_ime_key=true` のはず。
+    // ── ADR-208 決定2 D1: 押下 ID（PressId）の運搬 ──
+
+    /// `SetOpen` の押下 ID を取り出す（`SetOpen` が無ければ `None` の外側）。
+    fn set_open_press(d: &Decision) -> Option<Option<crate::types::PressId>> {
+        effects_of(d).iter().find_map(|e| match e {
+            Effect::Ime(ImeEffect::SetOpen { press, .. }) => Some(*press),
+            _ => None,
+        })
+    }
+
+    fn make_engine_with_bare_ime_on_combo() -> Engine {
+        let combo = ParsedKeyCombo {
+            ctrl: false,
+            shift: false,
+            alt: false,
+            vk: VK_CONVERT,
+        };
+        make_engine_with_special(SpecialKeyCombos {
+            engine_on: vec![],
+            engine_off: vec![],
+            ime_on: vec![combo],
+            ime_off: vec![],
+            ime_toggle: vec![],
+        })
+    }
+
+    /// コンボ（`keys.ime_on` 等）の `SetOpen` は、その打鍵の押下 ID を運ぶ。
     #[test]
-    fn active_to_inactive_transition_normal_send_ime_key_true() {
+    fn combo_set_open_carries_the_press_of_its_key_down() {
+        let mut engine = make_engine_with_bare_ime_on_combo();
+        let d = engine.on_input(
+            Ev::down(VK_CONVERT).at(100).press(7).build(),
+            &ime_off_ctx(),
+        );
+        assert_eq!(
+            set_open_press(&d),
+            Some(Some(crate::types::PressId::new(7))),
+            "got {:?}",
+            effects_of(&d)
+        );
+        assert_eq!(
+            d.find_ime_set_open_press(),
+            Some(crate::types::PressId::new(7))
+        );
+    }
+
+    /// 自動リピートの Down（フックは `press_id=None`）は、特殊キー照合に一致しても `press=None`
+    /// （従来の `applied` の already-matched 省略に任せ、押し続けた間の書き込み連発を防ぐ）。
+    #[test]
+    fn repeat_down_set_open_carries_no_press() {
+        let mut engine = make_engine_with_bare_ime_on_combo();
+        let d = engine.on_input(
+            Ev::down(VK_CONVERT).at(100).repeat().build(),
+            &ime_off_ctx(),
+        );
+        assert_eq!(
+            set_open_press(&d),
+            Some(None),
+            "リピートでも SetOpen は出るが press は None, got {:?}",
+            effects_of(&d)
+        );
+        assert_eq!(d.find_ime_set_open_press(), None);
+    }
+
+    /// 単独タップの確定点は KeyUp（press=None のイベント）だが、`SetOpen` は保留開始 KeyDown の押下 ID を運ぶ。
+    #[test]
+    fn solo_tap_set_open_carries_the_press_of_the_pending_key_down() {
+        let mut engine = make_test_engine_with_muhenkan_solo_tap_turn_off();
+        let _ = engine.on_input(
+            Ev::down(VK_NONCONVERT).at(100).press(11).build(),
+            &ime_on_ctx(),
+        );
+        let up = engine.on_input(Ev::up(VK_NONCONVERT).at(200).build(), &ime_on_ctx());
+        assert_eq!(
+            set_open_press(&up),
+            Some(Some(crate::types::PressId::new(11))),
+            "got {:?}",
+            effects_of(&up)
+        );
+    }
+
+    /// 次のキー（Passthrough）の到着で保留の親指が単独確定する経路も、保留開始 KeyDown の押下 ID を運ぶ
+    /// （到着キー自身の ID ではない）。
+    #[test]
+    fn solo_tap_resolved_by_next_key_carries_the_thumbs_press_not_the_next_keys() {
+        let mut engine = make_test_engine_with_muhenkan_solo_tap_turn_off();
+        let _ = engine.on_input(
+            Ev::down(VK_NONCONVERT).at(100).press(21).build(),
+            &ime_on_ctx(),
+        );
+        // 修飾でも文字でもないキー（Passthrough）が保留中の親指を単独確定する。
+        let d = engine.on_input(
+            Ev::down(VkCode(0x70)).at(150).press(22).build(),
+            &ime_on_ctx(),
+        );
+        assert_eq!(
+            set_open_press(&d),
+            Some(Some(crate::types::PressId::new(21))),
+            "got {:?}",
+            effects_of(&d)
+        );
+    }
+
+    /// 自動リピートの Down（`press_id=None`）で保留に入った親指の単独タップは `press=None`
+    /// （ID が無い押下の確定は従来どおり `applied` の省略に任せる）。
+    #[test]
+    fn solo_tap_pending_started_without_press_carries_no_press() {
+        let mut engine = make_test_engine_with_muhenkan_solo_tap_turn_off();
+        let _ = engine.on_input(Ev::down(VK_NONCONVERT).at(100).build(), &ime_on_ctx());
+        let up = engine.on_input(Ev::up(VK_NONCONVERT).at(200).build(), &ime_on_ctx());
+        assert_eq!(set_open_press(&up), Some(None), "got {:?}", effects_of(&up));
+    }
+
+    /// M-4: Engine が同じ打鍵で `SetOpen` を出すキーを、副作用なしに向きつきで答える（shadow の抑止に使う）。
+    #[test]
+    fn matches_ime_set_open_reports_the_direction_without_side_effects() {
+        let engine = make_engine_with_bare_ime_on_combo();
+        let on = Ev::down(VK_CONVERT).at(100).press(1).build();
+        assert_eq!(engine.matches_ime_set_open(&ime_off_ctx(), &on), Some(true));
+        // 副作用なし（&self）: 同じ問い合わせを繰り返しても同じ答え。
+        assert_eq!(engine.matches_ime_set_open(&ime_off_ctx(), &on), Some(true));
+        // 無関係なキーは None。
+        let other = Ev::down(VK_A).at(100).press(2).build();
+        assert_eq!(engine.matches_ime_set_open(&ime_off_ctx(), &other), None);
+    }
+
+    /// M-4: `keys.ime_detect`（`sync_direction`）と重なるキーは Engine が元から一致させない（二重処理の防止）ので、
+    /// shadow が担う（Engine は問い合わせに `None`）。
+    #[test]
+    fn matches_ime_set_open_ignores_keys_that_are_also_sync_keys() {
+        let engine = make_engine_with_bare_ime_on_combo();
+        let ev = Ev::down(VK_CONVERT)
+            .at(100)
+            .press(3)
+            .sync_direction(ShadowImeAction::TurnOn)
+            .build();
+        assert_eq!(engine.matches_ime_set_open(&ime_off_ctx(), &ev), None);
+    }
+
+    /// M-4: トグル型（`keys.ime_toggle`）の向きは shadow の判断前の belief（`ctx.ime_on`）から決まる。
+    #[test]
+    fn matches_ime_set_open_toggle_direction_follows_ctx() {
+        let combo = ParsedKeyCombo {
+            ctrl: false,
+            shift: false,
+            alt: false,
+            vk: VkCode(0x7C),
+        };
+        let engine = make_engine_with_special(SpecialKeyCombos {
+            engine_on: vec![],
+            engine_off: vec![],
+            ime_on: vec![],
+            ime_off: vec![],
+            ime_toggle: vec![combo],
+        });
+        let ev = Ev::down(VkCode(0x7C)).at(100).press(4).build();
+        assert_eq!(engine.matches_ime_set_open(&ime_off_ctx(), &ev), Some(true));
+        assert_eq!(engine.matches_ime_set_open(&ime_on_ctx(), &ev), Some(false));
+    }
+
+    /// `stamp_set_open_press` は ID を持たない `SetOpen` にだけ載せ、既に持つものは書き換えない。
+    #[test]
+    fn stamp_set_open_press_does_not_overwrite_an_existing_press() {
+        let mut d = Decision::consumed_with(smallvec::smallvec![
+            Effect::Ime(ImeEffect::SetOpen {
+                open: true,
+                press: None
+            }),
+            Effect::Ime(ImeEffect::SetOpen {
+                open: false,
+                press: Some(crate::types::PressId::new(1))
+            }),
+        ]);
+        d.stamp_set_open_press(Some(crate::types::PressId::new(9)));
+        let presses: Vec<_> = effects_of(&d)
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Ime(ImeEffect::SetOpen { press, .. }) => Some(*press),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            presses,
+            vec![
+                Some(crate::types::PressId::new(9)),
+                Some(crate::types::PressId::new(1))
+            ]
+        );
+        // `None` を載せても何も変わらない。
+        d.stamp_set_open_press(None);
+        assert_eq!(
+            d.find_ime_set_open_press(),
+            Some(crate::types::PressId::new(9))
+        );
+    }
+
+    /// 通常の ImeOff 遷移（NotRomajiInput ではない）は `EngineStateChanged{enabled:false}` を出す
+    /// （ADR-207 で `send_ime_key` フィールドは撤去済み）。
+    #[test]
+    fn active_to_inactive_transition_normal_emits_engine_state_changed() {
         let mut engine = make_test_engine();
         assert!(engine.compute_active(&ime_on_ctx()));
 
@@ -7522,21 +9201,17 @@ mod engine_integration_tests {
         assert!(
             has_effect(&d, |e| matches!(
                 e,
-                Effect::Ui(UiEffect::EngineStateChanged {
-                    send_ime_key: true,
-                    ..
-                })
+                Effect::Ui(UiEffect::EngineStateChanged { enabled: false })
             )),
-            "normal ImeOff transition must set send_ime_key=true, got {:?}",
+            "normal ImeOff transition must emit EngineStateChanged, got {:?}",
             effects_of(&d)
         );
     }
 
-    /// `NotRomajiInput`（tray での英数モード選択等）への遷移では `suppress_set_open`
-    /// (=`suppress_ime_key`) が true になり、`SetOpen` を出さず `send_ime_key=false`
-    /// のはず（ユーザーが選択した kana/katakana モードを維持するため）。
+    /// `NotRomajiInput`（tray での英数モード選択等）への遷移では `suppress_set_open` が
+    /// true になり、`SetOpen` を出さない（ユーザーが選択した kana/katakana モードを維持するため）。
     #[test]
-    fn active_to_inactive_transition_not_romaji_input_suppresses_send_ime_key() {
+    fn active_to_inactive_transition_not_romaji_input_suppresses_set_open() {
         let mut engine = make_test_engine();
         assert!(engine.compute_active(&ime_on_ctx()));
 
@@ -7552,12 +9227,9 @@ mod engine_integration_tests {
         assert!(
             has_effect(&d, |e| matches!(
                 e,
-                Effect::Ui(UiEffect::EngineStateChanged {
-                    send_ime_key: false,
-                    ..
-                })
+                Effect::Ui(UiEffect::EngineStateChanged { enabled: false })
             )),
-            "NotRomajiInput transition must set send_ime_key=false, got {:?}",
+            "NotRomajiInput transition must still emit EngineStateChanged, got {:?}",
             effects_of(&d)
         );
         assert!(
@@ -7567,14 +9239,16 @@ mod engine_integration_tests {
         );
     }
 
-    // ── on_input: KeyUp dedup 短絡 (line 238) ──
+    // ── on_input: 保留中文字キーの KeyUp が FSM 経由で即時解決される (ADR-112決定2) ──
 
     #[test]
-    fn key_up_for_consumed_pending_char_short_circuits_without_resolving() {
-        // `if !is_key_down && self.lifecycle.on_key_up(...)` (line 238) の `!` が
-        // 消えると、この短絡がもう機能せず、保留中の文字キーの KeyUp が
-        // （本来は素通しの dedup のはずが）FSM 経由で再度解決され、
-        // 想定外に文字が出力されてしまう。
+    fn key_up_for_pending_char_resolves_immediately_via_fsm() {
+        // ADR-112決定2以前は、Engine::on_input の Phase 0 が「Consume済み
+        // KeyDownに対応するKeyUp」を無条件にFSMへ一切渡さず即consumeするだけ
+        // だった（BUG-101）ため、保留中の文字キー自身のKeyUpはタイムアウト
+        // (100ms)まで解決されなかった。決定2適用後は、KeyUpがFSMへ届き
+        // handle_key_up_pendingが即座にPendingCharを単独打鍵として解決する
+        // （タイムアウトを待たずに'う'が出力される）。
         let mut engine = make_test_engine();
         let d1 = engine.on_input(Ev::down(VK_A).at(0).build(), &ime_on_ctx());
         assert!(d1.is_consumed());
@@ -7582,10 +9256,259 @@ mod engine_integration_tests {
         let d2 = engine.on_input(Ev::up(VK_A).at(50).build(), &ime_on_ctx());
         assert!(d2.is_consumed());
         assert!(
-            effects_of(&d2).is_empty(),
-            "KeyUp for an already-consumed pending key must be a bare dedup consume \
-             with no effects, got {:?}",
+            has_effect(&d2, |e| matches!(
+                e,
+                Effect::Input(InputEffect::SendKeys(actions))
+                    if actions.iter().any(|a| matches!(a, KeyAction::Char('う')))
+            )),
+            "PendingCharが自身のKeyUpで即時単独確定されるはず、got {:?}",
             effects_of(&d2)
+        );
+    }
+
+    #[test]
+    fn key_up_for_unmapped_layout_key_emits_synthetic_keyup_after_timeout() {
+        // ADR-112 BUG-101発見事項2: resolve_pending_char_as_singleがNormal面
+        // 未定義キーでKeyAction::Key(vk)へフォールバックする経路
+        // (nicola_fsm.rs:1272)の出力に対応するKeyUp(vk)は、release_only
+        // （旧handle_key_up_active）だけが送出する。Phase 0がこれを阻んで
+        // いたため、実運用で一度もKeyUpが送出されていなかった(stuck key)。
+        // D をレイアウトキー化（left_thumb面にのみ定義、normal面は未定義のまま）。
+        let mut layout = make_layout();
+        layout.left_thumb.insert(POS_D, lit('よ'));
+        let fsm = NicolaFsm::new(
+            layout,
+            VK_NONCONVERT,
+            VK_CONVERT,
+            100,
+            ConfirmMode::Wait,
+            30,
+        );
+        let mut engine = Engine::new(fsm, empty_special_keys());
+        engine.set_prev_active(true);
+
+        let d1 = engine.on_input(Ev::down(VK_D).at(0).build(), &ime_on_ctx());
+        assert!(d1.is_consumed());
+
+        let d2 = engine.on_timeout(TIMER_PENDING, &ime_on_ctx());
+        assert!(
+            has_effect(&d2, |e| matches!(
+                e,
+                Effect::Input(InputEffect::SendKeys(actions))
+                    if actions.iter().any(|a| matches!(a, KeyAction::Key(x) if *x == VK_D))
+            )),
+            "normal面未定義キーはKey(vk)へフォールバックするはず: {:?}",
+            effects_of(&d2)
+        );
+
+        let d3 = engine.on_input(Ev::up(VK_D).at(200_000).build(), &ime_on_ctx());
+        assert!(d3.is_consumed());
+        assert!(
+            has_effect(&d3, |e| matches!(
+                e,
+                Effect::Input(InputEffect::SendKeys(actions))
+                    if actions.iter().any(|a| matches!(a, KeyAction::KeyUp(x) if *x == VK_D))
+            )),
+            "Key(vk)出力の対応するKeyUp(vk)がOSへ送出されるはず(stuck key修正): {:?}",
+            effects_of(&d3)
+        );
+    }
+
+    #[test]
+    fn key_up_after_context_goes_inactive_is_still_consumed_via_release_only() {
+        // ADR-112決定2、CON指摘4: force_consumeだけでなくPhase 2の非活性
+        // 早期returnでもrelease_onlyを呼ぶことで、「Consume義務のあるKeyUp
+        // は、コンテキスト非活性化(IME OFF等)を挟んでも必ずConsumeされ、
+        // OSへ漏れない」という不変条件を確認する。
+        let mut engine = make_test_engine();
+        let d1 = engine.on_input(Ev::down(VK_A).at(0).build(), &ime_on_ctx());
+        assert!(d1.is_consumed());
+
+        // コンテキストが非活性化(IME OFF)した後にKeyUpが届く。
+        let d2 = engine.on_input(Ev::up(VK_A).at(50_000).build(), &ime_off_ctx());
+        assert!(
+            d2.is_consumed(),
+            "Consume義務のあるKeyUpは非活性化を挟んでもOSへ漏れてはならない: {:?}",
+            d2
+        );
+    }
+
+    #[test]
+    fn engine_level_char1_key_up_makes_overlap_verdict_reachable() {
+        // ADR-112 BUG-101発見事項1、決定1/2の組み合わせ確認: Engine::on_input
+        // 経由でchar1のKeyUpが実際にNicolaFsmへ届き、char1_released_atが
+        // 埋まることを確認する（本ADR発見のきっかけになった具体的な
+        // 再現シナリオ）。本番既定(RUNTIME_MIN_OVERLAP_MARGIN_PERCENT=0%)
+        // では重なり不足でも常にchord確定になるため、min_overlap_margin_
+        // percentを明示的に上書きしてアルゴリズムの15%境界を検証する
+        // （NicolaFsmには`feat/confirm-mode-simplify`ブランチのような
+        // config配線が無いため、ここではNicolaFsm経由の直接呼び出しで
+        // margin値を差し込む。Engine自体はテスト用APIを持たない）。
+        let mut engine = make_test_engine();
+        engine.set_min_overlap_margin_percent_for_test(15);
+
+        engine.on_input(Ev::down(VK_S).at(0).build(), &ime_on_ctx());
+        engine.on_input(Ev::down(VK_NONCONVERT).at(30_000).build(), &ime_on_ctx());
+        // char1(S) KeyUp: thumb押下から2ms後 → 重なりほぼ無し（決定2以前は
+        // このKeyUpがFSMへ一切届かず、char1_released_atは常にNoneだった）。
+        engine.on_input(Ev::up(VK_S).at(32_000).build(), &ime_on_ctx());
+        let d = engine.on_timeout(TIMER_PENDING, &ime_on_ctx());
+
+        assert!(
+            has_effect(&d, |e| matches!(
+                e,
+                Effect::Input(InputEffect::SendKeys(actions))
+                    if actions.iter().any(|a| matches!(a, KeyAction::Char('し')))
+            )),
+            "char1のKeyUpがFSMへ届きchar1_released_atが埋まっていれば、重なり不足で\
+             単独打鍵('し')に倒れるはず: {:?}",
+            effects_of(&d)
+        );
+        assert!(
+            !has_effect(&d, |e| matches!(
+                e,
+                Effect::Input(InputEffect::SendKeys(actions))
+                    if actions.iter().any(|a| matches!(a, KeyAction::Char('あ')))
+            )),
+            "char1_released_atが届いていなければchord('あ')に誤確定してしまう(BUG-101): {:?}",
+            effects_of(&d)
+        );
+    }
+
+    #[test]
+    fn key_up_with_os_modifier_held_still_emits_keyup_for_injected_vk() {
+        // /code-review指摘（PR #126）: is_os_modifier_held()ガードが
+        // KeyAction::Key(vk)型エントリの中身にも反応しないままだと、OSへ
+        // 注入済みのVKに対応するKeyUpが二度と送られず、Ctrl保持中にキーを
+        // 離すと押されっぱなしになる（ADR-112が修正したはずのstuck keyの
+        // 再発）。Char/Romajiと違い、Key(vk)は「中身に反応しない」の例外と
+        // すべきで、Engine::on_input経由（force_consumeを通る本番相当の
+        // 経路）で実際にKeyUp(vk)が出ることを確認する。
+        let mut layout = make_layout();
+        layout.left_thumb.insert(POS_D, lit('よ')); // Dをレイアウトキー化(normal面は未定義)
+        let fsm = NicolaFsm::new(
+            layout,
+            VK_NONCONVERT,
+            VK_CONVERT,
+            100,
+            ConfirmMode::Wait,
+            30,
+        );
+        let mut engine = Engine::new(fsm, empty_special_keys());
+        engine.set_prev_active(true);
+
+        engine.on_input(Ev::down(VK_D).at(0).build(), &ime_on_ctx());
+        engine.on_timeout(TIMER_PENDING, &ime_on_ctx());
+
+        // Dを押しっぱなしのままCtrlを押し、その状態でDを離す。
+        let ctrl_held_ctx = InputContext {
+            modifiers: ModifierState {
+                ctrl: true,
+                ..Default::default()
+            },
+            ..ime_on_ctx()
+        };
+        let d = engine.on_input(Ev::up(VK_D).at(50_000).build(), &ctrl_held_ctx);
+        assert!(
+            has_effect(&d, |e| matches!(
+                e,
+                Effect::Input(InputEffect::SendKeys(actions))
+                    if actions.iter().any(|a| matches!(a, KeyAction::KeyUp(x) if *x == VK_D))
+            )),
+            "Ctrl保持中でもKey(vk)出力の対応するKeyUp(vk)は送出されるべき(stuck key修正): {:?}",
+            effects_of(&d)
+        );
+    }
+
+    #[test]
+    fn key_up_with_os_modifier_held_still_suppresses_char_entry_via_engine() {
+        // /code-review指摘（teammate検証、PR #126）:
+        // test_key_up_with_os_modifier_held_still_cleans_up_pending_release_entry
+        // （このファイル冒頭付近、make_engine()=TestHarnessのbare-FSMテスト）は
+        // Engine::on_inputを一切経由せずis_os_modifier_held()→release_only委譲の
+        // Char/Romajiケースを検証していた。ADR-112の「テスト方針」（bare
+        // NicolaFsm直呼びの新規テストはEngine::on_input経由で書く）に反する
+        // カバレッジの穴であり、is_os_modifier_held()ガードのKey(vk)ケースは
+        // key_up_with_os_modifier_held_still_emits_keyup_for_injected_vk が
+        // Engine::on_input経由で検証済みだが、Char/RomajiケースにはEngine
+        // レベルの対応する回帰テストが無かった。本テストで埋める。
+        let mut engine = make_test_engine();
+        engine.on_input(Ev::down(VK_A).at(0).build(), &ime_on_ctx());
+        engine.on_timeout(TIMER_PENDING, &ime_on_ctx());
+
+        // Aを離す前にCtrlを押し、その状態でAを離す: is_os_modifier_held()
+        // ガード→release_only委譲に入る。Aの出力はChar型（'う'）なので
+        // 通常のKeyUpと同じくSuppressとして解放されるべき。
+        let ctrl_held_ctx = InputContext {
+            modifiers: ModifierState {
+                ctrl: true,
+                ..Default::default()
+            },
+            ..ime_on_ctx()
+        };
+        let d = engine.on_input(Ev::up(VK_A).at(50_000).build(), &ctrl_held_ctx);
+        assert!(
+            has_effect(&d, |e| matches!(
+                e,
+                Effect::Input(InputEffect::SendKeys(actions))
+                    if actions.iter().any(|a| matches!(a, KeyAction::Suppress))
+            )),
+            "Ctrl保持中でもChar/Romajiエントリはrelease_only委譲でSuppressとして\
+             解放されるはず（本番相当のEngine::on_input経由）: {:?}",
+            effects_of(&d)
+        );
+    }
+
+    #[test]
+    fn focus_changed_releases_pending_output_history_entry_for_still_held_key() {
+        // /code-review指摘（PR #126）: KeyLifecycle::flush_pending_key_ups が
+        // active_keys をdrainしてConsume義務の追跡を消しても、output_historyの
+        // pending_releasesを同期して掃除しないと、対応する実KeyUpがその後
+        // UpDuty::Noneとして素通りするようになり、二度と掃除されない
+        // （stuck keyの再発）。フォーカス変更（EngineCommand::FocusChanged）で
+        // このタイミングでもpending_releasesが正しく解放されることを確認する。
+        let mut layout = make_layout();
+        layout.left_thumb.insert(POS_D, lit('よ')); // Dをレイアウトキー化(normal面は未定義)
+        let fsm = NicolaFsm::new(
+            layout,
+            VK_NONCONVERT,
+            VK_CONVERT,
+            100,
+            ConfirmMode::Wait,
+            30,
+        );
+        let mut engine = Engine::new(fsm, empty_special_keys());
+        engine.set_prev_active(true);
+
+        // Dを押しっぱなしのまま、KeyAction::Key(VK_D)へフォールバック解決させる。
+        engine.on_input(Ev::down(VK_D).at(0).build(), &ime_on_ctx());
+        engine.on_timeout(TIMER_PENDING, &ime_on_ctx());
+
+        // Dを離す前にフォーカスが変わる。
+        let d = engine.on_command(EngineCommand::FocusChanged, &ime_on_ctx());
+        assert!(
+            has_effect(&d, |e| matches!(
+                e,
+                Effect::Input(InputEffect::SendKeys(actions))
+                    if actions.iter().any(|a| matches!(a, KeyAction::KeyUp(x) if *x == VK_D))
+            )),
+            "フォーカス変更時にpending_releasesのKey(vk)エントリはKeyUp(vk)として\
+             解放されるべき（stuck key修正）: {:?}",
+            effects_of(&d)
+        );
+        // /code-review指摘（PR #126、4回目）: release_all_pending_outputが
+        // KeyUp(VK_D)を発行するのに加え、KeyLifecycle::flush_pending_key_ups
+        // 由来のReinjectKey(VK_D)も独立して発行されると、同じVKに対する
+        // KeyUpがOSへ二重に注入される。release_all_pending_outputが解放した
+        // VKはReinjectKeyから除外されるべき。
+        assert!(
+            !has_effect(&d, |e| matches!(
+                e,
+                Effect::Input(InputEffect::ReinjectKey(evt)) if evt.vk_code == VK_D
+            )),
+            "release_all_pending_outputで解放済みのVKはReinjectKeyで二重注入\
+             されるべきではない: {:?}",
+            effects_of(&d)
         );
     }
 
@@ -7616,7 +9539,7 @@ mod engine_integration_tests {
     #[test]
     fn on_timeout_while_active_resolves_normally_not_via_flush() {
         // `if !self.compute_active(ctx)` (line 278) の `!` が消えると、
-        // active なときに flush(ImeOff, ComposingHint::Unknown) 経由になってしまう。
+        // active なときに flush(ImeOff, ThumbRawVkEmission::Denied) 経由になってしまう。
         // PendingChar の場合は resolve_pending_char_as_single が hint に依存しないため
         // 区別できないが、PendingThumb は composing hint で挙動が変わる
         // （Unknown なら無条件 suppress）ため、こちらで区別する。
@@ -7633,7 +9556,7 @@ mod engine_integration_tests {
                 Effect::Input(InputEffect::SendKeys(actions)) if !actions.is_empty()
             )),
             "active な on_timeout は通常経路で親指キーの生VKを出力するはず（flush 経路だと \
-             ComposingHint::Unknown により無条件 suppress され actions が空になる）, got {:?}",
+             ThumbRawVkEmission::Denied により無条件 suppress され actions が空になる）, got {:?}",
             effects_of(&d2)
         );
     }
@@ -7978,7 +9901,14 @@ mod engine_integration_tests {
         };
 
         engine.on_input(Ev::down(VK_NONCONVERT).at(0).build(), &composing_ctx);
-        let d2 = engine.on_timeout(TIMER_PENDING, &composing_ctx);
+        // ADR-182 決定1c: タイムアウトでは単独確定せず、親指を離した時点で生VKを送出する。
+        let d_timeout = engine.on_timeout(TIMER_PENDING, &composing_ctx);
+        assert!(
+            !any_raw_nonconvert_sent(std::slice::from_ref(&d_timeout)),
+            "タイムアウトでは生VKを送出しない: {:?}",
+            effects_of(&d_timeout)
+        );
+        let d2 = engine.on_input(Ev::up(VK_NONCONVERT).at(300_000).build(), &composing_ctx);
         assert!(
             has_effect(&d2, |e| matches!(
                 e,
@@ -8034,25 +9964,21 @@ mod engine_integration_tests {
         // ギャップが simultaneous でなくなることで、指定した値が実際に反映されている
         // ことを確認する。
         let mut engine = make_test_engine();
-        engine.on_command(
-            EngineCommand::UpdateFsmParams {
-                threshold_ms: 10,
-                confirm_mode: ConfirmMode::Wait,
-                speculative_delay_ms: 30,
-            },
-            &ime_on_ctx(),
-        );
+        engine.on_command(update_fsm_params(10, ConfirmMode::Wait, 30), &ime_on_ctx());
 
         let d1 = engine.on_input(Ev::down(VK_NONCONVERT).at(0).build(), &ime_on_ctx());
         assert!(d1.is_consumed());
 
         // 50ms gap: 変更後の 10ms 閾値なら simultaneous ではない → 親指単独確定。
+        // ADR-182 決定1b: Aには左親指面のかな（を）があるため、親指を単独確定するときも生の
+        // `Key(VK_NONCONVERT)`は出さない（同じ押下をshiftとして使うため）。simultaneousなら
+        // この時点で`Char('を')`が即時出力されるので、その不在で「同時打鍵にならなかった」ことを見る。
         let d2 = engine.on_input(Ev::down(VK_A).at(50_000).build(), &ime_on_ctx());
         assert!(
-            has_effect(&d2, |e| matches!(
+            !has_effect(&d2, |e| matches!(
                 e,
                 Effect::Input(InputEffect::SendKeys(actions))
-                    if actions.iter().any(|a| matches!(a, KeyAction::Key(x) if *x == VK_NONCONVERT))
+                    if actions.iter().any(|a| matches!(a, KeyAction::Char('を')))
             )),
             "threshold_ms=10 なら 50ms gap は simultaneous にならないはず, got {:?}",
             effects_of(&d2)
@@ -8065,11 +9991,7 @@ mod engine_integration_tests {
         // 既定の Wait のままになり、文字キー押下時に即座出力（投機）されなくなる。
         let mut engine = make_test_engine();
         engine.on_command(
-            EngineCommand::UpdateFsmParams {
-                threshold_ms: 100,
-                confirm_mode: ConfirmMode::Speculative,
-                speculative_delay_ms: 40,
-            },
+            update_fsm_params(100, ConfirmMode::NgramPredictive, 0),
             &ime_on_ctx(),
         );
 
@@ -8098,11 +10020,7 @@ mod engine_integration_tests {
         // remaining_us = 100_000 - 40_000 = 60_000 (60ms) を直接検証する。
         let mut engine = make_test_engine();
         engine.on_command(
-            EngineCommand::UpdateFsmParams {
-                threshold_ms: 100,
-                confirm_mode: ConfirmMode::TwoPhase,
-                speculative_delay_ms: 40,
-            },
+            update_fsm_params(100, ConfirmMode::NgramPredictive, 40),
             &ime_on_ctx(),
         );
 
@@ -8173,6 +10091,73 @@ mod engine_integration_tests {
             "ngram model が反映されていれば 50ms gap は simultaneous にならず 'あ' は \
              出ないはず, got {:?}",
             effects_of(&d2)
+        );
+    }
+
+    // ── EngineCommand::UpdateFsmParams の timing_margin_percent /
+    // min_overlap_margin_percent 配線（config.rs → Engine → FsmAdapter →
+    // NicolaFsm → TimingJudge の5層）を検証する。2026-08-30 コードレビュー指摘:
+    // 両パラメータが常に同じ既定値(30/15)でしかテストされておらず、途中の
+    // どこかで2引数が入れ替わっても（型がどちらもu32/u64で揃うためコンパイルは
+    // 通る）既存スイートでは検出できなかった。min_overlap_margin_percent 側の
+    // 対になるテスト（`set_timing_margins_min_overlap_margin_percent_actually_
+    // gates_chord_confirmation`）はこのモジュールの外、`make_engine()`（bare
+    // NicolaFsm、Engine の KeyLifecycle を経由しない）を使う既存の重なり判定
+    // テスト群のそばに置いてある。理由: char1 の KeyUp を `Engine::on_input`
+    // 経由で送ると、`KeyLifecycle::on_key_up`（`on_input_key_up_after_consumed_
+    // down_is_auto_consumed` が固定する既存仕様、engine.rs:360）が「Consume
+    // 済み KeyDown には対応する KeyUp を常に Consume する」ため、この特定の
+    // シナリオでは char1 の KeyUp イベントが `NicolaFsm::on_key_up` まで届かず
+    // `char1_released_at` が更新されない。この重なり判定ロジック自体は既存の
+    // 全テストが bare NicolaFsm レベルで書かれており、その慣習に合わせた。
+
+    #[test]
+    fn update_fsm_params_timing_margin_percent_actually_gates_three_key_arbitration() {
+        // char1(S, t=0) → thumb(左, t=10ms) → char2(A, t=100ms): d1=10ms, d2=90ms。
+        // n-gram モデルは "しを"=2.0 のみを持つため、タイミングだけで決まらない
+        // (= マージンが広い)場合は n-gram が char2+thumb('を')を選ぶ。
+        // timing_margin_percent=95 なら d1+95ms=105ms は d2=90ms 未満にならず
+        // フェーズ1で決着しない → フェーズ2の n-gram が 'を' を選ぶ。
+        // もし min_overlap_margin_percent(=1)がこのフィールドに紛れ込んだ場合、
+        // margin=1ms → d1+1ms=11ms < d2=90ms でフェーズ1がタイミングだけで
+        // char1+thumb('あ')に決めてしまい、結果が変わる。
+        let mut engine = make_test_engine();
+        let ctx = ime_on_ctx();
+        engine.on_command(EngineCommand::SetNgramModel(make_ngram_model()), &ctx);
+        engine.on_command(
+            EngineCommand::UpdateFsmParams {
+                threshold_ms: 100,
+                confirm_mode: ConfirmMode::Wait,
+                speculative_delay_ms: 30,
+                timing_margin_percent: 95,
+                min_overlap_margin_percent: 1,
+            },
+            &ctx,
+        );
+
+        engine.on_input(Ev::down(VK_S).at(0).build(), &ctx);
+        engine.on_input(Ev::down(VK_NONCONVERT).at(10_000).build(), &ctx);
+        let d = engine.on_input(Ev::down(VK_A).at(100_000).build(), &ctx);
+
+        assert!(
+            has_effect(&d, |e| matches!(
+                e,
+                Effect::Input(InputEffect::SendKeys(actions))
+                    if actions.iter().any(|a| matches!(a, KeyAction::Char('を')))
+            )),
+            "timing_margin_percent=95 なら3キー仲裁がフェーズ2(n-gram)へ進み \
+             char2+thumb('を')を選ぶはず、got {:?}",
+            effects_of(&d)
+        );
+        assert!(
+            !has_effect(&d, |e| matches!(
+                e,
+                Effect::Input(InputEffect::SendKeys(actions))
+                    if actions.iter().any(|a| matches!(a, KeyAction::Char('あ')))
+            )),
+            "min_overlap_margin_percent(1) が誤って3キー仲裁のマージンに \
+             使われていないか('あ' が出ていたら値が入れ替わっている), got {:?}",
+            effects_of(&d)
         );
     }
 

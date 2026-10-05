@@ -1,4 +1,18 @@
+---
+id: ADR-072
+title: |-
+  conv_mode_authority を apply 完了ごとに再同期する
+status: |-
+  撤去済み(再同期は現存しない、2026-10-04 確認)。ADR-088 §1.7 が bf8727ac 時点で apply 完了ごとの再同期(record_ime_apply_result)は既に撤去済みと確認済み。set_conv_mode_authority の呼び出しは EngineStateChanged 駆動に戻っている。ConvModeAuthority 型自体は state/conv_mode.rs に現存。旧: 採用済み
+related_adr:
+  - "ADR-038"
+  - "ADR-056"
+  - "ADR-064"
+---
+
 # ADR-072: conv_mode_authority を apply 完了ごとに再同期する
+
+> 状態更新(2026-10-04): 撤去済み(再同期は現存しない、2026-10-04 確認)。ADR-088 §1.7 が bf8727ac 時点で apply 完了ごとの再同期(record_ime_apply_result)は既に撤去済みと確認済み。set_conv_mode_authority の呼び出しは EngineStateChanged 駆動に戻っている。ConvModeAuthority 型自体は state/conv_mode.rs に現存
 
 ## ステータス
 

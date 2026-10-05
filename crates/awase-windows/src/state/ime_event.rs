@@ -146,6 +146,17 @@ pub enum ObservationSource {
     /// Medium+ 多数決には参加しないが、他に観測が一切ない場合の
     /// `effective_open()` フォールバックとしてのみ使われる。真の観測（Lowでも）が
     /// 後から届けば、鮮度・信頼度が同等以上のため上書きされる。
+    ///
+    /// **新しい「外部観測の裏付けが一切ない、awase 自身の推測」バリアントを
+    /// 追加するときの注意（BUG-110 追補9、/code-review 指摘）**:
+    /// `state/platform_state.rs::check_drift_correction` は `ConvOpenInference`
+    /// とこの `HeuristicDefault` の2つだけを明示的に列挙するガードを持つ
+    /// （`authority() == BeliefOnly` 全体ではなく、あえて狭い——`HwndCache`/
+    /// `FocusProbe`/`ConvBitsInference`/`GjiIoInference` を除外する理由は
+    /// 当該ガードのコメント参照）。同じ性質（外部観測の裏付けが無い自己推測）
+    /// を持つ新しいソースを追加する場合は、この enum に追加するだけでは
+    /// 自動的に保護対象へ入らない——`check_drift_correction` の
+    /// `matches!` も忘れず更新すること。
     HeuristicDefault,
 }
 
@@ -252,6 +263,10 @@ pub enum ApplyError {
     CrossProcessFailed,
     /// トグル操作が unsafe（shadow 信頼度不足・focus 直後等）で送信しなかった
     UnsafeToToggle,
+    /// フォーカス先が入力中継ツールで、awase が IME actuation を所有しないため送らなかった
+    NotOwned,
+    /// `issue_open_warrant()` が授権を発行しなかったため送らなかった（ADR-090 A-2）
+    Unwarranted,
     /// その他
     Other,
 }
@@ -319,24 +334,33 @@ pub enum InputModeApplyResult {
 /// （conv-mode 軸の `ConvMutationReason` と同型の役割分担、ADR-086 §5 Phase 3
 /// item 2 の訂正経緯参照）。ログ・ジャーナルから「これは force による書き込みか、
 /// 観測に基づく是正か、エンジンの通常の決定か」が一意に読めるようにする。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(strum::IntoStaticStr, Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum OpenApplyReason {
     /// `Engine::on_input`/`on_timeout` の `Decision::SetOpen` エフェクトによる、
     /// 通常のキー入力駆動の適用（`executor.rs::execute_one`/`dispatch_ime_set_open`）。
     EngineDecision,
     /// IMM32 クロスプロセス制御が使えないアプリ（TsfNative 等）向けの、
     /// `force_policy` によらない applied スロットル付き強制 ON
-    /// （`apply_force_on_for_imm_broken` の非 force 分岐、既存挙動）。
+    /// （撤去済みの `apply_force_on_for_imm_broken` の非 force 分岐、`f83084b3` 以前の挙動）。
     ImmBrokenForceOn,
     /// 未知 Imm32Unavailable アプリで IME 検出が連続失敗したときの一時 force-ON
-    /// （`try_force_on_bootstrap`）。
+    /// （撤去済みの `try_force_on_bootstrap`、`621bf93c`）。
     Bootstrap,
     /// 観測値（conv/IMC 読み取り）と belief の乖離を検出しての是正
     /// （`ir_apply_drift_correction`、`kp_apply_conv_engine_sync` の
-    /// `EngineSync::DirectInput` 分岐）。
+    /// `EngineSync::DirectInput`（ADR-185で撤去済み） 分岐）。
     DriftCorrection,
     /// Shadow IME belief のトグル（`kp_stage_shadow_ime_toggle`）に伴う適用。
     ShadowToggle,
+    /// ADR-121 D1/D5: 物理IMEキー（`VK_DBE_HIRAGANA`、`TurnOn` 方向）が belief
+    /// 一致で no-op になったときの冪等な追加再送（`Runtime::
+    /// reassert_explicit_physical_key`）。「必ず直る」ではなく「試みる」
+    /// best-effort な書き込みであり、`applied` belief（`record_ime_apply_result`）
+    /// は更新しない——効果が確認できていない書き込みを確定した観測であるかの
+    /// ように記録すると BUG-69 型の belief 偽装と同型の危険を持ち込むため
+    /// （ADR-121 D3 参照）。既存の `ShadowToggle`/`ImmBrokenForceOn` と journal
+    /// 上で区別できるよう専用 variant にする。
+    ExplicitKeyReassert,
 }
 
 /// IME 状態モデルへの全 event。
@@ -347,7 +371,7 @@ pub enum OpenApplyReason {
 /// 構造化）が必要とする。全フィールドが `Serialize` 対応のプレーンな値のみで
 /// 構成されるため機械的に導出可能。書き出し専用のため `Deserialize` は導出しない
 /// （`state::ime_actuation::ActuationRecord` と同じ方針）。
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(strum::IntoStaticStr, Debug, Clone, serde::Serialize)]
 pub enum ImeEvent {
     /// ユーザー/awase が IME を toggle したい意図
     UserImeToggleIntent { source: UserIntentSource },
@@ -372,17 +396,6 @@ pub enum ImeEvent {
     /// キャッシュ復元はユーザーの能動的操作ではないため、`has_user_explicit_intent()`
     /// を true にしてはならない。HwndCache 復元コードはこれを使うこと。
     HwndCacheRestored { target: bool },
-
-    /// Engine の active/inactive 遷移が対称性のために自動発行した `SetOpen` の echo
-    /// （`awase::engine::decision::SetOpenOrigin::ActivationSync`）を反映する。
-    ///
-    /// `UserImeSetIntent` と違い `last_intent` を設定しない。この SetOpen は
-    /// `ctx.ime_on`（観測駆動で変化しうる）を Engine がそのまま追認しただけで、
-    /// ユーザーが今このキーで ON/OFF を選んだわけではない。`last_intent` を
-    /// 設定すると、以後の drift correction がこの echo を「ユーザーの本物の意図」
-    /// として扱ってしまい、ユーザーが明示的に IME を OFF にした直後でも Engine が
-    /// 勝手に ON へ戻る再発を引き起こす（2026-08-04、`docs/known-bugs.md` 参照）。
-    EngineActivationSync { target: bool },
 
     /// OS への適用を開始した。
     ///
@@ -441,6 +454,126 @@ pub enum ImeEvent {
     /// `ImmCrossProbe`/`FocusProbe` 観測を次のプロセス変更まで恒久的に拒否する
     /// （code review 2026-08-26 で発見された退行）。
     FocusHwndUpdated { hwnd: HwndId },
+
+    /// 起動直後（bootstrap）に確立した最初のフォーカススコープの同一性を
+    /// `ObservationStore::current_fence` へ同期する（BUG-102、ADR-102 決定3-b ×
+    /// ADR-106 決定3）。`establish_initial_focus_scope` からのみ dispatch される。
+    ///
+    /// **belief を一切書かない。** 運ぶのは「今どの窓のどの epoch を見ているか」と
+    /// いう識別子だけで、IME が ON か OFF かの推測は含まない。reducer 側も
+    /// `ObservationStore::establish_initial_fence()`（fence 1 フィールドの差し替え）
+    /// しか行わず、`FocusChanged` が触る `app_policy` / `last_intent` / `applied` /
+    /// `force_guards` / `input_barrier` / `current_focus` / 観測
+    /// プールのいずれにも触れない。ADR-102 決定3-b の「最初の IME 観測より前に
+    /// belief を書き換えない」を守ったまま fence だけを揃えるための専用イベント。
+    ///
+    /// **これが無いと何が壊れるか（BUG-102）**: `establish_initial_focus_scope` は
+    /// `enter_focus_scope` で `FocusStore::focus_epoch` を 0→1 に進め、
+    /// `update_focus_info` で `platform.focus.current.hwnd` に実 hwnd を入れる。
+    /// つまり live 側フェンス（`Runtime::focus_fence()`）は `{epoch: 1, hwnd: 実 hwnd}`
+    /// になる。一方 `ObservationStore::current_fence` は `FocusChanged` /
+    /// `FocusHwndUpdated` でしか動かず、bootstrap ではどちらも dispatch しないため
+    /// `FocusFence::default()`（`{epoch: 0, hwnd: HwndId::NULL}`）のまま残る。
+    /// 結果、起動時にフォーカスされていたアプリの `ImmCrossProbe` 観測（live 側
+    /// フェンスでスタンプされる）が `ObservationStore::derive_filtered` の
+    /// `is_identity_ok` で stale 扱いされ、**別プロセスへ切り替えて戻る
+    /// （= `FocusChanged`）まで恒久的に導出から外れ続ける**。
+    ///
+    /// 影響を受けるのは `ImmCrossProbe`（High / `ActuatingPool`）1 ソースだけである
+    /// ——`is_identity_ok` は `FocusProbe` も照合対象にするが、`FocusProbe` は
+    /// `Low`（`state/evidence.rs`）であり `derive_filtered` の High 分岐
+    /// （`== High`）にも Medium 分岐（`>= Medium`）にも元から載らないため、
+    /// フェンスの一致・不一致で結論が変わらない。実害は 2 経路:
+    ///
+    /// - `ImeModel::resolve_open_at`: 解決順が `derive_any` →
+    ///   `most_recent_trusted`（**フェンス照合なし**）→ `desired_open` なので、
+    ///   ImmCrossProbe 以外に fresh な観測が無ければ `most_recent_trusted` が同じ
+    ///   ImmCrossProbe を拾い直し、値としては同じになる（症状なし）。一方
+    ///   `ObserverPoll` 等の fresh な Medium が併存すると `derive_any` がその
+    ///   Medium 単独合意を返し、**本来なら即採用されるはずの High を上書きする**。
+    /// - `state/open_warrant.rs::issue_open_warrant` Step 3（`derive_actuating`）:
+    ///   こちらには `most_recent_trusted` フォールバックが無い。ImmCrossProbe が
+    ///   外れると、根拠が `DirectRead` から Medium の `SingleIndirect` へ落ちるか、
+    ///   Actuating 観測が他に無ければ Step 3 自体が飛ばされ Step 4a/4b の
+    ///   `HeuristicGuess`（あるいは warrant 不発行）まで劣化する。
+    InitialFocusFenceEstablished {
+        fence: crate::state::probe_admission::FocusFence,
+    },
+
+    /// 起動直後の初回フォーカス確立時、`app_policy` を live 側の profile 分類で
+    /// 初期化する（BUG-114 根本原因1、ADR-134 D1c）。
+    ///
+    /// `ImeModel::app_policy` の書き込み口は従来
+    /// `FocusChanged`（プロセス変更時のみ）と初期値
+    /// `AppImePolicy::standard()`（`ImmCross` 固定）の2箇所しかなかった。
+    /// 起動から最初のプロセス切替までの間（ユーザーが一度もアプリを
+    /// 切り替えない、ごく自然な使い方）は `app_policy.default_feedback`
+    /// が既定値 `Read` のまま固定され、TsfNative/Imm32Unavailable
+    /// （読み戻し不能で `Blind` が本来割り当てられるべきプロファイル）に
+    /// フォーカスしていても `Read` の無条件再送に陥る（実機で
+    /// `current_focus=None`・`live_policy=Blind`・`snapshot_policy=Read`
+    /// の食い違いを確認済み、`docs/known-bugs.md` BUG-114）。
+    ///
+    /// `InitialFocusFenceEstablished` とは意図的に**別イベント**にする——
+    /// あちらは「fence 1フィールドの差し替えのみ」という不変条件
+    /// （ADR-102 決定3-b、`initial_focus_fence_event_only_touches_the_fence`
+    /// が固定）を持ち、他の書き込みを一切混ぜてはならないため。
+    InitialAppPolicyEstablished { profile: ImePolicyProfile },
+
+    /// 無変換/変換の生キーを GJI へ通過させた（ADR-187 follow 方式）。
+    ///
+    /// 実 IME の開閉は GJI 側が決めるため、awase は結果の開閉状態を知らない。
+    /// 古い明示意図（`last_intent`）を捨て、直前に得た観測へ解決を委ねる。
+    /// さらに、観測から導ける開閉（`derive_any`）があるときは、`desired_open` をそれへ揃える
+    /// （BUG-157: 通過させたモードキーの結果は実IMEが決めた。`desired_open` が古いままだと
+    /// `check_drift_correction` がユーザーの操作を書き戻す）。観測が無い窓では `desired_open` に触れない。
+    /// reducer は `last_intent` と `desired_open` 以外（`applied` / 観測 / `current_focus`
+    /// など）には触れない。dispatch 元は `ImeStateHub::pass_through_observed` の1箇所に限定する
+    /// （`desired_open` を書ける口なので dylint `ime_event_guard` の designated 関数に登録、レビュー round2 NB2。
+    /// 構造体形式の variant にしているのは、unit variant では dylint の構築検出〈`ExprKind::Struct`〉に掛からないため）。
+    ///
+    /// `align_desired == false` は、観測が一度も成功しないまま窓が切れた破棄（BUG-158）用: `last_intent` だけを捨て、
+    /// `desired_open` は書かない。観測プールに残る打鍵**より前**の値を「ユーザーの結果」として採らないため
+    /// （レビュー round2 A-N1）。
+    ///
+    /// `demote_applied`（ADR-205 D6）は外部変化への追随（`ImeStateHub::follow_external_change`）だけが `true` にする: 揃えた観測と
+    /// 食い違う `applied`（awase 自身の書き込みの記録）を未確認へ落とす。ADR-187 の通過マーク・BUG-163 の初期値揃えは `false`
+    /// （従来どおり `applied` に触れない）。
+    ModeKeyPassedThrough {
+        align_desired: bool,
+        demote_applied: bool,
+    },
+
+    /// 物理モードキーの打鍵時点で、キーマップの表（`key_effect_predictor`）から予測した効果を
+    /// beliefへ反映する（ADR-191 決定3）。**観測ではなく予測**で、awaseはIMEへ書かない。
+    ///
+    /// reducerは`key_effect`（予測の記録とfence）を書き、`mode`があれば`input_mode`を先に動かす。
+    /// 開閉（`open`）は`desired_open`を書かず、`resolve_open_at`が予測を最優先の観測の代わりに使う
+    /// （`desired_open`を書くと、ドリフト補正がIMEへ書き戻して「awaseは書かない」に反するため）。
+    /// settle後に始まった観測が来たら予測と照合して観測が勝つ。dispatch元は
+    /// `ImeStateHub::apply_key_effect_prediction`の1箇所に限定する。
+    KeyEffectPredicted {
+        open: Option<bool>,
+        mode: Option<InputModeState>,
+        /// 打鍵履歴から追跡する隠れ状態（変換モード5種・変換中の段階）。開閉/入力モードに変化が
+        /// 無くても、追跡状態が変わる打鍵ではこのイベントを送る。
+        track: crate::state::key_effect_predictor::KeyTrack,
+    },
+
+    /// 起動直後の初回フォーカス確立時、`current_focus` を bootstrap で確立した
+    /// 前面 hwnd に設定する（BUG-148、ADR-186）。`establish_initial_focus_scope` からのみ
+    /// dispatch される。
+    ///
+    /// `ImeModel::current_focus` の書き込み口は従来 `FocusChanged`（プロセス変更時のみ）
+    /// しかなかった。起動時に既に対象アプリが前面にあると、最初のプロセス切替まで
+    /// `None` のままになり、`record_explicit_intent`（`current_focus()` が `None` だと
+    /// 何もしない）が空振り→`issue_open_warrant` Step 1 が外れ、委譲 SetOpen が全て
+    /// `Unwarranted` になってキーが飲み込まれる。
+    ///
+    /// **`current_focus` 以外の一切のフィールドに触れない**（belief を書かない）。
+    /// `InitialFocusFenceEstablished`/`InitialAppPolicyEstablished` と同じ理由で
+    /// 別イベントにする——あちらは1フィールドだけの差し替えという不変条件を持つ。
+    InitialFocusHwndEstablished { hwnd: HwndId },
 
     // 旧 ChordStarted は 2026-07-06 到達不能パス監査 B2 で撤去 — production の
     // dispatch サイトがなく（chord 開始は ImeApplyRequested { target:false,
@@ -504,7 +637,7 @@ impl ImeEvent {
         use awase::platform::ImeOpenOutcome;
         match outcome {
             ImeOpenOutcome::Applied
-            | ImeOpenOutcome::FallbackSent
+            | ImeOpenOutcome::AppliedWithoutSendInput
             | ImeOpenOutcome::AlreadyMatched => Self::ImeApplySucceeded { target, generation },
             ImeOpenOutcome::Failed => Self::ImeApplyFailed {
                 target,
@@ -515,6 +648,16 @@ impl ImeEvent {
                 target,
                 generation,
                 error: ApplyError::UnsafeToToggle,
+            },
+            ImeOpenOutcome::NotOwned => Self::ImeApplyFailed {
+                target,
+                generation,
+                error: ApplyError::NotOwned,
+            },
+            ImeOpenOutcome::Unwarranted => Self::ImeApplyFailed {
+                target,
+                generation,
+                error: ApplyError::Unwarranted,
             },
         }
     }

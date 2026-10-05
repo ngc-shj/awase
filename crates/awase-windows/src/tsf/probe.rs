@@ -84,6 +84,7 @@ impl TsfReadinessProbe {
     ///
     /// `None` = まだ待機中、`Some(outcome)` = 送信可能。
     /// TIMER_TSF_PROBE ハンドラから 10ms ごとに呼ぶ。
+    #[tracing::instrument(level = "debug", skip_all, fields(total_max_ms = total_max_ms))]
     pub fn check_outcome(&self, total_max_ms: u64) -> Option<GjiProbeOutcome> {
         if !self.check_now(total_max_ms) {
             return None;
@@ -163,8 +164,6 @@ pub struct WarmEpoch {
     last_send_ms: std::cell::Cell<u64>,
     /// Cold-start 発生回数カウンタ
     cold_start_count: std::cell::Cell<Generation>,
-    /// NativeF2Consumed 時に即送信した eager warmup F2 の送信時刻（ms）。0 = 未送信
-    eager_warmup_sent_ms: std::cell::Cell<u64>,
     /// KEYEVENTF_UNICODE で文字を送信した時刻（ms）。0 = 未送信 / リセット済み。
     ///
     /// GJI probe が settled=false で完了した後 unicode fallback を使った際にセットされる。
@@ -179,20 +178,17 @@ impl WarmEpoch {
         Self {
             last_send_ms: std::cell::Cell::new(0),
             cold_start_count: std::cell::Cell::new(Generation::INITIAL),
-            eager_warmup_sent_ms: std::cell::Cell::new(0),
             last_unicode_transmit_ms: std::cell::Cell::new(0),
         }
     }
 
-    /// コールド状態にマークする（eager_warmup_sent_ms / last_unicode_transmit_ms をリセット）。
+    /// コールド状態にマークする（last_unicode_transmit_ms をリセット）。
     pub fn mark_cold(&self) {
-        self.eager_warmup_sent_ms.set(0);
         self.last_unicode_transmit_ms.set(0);
     }
 
-    /// フォーカス変更時に eager_warmup_sent_ms / last_unicode_transmit_ms をリセットする。
+    /// フォーカス変更時に last_unicode_transmit_ms をリセットする。
     pub fn on_focus_changed(&self) {
-        self.eager_warmup_sent_ms.set(0);
         self.last_unicode_transmit_ms.set(0);
     }
 
@@ -221,19 +217,8 @@ impl WarmEpoch {
     /// `last_send_ms` を現在時刻に更新する。
     pub fn update_last_send_ms(&self) {
         let ms = crate::hook::current_tick_ms();
-        log::debug!("[mark-send] last_send_ms={ms}");
+        tracing::debug!("[mark-send] last_send_ms={ms}");
         self.last_send_ms.set(ms);
-    }
-
-    /// eager warmup F2 を送信した時刻（ms）を返す。0 = 未送信。
-    #[must_use]
-    pub const fn eager_warmup_sent_ms(&self) -> u64 {
-        self.eager_warmup_sent_ms.get()
-    }
-
-    /// eager warmup F2 の送信時刻をセットする。
-    pub fn set_eager_warmup_sent_ms(&self, ms: u64) {
-        self.eager_warmup_sent_ms.set(ms);
     }
 
     /// cold-start 発生回数を返す。
@@ -267,6 +252,11 @@ pub struct ColdContext {
     idle_ms_at_last_cold: std::cell::Cell<u64>,
     /// `RawTsfLiteralRecovery` が連続で発火した回数
     raw_tsf_literal_consecutive_count: std::cell::Cell<u32>,
+    /// 「literal だった」という否定的証拠（`SuspectedLiteral`）の累計（ADR-200 決定1）。
+    /// `StaleConfirm` は着弾を否定する証拠を持たない（BUG-075）ので数えない。
+    /// `consecutive` と同じ場所でリセットされる。give-up 時の reinit（VK_IME_OFF→ON は
+    /// 未確定 preedit を破棄する、BUG-168）を、この値が2以上のときだけ許すために使う。
+    negative_evidence_count: std::cell::Cell<u32>,
 }
 
 impl ColdContext {
@@ -276,6 +266,7 @@ impl ColdContext {
             last_cold_reason: std::cell::Cell::new(crate::output::ColdReason::FocusChange),
             idle_ms_at_last_cold: std::cell::Cell::new(0),
             raw_tsf_literal_consecutive_count: std::cell::Cell::new(0),
+            negative_evidence_count: std::cell::Cell::new(0),
         }
     }
 
@@ -292,9 +283,23 @@ impl ColdContext {
         n
     }
 
-    /// `RawTsfLiteralRecovery` 連続カウントをリセットする。
+    /// `RawTsfLiteralRecovery` 連続カウントをリセットする（否定的証拠カウンタも同時にリセットする）。
     pub fn reset_consecutive_count(&self) {
         self.raw_tsf_literal_consecutive_count.set(0);
+        self.negative_evidence_count.set(0);
+    }
+
+    /// 否定的証拠（`SuspectedLiteral`）カウンタをインクリメントして新値を返す。
+    pub fn increment_negative_evidence_count(&self) -> u32 {
+        let n = self.negative_evidence_count.get() + 1;
+        self.negative_evidence_count.set(n);
+        n
+    }
+
+    /// 否定的証拠（`SuspectedLiteral`）の累計を返す。
+    #[must_use]
+    pub const fn negative_evidence_count(&self) -> u32 {
+        self.negative_evidence_count.get()
     }
 
     /// 最後に cold になった時点での idle 時間（ms）を返す。
@@ -358,7 +363,7 @@ impl CompositionState {
         let idle_ms = self.ms_since_last_send();
         if reason == crate::output::ColdReason::RawTsfLiteralRecovery {
             let n = self.cold_ctx.increment_consecutive_count();
-            log::debug!("[composition] marked cold reason={reason:?} idle={idle_ms}ms consecutive={n} → next VK/TSF output will send VK_DBE_HIRAGANA warmup");
+            tracing::debug!("[composition] marked cold reason={reason:?} idle={idle_ms}ms consecutive={n} → next VK/TSF output will send VK_DBE_HIRAGANA warmup");
         } else {
             // consecutive_count はフォーカス変更と SetOpenTrue（engine activation）でリセット。
             // SetOpenTrue = engine が新たに IME ON を決定した瞬間。前回セッションのリテラル履歴は
@@ -373,7 +378,7 @@ impl CompositionState {
             ) {
                 self.cold_ctx.reset_consecutive_count();
             }
-            log::debug!("[composition] marked cold reason={reason:?} idle={idle_ms}ms → next VK/TSF output will send VK_DBE_HIRAGANA warmup");
+            tracing::debug!("[composition] marked cold reason={reason:?} idle={idle_ms}ms → next VK/TSF output will send VK_DBE_HIRAGANA warmup");
         }
         self.warm_epoch.mark_cold();
         self.cold_ctx.record_cold(reason, idle_ms);
@@ -398,7 +403,7 @@ impl CompositionState {
         self.cold_ctx
             .record_cold(crate::output::ColdReason::FocusChange, idle_ms);
         self.cold_ctx.reset_consecutive_count();
-        log::debug!("[composition] focus changed → marked cold");
+        tracing::debug!("[composition] focus changed → marked cold");
     }
 
     /// 最後の `send_keys` 完了からの経過時間（ms）。
@@ -411,17 +416,6 @@ impl CompositionState {
     /// `last_send_ms` を現在時刻に更新する。
     pub fn update_last_send_ms(&self) {
         self.warm_epoch.update_last_send_ms();
-    }
-
-    /// eager warmup F2 を送信した時刻（ms）を返す。0 = 未送信。
-    #[must_use]
-    pub const fn eager_warmup_sent_ms(&self) -> u64 {
-        self.warm_epoch.eager_warmup_sent_ms()
-    }
-
-    /// eager warmup F2 の送信時刻をセットする。
-    pub fn set_eager_warmup_sent_ms(&self, ms: u64) {
-        self.warm_epoch.set_eager_warmup_sent_ms(ms);
     }
 
     /// 最後に cold になった時点での idle 時間（ms）を返す。
@@ -453,7 +447,18 @@ impl CompositionState {
         self.cold_ctx.consecutive_count()
     }
 
-    /// `RawTsfLiteralRecovery` 連続カウントをリセットする。
+    /// 否定的証拠（`SuspectedLiteral`）カウンタをインクリメントして新値を返す（ADR-200 決定1）。
+    pub fn increment_negative_evidence_count(&self) -> u32 {
+        self.cold_ctx.increment_negative_evidence_count()
+    }
+
+    /// 否定的証拠（`SuspectedLiteral`）の累計を返す（ADR-200 決定1）。
+    #[must_use]
+    pub const fn negative_evidence_count(&self) -> u32 {
+        self.cold_ctx.negative_evidence_count()
+    }
+
+    /// `RawTsfLiteralRecovery` 連続カウントをリセットする（否定的証拠カウンタも同時）。
     ///
     /// `DetectionResult::CompositionConfirmed`（非 partial）を確認した dispatcher が
     /// 呼ぶ（BUG-27 追補4）。フォーカス変更・`SetOpenTrue` 以外に、本物の confirm
@@ -1163,8 +1168,13 @@ mod tests {
         let held = detector.check_now(far_deadline);
         assert!(held.is_none(), "猶予開始直後はまだ None のはず: {held:?}");
 
+        // +10ms マージンは `GetTickCount64` の既定タイマー分解能（~15.6ms）より
+        // 小さく、CI runner 負荷下では実経過 30ms でも tick 差分が量子化により
+        // grace(20ms) 未満に丸まることがあった（windows-build run 34659416676
+        // で1回再現、`docs/known-bugs/BUG-131.md`）。tick 分解能を確実に上回る
+        // マージンに広げて量子化ぶれを吸収する。
         std::thread::sleep(std::time::Duration::from_millis(
-            LiteralDetector::EPOCH_FENCE_GRACE_MS + 10,
+            LiteralDetector::EPOCH_FENCE_GRACE_MS + 50,
         ));
         let result = detector.check_now(far_deadline);
         assert!(
@@ -1277,5 +1287,41 @@ mod tests {
         );
 
         crate::tsf::observer::reset_literal_session_confirmed();
+    }
+
+    // ---- ADR-200: 否定的証拠カウンタの寿命は `consecutive` と同じ ----
+
+    #[test]
+    fn negative_evidence_count_is_reset_together_with_consecutive() {
+        let c = CompositionState::new();
+        assert_eq!(c.increment_negative_evidence_count(), 1);
+        assert_eq!(c.increment_negative_evidence_count(), 2);
+        assert_eq!(c.negative_evidence_count(), 2);
+        // CompositionConfirmed の dispatch（reset_consecutive_count）でリセットされる。
+        c.reset_consecutive_count();
+        assert_eq!(c.negative_evidence_count(), 0);
+    }
+
+    #[test]
+    fn negative_evidence_count_survives_raw_recovery_cold_mark_but_resets_on_focus_and_set_open() {
+        use crate::output::ColdReason;
+        let c = CompositionState::new();
+        c.increment_negative_evidence_count();
+        // give-up の cold mark（RawTsfLiteralRecovery）自体はリセットしない。
+        c.mark_composition_cold(ColdReason::RawTsfLiteralRecovery);
+        assert_eq!(c.negative_evidence_count(), 1);
+        // 通常のタイピング操作の cold mark でもリセットしない（consecutive と同じ）。
+        c.mark_composition_cold(ColdReason::PassthroughConfirmKey);
+        assert_eq!(c.negative_evidence_count(), 1);
+        // SetOpenTrue でリセット。
+        c.mark_composition_cold(ColdReason::SetOpenTrue);
+        assert_eq!(c.negative_evidence_count(), 0);
+        // FocusChange（mark 経由と on_focus_changed 経由）でもリセット。
+        c.increment_negative_evidence_count();
+        c.mark_composition_cold(ColdReason::FocusChange);
+        assert_eq!(c.negative_evidence_count(), 0);
+        c.increment_negative_evidence_count();
+        c.on_focus_changed();
+        assert_eq!(c.negative_evidence_count(), 0);
     }
 }

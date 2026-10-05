@@ -1,0 +1,699 @@
+//! 実行器: `SimIme`(実機のドライバに当たる)を、異常方針・読み取り方針つきで動かし、観測を表に記録し、時間・件数を数える。
+
+use std::collections::{HashMap, HashSet};
+
+use crate::anomaly::{Anomaly, AnomalyPolicy, AnomalyTracker, ResetLevel};
+use crate::model::{Outcome, Status};
+use crate::sim::{PressReport, SimIme};
+use crate::table::Table;
+
+/// status読み取りの方針(観測経路を2つ使う頻度)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadPolicy {
+    /// 1経路だけ読む。
+    Single,
+    /// 各statusを初めて見たときだけ2経路で読んで照合する(文献のR2)。
+    DoubleFirst,
+    /// 毎回2経路で読む。
+    DoubleAlways,
+}
+
+/// 1回の押下の結果。
+#[derive(Debug, Clone, Copy)]
+pub struct PressInfo {
+    pub before: Status,
+    pub outcome: Outcome,
+    /// [ADR195-T7](../../../docs/tasks/adr195-t7-safety-measures.md)項目2
+    /// （opus-adversarial-consult round2 N1対応）: `PressReport::contaminated`
+    /// をそのまま引き継ぐ。呼び出し側（`awase-keymap-learn-win::main`の検証
+    /// ウォーク等、`Executor`が`recording=false`で使われる場面）は、これが
+    /// 立っている観測を採点・記録に使ってはならない——`Executor::press`自身は
+    /// `recording=true`のときの表への記録は既に見送るが、`recording=false`の
+    /// 呼び出し元（採点用ウォーク）には`contaminated`を伝える手段がこれまで
+    /// 無かった。
+    pub contaminated: bool,
+}
+
+/// 実行の統計。
+#[derive(Debug, Clone, Default)]
+pub struct Stats {
+    pub presses: u32,
+    pub resets: u32,
+    pub reads: u32,
+    pub retries: u32,
+    pub sync_losses: u32,
+    pub forced_resets: u32,
+    /// [ADR195-T7](../../../docs/tasks/adr195-t7-safety-measures.md)項目2:
+    /// `PressReport::contaminated`が立っていたため表への記録を見送った回数。
+    pub contaminated_trials: u32,
+    /// 実機のIMMが矛盾した状態(`open=false`かつ`composing=true`)を報告したため、表への記録を
+    /// 見送った押下の回数(ADR-210 Opusレビュー B2-3)。
+    pub impossible_status_trials: u32,
+    pub anomalies: HashMap<Anomaly, u32>,
+    /// 押下ごとの (経過ms, 1回以上測ったセル数, 2回以上測ったセル数)。
+    pub timeline: Vec<(f64, usize, usize)>,
+    /// 巡回(`strategy::tour`)の今の計画に残っている打鍵数・リセット数・必要観測数(進捗の見積り用)。
+    /// 計画を立てるたびに更新し、実行で減らし、巡回が終わったら0にする。
+    pub plan_presses_left: u32,
+    pub plan_resets_left: u32,
+    pub need_left: u32,
+}
+
+/// IMEへの注入・観測・待機を内包するドライバ。
+///
+/// ADR-195段階1は本トレイトを「6メソッド(press/press_setup/read_status/
+/// reread_status/settle_setup/reset)+elapsed_ms」と定めるが、実装は意図的に
+/// それより広い9メソッドを持つ。差分2点はADR文面のミス(round4時点の見立て)ではなく、
+/// 実際の呼び出しパターンが要求する区別:
+///
+/// - `read_primary`/`read_secondary`(ADRの`read_status`1本に対応)は2経路読み取り
+///   (`ReadPolicy::DoubleFirst`/`DoubleAlways`)を成立させるために分離が必要。1本化
+///   すると`double_read_detects_channel_mismatch_and_resolves`等が依存する
+///   チャンネル間不一致検出ができなくなる。
+/// - `machine_initial_status`はADRが提案する「`Executor::new`は
+///   `ImeDriver::read_status()`から初期状態を取る」に反して残している。
+///   `SimIme::machine_initial_status`はコスト0・ノイズ無しの真値だが、
+///   `read_primary`はコスト(`cost.read_ms`)とノイズ(`noisy_status`)を伴う観測。
+///   `Executor::reset()`の`s == self.initial`比較(リセット成功判定)がノイズ無しの
+///   真値を要求するため、`read_primary`で代替すると確率的に不一致になり
+///   `reset_recovers_even_when_the_first_level_fails`等が壊れる。`RealImeDriver`側も
+///   `machine_initial_status`はキャッシュ済み定数(`self.initial`)を返すのに対し
+///   `read_primary`は実際のWin32観測I/Oを行うため、置き換えは構築時に不要な実機I/Oを
+///   発生させる。
+pub trait ImeDriver {
+    fn press(&mut self, key: usize) -> PressReport;
+    fn press_setup(&mut self, key: usize);
+    fn read_primary(&mut self) -> Status;
+    fn read_secondary(&mut self) -> Status;
+    fn reread_status(&mut self) -> Status;
+    fn settle_setup(&mut self) -> Status;
+    fn reset(&mut self, level: ResetLevel) -> bool;
+    fn elapsed_ms(&self) -> f64;
+    fn machine_initial_status(&self) -> Status;
+    /// 直前の`reset`が最後に送ったキーの添字(あれば)。リセット直後の観測は、実際には
+    /// このキーが直前キーなので、文脈として記録する(ADR-210 Opusレビュー B2-1)。
+    fn last_reset_key(&self) -> Option<usize> {
+        None
+    }
+    /// [ADR195-T7](../../../docs/tasks/adr195-t7-safety-measures.md)項目2
+    /// （opus-adversarial-consult round2 N3対応）: セッション監視が既に
+    /// 失敗と判定した後は、`strategy::over()`が予算（時間・押下数）を使い切る
+    /// 前に打ち切れるようにする。既定は`false`（`SimIme`等、セッション監視を
+    /// 持たないドライバはこれまで通り予算のみで打ち切る）。
+    fn should_abort(&self) -> bool {
+        false
+    }
+}
+
+/// 実行器。
+///
+/// `progress`は`Box<dyn FnMut>`を持つため`#[derive(Debug)]`は付けない
+/// (Executorの`{:?}`表示は既存コード・テストのどこからも使われていない)。
+pub struct Executor<D: ImeDriver = SimIme> {
+    pub driver: D,
+    pub table: Table,
+    pub stats: Stats,
+    tracker: AnomalyTracker,
+    read: ReadPolicy,
+    recording: bool,
+    cur: Option<Status>,
+    last_key: Option<usize>,
+    run_len: usize,
+    max_run: Option<usize>,
+    seen: HashSet<Status>,
+    initial: Status,
+    /// ADR-195段階6: 学習プロセス(`awase-keymap-learn-win`)が進捗を標準出力へ
+    /// 運ぶための差し込み口。`press()`が完了するたびに呼ばれる(呼び出し側で
+    /// 出力頻度を間引く)。既定は`None`(シミュレータ・既存テストへの影響なし)。
+    progress: Option<ProgressSink>,
+}
+
+/// [`Executor::progress`]の型(clippyの`type_complexity`回避のため型エイリアスに分離)。
+type ProgressSink = Box<dyn FnMut(&Stats, &Table)>;
+
+impl<D: ImeDriver + std::fmt::Debug> std::fmt::Debug for Executor<D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Executor")
+            .field("driver", &self.driver)
+            .field("table", &self.table)
+            .field("stats", &self.stats)
+            .field("tracker", &self.tracker)
+            .field("read", &self.read)
+            .field("recording", &self.recording)
+            .field("cur", &self.cur)
+            .field("last_key", &self.last_key)
+            .field("run_len", &self.run_len)
+            .field("max_run", &self.max_run)
+            .field("seen", &self.seen)
+            .field("initial", &self.initial)
+            .field("progress", &self.progress.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<D: ImeDriver> Executor<D> {
+    pub fn new(driver: D, policy: AnomalyPolicy, read: ReadPolicy) -> Self {
+        let initial = driver.machine_initial_status();
+        Self {
+            driver,
+            table: Table::new(),
+            stats: Stats::default(),
+            tracker: AnomalyTracker::new(policy),
+            read,
+            recording: true,
+            cur: None,
+            last_key: None,
+            run_len: 0,
+            max_run: None,
+            seen: HashSet::new(),
+            initial,
+            progress: None,
+        }
+    }
+
+    pub fn set_read_policy(&mut self, r: ReadPolicy) {
+        self.read = r;
+    }
+
+    /// ADR-195段階6: 進捗の差し込み口を設定する。`press()`終了のたびに
+    /// `(stats, table)`で呼ばれる。呼び出し側で出力頻度(何押下ごとに実際に
+    /// 表示するか)を判断すること——ここでは無条件に毎回呼ぶ。
+    pub fn set_progress_sink(&mut self, sink: impl FnMut(&Stats, &Table) + 'static) {
+        self.progress = Some(Box::new(sink));
+    }
+
+    pub fn set_recording(&mut self, on: bool) {
+        self.recording = on;
+    }
+
+    /// 1巡の長さの上限(R7)。連続して押した数がこれに達したら強制リセットが要る。
+    pub fn set_max_run(&mut self, n: Option<usize>) {
+        self.max_run = n;
+    }
+
+    pub fn elapsed_ms(&self) -> f64 {
+        self.driver.elapsed_ms()
+    }
+
+    pub const fn last_key(&self) -> Option<usize> {
+        self.last_key
+    }
+
+    pub const fn current(&self) -> Option<Status> {
+        self.cur
+    }
+
+    fn note_anomaly(&mut self, a: Anomaly) {
+        *self.stats.anomalies.entry(a).or_default() += 1;
+    }
+
+    fn should_double_read(&self, primary: Status) -> bool {
+        match self.read {
+            ReadPolicy::Single => false,
+            ReadPolicy::DoubleAlways => true,
+            ReadPolicy::DoubleFirst => !self.seen.contains(&primary),
+        }
+    }
+
+    /// 2経路の読み取り結果 `(a, b)` を方針に従って1つに決める。
+    fn resolve(&mut self, a: Status, b: Status) -> Status {
+        let double = self.should_double_read(a);
+        self.stats.reads += 1;
+        let mut out = a;
+        if double {
+            self.stats.reads += 1;
+            if a != b {
+                self.note_anomaly(Anomaly::ChannelMismatch);
+                let c = self.driver.reread_status();
+                self.stats.reads += 1;
+                out = if c == a || c == b { c } else { a };
+            }
+        }
+        self.seen.insert(out);
+        out
+    }
+
+    /// 現在のstatusを読む。
+    pub fn read_status(&mut self) -> Status {
+        let a = self.driver.read_primary();
+        let b = if self.should_double_read(a) {
+            self.driver.read_secondary()
+        } else {
+            a
+        };
+        let s = self.resolve(a, b);
+        self.cur = Some(s);
+        s
+    }
+
+    /// 強制リセットが要るか(異常が窓内で多い、または1巡の上限)。
+    pub fn should_reset(&self) -> bool {
+        self.tracker.should_force_reset() || self.max_run.is_some_and(|m| self.run_len >= m)
+    }
+
+    /// キー `key` を押し、押下前後のstatusと行方を読んで記録する。キーが届かなかったときは再試行し、それでも届かなければ `None`。
+    pub fn press(&mut self, key: usize) -> Option<PressInfo> {
+        let before = self.read_status();
+        let mut report = None;
+        let retries = self.tracker.policy().max_press_retries;
+        for attempt in 0..=retries {
+            let r = self.driver.press(key);
+            if r.delivered {
+                report = Some(r);
+                break;
+            }
+            self.note_anomaly(Anomaly::KeyNotDelivered);
+            self.tracker.note(true);
+            if attempt < retries {
+                self.stats.retries += 1;
+            }
+        }
+        let r = report?;
+        let flag_before = self.stats.anomalies.get(&Anomaly::ChannelMismatch).copied();
+        let after = self.resolve(r.seen.status, r.seen_b);
+        let flag_after = self.stats.anomalies.get(&Anomaly::ChannelMismatch).copied();
+        self.tracker.note(flag_before != flag_after);
+        let outcome = Outcome {
+            status: after,
+            disp: r.seen.disp,
+        };
+        // ADR195-T7項目2: 測定区間に混入があった観測は、記録も学習アルゴリズムへの
+        // フィードバックもしない(信頼できないため)。`recording=false`のとき(検証
+        // ウォーク中)と同様に扱う——両方とも「表を更新しない」という同じ効果を持つが、
+        // 意味は異なる(前者は「無効化された観測」、後者は「意図的に記録しない」)ため
+        // `contaminated_trials`で区別して数える。
+        let impossible = (!after.open && after.composing) || (!before.open && before.composing);
+        if r.contaminated {
+            self.stats.contaminated_trials += 1;
+        } else if impossible {
+            // 閉と報告されているのに入力中、はIMMの矛盾した観測。記録しない。
+            self.stats.impossible_status_trials += 1;
+        } else if self.recording {
+            self.table.record(before, key, self.last_key, outcome);
+        }
+        self.cur = Some(after);
+        self.last_key = Some(key);
+        self.run_len += 1;
+        self.stats.presses += 1;
+        self.stats.timeline.push((
+            self.driver.elapsed_ms(),
+            self.table.covered1(),
+            self.table.covered2(),
+        ));
+        if let Some(sink) = &mut self.progress {
+            sink(&self.stats, &self.table);
+        }
+        Some(PressInfo {
+            before,
+            outcome,
+            contaminated: r.contaminated,
+        })
+    }
+
+    /// S0用: 状態を作るための押下(観測も記録もしない)。コストは経路のキー間隔だけ。
+    pub fn press_setup(&mut self, key: usize) {
+        self.driver.press_setup(key);
+        self.last_key = Some(key);
+    }
+
+    /// S0用: 経路を打ち終えた後の待ちと検証(statusを読む)。
+    ///
+    /// `driver.settle_setup()`は単一チャネルの読み取りで、`read_status()`とは違い
+    /// `ReadPolicy`(Double系)の二重読み取り・`seen`集合の更新を経由しない。
+    /// 現状の呼び出し元は`strategy::s0`(常に`ReadPolicy::Single`)だけなので実害は
+    /// 無いが、将来Double系ポリシーの戦略がS0を再利用すると、二重読み取りが
+    /// 黙って行われなくなる(レビュー指摘)。その組み合わせを早期に検知する。
+    pub fn settle_setup(&mut self) -> Status {
+        debug_assert_eq!(
+            self.read,
+            ReadPolicy::Single,
+            "settle_setup() は単一チャネル読み取りのみ対応(ReadPolicy::Double*と組み合わせない)"
+        );
+        let status = self.driver.settle_setup();
+        self.cur = Some(status);
+        status
+    }
+
+    /// リセット(段階的に昇格しながら、初期のstatusに戻ったことを読んで確かめる)。
+    ///
+    /// `driver.reset(level)`のbool(実機では`settle()`込みの自己申告)だけでなく、
+    /// 毎回`self.read_status()`を無条件で呼ぶ(旧`(f64, bool)`版の不変条件を維持する
+    /// ためのレビュー指摘対応)。`ok`だけを見て読み取りを省略すると、`SimIme`側の
+    /// `ok`は観測に基づかない確率的な値なので、`stats.reads`/コストが
+    /// シナリオ(特に`reset_fail_prob`>0)ごとに黙って変わってしまう
+    /// (ADR-195が要求する「シミュレータ比較実験に影響しない」という不変条件に反する)。
+    pub fn reset(&mut self) {
+        let mut level = self.tracker.policy().first_reset;
+        for _ in 0..6 {
+            let ok = self.driver.reset(level);
+            self.stats.resets += 1;
+            self.last_key = self.driver.last_reset_key();
+            let s = self.read_status();
+            if ok && s == self.initial {
+                break;
+            }
+            self.note_anomaly(Anomaly::ResetFailed);
+            level = level.next().unwrap_or(ResetLevel::Hard);
+        }
+        self.cur = Some(self.initial);
+        self.run_len = 0;
+        self.tracker.clear();
+    }
+
+    /// 期待と違う状態に出たときに数える(同期喪失)。
+    pub fn note_sync_loss(&mut self) {
+        self.stats.sync_losses += 1;
+        self.note_anomaly(Anomaly::UnexpectedStatus);
+        self.tracker.note(true);
+    }
+
+    pub fn note_forced_reset(&mut self) {
+        self.stats.forced_resets += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cost::CostModel;
+    use crate::model::Disposition;
+    use crate::sample_models::{atok_keys, atok_like};
+    use crate::sim::SimConfig;
+
+    fn exec(cfg: SimConfig) -> Executor<SimIme> {
+        Executor::new(
+            SimIme::new(atok_like(), cfg, CostModel::event()),
+            AnomalyPolicy::default(),
+            ReadPolicy::Single,
+        )
+    }
+
+    /// [ADR195-T7](../../../docs/tasks/adr195-t7-safety-measures.md)項目2
+    /// （opus-adversarial-consult round1 M1対応）のテスト専用ドライバ:
+    /// `press()`が返す`PressReport::contaminated`を呼び出し側が指定できる。
+    /// `RealImeDriver`の実際のWin32結線(`check_session_interference`)を
+    /// 経由せずに、`Executor::press`が`contaminated=true`をどう扱うかだけを
+    /// 検証する。
+    struct FixedContaminationDriver {
+        contaminated: bool,
+    }
+
+    impl ImeDriver for FixedContaminationDriver {
+        fn press(&mut self, _key: usize) -> PressReport {
+            let status = Status {
+                open: true,
+                mode: 0,
+                composing: false,
+            };
+            PressReport {
+                delivered: true,
+                cost_ms: 1.0,
+                seen: Outcome {
+                    status,
+                    disp: Disposition::None,
+                },
+                seen_b: status,
+                contaminated: self.contaminated,
+            }
+        }
+        fn press_setup(&mut self, _key: usize) {}
+        fn read_primary(&mut self) -> Status {
+            self.machine_initial_status()
+        }
+        fn read_secondary(&mut self) -> Status {
+            self.machine_initial_status()
+        }
+        fn reread_status(&mut self) -> Status {
+            self.machine_initial_status()
+        }
+        fn settle_setup(&mut self) -> Status {
+            self.machine_initial_status()
+        }
+        fn reset(&mut self, _level: ResetLevel) -> bool {
+            true
+        }
+        fn elapsed_ms(&self) -> f64 {
+            0.0
+        }
+        fn machine_initial_status(&self) -> Status {
+            Status {
+                open: false,
+                mode: 0,
+                composing: false,
+            }
+        }
+    }
+
+    #[test]
+    fn contaminated_press_is_not_recorded_but_is_counted() {
+        let mut e = Executor::new(
+            FixedContaminationDriver { contaminated: true },
+            AnomalyPolicy::default(),
+            ReadPolicy::Single,
+        );
+        let info = e.press(0);
+        assert!(info.is_some(), "delivered=trueなのでPressInfoは返る");
+        assert!(
+            info.expect("直前でSomeを確認済み").contaminated,
+            "round2 N1対応: PressInfo自体にもcontaminatedが伝わるはず(検証ウォーク等、\
+             recording=falseの呼び出し元が判定に使う)"
+        );
+        assert_eq!(
+            e.table.covered1(),
+            0,
+            "汚染された観測(contaminated=true)は表に記録してはならない(round1 M1)"
+        );
+        assert_eq!(e.stats.contaminated_trials, 1);
+        assert_eq!(e.stats.presses, 1, "押下自体のコスト・件数は数える");
+    }
+
+    #[test]
+    fn uncontaminated_press_is_recorded_normally() {
+        let mut e = Executor::new(
+            FixedContaminationDriver {
+                contaminated: false,
+            },
+            AnomalyPolicy::default(),
+            ReadPolicy::Single,
+        );
+        let info = e.press(0).expect("delivered=trueなのでSome");
+        assert!(!info.contaminated);
+        assert_eq!(e.table.covered1(), 1);
+        assert_eq!(e.stats.contaminated_trials, 0);
+    }
+
+    #[test]
+    fn press_records_before_and_after() {
+        let mut e = exec(SimConfig::default());
+        e.reset();
+        let info = e.press(atok_keys::HANKAKU).expect("届く");
+        assert!(info.before.open && !info.outcome.status.open);
+        assert_eq!(e.table.covered1(), 1);
+        assert!(e.elapsed_ms() > 0.0);
+    }
+
+    #[test]
+    fn progress_sink_is_called_once_per_successful_press() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let calls = Rc::new(RefCell::new(0u32));
+        let calls_in_sink = Rc::clone(&calls);
+        let mut e = exec(SimConfig::default());
+        e.set_progress_sink(move |stats, table| {
+            *calls_in_sink.borrow_mut() += 1;
+            assert!(stats.presses >= 1);
+            assert!(table.covered1() <= stats.presses as usize);
+        });
+        e.reset();
+        assert_eq!(
+            *calls.borrow(),
+            0,
+            "reset()はpress()を経由しないので呼ばれない"
+        );
+        e.press(atok_keys::HANKAKU).expect("届く");
+        assert_eq!(*calls.borrow(), 1);
+        e.press(atok_keys::HANKAKU).expect("届く");
+        assert_eq!(*calls.borrow(), 2);
+    }
+
+    #[test]
+    fn undelivered_key_is_retried_then_reported() {
+        let mut e = exec(SimConfig {
+            key_drop_prob: 1.0,
+            ..SimConfig::default()
+        });
+        e.reset();
+        assert!(e.press(0).is_none());
+        assert_eq!(e.stats.retries, 1);
+        assert_eq!(e.table.covered1(), 0);
+    }
+
+    #[test]
+    fn reset_recovers_even_when_the_first_level_fails() {
+        let mut e = exec(SimConfig {
+            reset_fail_prob: 0.9,
+            seed: 3,
+            ..SimConfig::default()
+        });
+        e.press(atok_keys::HANKAKU);
+        e.reset();
+        assert_eq!(e.current(), Some(e.driver.machine().initial_status()));
+        assert!(e.stats.resets >= 1);
+    }
+
+    #[test]
+    fn double_read_detects_channel_mismatch_and_resolves() {
+        let mut e = exec(SimConfig {
+            obs_noise: 0.3,
+            seed: 9,
+            ..SimConfig::default()
+        });
+        e.set_read_policy(ReadPolicy::DoubleAlways);
+        let truth = e.driver.machine().initial_status();
+        let mut wrong = 0;
+        for _ in 0..200 {
+            if e.read_status() != truth {
+                wrong += 1;
+            }
+        }
+        // 単一読みの誤り率(約0.3)より大きく減る。
+        assert!(wrong < 40, "wrong={wrong}");
+        assert!(
+            e.stats
+                .anomalies
+                .get(&Anomaly::ChannelMismatch)
+                .copied()
+                .unwrap_or(0)
+                > 0
+        );
+    }
+
+    #[test]
+    fn double_always_read_charges_for_both_channels_when_no_mismatch() {
+        let mut e = exec(SimConfig::default());
+        e.set_read_policy(ReadPolicy::DoubleAlways);
+        e.reset();
+        let before = e.elapsed_ms();
+        for _ in 0..10 {
+            e.read_status();
+        }
+        let read_ms = CostModel::event().read_ms;
+        assert!((e.elapsed_ms() - before - 10.0 * 2.0 * read_ms).abs() < 1e-6);
+    }
+
+    #[test]
+    fn max_run_forces_a_reset_request() {
+        let mut e = exec(SimConfig::default());
+        e.set_max_run(Some(2));
+        e.reset();
+        e.press(atok_keys::HIRAGANA);
+        assert!(!e.should_reset());
+        e.press(atok_keys::HIRAGANA);
+        assert!(e.should_reset());
+    }
+
+    /// リセットが最後に送ったキーを返し、押下の結果を固定するテスト用ドライバ。
+    struct ScriptedDriver {
+        reset_key: Option<usize>,
+        status: Status,
+    }
+
+    impl ImeDriver for ScriptedDriver {
+        fn press(&mut self, _key: usize) -> PressReport {
+            PressReport {
+                delivered: true,
+                cost_ms: 0.0,
+                seen: Outcome {
+                    status: self.status,
+                    disp: Disposition::None,
+                },
+                seen_b: self.status,
+                contaminated: false,
+            }
+        }
+        fn press_setup(&mut self, _key: usize) {}
+        fn read_primary(&mut self) -> Status {
+            self.status
+        }
+        fn read_secondary(&mut self) -> Status {
+            self.status
+        }
+        fn reread_status(&mut self) -> Status {
+            self.status
+        }
+        fn settle_setup(&mut self) -> Status {
+            self.status
+        }
+        fn reset(&mut self, _level: ResetLevel) -> bool {
+            true
+        }
+        fn elapsed_ms(&self) -> f64 {
+            0.0
+        }
+        fn machine_initial_status(&self) -> Status {
+            self.status
+        }
+        fn last_reset_key(&self) -> Option<usize> {
+            self.reset_key
+        }
+    }
+
+    #[test]
+    fn reset_records_the_key_the_reset_sent_as_the_last_key() {
+        let s = Status {
+            open: false,
+            mode: 0x09,
+            composing: false,
+        };
+        let mut e = Executor::new(
+            ScriptedDriver {
+                reset_key: Some(2),
+                status: s,
+            },
+            AnomalyPolicy::default(),
+            ReadPolicy::Single,
+        );
+        e.reset();
+        assert_eq!(
+            e.last_key(),
+            Some(2),
+            "リセット直後の直前キーはリセットが送ったキー"
+        );
+        let mut e = Executor::new(
+            ScriptedDriver {
+                reset_key: None,
+                status: s,
+            },
+            AnomalyPolicy::default(),
+            ReadPolicy::Single,
+        );
+        e.reset();
+        assert_eq!(
+            e.last_key(),
+            None,
+            "何も送らないドライバは従来どおり文脈なし"
+        );
+    }
+
+    #[test]
+    fn impossible_closed_but_composing_observation_is_not_recorded() {
+        let impossible = Status {
+            open: false,
+            mode: 0x09,
+            composing: true,
+        };
+        let mut e = Executor::new(
+            ScriptedDriver {
+                reset_key: None,
+                status: impossible,
+            },
+            AnomalyPolicy::default(),
+            ReadPolicy::Single,
+        );
+        let _ = e.press(0);
+        assert_eq!(e.stats.impossible_status_trials, 1);
+        assert_eq!(e.table.covered1(), 0, "矛盾した観測は表に記録しない");
+        assert_eq!(e.stats.presses, 1, "押下自体は数える");
+    }
+}

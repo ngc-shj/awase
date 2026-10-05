@@ -350,8 +350,10 @@ pub struct IntentWitness {
 impl IntentWitness {
     /// 物理 IME キー（VK_F3/F4 等）由来の明示意図。
     ///
-    /// `injected == true`（他プロセスの SendInput 由来）と、そもそも
-    /// shadow_action を持たないキーは `None`。
+    /// `injected == true`（他プロセスの SendInput 由来）は常に `None`。
+    /// 非注入イベントについては、`shadow_action`（役割由来・静的）を「IME 関連の物理キーである」証拠として受理する。
+    /// （旧 ADR-153 決定1の明示config〈ケース2〉が立てた `explicit_ime_action_consumed` の受理は、ADR-206 で
+    /// ケース2ごと撤去した。無変換/変換単独タップの開閉はエンジンの `SetOpen` 経路を通る。）
     #[must_use]
     pub fn from_physical(e: &awase::types::RawKeyEvent) -> Option<Self> {
         (!e.injected && e.ime_relevance.shadow_action.is_some()).then_some(Self {
@@ -509,6 +511,8 @@ mod tests {
             ShadowImeAction, VkCode,
         };
         awase::types::RawKeyEvent {
+            was_down: false,
+            press_id: None,
             vk_code: VkCode(0xF2),
             scan_code: ScanCode(0),
             event_type: KeyEventType::KeyDown,
@@ -522,9 +526,13 @@ mod tests {
                 is_sync_key: sync,
                 sync_direction: sync.then_some(ShadowImeAction::TurnOn),
                 is_ime_control: false,
+                is_ime_mode_key: false,
+                layout_japanese: None,
             },
             modifier_key: None,
             modifier_snapshot: ModifierState::default(),
+            left_thumb_down_snapshot: None,
+            right_thumb_down_snapshot: None,
             injected,
         }
     }

@@ -193,13 +193,13 @@ mod imp {
         pub fn set_enabled(&mut self, enabled: bool) {
             self.enabled = enabled;
             self.sync_ui();
-            log::info!("Tray: engine {}", if enabled { "ON" } else { "OFF" });
+            tracing::info!("Tray: engine {}", if enabled { "ON" } else { "OFF" });
         }
 
         /// 通知表示（未実装: ログのみ。NSUserNotification は deprecated のため
         /// UserNotifications framework 対応まで保留）。
         pub fn show_balloon(&self, title: &str, message: &str) {
-            log::info!("Notification: {title}: {message}");
+            tracing::info!("Notification: {title}: {message}");
         }
 
         pub fn set_layout_name(&self, name: &str) {
@@ -229,21 +229,21 @@ pub struct SystemTray {
 impl SystemTray {
     #[must_use]
     pub fn new() -> Self {
-        log::info!("Menu bar icon is only available on macOS");
+        tracing::info!("Menu bar icon is only available on macOS");
         Self { enabled: true }
     }
 
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
-        log::info!("Tray: engine {}", if enabled { "ON" } else { "OFF" });
+        tracing::info!("Tray: engine {}", if enabled { "ON" } else { "OFF" });
     }
 
     pub fn show_balloon(&self, title: &str, message: &str) {
-        log::info!("Notification: {title}: {message}");
+        tracing::info!("Notification: {title}: {message}");
     }
 
     pub fn set_layout_name(&self, name: &str) {
-        log::info!("Tray: layout = {name}");
+        tracing::info!("Tray: layout = {name}");
     }
 
     pub fn sync_login_item(&self) {}

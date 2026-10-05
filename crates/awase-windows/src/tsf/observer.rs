@@ -51,9 +51,12 @@ impl ChangeCounter {
         self.0.load(Ordering::Relaxed) != b.0
     }
 
-    /// カウンタを 0 にリセットする（ウォームアップ開始時等）。
-    pub(super) fn reset(&self) {
-        self.0.store(0, Ordering::Relaxed);
+    /// 現在値をそのまま読み取る。診断ログ用（ADR-117、issue #138 切り分け）。
+    ///
+    /// `baseline()`/`has_changed()` の変化検出とは別に、「一度でも発火したか」
+    /// （0 かどうか）を単独で確認したい呼び出し元向け。
+    pub(super) fn value(&self) -> u32 {
+        self.0.load(Ordering::Relaxed)
     }
 }
 
@@ -106,6 +109,12 @@ pub struct TsfObservations {
     /// `send_romaji_as_tsf` や `TsfReadinessJudge` が参照する。
     pub(super) gji_last_io_ms: AtomicU64,
 
+    /// GJI モニターが GJI プロセスへ（再）接続した時刻 (GetTickCount64 ms)。0 = 未接続。
+    ///
+    /// 接続直後の `gji_last_io_ms` は、累積 I/O カウンタの初回読みを「変化」として数えた値（実際の IME 操作の
+    /// 証拠ではない）。`gji_io_is_attach_artifact` で区別する（BUG-176）。
+    pub(super) gji_attach_ms: AtomicU64,
+
     /// GJI プロセスの累積 WriteTransferCount（バイト数）。
     ///
     /// バックグラウンドモニタースレッドが 10ms ごとに更新する。
@@ -144,6 +153,24 @@ pub struct TsfObservations {
     /// 計上される）。[`Self::gji_write_ops`] と同じ理由で診断専用に記録する。
     pub(super) gji_other_ops: AtomicU64,
 
+    /// GJI プロセスの累積 `OtherTransferCount`（バイト数、`gji_other_ops` の量版）。
+    ///
+    /// `gji_write_bytes` は F2/`VK_IME_ON` 等のモード切替キーでは +0.0KB のまま
+    /// 動かないことが実測済み（本ファイル `gji_write_bytes` の doc 参照）。
+    /// 2026-09-07、`GetProcessIoCounters` のドキュメントが「Other」を「データ
+    /// 転送を伴わない制御系 I/O」と定義していることから、モード切替のような
+    /// RPC/パイプ制御呼び出しは Write ではなく Other 側にバイト量が現れるので
+    /// はないかという仮説を立て、dragonflyg4 実機（半角/全角キー、awase が
+    /// actuate しない委譲シナリオ）で検証した。**結果は否定的**——`gji_write_
+    /// bytes` と同じく `gji_other_bytes` も常に +0.0KB のまま動かないことを
+    /// 確認済み（`ObservationSource` ではなく `gji_other_ops`〈操作回数〉の
+    /// 方が有望というのが実際の結論、`docs/adr/151-*.md` 論点7-1/7-2、
+    /// `project_adr151_force_on_rescue_observation_experiment_2026_09_07`
+    /// メモリ参照）。この否定的な実測結果自体に診断上の価値があるため
+    /// フィールドは撤去せず残す。[`Self::gji_write_ops`] と同じ理由で診断専用
+    /// （判定ロジックには使わない）。
+    pub(super) gji_other_bytes: AtomicU64,
+
     /// GJI モニターが利用可能か（プロセス発見・ハンドル取得成功）。
     pub(super) gji_monitor_ok: AtomicBool,
 
@@ -151,7 +178,7 @@ pub struct TsfObservations {
     /// 「shadow=OFF なのに候補ウィンドウが表示された（desync）」ことがあったかを記録するラッチ。
     ///
     /// `EVENT_OBJECT_SHOW` で `true` に、`reset_candidate_was_seen()` 呼び出し時に `false` にリセット。
-    /// `KanjiToggleStrategy` が shadow=false でも desync を検出して VK_KANJI を送れるようにする。
+    /// `GjiDirectStrategy`（ADR-171）が shadow=false でも desync を検出して必要な再送を行えるようにする。
     pub(super) candidate_was_seen: AtomicBool,
 
     /// `LiteralDetectCore` が最後に `CompositionConfirmed`（かつ非 partial-literal）を
@@ -227,6 +254,9 @@ pub struct TsfObservations {
     /// COM/TSF 呼び出しは `gji-io-monitor` スレッド側に閉じ、BugReport 生成時は
     /// このキャッシュだけを読む。
     pub(super) ime_product_name: RwLock<Option<String>>,
+    /// アクティブな TIP が Microsoft IME 本体の CLSID と一致したか（`state::ime_kind::identify_tip`）。
+    /// `tsf_active_kind == 2` は「GJI 以外」の意味で、ATOK 等も含むので区別に使えない。
+    pub(super) ms_ime_native_identified: AtomicBool,
 }
 
 impl Default for TsfObservations {
@@ -243,11 +273,13 @@ impl TsfObservations {
             gji_candidate_show: ChangeCounter::new(),
             gji_candidate_visible: AtomicBool::new(false),
             gji_last_io_ms: AtomicU64::new(0),
+            gji_attach_ms: AtomicU64::new(0),
             gji_write_bytes: AtomicU64::new(0),
             gji_last_write_ms: AtomicU64::new(0),
             gji_write_ops: AtomicU64::new(0),
             gji_read_ops: AtomicU64::new(0),
             gji_other_ops: AtomicU64::new(0),
+            gji_other_bytes: AtomicU64::new(0),
             gji_monitor_ok: AtomicBool::new(false),
             candidate_was_seen: AtomicBool::new(false),
             literal_session_confirmed_gen: AtomicU64::new(0),
@@ -258,6 +290,7 @@ impl TsfObservations {
             ime_change_seq: ChangeCounter::new(),
             tsf_active_kind: AtomicU8::new(0),
             ime_product_name: RwLock::new(None),
+            ms_ime_native_identified: AtomicBool::new(false),
         }
     }
 
@@ -265,6 +298,12 @@ impl TsfObservations {
     #[must_use]
     pub fn gji_last_io_ms(&self) -> u64 {
         self.gji_last_io_ms.load(Ordering::Relaxed)
+    }
+
+    /// GJI モニターの最終接続時刻 (ms)。0 = 未接続。
+    #[must_use]
+    pub fn gji_attach_ms(&self) -> u64 {
+        self.gji_attach_ms.load(Ordering::Relaxed)
     }
 
     /// GJI モニターが利用可能かを読み取る（Acquire）。
@@ -277,6 +316,35 @@ impl TsfObservations {
     #[must_use]
     pub fn gji_candidate_visible(&self) -> bool {
         self.gji_candidate_visible.load(Ordering::Relaxed)
+    }
+
+    /// 現在（GJI/MS-IME 問わず）IME composition window が可視かどうかを読み取る（Relaxed）。
+    ///
+    /// `EVENT_OBJECT_IME_SHOW`/`HIDE` により更新される（`win_event_obs.rs`）。
+    /// ADR-117（issue #138 切り分け）: MS-IME 環境での信頼性は未検証——PID/フォーカスで
+    /// フィルタしておらずフォーカス変更でもリセットされない上、MS-IME の TSF インライン
+    /// 未確定文字列は IME ウィンドウを生成しないことが多く、一度も発火せず常時 `false`
+    /// の可能性がある。`false` を「composition 無し」の証明として読まないこと
+    /// （`ime_show_seq`/`ime_change_seq` と併読し、一度も発火していないのか
+    /// 発火後に閉じたのかを区別すること）。
+    #[must_use]
+    pub fn ime_composition_active(&self) -> bool {
+        self.ime_composition_active.load(Ordering::Relaxed)
+    }
+
+    /// `EVENT_OBJECT_IME_SHOW` の発火回数（診断ログ用、ADR-117）。
+    ///
+    /// 0 なら「一度も発火していない」。`ime_composition_active() == false` と
+    /// 組み合わせて「発火自体が無い」か「発火後 HIDE で閉じた」かを区別する。
+    #[must_use]
+    pub fn ime_show_seq(&self) -> u32 {
+        self.ime_show_seq.value()
+    }
+
+    /// `EVENT_OBJECT_IME_CHANGE` の発火回数（診断ログ用、ADR-117）。
+    #[must_use]
+    pub fn ime_change_seq(&self) -> u32 {
+        self.ime_change_seq.value()
     }
 
     /// 現在使用中の IME 種別を返す。
@@ -300,6 +368,56 @@ impl TsfObservations {
     /// （MS-IME キー割当てチェック等）はこれを併用すること。
     pub(crate) fn ime_kind_detected(&self) -> bool {
         self.tsf_active_kind.load(Ordering::Acquire) != 0
+    }
+
+    /// アクティブな TIP が Microsoft IME 本体と**同定できているか**（CLSID 一致）。
+    ///
+    /// `ime_kind_detected()`（CLSID 判定が一度でも走ったか）や `active_ime_kind() == MicrosoftIme`
+    /// （GJI 以外の全 TIP・IMM32 HKL を含む）と違い、ATOK・Japanist・未知の TIP・IMM32 HKL のみのときは
+    /// `false`。打鍵時予測の Microsoft IME 本体の表と、半角/全角の belief トグルの適用可否に使う
+    /// （レビュー round2 NB1/NB3）。
+    pub(crate) fn ms_ime_native_identified(&self) -> bool {
+        self.ms_ime_native_identified.load(Ordering::Acquire)
+    }
+
+    /// 打鍵時予測の表・半角/全角の belief トグルを当ててよい IME 種別。GJI と、同定できた Microsoft IME 本体だけ。
+    /// GJI 未検出・第三者 IME・IMM32 HKL のみは `None`（安全側: 静的に決めず、生キーを通して観測に追随する）。
+    ///
+    /// **起動直後の窓（round3 A-NEW-8）**: `tsf_active_kind`の既定（0）と`ms_ime_native_identified=false`の
+    /// 間、最初の`query_active_kind`ポーリングが確定するまで`None`を返す。ADR-189の半角/全角belief
+    /// トグルはこの間付かず、物理キーがそのままIMEへ通る（ADR-191の方向としては正しいが、ADR-189
+    /// 「復元して残す」経路の起動直後だけの挙動変化。CI（`sc-hz`/`sc-*-msime-native`）でカバー済み）。
+    #[must_use]
+    pub(crate) fn table_ime_kind(&self) -> Option<crate::state::ime_kind::ImeKindId> {
+        use crate::state::ime_kind::ImeKindId;
+        match self.active_ime_kind() {
+            ActiveImeKind::GoogleJapaneseInput => Some(ImeKindId::Gji),
+            ActiveImeKind::MicrosoftIme if self.ms_ime_native_identified() => {
+                Some(ImeKindId::MsIme)
+            }
+            ActiveImeKind::MicrosoftIme => None,
+        }
+    }
+
+    /// 現在確定している `TipIdentity`（`active_ime_kind()`と`ms_ime_native_identified()`から導出）。
+    /// `gji_monitor`の`TipIdentityDebounce`が「変化なし」を判定する基準に使う（レビュー round3 NR1）。
+    #[must_use]
+    pub(super) fn current_tip_identity(&self) -> crate::state::ime_kind::TipIdentity {
+        use crate::state::ime_kind::TipIdentity;
+        match self.active_ime_kind() {
+            ActiveImeKind::GoogleJapaneseInput => TipIdentity::Gji,
+            ActiveImeKind::MicrosoftIme if self.ms_ime_native_identified() => {
+                TipIdentity::MsImeNative
+            }
+            ActiveImeKind::MicrosoftIme => TipIdentity::Other,
+        }
+    }
+
+    /// 値が変化した場合 `true` を返す（`set_tsf_active_kind`と同じ形。デバウンス確定後にログを出すか判定するため）。
+    pub(super) fn set_ms_ime_native_identified(&self, identified: bool) -> bool {
+        self.ms_ime_native_identified
+            .swap(identified, Ordering::Release)
+            != identified
     }
 
     /// CLSID ベース IME 種別を更新する。値が変化した場合 `true` を返す。
@@ -380,6 +498,13 @@ pub(crate) fn gji_last_io_ms() -> u64 {
     TSF_OBS.gji_last_io_ms.load(Ordering::Relaxed)
 }
 
+/// `last_io_ms` が、モニター接続時の累積カウンタ初回読み（実 I/O ではない）のままか。
+/// 接続後に実 I/O があれば `last_io_ms` は `attach_ms` より後になる。純粋関数（BUG-176）。
+#[must_use]
+pub(crate) const fn gji_io_is_attach_artifact(last_io_ms: u64, attach_ms: u64) -> bool {
+    attach_ms > 0 && last_io_ms <= attach_ms
+}
+
 /// 現在時刻と最終 GJI I/O 時刻の差（アイドル時間）を ms で返す。
 pub(crate) fn gji_idle_ms() -> u64 {
     crate::hook::current_tick_ms().saturating_sub(gji_last_io_ms())
@@ -420,6 +545,16 @@ pub(crate) fn gji_other_ops() -> u64 {
     TSF_OBS.gji_other_ops.load(Ordering::Relaxed)
 }
 
+/// GJI プロセスの累積 `OtherTransferCount`（バイト数）を返す。0 = 未観測。live 読み取り。
+///
+/// 診断専用。`gji_write_bytes` と同じくモード切替キーでは +0.0KB のまま動かない
+/// ことが実機確認済み（`gji_other_bytes` フィールドの doc 参照）だが、
+/// `gji_write_ops`/`gji_other_ops`（操作回数）と同じ呼び出し元から突き合わせて
+/// 参照できるよう、他のアクセサと対称に用意する（/code-review指摘、2026-09-07）。
+pub(crate) fn gji_other_bytes() -> u64 {
+    TSF_OBS.gji_other_bytes.load(Ordering::Relaxed)
+}
+
 /// GJI プロセスが起動済みかつアクティブ IME として CLSID ベースで選択されているかどうか。
 ///
 /// `gji_monitor_ok`（プロセス稼働）だけでは、GJI Converter が起動中でも
@@ -442,14 +577,9 @@ pub(crate) fn current_ime_product_name() -> Option<String> {
         .clone()
 }
 
-/// OBJ_NAMECHANGE カウンタをリセットする（`send_eager_tsf_warmup` 用）。
-pub(crate) fn reset_namechange_seq() {
-    TSF_OBS.focus_namechange.reset();
-}
-
 /// GJI candidate が SHOW になってから次の `reset_candidate_was_seen()` まで `true`。
 ///
-/// `KanjiToggleStrategy` が shadow=false でも desync を検出するために使う。
+/// `GjiDirectStrategy`（ADR-171）が shadow=false でも desync を検出するために使う。
 pub(crate) fn candidate_was_seen() -> bool {
     TSF_OBS.candidate_was_seen.load(Ordering::Relaxed)
 }
@@ -483,9 +613,9 @@ pub(crate) fn reset_candidate_was_seen() {
 ///
 /// 決定分岐の呼び出し元（`probe_fsm.rs`/`literal_detect_fsm.rs`/`gji_warmup_coro.rs`）は
 /// `TsfEnvSnapshot::literal_session_confirmed_gen` 経由の比較へ移行済み（belief 監査、
-/// `.claude/rules/ime-belief-architecture.md` 参照）。本関数自体は削除せず残すが、
-/// 現状クレート内に非テストの呼び出し元がないため `#[allow(dead_code)]` を付与する。
-#[allow(dead_code)]
+/// `.claude/rules/ime-belief-architecture.md` 参照）。現在の呼び出し元は
+/// `tsf/probe.rs::evidence_now` のみで、journal に記録する診断専用の値
+/// （`LiteralEvidence::literal_session_confirmed`）を作るために使う。
 pub(crate) fn literal_session_confirmed(current_cold_seq: Generation) -> bool {
     let confirmed_gen = TSF_OBS
         .literal_session_confirmed_gen
@@ -557,6 +687,19 @@ pub(crate) fn take_pending_end_composition() -> bool {
         .swap(false, Ordering::Relaxed)
 }
 
+/// 保留中の `StartComposition`/`EndComposition`（候補窓 SHOW/HIDE の latch）を捨てる。
+///
+/// IME OFF とフォーカス変更は、それまでの composition セッションの終わりを意味する。latch が
+/// drain されないまま残ると、次の send_keys/WM_DRAIN で**前のセッションの SHOW**が新しい状態へ
+/// `StartComposition` として配られる（OffCold では `StartComposition while engine off`、
+/// cold/warm では存在しない composition で `OnComposing` に入る）。`ImeOff`・`FocusChange` の
+/// GjiFsm 通知の直前に呼ぶ。
+pub(crate) fn discard_pending_composition_events() -> bool {
+    let start = take_pending_start_composition();
+    let end = take_pending_end_composition();
+    start || end
+}
+
 // ── IME 種別 ──
 
 /// フォアグラウンドで使用中の IME の種別。
@@ -599,6 +742,38 @@ mod tests {
     /// `TSF_OBS` はプロセス全体のグローバル状態のため、テスト間の競合を防ぐロック
     /// (`probe.rs`/`literal_detect_fsm.rs`と共有、詳細は`TSF_OBS_TEST_LOCK`のdoc参照)。
     use super::TSF_OBS_TEST_LOCK as TEST_LOCK;
+
+    /// BUG-176: 接続直後の `gji_last_io_ms`（累積カウンタ初回読み）は実 I/O ではない。接続後の実 I/O は区別できる。
+    #[test]
+    fn gji_io_attach_artifact_is_distinguished_from_real_io() {
+        // 未接続(0)は判定しない。
+        assert!(!gji_io_is_attach_artifact(500, 0));
+        // 接続時刻以前の値(接続時の初回読み)は実 I/O ではない。
+        assert!(gji_io_is_attach_artifact(1000, 1000));
+        assert!(gji_io_is_attach_artifact(990, 1000));
+        // 接続後に更新された値は実 I/O。
+        assert!(!gji_io_is_attach_artifact(1001, 1000));
+    }
+
+    /// IME OFF/フォーカス変更で保留の SHOW/HIDE latch が捨てられ、次の drain で前セッションの
+    /// `StartComposition` が配られない(ADR-213 P2b の CI で `StartComposition while engine off`)。
+    #[test]
+    fn discard_pending_composition_events_clears_both_latches() {
+        let _g = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        TSF_OBS
+            .pending_start_composition
+            .store(true, Ordering::Relaxed);
+        TSF_OBS
+            .pending_end_composition
+            .store(true, Ordering::Relaxed);
+        assert!(discard_pending_composition_events());
+        assert!(!take_pending_start_composition());
+        assert!(!take_pending_end_composition());
+        // 何も保留が無ければ false。
+        assert!(!discard_pending_composition_events());
+    }
 
     // ── BUG-39: literal_session_confirmed の世代付け回帰テスト ─────────────
 
@@ -671,5 +846,47 @@ mod tests {
         reset_literal_session_confirmed();
 
         assert!(!literal_session_confirmed(Generation::new(301)));
+    }
+
+    // ── ADR-171: candidate_was_seen の同期消費 ──────────────────────────
+
+    /// ADR-171「BUG-113再導入にならない理由」の前提: `reset_candidate_was_seen()`
+    /// は呼び出しと同時に（次の drain/timer 等を待たず）`candidate_was_seen()`
+    /// を `false` へ切り替える。`ime_controller.rs::apply_mechanism` の
+    /// GjiDirect アームは、override 送信（`send_ime_mode_key`）が成功した
+    /// 直後にこの関数を呼ぶことで、同一バッチ内の2つ目の `SetOpen` effect が
+    /// 新しく構築する `view` が同じ desync 証拠を再度読んでしまう
+    /// （BUG-113型の二重送信を再導入する）ことを防いでいる。
+    ///
+    /// このテストは `apply_mechanism` 自体（実 Win32 `SendInput` を伴うため
+    /// このモジュールの `#[cfg(test)]` からは意図的に呼ばない、
+    /// `ime_controller.rs` 側のテストが `shadow_on=None`/`Some(false)` の
+    /// 組み合わせで一貫して実送信を避けている設計と同じ理由）ではなく、
+    /// その前提となる「消費が同期的であること」自体を固定する
+    /// （/code-review指摘: この保証を検証する自動テストが無かった）。
+    /// 将来 `reset_candidate_was_seen()` が非同期化・遅延化されると、
+    /// この保証が崩れ2つ目のeffectが二重送信しうる——その変化をこのテストが
+    /// 検知する。
+    #[test]
+    fn reset_candidate_was_seen_takes_effect_synchronously() {
+        let _g = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // EVENT_OBJECT_SHOW 相当（win_event_obs.rs が実際に立てる値）を模擬する。
+        TSF_OBS.candidate_was_seen.store(true, Ordering::Relaxed);
+        assert!(candidate_was_seen());
+
+        // apply_mechanism の GjiDirect アームが override 送信成功直後に呼ぶ。
+        reset_candidate_was_seen();
+
+        // 呼び出し直後（他のイベント処理を挟まず）に false が読める必要がある
+        // ——これが同一バッチ内の2つ目の effect が正しく AlreadyMatched に
+        // 落ちるための前提。
+        assert!(
+            !candidate_was_seen(),
+            "reset_candidate_was_seen() は同期的に candidate_was_seen() へ反映されなければ \
+             ならない（次の apply の view 構築が古い desync 証拠を再度読んでしまう）"
+        );
     }
 }

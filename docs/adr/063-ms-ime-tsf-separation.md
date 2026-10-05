@@ -1,4 +1,18 @@
+---
+id: ADR-063
+title: |-
+  TSF 共通層と IME 固有層の分離 + MS-IME 対応（案B）
+status: |-
+  採用・実装済み(一部撤去、2026-10-04 確認)。ActiveImeKind・MsImeDirectStrategy・ImeWarmupStrategy による分離は現存。GJI 側の SacrificialWarmup(VK_A+BS)は d4956490 で撤去。旧: 採用済み
+related_adr:
+  - "ADR-034"
+  - "ADR-047"
+  - "ADR-048"
+---
+
 # ADR-063: TSF 共通層と IME 固有層の分離 + MS-IME 対応（案B）
+
+> 状態更新(2026-10-04): 採用・実装済み(一部撤去、2026-10-04 確認)。ActiveImeKind・MsImeDirectStrategy・ImeWarmupStrategy による分離は現存。GJI 側の SacrificialWarmup(VK_A+BS)は d4956490 で撤去
 
 ## ステータス
 

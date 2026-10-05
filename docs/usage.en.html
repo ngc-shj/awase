@@ -508,7 +508,7 @@ footer p{margin-bottom:0.3rem}
       <ul>
         <li><strong>Select layout</strong> — Lists the .yab files in <code>layouts_dir</code>. Selecting one switches the layout immediately</li>
         <li><strong>Settings...</strong> — Opens the Settings window</li>
-        <li><strong>Clear learning cache</strong> — Deletes the IME's learning-data cache</li>
+        <li><strong>Clear IME-control learning cache</strong> — Deletes the per-app record of whether IMM32 can control the IME (<code>[imm_capability]</code> in <code>cache.toml</code>). Use it to recover from a mislearned entry. The keymap learning table (<code>keymap-learn-table.json</code>) is not deleted</li>
         <li><strong>Restart process</strong> — Fully restarts the process when input misbehaves (see <a href="#panic-reset">"Emergency operations & reset"</a> for details)</li>
         <li><strong>Auto-start</strong> — Enables/disables auto-start at logon (checked = enabled)</li>
         <li><strong>Restart as administrator</strong> — Restarts awase elevated via UAC. This lets it work even with apps that require administrator privileges (some games, for example)</li>
@@ -540,24 +540,18 @@ footer p{margin-bottom:0.3rem}
         <tr><th>Item</th><th>Description</th></tr>
         <tr><td>Keyboard model</td><td>Choose JIS (Japanese layout) or US (English layout)</td></tr>
         <tr><td>Simultaneous-keystroke threshold</td><td>The time window (ms) within which two keystrokes count as simultaneous. The NICOLA standard default is 100 ms</td></tr>
-        <tr><td>Confirm mode</td><td>The timing at which characters are committed. See the table below</td></tr>
-        <tr><td>Speculative-output wait</td><td>The wait (ms) before speculative output when using two_phase / adaptive_timing</td></tr>
-        <tr><td>Output mode</td><td>Unicode (recommended), PerKey, or Batched. Normally leave it as Unicode</td></tr>
-        <tr><td>Hook mode</td><td>Relay (recommended, stable) or Filter (low latency)</td></tr>
         <tr><td>Auto-start</td><td>Whether to start automatically at Windows logon</td></tr>
         <tr><td>Layout</td><td>Selects the .yab layout file to use. "Rescan" refreshes the list</td></tr>
       </table>
+      <p class="note">The confirm mode (<code>confirm_mode</code>) and the speculative-output wait (<code>speculative_delay_ms</code>) have been removed from the settings screen. Most users kept the default <code>wait</code>, and offering other modes there added more complexity than benefit. The n-gram tie-break (3-key branching and insufficient-overlap decisions) is always active regardless of <code>confirm_mode</code>. To change it, edit <code>config.toml</code> directly as described under "Confirm-mode options" below. The margins for 3-key branching and insufficient-overlap decisions (<code>timing_margin_percent</code> / <code>min_overlap_margin_percent</code>) can be adjusted with the sliders on the "Advanced settings" tab.</p>
     </div>
 
     <div class="card">
       <h3>Confirm-mode options</h3>
       <table class="tab-table">
         <tr><th>Mode</th><th>Behavior</th><th>Suited for</th></tr>
-        <tr><td>wait</td><td>Holds until the timeout before committing. Most accurate</td><td>People who want to type slowly and accurately</td></tr>
-        <tr><td>speculative</td><td>Outputs immediately and replaces on a simultaneous keystroke. Fastest, but flickers briefly</td><td>People who prioritize speed above all</td></tr>
-        <tr><td>two_phase</td><td>Speculative output after a short wait. Between wait and speculative</td><td>People who want a balance</td></tr>
-        <tr><td>adaptive_timing</td><td>wait during continuous typing, speculative once typing pauses. Adapts to speed automatically</td><td>People whose typing speed varies</td></tr>
-        <tr><td>ngram_predictive</td><td>Dynamically decides speculative vs. wait using n-gram statistics. Uses context to improve accuracy</td><td>People who want the smartest decision (recommended)</td></tr>
+        <tr><td>wait (default, recommended)</td><td>Holds until the timeout before committing. Most accurate</td><td>People who want to type slowly and accurately</td></tr>
+        <tr><td>ngram_predictive</td><td>Dynamically decides speculative vs. wait using n-gram statistics. Uses context to improve accuracy</td><td>People who want the smartest decision</td></tr>
       </table>
     </div>
 
@@ -568,7 +562,7 @@ footer p{margin-bottom:0.3rem}
         <tr><td>Left thumb key</td><td>The key used for the left thumb-shift key (default: VK_NONCONVERT = Muhenkan)</td></tr>
         <tr><td>Right thumb key</td><td>The key used for the right thumb-shift key (default: VK_CONVERT = Henkan)</td></tr>
         <tr><td>IME ON/OFF keys</td><td>The keys awase actively sends to turn the IME ON/OFF (idempotent). Multiple entries allowed</td></tr>
-        <tr><td>IME ON/OFF toggle</td><td>Key that flips ON⇔OFF based on the IME state at the moment it's pressed. Default: the Kanji key. Multiple entries allowed</td></tr>
+        <tr><td>IME ON/OFF toggle</td><td>Key that flips ON⇔OFF based on the IME state at the moment it's pressed. Default: empty (follows the IME's own settings). Multiple entries allowed</td></tr>
         <tr><td>Thumb Shift ON key</td><td>The key that turns the NICOLA engine ON. Multiple entries allowed</td></tr>
         <tr><td>Thumb Shift OFF key</td><td>The key that turns the NICOLA engine OFF. Multiple entries allowed</td></tr>
         <tr><td>Thumb Shift-toggle hotkey</td><td>A global hotkey that toggles the engine ON/OFF</td></tr>
@@ -586,7 +580,7 @@ footer p{margin-bottom:0.3rem}
         or if you want to pin a specific Fn key intentionally (there's currently no
         setting for this in the settings screen).
       </p>
-      <div class="code-block">[general]
+      <div class="code-block" data-example="usage-en-1" data-mode="uncomment">[general]
 # Dedicated Fn key to send on a Muhenkan solo tap (default: unset — defer to auto-detection)
 # muhenkan_solo_tap_dedicated_fn_key = "VK_F21"</div>
       <p class="note" style="margin-top:0.7rem">
@@ -637,7 +631,7 @@ footer p{margin-bottom:0.3rem}
     <div class="card">
       <h3>Customizing shortcuts</h3>
       <p style="color:var(--text-secondary);font-size:0.93rem;margin-bottom:0.7rem">The following are the default values. Add a <code>[keys]</code> section to <code>config.toml</code> to override them.</p>
-      <div class="code-block">[keys]
+      <div class="code-block" data-example="usage-en-2" data-mode="asis" data-default="keys">[keys]
 # NICOLA engine ON (enable thumb-shift input)
 engine_on = ["Ctrl+Shift+変換"]
 
@@ -650,36 +644,34 @@ ime_on = ["Ctrl+変換"]
 # IME OFF (switch to direct input mode)
 ime_off = ["Ctrl+無変換"]
 
-# IME ON/OFF toggle (flips based on the IME state at the moment it's pressed)
-ime_toggle = ["VK_KANJI"]
+# IME ON/OFF toggle (flips based on the IME state at the moment it's pressed. Default: empty = follow the IME's own settings)
+ime_toggle = []
 
 # Emergency: pressing Muhenkan alone three times within 400 ms turns the engine OFF.
 # A last resort for when Ctrl gets stuck and the shortcuts stop working.
 # Disable it with an empty string "" or by deleting the line.
 engine_off_solo_triple = "VK_NONCONVERT"</div>
-      <p class="note" style="margin-top:0.7rem"><code>engine_on_ime_key</code>/<code>engine_off_ime_key</code> (an advanced setting that force-sends an IME full-width/half-width mode key when the engine turns ON/OFF) are disabled (unset) by default. This bundles opening/closing the IME with forcing its mode into a single key, so <code>ime_on</code>/<code>ime_off</code> above is usually enough. You can enable it by adding these lines to <code>config.toml</code> manually.</p>
+      <p class="note" style="margin-top:0.7rem"><code>engine_on_ime_key</code>/<code>engine_off_ime_key</code> (which sent an IME mode key when the engine turned ON/OFF) have been removed. They are ignored if still present in <code>config.toml</code> (a notice is shown at startup — delete those lines). There is no replacement (use <code>ime_on</code>/<code>ime_off</code> above to open/close the IME).</p>
       <p class="note" style="margin-top:0.7rem">To assign multiple keys, add them to the array: <code>["Ctrl+Shift+変換", "Ctrl+F8"]</code></p>
       <p class="note">A global hotkey (which works regardless of app focus) is set with <code>engine_toggle_hotkey = "Ctrl+Shift+F12"</code> under <code>[general]</code>.</p>
     </div>
 
     <div class="card">
       <h3>Simultaneous-keystroke detection</h3>
-      <div class="code-block">[general]
+      <div class="code-block" data-example="usage-en-3" data-mode="asis">[general]
 # Simultaneous-keystroke detection threshold (milliseconds). The NICOLA standard default is 100 ms.
 simultaneous_threshold_ms = 100
 
 # Confirm-mode selection
-#   ngram_predictive  - dynamically switch speculative/wait with n-gram prediction (recommended)
-#   wait              - hold until the timeout (most accurate)
-#   speculative       - output immediately (fastest)
-#   two_phase         - short wait -> speculative output -> replace
-#   adaptive_timing   - automatically adjust the threshold to typing speed
-confirm_mode = "ngram_predictive"</div>
+#   wait              - hold until the timeout (most accurate, default, recommended)
+#   ngram_predictive  - dynamically switch speculative/wait with n-gram prediction
+#   (the old speculative / two_phase / adaptive_timing were removed; if left in place awase warns and treats them as wait)
+confirm_mode = "wait"</div>
     </div>
 
     <div class="card">
       <h3>Customizing the thumb keys</h3>
-      <div class="code-block">[general]
+      <div class="code-block" data-example="usage-en-4" data-mode="asis">[general]
 # Left thumb key (VK code name)
 left_thumb_key = "VK_NONCONVERT"    # Muhenkan key
 
@@ -689,23 +681,17 @@ right_thumb_key = "VK_CONVERT"      # Henkan key</div>
 
     <div class="card">
       <h3>Keyboard model and output method</h3>
-      <div class="code-block">[general]
+      <div class="code-block" data-example="usage-en-5" data-mode="asis">[general]
 # Keyboard model (the default is fine if you use a JIS keyboard)
 # keyboard_model = "jis"   # JIS keyboard (default)
 # keyboard_model = "us"    # US keyboard
-
-# Send method for romaji output (normally no need to change)
-#   unicode  - send hiragana directly (no IME needed, recommended)
-#   per_key  - SendInput one character at a time (for compatibility with other hooks)
-#   batched  - all characters in a single SendInput
-output_mode = "unicode"</div>
-      <p class="note">For the new Microsoft IME (Windows 10 20H1 or later), <code>unicode</code> mode is recommended. With <code>per_key</code> / <code>batched</code>, input may not be processed correctly.</p>
+</div>
     </div>
 
     <div class="card">
       <h3>Auto-start settings</h3>
       <p style="color:var(--text-secondary);font-size:0.93rem;margin-bottom:0.6rem">Whether you install via the MSI installer or the ZIP distribution's <code>install.ps1</code>, auto-start at Windows logon is enabled by default with no confirmation prompt. You can turn it off from the tray icon menu or with the <code>auto_start</code> setting below.</p>
-      <div class="code-block">[general]
+      <div class="code-block" data-example="usage-en-6" data-mode="asis">[general]
 # Start automatically at Windows logon
 #   "enabled"  - enable auto-start (default)
 #   "disabled" - disable auto-start
@@ -715,7 +701,7 @@ auto_start = "enabled"</div>
 
     <div class="card">
       <h3>Overriding behavior for specific windows</h3>
-      <div class="code-block">[focus_overrides]
+      <div class="code-block" data-example="usage-en-7" data-mode="asis">[app_overrides]
 # Force text input in specific apps
 force_text = [
     { process = "myapp.exe", class = "MyWindowClass" },
@@ -730,7 +716,7 @@ force_bypass = [
 
     <div class="card">
       <h3>Per-app output-mode override</h3>
-      <div class="code-block">[focus_overrides]
+      <div class="code-block" data-example="usage-en-8" data-mode="asis">[app_overrides]
 # Send as VK keystrokes (Chrome / Edge / VS Code and other Electron-based apps)
 force_vk = [
     { process = "chrome.exe",  class = "Chrome_RenderWidgetHostHWND" },
@@ -745,16 +731,16 @@ force_tsf = [
 
     <div class="card">
       <h3>Manually setting IME-detection keys</h3>
-      <p style="color:var(--text-secondary);font-size:0.93rem;margin-bottom:0.6rem">Detects external IME state changes (e.g. the Hankaku/Zenkaku key). Not in the GUI — edit <code>config.toml</code> directly (most people don't need it). <code>toggle</code> defaults to empty. The Kanji key is already actively handled by the "IME ON/OFF toggle" setting on the Keys tab (<code>keys.ime_toggle</code>, default: the Kanji key) — assigning it here too would double-process the same key and break it.</p>
-      <div class="code-block">[keys.ime_detect]
+      <p style="color:var(--text-secondary);font-size:0.93rem;margin-bottom:0.6rem">Detects external IME state changes (e.g. the Hankaku/Zenkaku key). Not in the GUI — edit <code>config.toml</code> directly (most people don't need it). <code>toggle</code>, <code>on</code> and <code>off</code> all default to empty (the IME-On/IME-Off keys are followed automatically). Keys set in the "IME ON/OFF toggle" setting on the Keys tab (<code>keys.ime_toggle</code>, default: empty) are handled actively by awase — assigning the same key here too would double-process it and break it.</p>
+      <div class="code-block" data-example="usage-en-9" data-mode="uncomment">[keys.ime_detect]
 # Key that toggles the IME ON/OFF (default: empty. Don't set this to the
 # same key as "IME ON/OFF toggle" above — that causes double-processing)
 # toggle = ["VK_KANJI"]
 
-# Key that turns the IME directly ON (default: ["IMEオン"])
+# Key that turns the IME directly ON (default: empty. The IME-On/IME-Off keys (VK_IME_ON/OFF) are followed automatically without listing them)
 # on = ["VK_DBE_HIRAGANA"]
 
-# Key that turns the IME directly OFF (default: ["IMEオフ"])
+# Key that turns the IME directly OFF (default: empty)
 # off = ["VK_DBE_SBCSCHAR"]</div>
     </div>
   </div>
@@ -806,7 +792,7 @@ force_tsf = [
         A last resort for forcing the NICOLA engine to stop when even the normal shortcuts do not work — for example, when the Ctrl key is stuck.
         It is <strong>enabled by default</strong> (already assigned to the Muhenkan key).
       </p>
-      <div class="code-block">[keys]
+      <div class="code-block" data-example="usage-en-10" data-mode="asis" data-default="keys">[keys]
 # Key that turns the engine OFF when tapped alone three times within 400 ms (default: Muhenkan)
 engine_off_solo_triple = "VK_NONCONVERT"
 
@@ -942,9 +928,8 @@ engine_off_solo_triple = "VK_NONCONVERT"
     <div class="card">
       <h3>2. Adjust the confirm mode</h3>
       <ul>
-        <li>First try <code>confirm_mode = "ngram_predictive"</code> (recommended)</li>
-        <li>If there are many misconversions, change it to <code>"wait"</code> (accurate but somewhat slower)</li>
-        <li>If fast typing feels off, try <code>"adaptive_timing"</code></li>
+        <li>First try the default <code>confirm_mode = "wait"</code> (recommended; accurate but somewhat slower)</li>
+        <li>If the delay bothers you, try <code>"ngram_predictive"</code></li>
       </ul>
     </div>
 

@@ -3,10 +3,7 @@
 //! `Output` が本番実装。`#[cfg(test)]` ブロック内の `FakeProbeIo` がテスト実装。
 //! `dispatch_probe_actions` は `ProbeIo` を受け取り、Win32 呼び出しを直接行わない。
 
-use crate::output::{
-    GjiReinitPollStatus, KeyInjector, Output, ScheduleGjiReinitResult, VkMarker, VkSequence,
-    WarmupOutcome,
-};
+use crate::output::{KeyInjector, Output, VkMarker, VkSequence, WarmupOutcome};
 use crate::state::event_origin::Generation;
 use crate::tsf::gji_fsm::StageEndReason;
 use crate::tsf::literal_facts::{
@@ -48,9 +45,8 @@ pub(crate) trait ProbeIo {
     /// 連続 raw TSF literal 回数を返す。
     fn consecutive_count(&self) -> u32;
     /// 連続カウントをリセットする（`DetectionResult::CompositionConfirmed` 確認時、BUG-27 追補4）。
+    /// 否定的証拠カウンタも同時にリセットされる（ADR-200）。
     fn reset_consecutive_count(&self);
-    /// retry 済み tombstone を解除する。
-    fn clear_gji_reinit_retry_tombstone(&self);
     /// `RAW_TSF_LITERAL` グローバルを設定する（`consecutive == 0` のときのみ呼ばれる）。
     ///
     /// `escape_composition`: partial literal（candidate 表示中に一部だけ literal 化）回収時に
@@ -58,38 +54,6 @@ pub(crate) trait ProbeIo {
     fn set_raw_literal(&self, backs: usize, romaji: String, escape_composition: bool);
     /// composition を `RawTsfLiteralRecovery` で cold にマークする。
     fn mark_cold_raw_tsf(&self);
-    /// Unicode injection mode の long-cold GJI 再初期化: VK_IME_OFF→VK_IME_ON を
-    /// SendInput でキューイングし、`ImeModeFsm` の belief 更新 + async
-    /// `IMC_GETCONVERSIONMODE` ポーリングを開始する。
-    ///
-    /// `Output::send_f22_f21_reinit`（`gji_fsm::GjiAction::StartProbe` の
-    /// Unicode-mode long-cold ハンドリング）が直接呼ぶ。
-    fn send_chrome_gji_reinit_and_poll(
-        &self,
-        cold_seq: Generation,
-        focus_gen: u32,
-        retry_poll_token: Option<u32>,
-    ) -> bool;
-    /// `RawTsfLiteralRecovery` give-up 分岐専用: `send_chrome_gji_reinit_and_poll` の
-    /// 即時実行ではなく、`flush_raw_tsf_literal_recovery`（backspace 送信直後）まで
-    /// 予約する。BUG-36: reinit の `VK_IME_OFF` は未確定の preedit を commit して
-    /// しまうため、backspace より先に reinit を送ると commit 済みの literal 文字を
-    /// 確実に消せないレースが起きる（`Output::pending_gji_reinit_cold_seq` の
-    /// フィールド doc・`docs/known-bugs.md` BUG-36 参照）。
-    fn schedule_chrome_gji_reinit(
-        &self,
-        cold_seq: Generation,
-        focus_gen: u32,
-        retry_romaji: Option<String>,
-        consecutive_before: u32,
-    ) -> ScheduleGjiReinitResult;
-    /// 現在の IME mode focus 世代を返す。
-    fn ime_mode_focus_gen(&self) -> u32;
-    /// Unicode char を直接送信する（defer モードを無視して即送信）。
-    ///
-    /// `FlushDeferredUnicodeChars` ハンドラが deferred chars を送信するために使う。
-    /// `Output::send_unicode_char()` とは異なり defer フラグをチェックしない。
-    fn send_unicode_char_direct(&self, ch: char);
 }
 
 impl ProbeIo for Output {
@@ -112,7 +76,7 @@ impl ProbeIo for Output {
         if outcome.used_eager_path && crate::tsf::output::kana_for_romaji_static(romaji).is_some() {
             let now = crate::hook::current_tick_ms();
             self.composition.set_last_unicode_transmit_ms(now);
-            log::debug!(
+            tracing::debug!(
                 "[post-unicode] PendingGjiConfirm 開始: last_unicode_transmit_ms={now} romaji={romaji:?}"
             );
         }
@@ -147,11 +111,6 @@ impl ProbeIo for Output {
 
     fn reset_consecutive_count(&self) {
         self.composition.reset_consecutive_count();
-        self.clear_gji_reinit_retry_tombstone();
-    }
-
-    fn clear_gji_reinit_retry_tombstone(&self) {
-        Self::clear_gji_reinit_retry_tombstone(self);
     }
 
     fn set_raw_literal(&self, backs: usize, romaji: String, escape_composition: bool) {
@@ -163,214 +122,11 @@ impl ProbeIo for Output {
         self.warmup_coord.note_stage_recovery();
         self.warmup_coord.mark_composition_reset();
     }
-
-    fn send_chrome_gji_reinit_and_poll(
-        &self,
-        cold_seq: Generation,
-        focus_gen: u32,
-        retry_poll_token: Option<u32>,
-    ) -> bool {
-        use crate::tsf::output::{make_key_input_ex, IME_KANJI_MARKER};
-        use crate::vk::{VK_IME_OFF, VK_IME_ON};
-        // BUG-33: give-up（RawTsfLiteralRecovery 連続失敗）からもこの reinit を呼ぶため、
-        // CHROME_GJI_REINIT_CONFIRM_MS のポーリング窓が終わる前の再発火をレート制限する。
-        // OFF→ON の最終到達状態は ON で決定論的だが、窓内に連続 give-up が来るたびに
-        // 重ねて送ると「OFF→ON→OFF→ON…」の瞬間的な OFF ブリップが積み重なり、
-        // GJI 側の composition/候補ウィンドウを無用に揺らす（BUG-29/BUG-30 のような
-        // 誤検知の温床になりかねない）。前回の送信からポーリング窓が経過するまで待つ。
-        let now_ms = crate::hook::current_tick_ms();
-        let elapsed = now_ms.saturating_sub(self.last_gji_reinit_ms.get());
-        if elapsed < crate::tuning::CHROME_GJI_REINIT_CONFIRM_MS {
-            log::debug!(
-                "[chrome-reinit] cold={cold_seq} skip: 前回 reinit から {elapsed}ms \
-                 (< {}ms) しか経っていない",
-                crate::tuning::CHROME_GJI_REINIT_CONFIRM_MS,
-                cold_seq = cold_seq.value(),
-            );
-            return false;
-        }
-        self.last_gji_reinit_ms.set(now_ms);
-        // 1. VK_IME_OFF → VK_IME_ON を SendInput でキューイングし GJI を OFF/ON リセット。
-        let inputs = [
-            make_key_input_ex(VK_IME_OFF, false, IME_KANJI_MARKER),
-            make_key_input_ex(VK_IME_OFF, true, IME_KANJI_MARKER),
-            make_key_input_ex(VK_IME_ON, false, IME_KANJI_MARKER),
-            make_key_input_ex(VK_IME_ON, true, IME_KANJI_MARKER),
-        ];
-        // write_bytes ベースラインを SendInput 前に取得する。
-        // VK_IME_OFF→ON が GJI の WriteTransferCount を上昇させるかを観測する実験ログ。
-        let write_bytes_before = crate::tsf::observer::gji_write_bytes();
-        log::debug!(
-            "[chrome-reinit] cold={cold_seq} VK_IME_OFF→VK_IME_ON 強制リセット送信 + IMC ポーリング開始 \
-             (write_bytes_baseline={write_bytes_before})",
-            cold_seq = cold_seq.value(),
-        );
-        let _ = crate::win32::send_input_safe(&inputs);
-
-        // 2. ImeModeFsm belief を即時更新: VK_IME_OFF → Off, VK_IME_ON → Hiragana。
-        self.on_f22_f21_sent();
-
-        // 3. async IMC ポーリング開始（CHROME_GJI_REINIT_CONFIRM_MS の間、10ms ごとに発行）。
-        //    with_app 再入を避けるため spawn_local で defer する。
-        let max_retries = crate::tuning::CHROME_GJI_REINIT_CONFIRM_MS
-            / crate::tuning::CHROME_GJI_REINIT_POLL_INTERVAL_MS;
-        win32_async::spawn_local(async move {
-            let mut first_write_tick: Option<u32> = None;
-            let mut final_status = GjiReinitPollStatus::Timeout;
-            for i in 0..max_retries {
-                win32_async::sleep_ms(crate::tuning::CHROME_GJI_REINIT_POLL_INTERVAL_MS as u32)
-                    .await;
-                let write_bytes_now = crate::tsf::observer::gji_write_bytes();
-                let write_delta = write_bytes_now.saturating_sub(write_bytes_before);
-                if write_delta > 0 && first_write_tick.is_none() {
-                    first_write_tick = Some(i as u32 + 1);
-                    log::info!(
-                        "[chrome-reinit] cold={cold_seq} GJI write_bytes 上昇検出: \
-                         tick=#{i} delta=+{write_delta}B (+{:.1}KB)",
-                        write_delta as f64 / 1024.0,
-                        cold_seq = cold_seq.value(),
-                    );
-                }
-                let conv = crate::ime::get_ime_conversion_mode_raw_timeout_async(15).await;
-                log::debug!(
-                    "[chrome-reinit] cold={cold_seq} IMC poll #{i}: conv={} NATIVE={} \
-                     write_delta=+{write_delta}B",
-                    fmt_conv(conv),
-                    conv.is_some_and(|v| crate::imm::cmode_has(v, crate::imm::IME_CMODE_NATIVE)),
-                    cold_seq = cold_seq.value(),
-                );
-                let status = crate::with_app(|runtime| {
-                    let current_focus_gen = runtime.platform.output.ime_mode_focus_gen.get();
-                    if current_focus_gen != focus_gen {
-                        return GjiReinitPollStatus::Stale;
-                    }
-                    runtime.platform.output.update_ime_mode_from_imc(conv);
-                    // Hiragana 確認済みならポーリング終了
-                    let fsm = runtime.platform.output.ime_mode_fsm.borrow();
-                    if fsm.state().is_hiragana() && fsm.is_confirmed() {
-                        GjiReinitPollStatus::Confirmed
-                    } else {
-                        GjiReinitPollStatus::Timeout
-                    }
-                });
-                // ADR-101/BUG-74 コードレビュー指摘: `with_app` が再入で `None` を
-                // 返した場合、focus 世代照合も Hiragana 確認も行えていない（判定不能）
-                // だけであり、実際に stale（フォーカスが変わった）と分かったわけではない。
-                // 旧実装はここを `Stale` 扱いにして即座に completion を確定させていたため、
-                // たまたま1tick 再入しただけで retry と deferred 救済の両方を失っていた。
-                // 未観測として次 tick へ継続する（`Timeout` 分岐と同じ「何もしない」扱い）。
-                if status.is_none() {
-                    log::debug!(
-                        "[chrome-reinit] cold={cold_seq} with_app reentrant, skip tick #{i}",
-                        cold_seq = cold_seq.value(),
-                    );
-                }
-                match gji_reinit_poll_tick_outcome(status) {
-                    GjiReinitPollTickOutcome::Done(GjiReinitPollTerminalStatus::Confirmed) => {
-                        final_status = GjiReinitPollStatus::Confirmed;
-                        log::debug!(
-                            "[chrome-reinit] cold={cold_seq} Hiragana 確認 → ポーリング終了",
-                            cold_seq = cold_seq.value(),
-                        );
-                        break;
-                    }
-                    GjiReinitPollTickOutcome::Done(GjiReinitPollTerminalStatus::Stale) => {
-                        final_status = GjiReinitPollStatus::Stale;
-                        log::debug!(
-                            "[chrome-reinit] cold={cold_seq} stale focus_gen={} → ポーリング終了",
-                            focus_gen,
-                            cold_seq = cold_seq.value(),
-                        );
-                        break;
-                    }
-                    GjiReinitPollTickOutcome::Continue => {}
-                }
-            }
-            log::info!(
-                "[chrome-reinit] cold={cold_seq} ポーリング完了: \
-                 total_write_delta=+{}B first_write_tick={:?}",
-                crate::tsf::observer::gji_write_bytes().saturating_sub(write_bytes_before),
-                first_write_tick,
-                cold_seq = cold_seq.value(),
-            );
-            if let Some(token) = retry_poll_token {
-                crate::win32::post_to_main_thread_with(
-                    crate::WM_GJI_REINIT_RETRY_COMPLETE,
-                    token as usize,
-                    final_status.encode(),
-                );
-            }
-        });
-        true
-    }
-
-    fn schedule_chrome_gji_reinit(
-        &self,
-        cold_seq: Generation,
-        focus_gen: u32,
-        retry_romaji: Option<String>,
-        consecutive_before: u32,
-    ) -> ScheduleGjiReinitResult {
-        self.schedule_pending_gji_reinit(cold_seq, focus_gen, retry_romaji, consecutive_before)
-    }
-
-    fn ime_mode_focus_gen(&self) -> u32 {
-        self.current_ime_mode_focus_gen()
-    }
-
-    fn send_unicode_char_direct(&self, ch: char) {
-        // FSM tick 時は unicode_cold_defer=false のため、通常の send_unicode_char で直接送信できる。
-        self.send_unicode_char(ch);
-    }
 }
 
 /// `Option<u32>` の IMC conversion mode 値をログ用文字列にフォーマットする。
 fn fmt_conv(conv: Option<u32>) -> String {
     conv.map_or_else(|| "none".to_owned(), |v| format!("0x{v:08X}"))
-}
-
-/// `gji_reinit_poll_tick_outcome` が確定させうる終端状態。`GjiReinitPollStatus`
-/// のうち `Timeout` は「まだ確定しない」を表す非終端値なのでここには含まれない
-/// ——コードレビュー指摘(simplify角度): 以前は `Break(GjiReinitPollStatus)` と
-/// 全3variantを許す型だったため、呼び出し側に構造的に到達不能な
-/// `Break(Timeout)` マッチアームが残っていた。型を絞ることでその不能アーム
-/// 自体を消す。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GjiReinitPollTerminalStatus {
-    Confirmed,
-    Stale,
-}
-
-/// `send_chrome_gji_reinit_and_poll` の1 tick 分の判定結果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GjiReinitPollTickOutcome {
-    /// この tick では確定しない。次 tick へ継続する。
-    Continue,
-    /// ポーリングを終了し、この終端状態を最終結果として確定する。
-    Done(GjiReinitPollTerminalStatus),
-}
-
-/// `with_app` クロージャの1 tick 分の観測結果から、ポーリングを継続すべきか
-/// 打ち切るべきかを純粋関数として決定する。
-///
-/// ADR-101/BUG-74 コードレビュー指摘: `with_app` が再入で `None` を返す場合、
-/// focus 世代照合も Hiragana 確認も行えていない（判定不能）だけであり、実際に
-/// stale（フォーカスが変わった）と分かったわけではない。`None` を `Stale` 扱い
-/// にすると、たまたま1 tick 再入しただけで retry と deferred 救済の両方を失う。
-/// `None`/`Some(Timeout)` はどちらも「まだ確定しない」という同じ意味であり、
-/// `Continue` に落とすことで区別しない。
-pub(crate) const fn gji_reinit_poll_tick_outcome(
-    observed: Option<GjiReinitPollStatus>,
-) -> GjiReinitPollTickOutcome {
-    match observed {
-        Some(GjiReinitPollStatus::Confirmed) => {
-            GjiReinitPollTickOutcome::Done(GjiReinitPollTerminalStatus::Confirmed)
-        }
-        Some(GjiReinitPollStatus::Stale) => {
-            GjiReinitPollTickOutcome::Done(GjiReinitPollTerminalStatus::Stale)
-        }
-        Some(GjiReinitPollStatus::Timeout) | None => GjiReinitPollTickOutcome::Continue,
-    }
 }
 
 /// [`Output::start_ms_ime_ready_poll`] の `with_app` クロージャ戻り値。
@@ -387,6 +143,61 @@ enum MsImePollStatus {
 }
 
 impl Output {
+    /// `send_chrome_gji_reinit_and_poll` / [`Output::start_ms_ime_ready_poll`] の
+    /// `with_app` クロージャ内で1 tickごとに独立してコピーされていた「focus_gen
+    /// 照合 → 不一致なら stale → `update_ime_mode_from_imc(conv)` で IMC を反映」を
+    /// 共通化する。この2行より外側（ループの周期・終了条件・give-up latch・
+    /// write_bytes 観測ログ・完了通知の有無）は両者で意味が異なるため、あえて
+    /// 呼び出し元にそのまま残す（無理に1つのポーリングループへ統合しない）。
+    ///
+    /// `false`（focus_gen不一致）なら呼び出し元は自分の stale 値を返すこと。
+    /// `true`なら`update_ime_mode_from_imc`済みなので、続けて終端判定を行える。
+    ///
+    /// 2026-09-10、自由関数からメソッドへ変更した（`&Output`を引数に取り続けて
+    /// いたが、同じファイル内に既存の`impl Output`ブロックがあった）。
+    /// 挙動は変更していない。
+    fn refresh_ime_mode_if_focus_matches(
+        &self,
+        expected_focus_gen: u32,
+        conv: Option<u32>,
+    ) -> bool {
+        if self.ime_mode_focus_gen.get() != expected_focus_gen {
+            return false;
+        }
+        self.update_ime_mode_from_imc(conv);
+        true
+    }
+
+    /// [`Output::start_ms_ime_ready_poll`] の期限判定（ADR-140 Step1b 指摘S1対応）。
+    ///
+    /// conv を読めた・読めなかった（GJI actuation フェンスで abandon した）に
+    /// 関わらず、**このループが必ず終了する**ことを保証するために、conv の
+    /// 有無と無関係に毎tick呼べる形で分離した。呼ばなければ「abandon が連続する
+    /// 限りタスクが不死になり `ms_ime_gate_give_up` を一度も立てない」という
+    /// 終了保証の喪失を招く（実装レビュー指摘S1、BUG-114のような actuation
+    /// ストーム下で顕在化しうる）。
+    ///
+    /// 2026-09-10、自由関数からメソッドへ変更した（同上）。挙動は変更していない。
+    fn ms_ime_ready_poll_check_deadline(&self, deadline_ms: u64, cold_seq: Generation) -> bool {
+        // ADR-084（BUG-49 追補2）: `shift-conv-guard` の hold 中は
+        // `confirm_gate_deadline_override_ms` が元の `deadline_ms`
+        // （送信試行時点起点）を押し出す。詳細は `MsImeReadyCoro` の
+        // 同型コメント参照。
+        let effective_deadline_ms = deadline_ms.max(self.confirm_gate_deadline_override_ms.get());
+        if crate::hook::current_tick_ms() >= effective_deadline_ms {
+            self.ms_ime_gate_give_up.set(true);
+            tracing::warn!(
+                "[msime-ready] cold={cold_seq} IMC 未確認のまま期限切れ \
+                 (deadline=0x{effective_deadline_ms:X}) → give-up latch 設定 \
+                 （フォーカス変更 / 次の IME ON / 次の conv actuation まで gate 停止）",
+                cold_seq = cold_seq.value(),
+            );
+            true
+        } else {
+            false
+        }
+    }
+
     /// MS-IME confirm-then-transmit ゲート（BUG-13）の IMC 確認ポーリングを開始する。
     ///
     /// `MS_IME_READY_POLL_INTERVAL_MS` 間隔で `IMC_GETCONVERSIONMODE` を読み、
@@ -397,44 +208,113 @@ impl Output {
     /// `ime_mode_focus_gen` の世代照合により、ポーリング中にフォーカスが変わった場合は
     /// stale 結果で `ImeModeFsm` / latch を汚染せず黙って終了する。
     /// 待機側は `MsImeReadyCoro`（`pending_tsf`）が env 経由で確認を観測する。
+    ///
+    /// ADR-140 Step1b（`/code-review max`指摘）: `kp_stage_idle_conv_check_inner`
+    /// と全く同型の spawn→クロスプロセス conv 読み取り→`with_app` の形でありながら
+    /// フェンス対象外だった。この読み取りは `confirmed=true` を実際に立てて
+    /// `Output::ms_ime_gate_defer`（BUG-13）の送信可否を決めるため、GJI/actuation
+    /// との交錯を見逃すと未準備な IME への早期送信を招きうる
+    /// （`crate::probe_actuation_fence` module doc 参照）。issue前
+    /// （checkpoint1/2）に加え read 完了直後（checkpoint3）でもフェンスを
+    /// 再比較する——ループ2箇所は `fence_at_call` を await 直前で取るため
+    /// checkpoint1 の窓が実質ゼロで、最も起こりやすい「`SendMessageTimeoutW`
+    /// in-flight 中の actuation」は checkpoint3 でしか捕捉できない
+    /// （実装レビュー指摘S2）。conv が信用できない（abandon/checkpoint3
+    /// 不一致のいずれか）場合も `ms_ime_ready_poll_check_deadline` による
+    /// 期限判定だけは必ず行う——これを省略すると actuation が連続する限り
+    /// このタスクが不死になり `ms_ime_gate_give_up` を一度も立てなくなる
+    /// （実装レビュー指摘S1）。
+    ///
+    /// **`/code-review max`指摘（S1実装のフォローアップ）**: 上記 abandon 分岐は
+    /// 元々 `ime_mode_focus_gen` の世代照合を欠いていた——good-read 分岐は
+    /// `refresh_ime_mode_if_focus_matches` 経由で必ず世代照合してから
+    /// `Output` へ触れるのに対し、abandon 分岐は照合なしで
+    /// `ms_ime_ready_poll_check_deadline` を呼んでいたため、フォーカスが
+    /// 切り替わった後も生き続ける旧世代のこのタスクが、（グローバル1本の
+    /// フェンスのため新フォーカス側の通常の IME 操作でも起こりうる）
+    /// actuation との交錯でこの分岐に落ち続けると、旧世代の `deadline_ms`
+    /// 期限切れを検知した瞬間に**現在の（新世代の）** `ms_ime_gate_give_up`
+    /// を誤って立ててしまう——新世代は一度もタイムアウトしていないのに
+    /// BUG-13 のゲートが無効化される。abandon 分岐にも世代照合を追加し、
+    /// 世代が一致しない限り `Output` へ触れない（`Stale` で終了する）よう
+    /// good-read 分岐と揃えた。
     pub(crate) fn start_ms_ime_ready_poll(&self, cold_seq: Generation, deadline_ms: u64) {
         let gen = self.ime_mode_focus_gen.get();
         win32_async::spawn_local(async move {
             loop {
-                let conv = crate::ime::get_ime_conversion_mode_raw_timeout_async(10).await;
-                let status = crate::with_app(|runtime| {
-                    let out = &runtime.platform.output;
-                    if out.ime_mode_focus_gen.get() != gen {
-                        return MsImePollStatus::Stale;
+                let fence_at_call = crate::probe_actuation_fence::current();
+                let outcome =
+                    crate::ime::get_ime_conversion_mode_fenced_async(10, fence_at_call).await;
+                // ADR-140 Step1b 指摘S2: checkpoint1/2（issue前）だけでは、probe の
+                // `SendMessageTimeoutW` が in-flight の間に発行された actuation
+                // （最も起こりやすい交錯）を捕捉できない。read 完了直後にもう一度
+                // フェンスを比較し（checkpoint3）、この窓も塞ぐ。issue前
+                // abandon（checkpoint1/2）と合わせて `outcome` へのガード付き
+                // `match` 1つに集約する（実装レビュー指摘S3: `Option` を経由して
+                // `unreachable!` で取り出す形は awase のようなキーボードフック
+                // プロセスでは避けたい——`outcome` を直接 match するガード条件
+                // なら型システムだけでパニック不能な形にできる）。
+                let status = match outcome {
+                    crate::probe_actuation_fence::FencedProbeOutcome::Read(conv)
+                        if crate::probe_actuation_fence::current() == fence_at_call =>
+                    {
+                        crate::with_app(|runtime| {
+                            let out = &runtime.platform.output;
+                            if !out.refresh_ime_mode_if_focus_matches(gen, conv) {
+                                return MsImePollStatus::Stale;
+                            }
+                            if out.ime_mode_fsm.borrow().is_native_ready() {
+                                return MsImePollStatus::Ready;
+                            }
+                            if out.ms_ime_ready_poll_check_deadline(deadline_ms, cold_seq) {
+                                MsImePollStatus::Expired
+                            } else {
+                                MsImePollStatus::Pending
+                            }
+                        })
+                        .unwrap_or(MsImePollStatus::Stale)
                     }
-                    out.update_ime_mode_from_imc(conv);
-                    if out.ime_mode_fsm.borrow().is_native_ready() {
-                        return MsImePollStatus::Ready;
-                    }
-                    // ADR-084（BUG-49 追補2）: `shift-conv-guard` の hold 中は
-                    // `confirm_gate_deadline_override_ms` が元の `deadline_ms`
-                    // （送信試行時点起点）を押し出す。詳細は `MsImeReadyCoro` の
-                    // 同型コメント参照。
-                    let effective_deadline_ms =
-                        deadline_ms.max(out.confirm_gate_deadline_override_ms.get());
-                    if crate::hook::current_tick_ms() >= effective_deadline_ms {
-                        out.ms_ime_gate_give_up.set(true);
-                        log::warn!(
-                            "[msime-ready] cold={cold_seq} IMC 未確認のまま期限切れ \
-                             (deadline=0x{effective_deadline_ms:X}) → give-up latch 設定 \
-                             （フォーカス変更 / 次の IME ON / 次の conv actuation まで gate 停止）",
+                    // Abandoned（issue前の交錯）、または Read だが read 後の
+                    // checkpoint3 でフェンス不一致を検知した場合。
+                    _ => {
+                        tracing::debug!(
+                            "[msime-ready] cold={cold_seq} GJI actuation との交錯を検知 \
+                             (issue前 or read後) → このtickの読み取りを破棄（次tickへ継続）",
                             cold_seq = cold_seq.value(),
                         );
-                        MsImePollStatus::Expired
-                    } else {
-                        MsImePollStatus::Pending
+                        // `/code-review max`指摘: 指摘S1で「conv が信用できなくても
+                        // deadline判定だけは行う」形にした際、good-read側の分岐が
+                        // `refresh_ime_mode_if_focus_matches` 経由で必ず行っていた
+                        // `ime_mode_focus_gen` 世代照合を、この分岐にだけ移植し忘れて
+                        // いた。世代照合を欠くと、フォーカスが切り替わった後も生き
+                        // 続ける旧世代（`gen`）のこのタスクが、GJI actuationとの交錯
+                        // （このタスクが生きている限りいつでも起こりうる。フェンス
+                        // グローバル1本のため、新フォーカス側の通常のIME操作でも
+                        // bumpされる）でこの分岐に落ち続け、旧世代の`deadline_ms`
+                        // が期限切れ（実時間は既に経過済みのため高確率で真）になった
+                        // 瞬間、**現在の（新世代の）** `Output.ms_ime_gate_give_up`
+                        // を誤って立ててしまう——新世代側は一度もタイムアウトして
+                        // いないのに、BUG-13のconfirm-then-transmitゲートが黙って
+                        // 無効化され、未準備なIMEへ早期送信しうる。good-read側と
+                        // 同じ「世代が一致しない限りOutputへ触れない」規律に揃える。
+                        crate::with_app(|runtime| {
+                            let out = &runtime.platform.output;
+                            if out.ime_mode_focus_gen.get() != gen {
+                                return MsImePollStatus::Stale;
+                            }
+                            if out.ms_ime_ready_poll_check_deadline(deadline_ms, cold_seq) {
+                                MsImePollStatus::Expired
+                            } else {
+                                MsImePollStatus::Pending
+                            }
+                        })
+                        .unwrap_or(MsImePollStatus::Stale)
                     }
-                })
-                .unwrap_or(MsImePollStatus::Stale);
+                };
 
                 match status {
                     MsImePollStatus::Ready => {
-                        log::debug!(
+                        tracing::debug!(
                             "[msime-ready] cold={cold_seq} IMC ポーリング: NATIVE 確認 → 終了",
                             cold_seq = cold_seq.value(),
                         );
@@ -506,6 +386,7 @@ impl DispatchResult {
 /// `io: &impl ProbeIo` で Win32 副作用を注入することでテスト可能。
 #[expect(clippy::too_many_lines)]
 #[expect(clippy::cognitive_complexity)]
+#[tracing::instrument(level = "debug", skip_all)]
 pub(crate) fn dispatch_probe_actions<M, I>(
     machine: &mut M,
     initial_actions: Vec<crate::tsf::warmup::probe_fsm::ProbeAction>,
@@ -539,7 +420,9 @@ where
                     match target {
                         TransmitTarget::Tsf => {
                             if io.gate_is_bypass() {
-                                log::debug!("[do-transmit] gate=Bypass, skipping TSF injection");
+                                tracing::debug!(
+                                    "[do-transmit] gate=Bypass, skipping TSF injection"
+                                );
                                 break 'stage Some(StageEndReason::GateBypass);
                             }
                             if chars.is_empty() {
@@ -562,7 +445,7 @@ where
                                     let conv =
                                         crate::ime::get_ime_conversion_mode_raw_timeout_async(10)
                                             .await;
-                                    log::debug!(
+                                    tracing::debug!(
                                     "[h1-send] cold={cold_seq} romaji={romaji_owned:?} chars={chars_len} \
                                      gji_idle={gji_idle}ms conv={} ROMAN={} NATIVE={}",
                                     fmt_conv(conv),
@@ -646,7 +529,7 @@ where
                     // Chrome には適用されない（Chrome は常に gate=Bypass 運用）。
                     // Tsf 向けのときだけ確認する。
                     if target == TransmitTarget::Tsf && idx == 0 && io.gate_is_bypass() {
-                        log::debug!(
+                        tracing::debug!(
                         "[do-transmit] cold={cold_seq} gate=Bypass, skipping per-VK TSF injection",
                         cold_seq = cold_seq.value(),
                     );
@@ -654,9 +537,20 @@ where
                     }
                     // ベースラインは SendInput **前**に取得する（送信中の SHOW/I-O 変化を見逃さないため）。
                     // TSF/Chrome 共通で write-bytes 閾値 + 候補ウィンドウ SHOW の OR 判定を使う
-                    // （BUG-30 で target 分岐を撤去して統一）。veto_eligible=false: per-VK 単体確認
-                    // では前の VK が開いた候補ウィンドウが可視のまま残っている状態で今回の VK が
-                    // 真にリテラル化するケース（前モーラ由来の誤 veto）を避けるため。
+                    // （BUG-30 で target 分岐を撤去して統一）。
+                    //
+                    // veto_eligible=false: この per-VK 経路（`run_per_vk_confirm` /
+                    // `await_vk_detection`）は `LiteralDetector` を `check_now`/
+                    // `visible_fencing_verdict`/`evidence_now` から直接呼ぶだけで、
+                    // `veto_eligible()` の唯一の読み手である `LiteralDetectCore::poll`
+                    // （`tsf/warmup/literal_detect_fsm.rs`）は経由しない。したがって
+                    // この `false` は現状どの経路からも読まれない（ADR-122 round 2
+                    // で確認、`docs/adr/122-cold-start-per-vk-confirm-race-recovery.md`
+                    // 参照）。値そのものは「前の VK が開いた候補ウィンドウを今回の
+                    // VK の証拠に誤用しない」という意図を保持するため `false` の
+                    // ままにしてあるが、per-VK 経路に候補可視 veto を実際に効かせる
+                    // には別途 `LiteralDetectCore`/`veto_decision` 相当のゲートを
+                    // このループに新設する必要がある（未実装、ADR-122 決定案参照）。
                     let detector = crate::tsf::probe::LiteralDetector::new_with_pre_send_baseline(
                         crate::tsf::observer::gji_write_bytes(),
                         false,
@@ -682,18 +576,6 @@ where
                     // UnicodeLiteralObserverFsm が GJI write なしと判断した。
                     // Done は後続 action として queue に入っているので、ここでは LearnedTsf を返す。
                     break 'stage Some(StageEndReason::UpgradedToTsf);
-                }
-
-                ProbeAction::FlushDeferredUnicodeChars(chars) => {
-                    // UnicodeColdWarmupFsm が GJI wake-up 確認後に emit する。
-                    // deferred chars を直接送信する（Done が続いて FSM 完了）。
-                    log::debug!(
-                        "[unicode-cold-warmup] FlushDeferredUnicodeChars: {} chars 送信",
-                        chars.len()
-                    );
-                    for ch in &chars {
-                        io.send_unicode_char_direct(*ch);
-                    }
                 }
 
                 ProbeAction::RawTsfLiteralRecovery {
@@ -725,7 +607,7 @@ where
                             romaji: Some(romaji.clone()),
                         }));
                     if consecutive == 0 {
-                        log::warn!(
+                        tracing::warn!(
                             "[raw-tsf-literal] cold={cold_seq} raw TSF literal suspected \
                         → backspace ×{backs} + re-send {romaji:?} scheduled \
                         + mark cold",
@@ -733,71 +615,16 @@ where
                         );
                         io.set_raw_literal(backs, romaji, escape_composition);
                     } else {
-                        log::warn!(
+                        tracing::warn!(
                             "[raw-tsf-literal] cold={cold_seq} consecutive raw-tsf-literal \
                         (count={}) → giving up, backs={backs} cleanup only (no re-send)",
                             consecutive + 1,
                             cold_seq = cold_seq.value(),
                         );
-                        // BUG-33: 2連続 literal 化は「GJI が実際に OFF/direct-input のまま
-                        // だった」ことの強い証拠（このパイプラインに来る romaji は常に
-                        // awase 自身が「日本語のかな」と決定した文字なので、英語入力の
-                        // つもりだった可能性は無い）。backspace で見た目を掃除するだけでは
-                        // 次の文字も同じ理由で literal 化し続けるため、実際に
-                        // VK_IME_OFF→VK_IME_ON を送って GJI を ON へ戻す（詳細は
-                        // docs/known-bugs.md BUG-33）。
-                        //
-                        // BUG-36: ただし即時実行してはいけない。上の set_raw_literal は
-                        // backspace を予約するだけで、実送信は WM_DRAIN_OUTPUT_QUEUE 経由の
-                        // flush_raw_tsf_literal_recovery まで遅延される。ここで
-                        // send_chrome_gji_reinit_and_poll を直接呼ぶと VK_IME_OFF が
-                        // backspace より先に外へ出て、未確定 preedit を commit した後に
-                        // backspace が追いつけないレースになる（docs/known-bugs.md BUG-36）。
-                        // 代わりに schedule_chrome_gji_reinit で予約し、
-                        // flush_raw_tsf_literal_recovery が backspace 送信直後に実行する。
-                        let schedule = io.schedule_chrome_gji_reinit(
-                            cold_seq,
-                            io.ime_mode_focus_gen(),
-                            Some(romaji),
-                            consecutive,
-                        );
-                        match schedule {
-                            ScheduleGjiReinitResult::Scheduled => {
-                                // 諦めても partial literal 由来の 'k'(literal) + composition が
-                                // terminal に残ると "kおの" 等の文字化けになる。
-                                // romaji 再送は reinit confirmed 後の retry に委ね、ここでは BS
-                                // cleanup だけを予約する。
-                                io.set_raw_literal(backs, String::new(), escape_composition);
-                            }
-                            ScheduleGjiReinitResult::SuppressedExistingPoll {
-                                existing_cold_seq,
-                                poll_token,
-                                age_ms,
-                            } => {
-                                log::warn!(
-                                    "[raw-tsf-literal] suppress raw cleanup during existing \
-                                 reinit retry poll: new_cold={} existing_cold={} token={} \
-                                 age_ms={} consecutive_before={}",
-                                    cold_seq.value(),
-                                    existing_cold_seq.value(),
-                                    poll_token,
-                                    age_ms,
-                                    consecutive,
-                                );
-                            }
-                            ScheduleGjiReinitResult::SuppressedExistingScheduled {
-                                existing_cold_seq,
-                            } => {
-                                log::warn!(
-                                    "[raw-tsf-literal] suppress raw cleanup: earlier reinit still \
-                                 scheduled (not yet flushed): new_cold={} existing_cold={} \
-                                 consecutive_before={}",
-                                    cold_seq.value(),
-                                    existing_cold_seq.value(),
-                                    consecutive,
-                                );
-                            }
-                        }
+                        // 以前はここで VK_IME_OFF→VK_IME_ON の reinit を予約していた(BUG-33/36/168)が、
+                        // 実 Chrome×GJI で 0/10 と効かず、入力中文字を消す副作用もあったので撤去した(ADR-212 P3)。
+                        // 見た目の掃除(BS)だけを予約する。
+                        io.set_raw_literal(backs, String::new(), escape_composition);
                     }
                     io.mark_cold_raw_tsf();
                 }
@@ -826,7 +653,6 @@ where
                     // されず、セッション中に一度でも literal 化すると以後ずっと
                     // give-up=backspace-onlyに固定される regression があった）。
                     io.reset_consecutive_count();
-                    io.clear_gji_reinit_retry_tombstone();
                     if mark_literal_session {
                         crate::tsf::observer::mark_literal_session_confirmed(cold_seq);
                     }
@@ -873,39 +699,6 @@ mod tests {
     // with_app 再入(None)を Stale ではなく Continue（未観測、次tickへ継続）扱いに
     // すること）──────────────────────────────────────────────────────────────
 
-    #[test]
-    fn gji_reinit_poll_tick_outcome_none_continues_not_stale() {
-        assert_eq!(
-            gji_reinit_poll_tick_outcome(None),
-            GjiReinitPollTickOutcome::Continue,
-            "with_app 再入(None)は未観測として継続すべき（Stale にしてはいけない）"
-        );
-    }
-
-    #[test]
-    fn gji_reinit_poll_tick_outcome_timeout_continues() {
-        assert_eq!(
-            gji_reinit_poll_tick_outcome(Some(GjiReinitPollStatus::Timeout)),
-            GjiReinitPollTickOutcome::Continue
-        );
-    }
-
-    #[test]
-    fn gji_reinit_poll_tick_outcome_confirmed_breaks() {
-        assert_eq!(
-            gji_reinit_poll_tick_outcome(Some(GjiReinitPollStatus::Confirmed)),
-            GjiReinitPollTickOutcome::Done(GjiReinitPollTerminalStatus::Confirmed)
-        );
-    }
-
-    #[test]
-    fn gji_reinit_poll_tick_outcome_stale_breaks() {
-        assert_eq!(
-            gji_reinit_poll_tick_outcome(Some(GjiReinitPollStatus::Stale)),
-            GjiReinitPollTickOutcome::Done(GjiReinitPollTerminalStatus::Stale)
-        );
-    }
-
     /// テスト用フェイク ProbeIo。Win32 副作用を no-op にし、呼び出しをフラグで記録する。
     struct FakeProbeIo {
         bypass: bool,
@@ -921,14 +714,6 @@ mod tests {
         reset_consecutive_called: Cell<bool>,
         /// transmit_tsf に渡された WarmupOutcome.used_eager_path を記録する。
         last_used_eager_path: Cell<bool>,
-        /// BUG-33: give-up 分岐からの `send_chrome_gji_reinit_and_poll` 呼び出し回数。
-        gji_reinit_call_count: Cell<u32>,
-        /// BUG-36: give-up 分岐からの `schedule_chrome_gji_reinit` 呼び出し回数
-        /// （backspace flush 後まで予約されるべきで、即時 `send_chrome_gji_reinit_and_poll`
-        /// は呼ばれないはず）。
-        gji_reinit_scheduled_count: Cell<u32>,
-        schedule_result: ScheduleGjiReinitResult,
-        focus_gen: Cell<u32>,
     }
 
     impl Default for FakeProbeIo {
@@ -946,10 +731,6 @@ mod tests {
                 mark_cold_raw_tsf_called: Cell::new(false),
                 reset_consecutive_called: Cell::new(false),
                 last_used_eager_path: Cell::new(false),
-                gji_reinit_call_count: Cell::new(0),
-                gji_reinit_scheduled_count: Cell::new(0),
-                schedule_result: ScheduleGjiReinitResult::Scheduled,
-                focus_gen: Cell::new(1),
             }
         }
     }
@@ -988,42 +769,12 @@ mod tests {
         fn reset_consecutive_count(&self) {
             self.reset_consecutive_called.set(true);
         }
-        fn clear_gji_reinit_retry_tombstone(&self) {}
         fn set_raw_literal(&self, _backs: usize, _romaji: String, _escape_composition: bool) {
             self.set_raw_literal_called.set(true);
         }
         fn mark_cold_raw_tsf(&self) {
             self.mark_cold_raw_tsf_called.set(true);
         }
-
-        fn send_chrome_gji_reinit_and_poll(
-            &self,
-            _cold_seq: Generation,
-            _focus_gen: u32,
-            _retry_poll_token: Option<u32>,
-        ) -> bool {
-            self.gji_reinit_call_count
-                .set(self.gji_reinit_call_count.get() + 1);
-            true
-        }
-
-        fn schedule_chrome_gji_reinit(
-            &self,
-            _cold_seq: Generation,
-            _focus_gen: u32,
-            _retry_romaji: Option<String>,
-            _consecutive_before: u32,
-        ) -> ScheduleGjiReinitResult {
-            self.gji_reinit_scheduled_count
-                .set(self.gji_reinit_scheduled_count.get() + 1);
-            self.schedule_result
-        }
-
-        fn ime_mode_focus_gen(&self) -> u32 {
-            self.focus_gen.get()
-        }
-
-        fn send_unicode_char_direct(&self, _ch: char) {}
     }
 
     fn make_chrome_machine() -> crate::tsf::warmup::probe_fsm::TsfProbeCoro {
@@ -1358,46 +1109,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn raw_tsf_literal_recovery_sets_literal_and_marks_cold_when_first_time() {
-        let io = FakeProbeIo::default(); // consecutive == 0
-        let mut machine = make_gji_machine();
-        let actions = vec![
-            ProbeAction::RawTsfLiteralRecovery {
-                cold_seq: Generation::INITIAL,
-                backs: 2,
-                romaji: "ka".to_string(),
-                escape_composition: false,
-                facts: test_facts(LiteralVerdict::SuspectedLiteral),
-            },
-            ProbeAction::Done,
-        ];
-        let mut trace = LiteralDetectTrace::default();
-        let result = dispatch_probe_actions(&mut machine, actions, &io, &mut trace);
-        assert!(result.is_done());
-        assert!(io.set_raw_literal_called.get());
-        assert!(io.mark_cold_raw_tsf_called.get());
-        assert_eq!(
-            io.gji_reinit_call_count.get(),
-            0,
-            "BUG-33: 初回の suspected literal では実 IME-ON 再送を発火させない \
-             (偽陽性の可能性がまだ高いため give-up まで待つ)"
-        );
-        assert_eq!(
-            io.gji_reinit_scheduled_count.get(),
-            0,
-            "BUG-33: 初回の suspected literal では reinit の予約すら行わない"
-        );
-        assert!(
-            trace.0.iter().any(|item| matches!(
-                item,
-                LiteralDetectTraceItem::Verdict(record)
-                    if record.romaji.as_deref() == Some("ka")
-            )),
-            "BUG-74/ADR-100決定3案L: 初回疑いでも romaji を journal 記録に残すべき: {trace:?}"
-        );
-    }
-
     // NOTE: `raw_tsf_literal_recovery_skips_set_literal_when_consecutive`（consecutive>0 で
     // set_raw_literal を呼ばない、という旧設計を検証していたテスト）は 2026-07-10 に削除した。
     // 2026-05-25 (9aa7e29) 時点の「諦めたら set_raw_literal を呼ばずスキップする」設計を
@@ -1574,6 +1285,37 @@ mod tests {
         assert!(io.transmit_tsf_called.get());
     }
 
+    // ---- ADR-200 決定1: reinit は SuspectedLiteral の否定的証拠が累計2回そろったときだけ ----
+
+    #[test]
+    fn raw_tsf_literal_recovery_sets_literal_and_marks_cold_when_first_time() {
+        let io = FakeProbeIo::default(); // consecutive == 0
+        let mut machine = make_gji_machine();
+        let actions = vec![
+            ProbeAction::RawTsfLiteralRecovery {
+                cold_seq: Generation::INITIAL,
+                backs: 2,
+                romaji: "ka".to_string(),
+                escape_composition: false,
+                facts: test_facts(LiteralVerdict::SuspectedLiteral),
+            },
+            ProbeAction::Done,
+        ];
+        let mut trace = LiteralDetectTrace::default();
+        let result = dispatch_probe_actions(&mut machine, actions, &io, &mut trace);
+        assert!(result.is_done());
+        assert!(io.set_raw_literal_called.get());
+        assert!(io.mark_cold_raw_tsf_called.get());
+        assert!(
+            trace.0.iter().any(|item| matches!(
+                item,
+                LiteralDetectTraceItem::Verdict(record)
+                    if record.romaji.as_deref() == Some("ka")
+            )),
+            "BUG-74/ADR-100決定3案L: 初回疑いでも romaji を journal 記録に残すべき: {trace:?}"
+        );
+    }
+
     #[test]
     fn raw_tsf_literal_recovery_tsf_mode_consecutive_gives_up_with_cold_mark() {
         // TSF mode でも consecutive > 0 のときは諦める。
@@ -1624,132 +1366,5 @@ mod tests {
             io.mark_cold_raw_tsf_called.get(),
             "consecutive > 0: mark_cold_raw_tsf で cold に戻すべき"
         );
-        assert_eq!(
-            io.gji_reinit_call_count.get(),
-            0,
-            "BUG-36: give-up 分岐は send_chrome_gji_reinit_and_poll を直接呼んではいけない \
-             （backspace flush より先に VK_IME_OFF が外へ出て未確定 preedit を commit \
-             してしまうレースになる。flush_raw_tsf_literal_recovery 側で backspace の \
-             あとに実行する）"
-        );
-        assert_eq!(
-            io.gji_reinit_scheduled_count.get(),
-            1,
-            "BUG-33/BUG-36: give-up（consecutive > 0）は実 IME-ON 再送を \
-             schedule_chrome_gji_reinit で1回予約すべき（即時実行はしない）"
-        );
-    }
-
-    #[test]
-    fn raw_tsf_literal_recovery_suppressed_existing_poll_does_not_set_raw_literal() {
-        let io = FakeProbeIo {
-            consecutive: 1,
-            schedule_result: ScheduleGjiReinitResult::SuppressedExistingPoll {
-                existing_cold_seq: Generation::INITIAL,
-                poll_token: 7,
-                age_ms: 50,
-            },
-            ..Default::default()
-        };
-        let mut machine = make_gji_machine();
-        let actions = vec![
-            ProbeAction::RawTsfLiteralRecovery {
-                cold_seq: Generation::INITIAL,
-                backs: 2,
-                romaji: "i".to_string(),
-                escape_composition: false,
-                facts: test_facts(LiteralVerdict::SuspectedLiteral),
-            },
-            ProbeAction::Done,
-        ];
-        let mut trace = LiteralDetectTrace::default();
-        let result = dispatch_probe_actions(&mut machine, actions, &io, &mut trace);
-        assert!(result.is_done());
-        assert_eq!(io.gji_reinit_scheduled_count.get(), 1);
-        assert!(
-            !io.set_raw_literal_called.get(),
-            "Polling中に抑止されたgive-upは、単一RAW_TSF_LITERALスロットへ \
-             backspace cleanupを残して既存retry後の文字を消してはいけない"
-        );
-        assert!(
-            io.mark_cold_raw_tsf_called.get(),
-            "suppressedでもgive-up観測自体はcold markとして残す"
-        );
-    }
-
-    #[test]
-    fn raw_tsf_literal_recovery_suppressed_existing_scheduled_does_not_set_raw_literal() {
-        // コードレビュー指摘(Angle A #1): 先行 give-up がまだ WM_DRAIN_OUTPUT_QUEUE で
-        // flush されておらず Scheduled のまま（poll未開始・guardなし）のうちに、
-        // 別の give-up が来た場合。schedule_pending_gji_reinit がこれを無条件
-        // 上書きすると、先行 give-up の romaji と RAW_TSF_LITERAL の backspace 数が
-        // 後勝ちで消え、retry も cleanup も行われないまま文字が失われる
-        // （ADR-101 が直そうとしている症状そのものの再演）。Polling と同じく
-        // 抑止すべきで、上書きしてはいけない。
-        let io = FakeProbeIo {
-            consecutive: 1,
-            schedule_result: ScheduleGjiReinitResult::SuppressedExistingScheduled {
-                existing_cold_seq: Generation::INITIAL,
-            },
-            ..Default::default()
-        };
-        let mut machine = make_gji_machine();
-        let actions = vec![
-            ProbeAction::RawTsfLiteralRecovery {
-                cold_seq: Generation::INITIAL,
-                backs: 2,
-                romaji: "i".to_string(),
-                escape_composition: false,
-                facts: test_facts(LiteralVerdict::SuspectedLiteral),
-            },
-            ProbeAction::Done,
-        ];
-        let mut trace = LiteralDetectTrace::default();
-        let result = dispatch_probe_actions(&mut machine, actions, &io, &mut trace);
-        assert!(result.is_done());
-        assert_eq!(io.gji_reinit_scheduled_count.get(), 1);
-        assert!(
-            !io.set_raw_literal_called.get(),
-            "先行 give-up が Scheduled のまま抑止された場合も、後続 give-up の \
-             backspace cleanupをRAW_TSF_LITERALへ残して先行分を巻き込んではいけない"
-        );
-        assert!(io.mark_cold_raw_tsf_called.get());
-    }
-
-    #[test]
-    fn schedule_pending_gji_reinit_does_not_overwrite_scheduled_phase() {
-        use crate::output::PendingGjiReinitPhase;
-        let o = Output::new();
-        o.ime_mode_focus_gen.set(1);
-        let first = o.schedule_pending_gji_reinit(Generation::INITIAL, 1, Some("ko".to_owned()), 0);
-        assert_eq!(first, ScheduleGjiReinitResult::Scheduled);
-
-        let second = o.schedule_pending_gji_reinit(Generation::new(2), 1, Some("i".to_owned()), 1);
-        assert_eq!(
-            second,
-            ScheduleGjiReinitResult::SuppressedExistingScheduled {
-                existing_cold_seq: Generation::INITIAL,
-            },
-            "Scheduledフェーズのpendingは上書きせず抑止すべき（Angle A #1回帰テスト）"
-        );
-
-        // 先行 give-up("ko")の予約が生き残っていることを確認する。
-        let pending = o.pending_gji_reinit.borrow();
-        let pending = pending
-            .as_ref()
-            .expect("先行 give-up の予約が残っているべき");
-        assert_eq!(pending.cold_seq, Generation::INITIAL);
-        match &pending.phase {
-            PendingGjiReinitPhase::Scheduled { retry } => {
-                assert_eq!(
-                    retry.as_deref(),
-                    Some("ko"),
-                    "先行 give-up の retry romaji が残っているべき"
-                );
-            }
-            other @ PendingGjiReinitPhase::Polling { .. } => {
-                panic!("Scheduled のままであるべき: {other:?}");
-            }
-        }
     }
 }

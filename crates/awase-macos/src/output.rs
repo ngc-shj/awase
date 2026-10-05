@@ -249,7 +249,7 @@ mod imp {
     use awase::types::{KeyAction, KeyEventType, SpecialKey, VkCode};
     use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, EventField};
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
-    use log::warn;
+    use tracing::warn;
 
     use super::{
         ascii_to_keycode, jis_kana_keycode, special_key_to_keycode, split_voicing, OutputStyle,
@@ -359,7 +359,7 @@ mod imp {
         ) -> anyhow::Result<Self> {
             let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
                 .map_err(|()| anyhow::anyhow!("Failed to create CGEventSource"))?;
-            log::info!(
+            tracing::info!(
                 "Output style: {style:?}, symbol_romaji entries: {}",
                 symbol_romaji.len()
             );
@@ -388,9 +388,9 @@ mod imp {
                 }
             }
             if key_content_enabled() {
-                log::debug!("Kana: injected '{ch}'");
+                tracing::debug!("Kana: injected '{ch}'");
             } else {
-                log::debug!("Kana: injected 1 character");
+                tracing::debug!("Kana: injected 1 character");
             }
             self.composing_hint = true;
             true
@@ -492,9 +492,9 @@ mod imp {
             }
             // 通常の debug は構造だけを残す。内容は追加オプトイン時のみ。
             if key_content_enabled() {
-                log::debug!("{kind}: injected \"{s}\"");
+                tracing::debug!("{kind}: injected \"{s}\"");
             } else {
-                log::debug!("{kind}: injected {} character(s)", s.chars().count());
+                tracing::debug!("{kind}: injected {} character(s)", s.chars().count());
             }
             self.composing_hint = true;
         }
@@ -554,9 +554,9 @@ mod imp {
                 }
                 self.post_key(KEYCODE_OPTION, false, false);
                 if key_content_enabled() {
-                    log::debug!("Char: injected '{ch}' via option-modified keystroke");
+                    tracing::debug!("Char: injected '{ch}' via option-modified keystroke");
                 } else {
-                    log::debug!("Char: injected 1 character via option-modified keystroke");
+                    tracing::debug!("Char: injected 1 character via option-modified keystroke");
                 }
                 self.composing_hint = true;
                 return;
@@ -573,7 +573,7 @@ mod imp {
             for action in actions {
                 match action {
                     KeyAction::SpecialKey(sk) => {
-                        log::debug!("SpecialKey: injected {sk:?}");
+                        tracing::debug!("SpecialKey: injected {sk:?}");
                         self.post_press_release(special_key_to_keycode(*sk), false);
                         // Enter/Escape は composition を確定・破棄する
                         if matches!(sk, SpecialKey::Enter | SpecialKey::Escape) {
@@ -602,6 +602,12 @@ mod imp {
                     }
                     KeyAction::KeySequence(s) => self.send_ascii_sequence(s, "KeySequence"),
                     KeyAction::Suppress => {}
+                    // ADR-115: CtrlChord の VK → macOS keycode の対応は未設計のため
+                    // Linux と同じく未対応として警告に留める
+                    KeyAction::CtrlChord(_) => {
+                        warn!("CtrlChord output is not yet supported on macOS");
+                    }
+                    KeyAction::Sequence(items) => self.send_keys(items),
                 }
             }
         }
@@ -646,18 +652,18 @@ impl Output {
     pub fn send_keys(&mut self, actions: &[awase::types::KeyAction]) {
         for action in actions {
             if crate::diagnostics::key_content_enabled() {
-                log::trace!("macOS output stub: {action:?}");
+                tracing::trace!("macOS output stub: {action:?}");
             } else {
-                log::trace!("macOS output stub: action");
+                tracing::trace!("macOS output stub: action");
             }
         }
     }
 
     pub fn reinject(&mut self, vk: awase::types::VkCode, event_type: awase::types::KeyEventType) {
         if crate::diagnostics::key_content_enabled() {
-            log::trace!("macOS output stub: reinject 0x{:02X} {event_type:?}", vk.0);
+            tracing::trace!("macOS output stub: reinject 0x{:02X} {event_type:?}", vk.0);
         } else {
-            log::trace!("macOS output stub: reinject {event_type:?}");
+            tracing::trace!("macOS output stub: reinject {event_type:?}");
         }
     }
 

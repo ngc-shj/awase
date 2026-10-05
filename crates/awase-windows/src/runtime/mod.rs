@@ -8,6 +8,7 @@ mod ime_actuation;
 mod ime_coordinator;
 mod ime_refresh;
 mod key_pipeline;
+mod lang_check;
 // ADR-089 §2.3 Phase B: ImmCross を機構チェーンの要素として実行する非同期経路。
 pub(crate) mod message_handlers;
 pub(crate) mod open_chain;
@@ -19,8 +20,8 @@ pub(crate) use transport::{PassthroughQueue, PhysicalKeyDisposition};
 use crate::focus::FocusKind;
 use awase::config::ValidatedConfig;
 use awase::engine::{
-    Engine, EngineCommand, InputContext, InputModeState, ModeKeyConfig, SpecialKeyCombos,
-    TextKeyConfig,
+    Engine, EngineCommand, InputContext, InputModeState, KanaLockHysteresis, ModeKeyConfig,
+    SpecialKeyCombos, TextKeyConfig,
 };
 use awase::ngram::NgramModel;
 use awase::types::Timestamp;
@@ -33,6 +34,86 @@ use crate::runtime::executor::ImeApplyPair;
 use crate::vk::VkCodeExt as _;
 use awase::platform::PlatformRuntime as _;
 
+/// ADR-192 決定3b: `keys.ime_on/off/toggle` の bare 無変換/変換を、coreへ渡す
+/// OS非依存のopen軸操作へ事前分類する。通常の特殊キー照合と同じく方向固定を
+/// toggleより優先し、onをoffより先に評価する。
+pub(crate) fn thumb_forced_open_actions(
+    special: &SpecialKeyCombos,
+) -> (
+    Option<awase::types::ShadowImeAction>,
+    Option<awase::types::ShadowImeAction>,
+) {
+    (
+        special.bare_ime_action(crate::vk::VK_NONCONVERT),
+        special.bare_ime_action(crate::vk::VK_CONVERT),
+    )
+}
+
+/// ADR-206 決定4: 非推奨の `*_solo_tap_ime_action`（親指キーに割り当てられているものだけ）を、
+/// 該当キーの bare コンボ（`keys.ime_on/off/toggle` に単独で書いたのと同じ）としてメモリ上の照合表へ移す。
+/// `SpecialKeyCombos` を組み立てた直後、`thumb_forced_open_actions` を求める**前**に呼ぶこと。
+pub(crate) fn migrate_legacy_solo_tap_actions(
+    general: &awase::config::GeneralConfig,
+    special: &mut SpecialKeyCombos,
+) {
+    let (muhenkan, henkan) = general.legacy_thumb_solo_tap_actions();
+    if let Some(action) = muhenkan {
+        special.set_bare_ime_action_if_absent(crate::vk::VK_NONCONVERT, action);
+    }
+    if let Some(action) = henkan {
+        special.set_bare_ime_action_if_absent(crate::vk::VK_CONVERT, action);
+    }
+}
+
+#[cfg(test)]
+mod adr192_tests {
+    use super::*;
+    use awase::config::ParsedKeyCombo;
+    use awase::types::ShadowImeAction;
+
+    fn combo(vk: VkCode, ctrl: bool, shift: bool, alt: bool) -> ParsedKeyCombo {
+        ParsedKeyCombo {
+            ctrl,
+            shift,
+            alt,
+            vk,
+        }
+    }
+
+    #[test]
+    fn bare_convert_keys_are_classified_with_direction_priority() {
+        let special = SpecialKeyCombos {
+            engine_on: vec![],
+            engine_off: vec![],
+            ime_on: vec![combo(crate::vk::VK_CONVERT, false, false, false)],
+            ime_off: vec![combo(crate::vk::VK_NONCONVERT, false, false, false)],
+            ime_toggle: vec![
+                combo(crate::vk::VK_CONVERT, false, false, false),
+                combo(crate::vk::VK_NONCONVERT, false, false, false),
+            ],
+        };
+        assert_eq!(
+            thumb_forced_open_actions(&special),
+            (
+                Some(ShadowImeAction::TurnOff),
+                Some(ShadowImeAction::TurnOn)
+            )
+        );
+    }
+
+    #[test]
+    fn modified_or_non_convert_combos_are_not_forced_thumb_actions() {
+        let special = SpecialKeyCombos {
+            engine_on: vec![],
+            engine_off: vec![],
+            ime_on: vec![combo(crate::vk::VK_CONVERT, true, false, false)],
+            ime_off: vec![combo(crate::vk::VK_NONCONVERT, false, true, false)],
+            ime_toggle: vec![combo(VkCode(0x20), false, false, false)],
+        };
+        assert_eq!(thumb_forced_open_actions(&special), (None, None));
+    }
+}
+
 /// `GeneralConfig::muhenkan_solo_tap_dedicated_fn_key`（ADR-091 §D3.2）を
 /// `VkCode` に解決する。`bootstrap.rs`（起動時）と `apply_config_update`
 /// （reload 時）の両方から呼ぶ。
@@ -40,17 +121,18 @@ use awase::platform::PlatformRuntime as _;
 /// `Some(name)` なのに `VkCode::from_name` が解決できない場合（誤字・
 /// `"F21"` のような短縮形など）は、専用 Fn キー変換が黙って無効化される
 /// （＝設定前と同じ挙動に留まる、安全側）が、原因が分かるよう警告ログを出す。
-pub(crate) fn resolve_dedicated_fn_key(name: Option<&str>) -> Option<VkCode> {
-    let name = name?;
+pub(crate) fn resolve_dedicated_fn_key(name: Option<&str>) -> (Option<VkCode>, Option<String>) {
+    let Some(name) = name else {
+        return (None, None);
+    };
     let resolved = VkCode::from_name(name);
-    if resolved.is_none() {
-        log::warn!(
-            "[config] muhenkan_solo_tap_dedicated_fn_key = {name:?} を VK 名として \
-             解決できませんでした。専用 Fn キー変換は無効のままです \
-             （\"VK_F18\" のような完全な VK 名が必要、\"F18\" 等の短縮形は不可）"
-        );
-    }
-    resolved
+    let warning = resolved.is_none().then(|| {
+        format!(
+            "general.muhenkan_solo_tap_dedicated_fn_key = {name:?} を VK 名として解決できませんでした。\
+             専用 Fn キー変換は無効のままです（\"VK_F18\" または \"F18\" のような VK 名が必要）"
+        )
+    });
+    (resolved, warning)
 }
 
 /// IME 状態と修飾キースナップショットから `InputContext` を構築する。
@@ -127,13 +209,46 @@ impl LayoutEntry {
     /// 一致する内部名を持つファイルが存在しない場合、常に先頭レイアウトへ
     /// 無言でフォールバックしていた）。起動時（`bootstrap::select_default_layout`）・
     /// 設定リロード時（`Runtime::reload_layouts`）の両方から同じロジックを使う。
+    ///
+    /// `default_layout` に一致するファイルが見つからない場合（存在しない、または
+    /// 読込/パースに失敗して `layouts` に含まれていない）、`nicola_keytop` が
+    /// あればそちらへフォールバックする（新規インストールの既定と同じ、
+    /// BUG-104）。無ければソート順先頭（`0`）にフォールバックする。呼び出し元
+    /// (`bootstrap::warn_layout_fallback`) がこのフォールバック発生をユーザーへ
+    /// モーダルで通知する。
+    ///
+    /// 比較は大文字小文字を無視する（Windows のファイルシステムが大文字小文字を
+    /// 区別しないため。`default_layout = "nicola.YAB"` のような設定でも
+    /// `nicola.yab` ファイルに正しく一致させる。/code-review 指摘: PR #131
+    /// の `warn_layout_fallback` 追加で、この不一致が「読込失敗」の誤警告として
+    /// 可視化されてしまう問題が見つかった）。
     #[must_use]
     pub fn resolve_index(layouts: &[Self], default_layout: &str) -> usize {
-        let default_name = default_layout.trim_end_matches(".yab");
+        let default_name = strip_yab_extension(default_layout);
         layouts
             .iter()
-            .position(|e| e.name == default_name)
+            .position(|e| e.name.eq_ignore_ascii_case(default_name))
+            .or_else(|| layouts.iter().position(|e| e.name == "nicola_keytop"))
             .unwrap_or(0)
+    }
+}
+
+/// `.yab` 拡張子を大文字小文字を無視して取り除く。
+/// `LayoutEntry::resolve_index` と `bootstrap::warn_layout_fallback`
+/// （どちらも `default_layout` の設定名とファイル名(拡張子抜き)を比較する）が
+/// 同じロジックを共有するための唯一の実装。
+#[must_use]
+pub fn strip_yab_extension(name: &str) -> &str {
+    // `to_ascii_lowercase()` で判定してから元の文字列を長さでスライスする。
+    // 判定が true ということは末尾4バイトが確実に ASCII（'.'+y/a/b の3文字）
+    // であることを意味するため、`name.len() - 4` は常に char boundary になる
+    // （マルチバイト文字を含む名前(例: "NICOLA＋確定.yab")でも安全。
+    // 逆に `name[name.len()-4..]` を先にスライスして判定する実装は、
+    // ".yab" で終わらない非ASCII文字列に対して境界外パニックの危険がある）。
+    if name.len() >= 4 && name.to_ascii_lowercase().ends_with(".yab") {
+        &name[..name.len() - 4]
+    } else {
+        name
     }
 }
 
@@ -151,6 +266,32 @@ pub(crate) struct PostBypassEntry {
 }
 
 impl PostBypassEntry {
+    /// `[[post_bypass]]` をコンパイルする（キー名パース + 小文字化）。起動時
+    /// （`bootstrap`）とリロード（`apply_config_update`）の**唯一の構築点**
+    /// （BUG-103: 起動時だけ構築していたためリロードで反映されなかった）。
+    /// 解決できないルールは除外し、警告を2つ目の戻り値で返す（ADR-201 決定2(a)）。
+    pub(crate) fn compile_all(config: &ValidatedConfig) -> (Vec<Self>, Vec<String>) {
+        let mut warnings = Vec::new();
+        let rules = config
+            .post_bypass
+            .iter()
+            .filter_map(
+                |rule| match crate::config_diagnostics::resolve_post_bypass_key(rule) {
+                    Ok(vk) => Some(Self {
+                        vk,
+                        process: rule.process.to_lowercase(),
+                        class: rule.class.to_lowercase(),
+                    }),
+                    Err(w) => {
+                        warnings.push(w);
+                        None
+                    }
+                },
+            )
+            .collect();
+        (rules, warnings)
+    }
+
     pub(crate) fn matches(&self, vk: VkCode, process: &str, class: &str) -> bool {
         self.vk == vk
             && (self.process.is_empty() || process.to_lowercase().contains(self.process.as_str()))
@@ -180,6 +321,8 @@ pub struct Runtime {
     layouts: Vec<LayoutEntry>,
     /// フォーカス追跡・IMM 能力学習・sync key 補完
     focus_tracker: focus_tracker::FocusTracker,
+    /// ADR-223 段階 0: 打鍵時の入力言語の記録(記録のみ、belief は変えない)
+    lang_check: lang_check::LangCheck,
     /// Platform 層の全状態
     platform_state: crate::PlatformState,
     /// 全キーマップルール（アプリフィルタ前）
@@ -191,36 +334,45 @@ pub struct Runtime {
     /// 進行中の IME actuation 試行（ADR-080）。`desired` 変化・`FocusChanged`・
     /// `Resolution` 確定でのみ破棄・再構築する（`runtime/ime_actuation.rs`）。
     active_actuation: Option<ime_actuation::Actuation>,
-    /// BUG-52 の DBE レンジ Suppress（`VK_DBE_ALPHANUMERIC`/`KATAKANA`/
-    /// `SBCSCHAR`/`DBCSCHAR`）を無条件のままにするか、パススルーを許すか。
-    /// `config.general.dbe_mode_key_policy` から `apply_config_update`/起動時の
-    /// `set_dbe_mode_key_policy` で反映される（ADR-091 §D3.6、既定は `Suppress`
-    /// で現状維持）。`PhysicalKeyDisposition::plan` が参照する。
-    dbe_mode_key_policy: awase::config::DbeModeKeyPolicy,
-    /// 左Shift単独タップによる「IME-ON 半角英数」持続トグルの許可範囲。
-    /// 既定 `MsImeOnly` で従来動作を維持し、GJI 経路は `All` の明示設定時だけ
-    /// `kp_shift_conv_guard_key_up` から発火する。
-    half_width_alnum_toggle_policy: awase::config::HalfWidthAlnumTogglePolicy,
-    /// `config.general.muhenkan_solo_tap_dedicated_fn_key` がユーザーにより
-    /// 明示設定されているか（`Some`）。`true` の間は
-    /// `state::gji_charset_autodetect`（ADR-091 §D3.1項目1）が専用Fnキー
-    /// 変換モードに一切介入しない（手動設定が常に優先、GJI 検出時の自動
-    /// 有効化・離脱時の自動解除いずれも行わない）。`apply_config_update`/
-    /// 起動時に反映される。
-    muhenkan_dedicated_fn_key_is_manual: bool,
-    /// 専用Fnキー変換モードが現在有効か（`set_muhenkan_dedicated_fn_key_config`/
-    /// `set_muhenkan_dedicated_fn_key_auto` に渡された最新の値が `Some` か）。
-    /// `gji_charset_popup` が「既に有効なら設定支援ポップアップを出さない」
-    /// 判定に使う。
-    muhenkan_dedicated_fn_key_active: bool,
-    /// `!config.general.muhenkan_solo_tap_always_suppress`（無変換単独タップが
-    /// 素のパススルー設定になっているか）。GJI向け設定支援ポップアップ
-    /// （ADR-091 §D3.2「設定未完了時のポップアップ」、`gji_charset_popup`）が
-    /// 「ポップアップを出すべきか」の判定に使う。`apply_config_update`/
-    /// 起動時に反映される。
-    muhenkan_solo_tap_is_passthrough: bool,
+    /// `config1.db` のキーマップ（打鍵時予測用）のキャッシュ。打鍵ごとに読み直さない。
+    key_effect_keymap: crate::state::key_effect_predictor::KeymapCache,
+    /// 直前のOS読み取り（`OsPoll`）で観測（`ime_on`）を得られたか。時間切れ・空振りは`false`。
+    /// 通過マークの窓の間の読み直し間隔（成功なら60ms、失敗なら窓の終了時の1回）に使う。
+    last_ime_read_ok: bool,
+    /// Microsoft IME本体用（レジストリのキー割り当ての版で読み直す。GJIの`key_effect_keymap`とは別のキャッシュ）。
+    key_effect_keymap_native: crate::state::key_effect_predictor::KeymapCache,
+    state_dependent_key_warning: crate::state::state_dependent_key_warning::WarningTracker,
+    state_dependent_key_warning_dialog:
+        crate::state::state_dependent_key_warning::WarningDialogTracker,
+    warn_state_dependent_mode_keys: bool,
+    /// 単独タップがIMEへ素通しされる親指キーのVK（状態依存キー警告の対象を絞る）。
+    passthrough_thumb_mode_keys: Vec<VkCode>,
+    /// ADR-195段階4: `<config dir>/keymap-learn-table.json`（段階3永続化）の実行時読込キャッシュ。
+    /// `KeyEffectPredicted`（belief更新）に使う。actuationの許可リストは広げない（ADR-195決定(A)）が、
+    /// 半角/全角の固定セットの`shadow_action=Toggle`を**外す**方向にだけ参照する（ADR-195追記、
+    /// `derive_key_shadow_action`）。
+    key_effect_runtime_table: crate::state::key_effect_runtime::RuntimeTableCache,
+    /// `config.general.use_learned_keymap_table`（opt-out、既定true）。
+    use_learned_keymap_table: bool,
+    /// `config.general.predict_henkan_open_in_unreadable_windows`（ADR-209、既定true）。
+    predict_henkan_open_in_unreadable_windows: bool,
+    /// 役割判定の候補キー（ADR-199決定18(i)、旧ADR-195追記の`hz_toggle_omit_latch`を一般化）の物理キー押下ごとの
+    /// 「この打鍵の最終的な`shadow_action`」を、KeyDownで確定して KeyUp まで持ち越すラッチ
+    /// （`(scan_code, 判定)`）。学習表の再読込がDownとUpの間に起きても、Down=Allow・Up=Suppressで
+    /// KeyDown だけがOSに残る形にしないため。識別は vk でなく scan_code（`VK_DBE_*`はDown/Upでvkが
+    /// 変わりうる、BUG-131/132）。**Upで消さず上書きのみ**にする（救済窓・drain 経路の再入で同じ打鍵が
+    /// 2回 `enrich_key_role` を通りうる）。
+    key_role_latch: Option<(
+        awase::types::ScanCode,
+        Option<awase::types::ShadowImeAction>,
+    )>,
+    /// 専用Fnキー変換モード（`muhenkan_solo_tap_dedicated_fn_key`、ADR-091
+    /// §D3.2、config.toml による手動設定のみ）が現在有効なら、その vk。
+    /// `recompute_active_keymaps` が `[[keymap]]` との衝突チェックに使う
+    /// （ADR-114「未解決の疑問」5 対応）。
+    muhenkan_dedicated_fn_key_vk: Option<VkCode>,
     /// `config.general.left_thumb_key`/`right_thumb_key` のいずれかが
-    /// `"VK_SPACE"` か。`true` の場合、MS-IME レジストリ自動検出の
+    /// Space（`VK_SPACE`）か。`true` の場合、MS-IME レジストリ自動検出の
     /// Shift+Space トグルは `engine.set_ime_toggle_auto_keys` へ反映しない
     /// （Space 親指キーの Shift リテラル送出機能との衝突を避けるため、
     /// Opus コードレビュー指摘）。`apply_config_update`/起動時に反映される。
@@ -229,8 +381,80 @@ pub struct Runtime {
     /// 不要（2026-08-16 ユーザー判断: 明示設定は自動検出キーと併用され、
     /// 一方を排他しない）。
     space_is_thumb_key: bool,
+    /// 前回`msime_key_assignment::check_and_warn`が警告を出した割当て内容
+    /// （bit0=変換, bit1=無変換、ADR-164フェーズ2、旧
+    /// `msime_key_assignment::windows_impl::LAST_WARNED`）。同じ内容で
+    /// 繰り返しポップアップを出さないためのデデュープ。`None`＝未警告
+    /// （競合が解消された観測でリセットされるため、割当てを解除→再度
+    /// 有効化した場合は再警告される）。
+    msime_key_assignment_warned: Option<u8>,
     /// BugReport 診断用: 現在ロード済みの `GeneralConfig.keyboard_model`。
     keyboard_model: awase::scanmap::KeyboardModel,
+    /// トレイ右クリック時の更新確認を有効にするか。
+    pub(crate) update_check_enabled: bool,
+    /// OS かな入力ロック検知の通知ヒステリシス。
+    kana_lock_hysteresis: KanaLockHysteresis,
+    /// hook watchdog が「フック詰まり」を検知した時点でサンプリングした
+    /// OS のかな入力ロック状態(前回値、ログの重複抑止用の診断専用メモ)。
+    ///
+    /// `kana_lock_hysteresis` とは完全に独立。3秒周期のwatchdogサンプルを
+    /// 混ぜると、無打鍵でも誤ってトレイ警告が発火しうる。
+    watchdog_kana_edge: Option<awase::engine::KanaLockReading>,
+    /// ADR-132 Phase 1: drift GiveUp のトレイ通知は1フォーカスにつき1回に制限する。
+    drift_giveup_notified_this_focus: bool,
+    /// ADR-132 Phase 1 診断用: 直近の GiveUp 通知区間の開始時刻。
+    drift_giveup_started_at: Option<std::time::Instant>,
+    /// issue #165（hook_starved）自己修復用（2026-09-28追記）。`bootstrap.rs`が
+    /// `install_hook()`直後に`set_hook_guard`で格納する（起動時は必ず`Some`）。
+    /// `reinstall_keyboard_hook_for_watchdog`がwatchdog検知時にドロップ→
+    /// 再インストールして差し替える。ここに保持する理由は、`HookGuard`の
+    /// ライフタイムを`Runtime`（`RUNTIME`グローバル、プロセス終了まで生存）に
+    /// 揃えることで、watchdogタイマー（`with_app`経由、`Runtime`にしか
+    /// アクセスできない）から直接差し替えられるようにするため
+    /// （`bootstrap.rs::run`のローカル変数のままでは他所から触れない）。
+    hook_guard: Option<crate::hook::HookGuard>,
+    /// `[diagnostics] hook_self_heal`（既定 true）。issue #165 自己修復の
+    /// ビルド無しキルスイッチ。`state::hook_watchdog::decide` へそのまま渡す。
+    hook_self_heal_enabled: bool,
+    /// カナリア確認済みの本物のstarvation再インストールを、現在の
+    /// hook_starved episode（`hook::hook_alive_tick_ms()`が自然回復するまでの
+    /// 連続区間）で何回試みたか。`note_hook_watchdog_recovered`が`0`に
+    /// リセットする。`state::hook_watchdog::backoff_delay_ms`の入力
+    /// （opus round2 B1(ii)、旧`hook_watchdog_episode_attempted: bool`を置換）。
+    hook_watchdog_confirmed_attempt_count: u32,
+    /// 次に自己修復（カナリア送信）を試みてよい tick_ms。`None`なら即座に
+    /// 試みてよい。カナリア確認済みの再インストール成功/失敗どちらでも
+    /// `reinstall_keyboard_hook_for_watchdog`が更新する
+    /// （`state::hook_watchdog::backoff_delay_ms`、opus round2 B1(ii)）。
+    hook_watchdog_next_retry_at_ms: Option<u64>,
+    /// 自己修復（カナリア確認済みの再インストール）を試行した tick_ms の履歴
+    /// （レート上限判定用、`state::hook_watchdog::THRASH_WINDOW_MS`より古い
+    /// エントリは`reinstall_keyboard_hook_for_watchdog`が随時刈り取る）。
+    hook_watchdog_reinstall_history_ms: Vec<u64>,
+    /// `WM_WTSSESSION_CHANGE`（`WTS_SESSION_LOCK`/`WTS_SESSION_UNLOCK`）から
+    /// 更新する、現在セッションがロック中かの永続フラグ。issue #165 自己修復の
+    /// F2ガード（ロック中は再インストールしても意味が無い）に使う。
+    session_locked: bool,
+    /// issue #165 自己修復のカナリア（`hook::send_hook_watchdog_canary`）を
+    /// 送信した tick_ms（opus round2 B1(i)）。`Some`の間は確認待ち
+    /// （`TIMER_HOOK_WATCHDOG_CANARY_CHECK`発火まで）で、多重送信を防ぐ
+    /// ガードにも使う。確認タイマー発火時に`confirm_hook_watchdog_canary`が
+    /// `take()`してクリアする。
+    hook_watchdog_canary_sent_at_ms: Option<u64>,
+    /// カナリア送信**前**に読んだ`hook::hook_alive_tick_ms()`のスナップ
+    /// ショット（opus round1 B1）。`hook_watchdog_canary_sent_at_ms`と常に
+    /// 同時にSome/Noneが揃う。`canary_confirmed_starved`の基準値として使う
+    /// ——送信「時刻」を基準にすると`GetTickCount64`の分解能（約15.6ms）に
+    /// 負けて誤検知するため、代わりにこの「最後にフックが呼ばれた時刻」の
+    /// 古い値（この分岐に入る時点で既に5秒以上古い）を基準にする。
+    hook_watchdog_canary_baseline_alive_ms: Option<u64>,
+    /// `stale_ms<=5000`（フック生存を確認できた）が連続した watchdog tick 数。
+    /// `stale_ms>5000`のtickで0にリセットされる。
+    /// `state::hook_watchdog::RECOVERY_CONFIRM_TICKS`に達して初めて
+    /// `note_hook_watchdog_recovered`（バックオフ/thrash履歴のリセット）を
+    /// 実行する（PR #349コードレビュー指摘: 1回のflickerで丸ごとリセット
+    /// されないようにするため、`note_hook_watchdog_tick_alive`参照）。
+    hook_watchdog_consecutive_alive_ticks: u32,
 }
 
 impl std::fmt::Debug for Runtime {
@@ -267,12 +491,6 @@ impl Runtime {
         if crate::hook::is_alt_impersonation_active() {
             modifiers.alt = false;
         }
-        // ADR-110 決定5 r3追記: key_remap で to=Ctrl系に現在リマップ中の
-        // キーが物理押下されている間は modifiers.ctrl を強制的に true にする
-        // （上記 Alt なりすまし補正の鏡像、`hook::key_remap_ctrl_effectively_held` の doc 参照）。
-        if crate::hook::key_remap_ctrl_effectively_held() {
-            modifiers.ctrl = true;
-        }
         let (left_thumb_down, right_thumb_down) = crate::hook::thumb_down_timestamps();
         build_input_context(
             self.platform_state.ime.effective_open(),
@@ -306,17 +524,6 @@ impl Runtime {
             epoch: self.platform_state.focus.focus_epoch,
             hwnd: crate::state::ime_event::HwndId(self.platform.focus.current.hwnd),
         }
-    }
-
-    /// 現在のフォーカスエポック。`focus_fence().epoch` の薄いラッパー
-    /// ——epoch と hwnd のペアリング/鮮度が意味を持たない（片方だけで十分な）
-    /// 呼び出し元向け。PR 109 コードレビュー軽微3の指摘により、現時点で
-    /// epoch 単独の呼び出し元は無いが API として意図的に残す
-    /// （`focus_hwnd()` と対称、Task3-c 参照）。
-    #[must_use]
-    #[allow(dead_code)]
-    pub(crate) fn focus_epoch(&self) -> crate::state::probe_admission::FocusEpoch {
-        self.focus_fence().epoch
     }
 
     /// 現在のフォーカス hwnd。`focus_fence().hwnd` の薄いラッパー
@@ -364,12 +571,35 @@ impl Runtime {
     }
 
     /// 現在フォーカス中のアプリが IMM32 クロスプロセス制御を使えるか返す。
-    #[expect(clippy::missing_const_for_fn)]
+    ///
+    /// ADR-158 TE3: `AppImeProfile::can_use_imm32_cross_process`が観測用の
+    /// `#[actuation_choke_point]`を付けた際に`const fn`ではなくなったため、
+    /// 以前ここにあった`#[expect(clippy::missing_const_for_fn)]`（「const化できる」
+    /// というclippy提案の抑制）は不要になった。
+    ///
+    /// `#[track_caller]`（opus code review S3で追加）: このメソッドは薄いラッパで、
+    /// `AppImeProfile::can_use_imm32_cross_process`が`std::panic::Location::caller()`で
+    /// 記録する呼び出し元は「直近1段」のみ。このラッパに`#[track_caller]`が無いと、
+    /// このラッパ経由の呼び出しがすべて`runtime/mod.rs`のこの行として記録され、
+    /// 真の呼び出し元（このラッパをさらに呼んでいる側）が観測ログから消える。
     #[must_use]
+    #[track_caller]
     pub fn can_use_imm32_cross_process(&self) -> bool {
         self.platform
             .current_app_profile()
             .can_use_imm32_cross_process()
+    }
+
+    /// ADR-205: 外部変化の監視窓（arm・追随の両方）を適用する窓か。`Imm32Unavailable`（Chrome 等）かつ有効な IME が
+    /// GJI のときだけ。InputRelay（awase が actuation を所有しない、BUG-90 決定4）と TsfNative（読みが `None`）は対象外。
+    /// MS-IME × 実 Chrome の開閉の読みは IME が開いている間も 0 で信用できず（CI 実測: run 36548761653 `imeoff-ext-msime-native` の trace）、GJI 以外への切替後に古い基準値が残る偽 OFF を
+    /// 避けるため、開く・閉じるの両方向とも GJI に限る（round: PR #377 Opus レビュー 1・2）。
+    #[must_use]
+    pub fn external_change_watch_applies(&self) -> bool {
+        self.platform.current_app_profile()
+            == crate::focus::class_names::AppImeProfile::Imm32Unavailable
+            && crate::tsf::observer::tsf_obs().active_ime_kind()
+                == crate::tsf::observer::ActiveImeKind::GoogleJapaneseInput
     }
 
     /// IMM 検出の前後ミス数から、クラス名単位の IMM 能力をキャッシュに記録する。
@@ -380,41 +610,265 @@ impl Runtime {
         if !self.platform.focus.is_focused() {
             return;
         }
+        let process_name = self.platform.focus.process_name().to_owned();
+        if process_name.is_empty() {
+            return;
+        }
         let class_name = self.platform.focus.class_name().to_owned();
-        let current = self.platform.focus.imm_capability(&class_name);
+        let current = self
+            .platform
+            .focus
+            .imm_capability(&process_name, &class_name);
         if let Some(new_cap) = focus_tracker::FocusTracker::decide_imm_capability(
             miss_before,
             miss_after,
             crate::IME_DETECT_MISS_THRESHOLD,
             current,
         ) {
-            log::info!(
-                "IMM capability learned: {class_name} → {new_cap:?} (miss {miss_before}→{miss_after})"
+            tracing::info!(
+                "IMM capability learned: {process_name}/{class_name} → {new_cap:?} (miss {miss_before}→{miss_after})"
             );
-            self.platform.learn_imm_capability(class_name, new_cap);
+            self.platform
+                .learn_imm_capability(process_name, class_name, new_cap);
         }
     }
 
     /// IME 関連の事前分類情報を sync key 設定で補完する。
     ///
-    /// 実処理は [`focus_tracker::FocusTracker::enrich_ime_relevance`] に委譲する。
-    pub fn enrich_ime_relevance(&self, event: &mut RawKeyEvent) {
+    /// 実処理は [`focus_tracker::FocusTracker::enrich_ime_relevance`] に委譲する。バッチ前処理
+    /// （`handle_wm_drain_output_queue`）もここを呼ぶ。候補キーの役割（`shadow_action`）は
+    /// **触らない**（[`Self::enrich_key_role`]が `kp_run_inner` で付ける。バッチ前処理との間で
+    /// `shadow_action` を読む経路が無いことは ADR-199 T4 で確認済み）。
+    pub fn enrich_ime_relevance(&mut self, event: &mut RawKeyEvent) {
         self.focus_tracker.enrich_ime_relevance(event);
     }
 
-    /// Decision の副作用を実行する（メッセージループ用）。
-    /// `suppress_engine_state_key = true` で囲んで decision を実行する。
+    /// 役割判定の候補キー（[`crate::vk::is_role_candidate`]）の打鍵に、役割由来の `shadow_action` を
+    /// 付け外しする（ADR-199 決定8。ADR-189/191 の「半角/全角は固定でToggle」を、ユーザーの IME 設定から
+    /// 逆算した役割に置き換えた）。`kp_run_inner` の冒頭から呼ぶ。これが`shadow_action`の唯一の上書き点
+    /// （`tests/architecture_guard.rs::ime_relevance_shadow_action_writes_are_accounted_for`が
+    /// このファイル内の書き込み箇所数を1に固定している）。
     ///
-    /// ポーリング / フォーカス変化起因の RefreshState で使う。
-    /// Kanji 等の sync key がすでに IME を正しい状態にしているとき、
-    /// `engine_on/off_ime_key`（VK_DBE_DBCSCHAR 等）を追加送信してしまう
-    /// フィードバックループを防ぐ。
-    pub fn execute_decision_suppressed(
+    /// 修飾付きはIME側で別意味を持ちうるので、無修飾の物理キーだけ。観測に依存しないので、
+    /// 読めないアプリ（TsfNative）でも効く。ひらがな・カタカナ・英数は入力モードも動かしうるので
+    /// 候補外（生のままIMEへ通して追随する、ADR-187のfollow）。
+    ///
+    /// **配線範囲は半角/全角(0xF3/0xF4)と F13〜F24（決定18）**。無変換/変換（決定16）は `shadow_action` でなく
+    /// 単独タップ確定点なのでここでは扱わない（T10）。
+    ///
+    /// 判定は打鍵ごとのラッチ（[`crate::state::key_effect_runtime::latch_step`]）で KeyDown に確定し、
+    /// 同じ物理キーの KeyUp・オートリピート（`was_down`）はそれを使う（Down=Allow・Up=Suppress の非対称防止）。
+    /// **F13〜F24 だけの違い**（決定18）: (a) 最初の Down の判定は暫定で、`kp_stage_shadow_ime_toggle` の直後に
+    /// [`Self::settle_fkey_role_latch`] が「実際に書いたか」で上書きする。(b) Up・リピートでラッチの scan が
+    /// 一致しないとき（別キーがラッチを上書きした）は役割で判定し直さず `None`（Allow）にする。
+    /// (c) injected の打鍵には付けない。
+    pub fn enrich_key_role(&mut self, event: &mut RawKeyEvent) {
+        use crate::state::key_effect_runtime::{latch_step, passive_without_lookup};
+        use awase::types::KeyEventType;
+        // 全打鍵で通る経路なので、候補キーでないものは修飾キーと IME 種別を見る前に抜ける。
+        // 0x19（Alt+半角/全角、ADR-202）は候補集合の外（Alt 付きで届き無修飾ガードを通らない）で、専用に扱う。
+        let is_kanji = matches!(event.vk_code.ime_kind(), Some(crate::vk::ImeKeyKind::Kanji));
+        if is_kanji && event.injected {
+            return; // injected は付けない。静的 Toggle のまま（現行と同じ）。
+        }
+        if !is_kanji && !crate::vk::is_role_candidate(event.vk_code) {
+            return;
+        }
+        let is_fkey = crate::vk::is_role_fkey(event.vk_code);
+        let is_hz = matches!(
+            event.vk_code.ime_kind(),
+            Some(crate::vk::ImeKeyKind::DbeSbcsChar | crate::vk::ImeKeyKind::DbeDbcsChar)
+        );
+        // 無変換/変換（決定16）は別の入口（T10）。
+        if !is_fkey && !is_hz && !is_kanji {
+            return;
+        }
+        let is_up = event.event_type == KeyEventType::KeyUp;
+        let fresh_down = event.event_type == KeyEventType::KeyDown && !event.injected;
+        let reuse = is_up || (fresh_down && event.was_down);
+        let vk = event.vk_code;
+        let m = event.modifier_snapshot;
+        let modified = m.ctrl || m.alt || m.shift || m.win;
+        let injected = event.injected;
+        let has_sync = event.ime_relevance.sync_direction.is_some();
+        let static_action = event.ime_relevance.shadow_action; // hook が付けた静的値（0x19 は Toggle）
+                                                               // 修飾付き・IME 未同定の打鍵も `None` の判定として**ラッチに記録する**（早期 return しない）。
+                                                               // 記録しないと、Ctrl を押したまま半角/全角を Down（判定なし=Allow）→ Ctrl を先に離す →
+                                                               // 半角/全角の Up がラッチ空で判定をやり直し `Some(Toggle)`（=Suppress）になり、
+                                                               // Down=Allow・Up=Suppress の非対称（BUG-131/132 型）になる（Opus レビュー、PR #326）。
+        let (action, latch) = latch_step(
+            self.key_role_latch,
+            reuse,
+            fresh_down,
+            event.scan_code,
+            || {
+                if is_kanji {
+                    return self.kanji_shadow_action(vk, static_action, m);
+                }
+                if passive_without_lookup(is_fkey, modified, injected, reuse, has_sync) {
+                    return None;
+                }
+                // 役割を求められる IME は GJI と、CLSID で同定できた Microsoft IME 本体だけ。GJI 未検出・
+                // 第三者 IME・IMM32 HKL のみでは付けず、生キーを通して観測に追随する（レビュー round2 NB3、決定6-3）。
+                let ime = crate::tsf::observer::tsf_obs().table_ime_kind()?;
+                self.derive_key_shadow_action(ime, vk)
+            },
+        );
+        self.key_role_latch = latch;
+        event.ime_relevance.shadow_action = action;
+    }
+
+    /// 0x19 の `shadow_action`（ADR-202）。GJI のときだけ `Hankaku/Zenkaku` 行から求める（修飾の扱いは
+    /// [`crate::state::key_effect_runtime::kanji_role_plan`]）。GJI 以外は hook の静的値のまま（決定2）。
+    fn kanji_shadow_action(
         &mut self,
-        decision: awase::engine::Decision,
-    ) -> CallbackResult {
-        let _guard = self.platform.suppress_engine_state_key_guard();
-        self.execute_decision(decision)
+        vk: VkCode,
+        static_action: Option<awase::types::ShadowImeAction>,
+        m: awase::types::ModifierState,
+    ) -> Option<awase::types::ShadowImeAction> {
+        use crate::state::ime_kind::ImeKindId;
+        use crate::state::key_effect_runtime::{kanji_role_plan, KanjiRolePlan};
+        let table_kind = crate::tsf::observer::tsf_obs().table_ime_kind();
+        // ADR-208 L2 M-1: IME 未同定かつ `is_japanese_ime` 偽は受動（物理は素通し。静的 Toggle のままだと昇格しないのに
+        // Suppress される二重の空振りになる）。`latch_step` の closure 内なので Down/Up の判定はラッチで一貫する。
+        if crate::state::key_effect_runtime::kanji_passive_when_unidentified(
+            table_kind.is_some(),
+            self.platform_state.ime.belief.is_japanese_ime(),
+        ) {
+            return None;
+        }
+        let is_gji = table_kind == Some(ImeKindId::Gji);
+        match kanji_role_plan(is_gji, m.ctrl, m.shift, m.win) {
+            KanjiRolePlan::KeepStatic => static_action,
+            KanjiRolePlan::Passive => None,
+            KanjiRolePlan::Derive => self.derive_key_shadow_action(ImeKindId::Gji, vk),
+        }
+    }
+
+    /// F13〜F24 の最初の Down（非injected・`!was_down`）で、`kp_stage_shadow_ime_toggle` が**実際に開閉を書いたか**
+    /// （役割由来の昇格で`shadow_toggled`）をラッチへ上書きし、一致する Up でラッチを捨てる
+    /// （[`crate::state::key_effect_runtime::settle_fkey_latch`]、ADR-199 決定18(i)）。書かなかった打鍵（`is_japanese_ime` が偽・
+    /// belief が更新されなかった等）の自動リピートと Up は `None`＝Allow になり、Down だけ Suppress・Up だけ
+    /// Suppress の非対称や、書かないのに握りつぶす二重の空振りを作らない。イベント自身の`shadow_action`は
+    /// 触らない（配送は `plan` が最初の Down では `shadow_toggled` を見る）。
+    pub(crate) fn settle_fkey_role_latch(&mut self, event: &RawKeyEvent, shadow_toggled: bool) {
+        use awase::types::KeyEventType;
+        if !crate::vk::is_role_fkey(event.vk_code) || event.injected {
+            return;
+        }
+        // 「書いた」は役割由来（`shadow_action` あり）の昇格だけ。同期キー（`keys.ime_detect`）や修飾付きで
+        // `shadow_toggled` が立っても、`shadow_action` は付いていない（`passive_without_lookup`）ので書いたことにしない。
+        let wrote = shadow_toggled && event.ime_relevance.shadow_action.is_some();
+        self.key_role_latch = crate::state::key_effect_runtime::settle_fkey_latch(
+            self.key_role_latch,
+            event.event_type == KeyEventType::KeyDown && !event.was_down,
+            event.event_type == KeyEventType::KeyUp,
+            event.scan_code,
+            wrote,
+        );
+    }
+
+    /// 無変換/変換の親指キーの KeyDown で、Engine に渡す**役割由来**の open 軸操作を設定し直す
+    /// （ADR-199 決定16、ADR-206 の訂正: 役割由来は単独タップの `ModeKeyConfig` が Passthrough のときだけ発火するので、
+    /// config.toml の bare `keys.ime_*` 由来の `set_thumb_forced_open_actions`〈設定に関係なく発火〉とは別の入力
+    /// `set_thumb_role_open_actions` に渡す。bare がある側は役割を引かない）。`kp_run_inner` の `engine.on_input` より前から呼ぶ。
+    ///
+    /// - 対象は非リピートの KeyDown だけ（決定16）。Up・リピートは押下時に決めた値のまま。役割を引くのは非 injected のときだけで、
+    ///   injected の Down は config 由来へ戻す。押した側の値だけを書き、もう一方は触らない。
+    /// - 打鍵ごとに求め直すので、IME を切り替えたときに古い役割が残らない（決定8 と同じ考え方）。役割が無ければ
+    ///   config 由来だけ（無ければ `None`＝従来どおり受動）に戻す。
+    /// - 役割は [`Self::derive_key_shadow_action`]（GJI の `config1.db` の逆算・学習表による狭め・config との重なり）。
+    ///   MS-IME 本体は `KeyAssignmentMuhenkan`/`Henkan == 2`（トグル、T12）のときだけ役割が付く（T17 Phase 4、
+    ///   `KeyEffectKeymap::msime_native_key_role`）。入力中・変換中・候補窓でも除外しない（所有者決定 2026-09-29）。
+    ///   発火は ADR-206 の role_open_action（単独タップの ModeKeyConfig が Passthrough のときだけ。Suppress は IME を動かさない。エンジン活性時のみ）。修飾付きの押下では役割を求めない。
+    /// - `shadow_action` は付けない（付けると `transport.rs` の先行 Allow と awase の書き込みで二重 actuation、BUG-46 型）。
+    ///   物理配送は `Decision::Consume`（PendingThumb）に任せる。発火は FSM が単独タップと解決したときだけ（チョード優先）。
+    pub(crate) fn enrich_thumb_key_role(&mut self, event: &RawKeyEvent) {
+        use awase::types::KeyEventType;
+        let is_muhenkan = event.vk_code == crate::vk::VK_NONCONVERT;
+        if !(is_muhenkan || event.vk_code == crate::vk::VK_CONVERT)
+            || event.event_type != KeyEventType::KeyDown
+            || event.was_down
+        {
+            return;
+        }
+        let m = event.modifier_snapshot;
+        let modified = m.ctrl || m.alt || m.shift || m.win;
+        let ime = crate::tsf::observer::tsf_obs().table_ime_kind();
+        let vk = event.vk_code;
+        let configured = self.engine.bare_ime_action(vk);
+        // injected の Down も設定し直す（役割は引かず config 由来へ戻す）: 早期 return すると、直前の物理打鍵で
+        // 決めた役割を引き継いでしまう（BUG-14 の原則・決定8「古い役割を残さない」、PR #331 Opus レビュー）。
+        // InputRelay の窓（RDP/VM/PowerToys MWB 等、ADR-119）は actuation を所有しない（`decide_gate` が NotOwned）。
+        // ここで役割を付けると、エンジンが生キーを Consume したのに何も送られず、リモート側の IME に届かない
+        // （何度押しても変わらない=固着、ADR-206 決定3・7）ので、役割は付けず config の bare だけにする。
+        let input_relay = matches!(
+            self.platform.current_app_profile(),
+            crate::focus::class_names::AppImeProfile::InputRelay
+        );
+        // bare（`configured`）がある側は config が勝つ（役割は付けない、ADR-199 Q2）。
+        let action = if configured.is_some() {
+            None
+        } else {
+            crate::state::key_effect_runtime::thumb_forced_action(
+                None,
+                ime.is_some() && !input_relay,
+                modified,
+                event.injected,
+                || ime.and_then(|ime| self.derive_key_shadow_action(ime, vk)),
+            )
+        };
+        // **押した側だけ**書く。もう一方の押下中の値を巻き込んで変えない。
+        let (muhenkan, henkan) = self.engine.thumb_role_open_actions();
+        if is_muhenkan {
+            self.engine.set_thumb_role_open_actions(action, henkan);
+        } else {
+            self.engine.set_thumb_role_open_actions(muhenkan, action);
+        }
+    }
+
+    /// `vk`（無修飾の候補キー）の役割由来の`shadow_action`（ADR-199 決定4・6・8）。取得（I/O・キャッシュ）だけを
+    /// ここで行い、規則の組み合わせは純関数
+    /// [`crate::state::key_effect_runtime::key_shadow_action`]（ホストテストあり）に任せる。
+    ///
+    /// キーマップ・学習表の取得は予測経路（`kp_predict_key_effect`）と同じインスタンス・同じ引数
+    /// （`KeymapCache::get_gji`/`get_native`）なので、間引きも共通で I/O は増えない。
+    /// `table_ime_kind` で分岐するのは打鍵の時点の同定なので、IME を切り替えたときに古い役割が残らない。
+    /// 役割そのものの判定は`ime`に応じて`KeyEffectKeymap::gji_key_role`／`msime_native_key_role`を
+    /// 選ぶだけで、`key_shadow_action`自体はIME種別を見ない（T17 opusレビュー、合流点を1つに保つ）。
+    fn derive_key_shadow_action(
+        &mut self,
+        ime: crate::state::ime_kind::ImeKindId,
+        vk: VkCode,
+    ) -> Option<awase::types::ShadowImeAction> {
+        use crate::state::ime_kind::ImeKindId;
+        use crate::state::key_effect_predictor::TableKey;
+        use crate::state::key_effect_runtime::{hz_omit_may_apply, key_shadow_action};
+        let explicit_overlap = self.engine.has_bare_ime_combo(vk);
+        let now_ms = crate::hook::current_tick_ms();
+        let keymap = match ime {
+            ImeKindId::Gji => self.key_effect_keymap.get_gji(now_ms),
+            ImeKindId::MsIme => self.key_effect_keymap_native.get_native(now_ms),
+        };
+        let use_learned = self.use_learned_keymap_table;
+        let contradiction = match (
+            hz_omit_may_apply(use_learned),
+            keymap,
+            TableKey::from_vk(vk.0),
+        ) {
+            (true, Some(keymap), Some(key)) => {
+                self.key_effect_runtime_table.get_for_keymap(now_ms, keymap);
+                self.key_effect_runtime_table
+                    .toggle_contradiction(key)
+                    .is_some()
+            }
+            _ => false,
+        };
+        let keymap_role = keymap.map(|k| match ime {
+            ImeKindId::Gji => k.gji_key_role(vk.0),
+            ImeKindId::MsIme => k.msime_native_key_role(vk.0),
+        });
+        key_shadow_action(explicit_overlap, keymap_role, use_learned, contradiction)
     }
 
     /// `ImeCoordinator::pending_ime_off_rescue` を取り出し、`TIMER_IME_OFF_RESCUE` をキャンセルする。
@@ -437,17 +891,12 @@ impl Runtime {
     }
 
     pub fn execute_decision(&mut self, decision: awase::engine::Decision) -> CallbackResult {
-        let (callback, sync_outcomes, stripped_set_open) =
-            self.executor
-                .execute_from_loop(&mut self.platform, &self.platform_state.ime, decision);
+        let (callback, sync_outcomes) = self.executor.execute_from_loop(
+            &mut self.platform,
+            &mut self.platform_state.ime,
+            decision,
+        );
         self.dispatch_outcomes(sync_outcomes);
-        if stripped_set_open.is_some() {
-            // settle 中に握りつぶした SetOpen は自然には再発行されない
-            // （Engine::prev_activation は遷移確定済みのため）。既存の
-            // apply_force_on_for_imm_broken 等と同じ「settle 明けに refresh で再試行」
-            // パターンで確実に一度だけ再同期する。
-            self.schedule_settle_retry("SetOpen stripped from execute_from_loop decision");
-        }
         callback
     }
 
@@ -467,6 +916,7 @@ impl Runtime {
     /// （force 系の適用は generation を持たずこの経路を通らない）、`reason` は
     /// ジャーナルへ直接記録することで force 系も含めた全経路の provenance を
     /// 一意に残す。
+    #[tracing::instrument(level = "debug", skip_all, fields(open = open, ?outcome, ?generation, ?reason))]
     pub fn on_ime_apply_complete(
         &mut self,
         open: bool,
@@ -531,18 +981,39 @@ impl Runtime {
 
     /// 現在の shadow model から `ImeControlView` を構築する。
     pub(crate) fn shadow_ime_control_view(&self) -> crate::state::ImeControlView<'_> {
-        let mut view = self
-            .platform
-            .build_ime_control_view(self.platform_state.ime.model().applied_pair());
+        let mut view = self.platform.build_ime_control_view(
+            self.platform_state
+                .ime
+                .model()
+                .applied_state()
+                .applied_open(),
+        );
         view.belief_input_mode = self.platform_state.ime.input_mode();
         view
     }
 
     /// エンジンの有効/無効を切り替え、Decision を実行する
     pub fn toggle_engine(&mut self) {
+        // 「無効化された瞬間」を捉えるスナップショットは on_command より前で
+        // 取る必要がある — on_command 自体が NicolaFsm::toggle_enabled で
+        // is_user_enabled を同期的に書き換えるため、execute_decision の中で
+        // 読むと既に更新後の値になってしまい判定が常に false になる
+        // （issue #137 3周目のレビューで指摘・修正）。
+        let was_user_enabled = self.engine.is_user_enabled();
         let ctx = self.build_ctx();
         let decision = self.engine.on_command(EngineCommand::ToggleEngine, &ctx);
         self.execute_decision(decision);
+        if was_user_enabled && !self.engine.is_user_enabled() {
+            // エンジンが無効化されている間は romaji VK を送信しないため
+            // kp_stage_kana_lock_warn のサンプリング自体が止まる。無効化前の
+            // 警告状態がトレイに固着し続け、実際のON/OFF状態が確認できなく
+            // なるのを避けるため、ここでヒステリシスとトレイ表示の両方を
+            // 一律リセットする。
+            self.kana_lock_hysteresis = KanaLockHysteresis::new();
+            self.drift_giveup_notified_this_focus = false;
+            self.drift_giveup_started_at = None;
+            self.platform.tray.set_kana_lock_warned(false);
+        }
     }
 
     /// エンジンを無条件で ON にする（トグルではなく強制）。
@@ -624,15 +1095,15 @@ impl Runtime {
     }
 
     /// settle 期間中に IME apply/decision をスキップしたとき、settle 明けに refresh で
-    /// 一度だけ再試行する「確立済みパターン」（`executor::strip_ime_set_open_if_settling`
-    /// doc 参照）を一元化する。
+    /// 一度だけ再試行する「確立済みパターン」（drift correction の settle 延期用。
+    /// 明示操作の SetOpen を settle で落とす旧 strip は ADR-213 P2d-2 で撤去）を一元化する。
     ///
     /// 遅延は settle 残余の上限（= `focus_settle_ms()`）+ タイマー粒度マージン 50ms。
     /// `reason` はログの `[focus-settle] {reason} → ...` に埋め込まれる、呼び出し元ごとの
-    /// 説明文（例: `"apply_force_on_for_imm_broken skipped (settling)"`）。
+    /// 説明文（例: `"drift correction skipped (settling)"`）。
     pub fn schedule_settle_retry(&mut self, reason: &str) {
         let retry_ms = self.platform_state.ime.focus_settle_ms() + 50;
-        log::debug!("[focus-settle] {reason} → {retry_ms}ms 後に refresh で再試行");
+        tracing::debug!("[focus-settle] {reason} → {retry_ms}ms 後に refresh で再試行");
         self.schedule_ime_refresh(retry_ms);
     }
 
@@ -671,13 +1142,63 @@ impl Runtime {
         // 例外が過去に存在した（`apply_force_on_for_imm_broken` の周期 force-ON
         // 再送を同じリフレッシュ連鎖に相乗りさせるため）。2026-08-17、ADR-094 で
         // force ポリシー自体を撤去したのに伴い削除した。`apply_force_on_for_imm_broken`
-        // は常時この早期 return の影響を受ける（force policy 分岐が無くなった今、
-        // 周期リフレッシュに乗るのが唯一の force-ON 経路になった）。
-        let is_tsf_native = crate::focus::class_names::is_effectively_tsf_native(
-            self.platform.current_app_profile(),
-            self.platform.focus.class_name(),
-        );
-        if is_tsf_native || self.platform_state.ime.explicit_intent().is_some() {
+        // は常時この早期 return の影響を受けていた（その後 `f83084b3` で関数ごと撤去済み）。
+        let is_tsf_native = self
+            .platform
+            .current_app_profile()
+            .is_effectively_tsf_native(self.platform.focus.class_name());
+        if is_tsf_native {
+            return;
+        }
+        // ADR-205: 外部注入の IME キー直後の監視窓が生きている間は、明示意図の有無に関わらず読み直しを予約する
+        // （明示意図があると下の分岐でポーリングが止まり、窓の中の読みが届かない）。
+        let now_for_watch = crate::hook::current_tick_ms();
+        if let Some(remaining) = self
+            .platform_state
+            .ime
+            .external_change_watch_remaining_ms(now_for_watch)
+        {
+            self.schedule_ime_refresh(crate::tuning::MODE_KEY_PASS_REREAD_MS.min(remaining + 1));
+            return;
+        }
+        // ADR-187: 無変換/変換の生キー通過後、窓が有効な間は follow の読み直しを予約する。通常のポーリング間隔で
+        // 上書きしない。意図を捨てた後は`explicit_intent()`が`None`になるため、ここで上書きすると読み直しが
+        // 窓(300ms)より後(既定500ms)に飛び、最初の観測が古い状態を読んだ回で追随できない。
+        // 直前の読み取りが成功したなら`MODE_KEY_PASS_REREAD_MS`ごと、失敗したなら窓の終了時の1回に絞る
+        // （`mode_key_pass_next_read_ms`。失敗する環境で60msごとに読むとprobeが重なり、3回連続失敗で
+        // `imm-learning`が窓を誤って降格する。BUG-158）。窓が切れた直後のtickで`ir_stage_notify`が古い意図を
+        // 捨てる（意図が残ってポーリングが止まらない）。
+        // 読めない窓（`Imm32Unavailable`等）では読み取り自体ができず、意図が読み取りで訂正される見込みが無い
+        // ので、通過マークの読み直しも窓終了時の意図の破棄もしない（意図はbeliefの唯一の手がかりとして残る。
+        // 破棄するとCIのblind条件でEngineずれが0→22〜25%に悪化した）。
+        let now_ms = crate::hook::current_tick_ms();
+        if !self.can_use_imm32_cross_process() {
+            // 立てた時点で読めた通過が、途中の降格で読めない窓になったときは、窓の終了時に1回だけ起こして
+            // 古い意図を捨てる（`ir_stage_notify`）。起こさないと通過マークが有効な間は何も予約されず、
+            // 意図が残ってポーリングが止まる（BUG-151原因③、レビュー round2 A-N2）。
+            if let Some(remaining) = self.platform_state.ime.mode_key_pass_expiry_wait_ms(now_ms) {
+                self.schedule_ime_refresh(remaining + 1);
+                return;
+            }
+            // 読めない窓は従来どおり（ADR-187）: 明示意図があれば停止、通過マークが有効な間は上書きしない。
+            if self.platform_state.ime.explicit_intent().is_some()
+                || self.platform_state.ime.mode_key_pass_mark_live(now_ms)
+            {
+                return;
+            }
+        } else if let Some(remaining) = self
+            .platform_state
+            .ime
+            .mode_key_pass_window_remaining_ms(now_ms)
+        {
+            self.schedule_ime_refresh(crate::state::mode_key_pass::mode_key_pass_next_read_ms(
+                self.last_ime_read_ok,
+                remaining,
+                crate::tuning::MODE_KEY_PASS_REREAD_MS,
+            ));
+            return;
+        }
+        if self.platform_state.ime.explicit_intent().is_some() {
             return;
         }
         self.schedule_ime_refresh(u64::from(self.platform_state.focus.ime_poll_interval_ms));
@@ -707,7 +1228,7 @@ impl Runtime {
         };
         self.platform.timer.kill(crate::TIMER_TSF_GATE);
         if !held.is_empty() {
-            log::debug!(
+            tracing::debug!(
                 "[tsf-gate] draining {} held keys via INPUT_DEFER",
                 held.len()
             );
@@ -718,10 +1239,10 @@ impl Runtime {
     /// IME を実際に ON/OFF する直接呼び出し（`Decision`/`Effect` を経由しない経路）が、
     /// フォーカス遷移の settle 期間中に実行されるべきでないかどうかを判定する。
     ///
-    /// `execute_decision`/`execute_decision_suppressed` 経由の `Decision` ベースの経路は
+    /// `execute_decision` 経由の `Decision` ベースの経路は
     /// `Executor::execute_from_loop` が一括でガードするが、`platform.set_ime_open` を
-    /// 直接呼ぶ経路（`apply_force_on_for_imm_broken`, `try_force_on_bootstrap`,
-    /// `ir_apply_drift_correction`）は `Decision`/`Effect` という抽象を経由しないため
+    /// 直接呼ぶ経路（`ir_apply_drift_correction` 等。撤去済みの
+    /// `apply_force_on_for_imm_broken`/`try_force_on_bootstrap` も同型だった）は `Decision`/`Effect` という抽象を経由しないため
     /// そちらのガードが効かない。これらの呼び出し元は実行前に必ずこれを確認すること。
     ///
     /// 2026-07-05: Alt+Tab 中間ウィンドウへの一瞬のフォーカス中に、これらの直接呼び出しが
@@ -739,250 +1260,11 @@ impl Runtime {
     /// という意図と正反対になる。加えて `ImeDiagnosticSnapshot::capture` は
     /// BUG-34 が撤去/非同期化の対象とする同族の同期 `SendMessageTimeoutW` を
     /// 含むため、BUG-34 が進めばこのゲートは静かに「常に不発」へ反転する。
-    /// enforce-OFF ブロック自体はこの関数を呼ばないまま維持する（決定4）。
+    /// （この enforce-OFF ブロック自体は 2026-09-25 に撤去した。docs/adr/191-calibration-experiments.md「A/B-1」。）
     pub(crate) fn ime_apply_should_defer(&self) -> bool {
         self.platform_state
             .ime
             .is_focus_transition_settling(std::time::Instant::now())
-    }
-
-    /// Blacklist アプリ（Chrome 等）で IME belief が ON のとき OS に force-ON を送る。
-    ///
-    /// IMM クロスプロセスが使えるアプリ（通常 IMM アプリ）では何もしない。
-    ///
-    /// NOTE: `conv_mode_policy = force` 時にこの関数を止める早期 return が過去に
-    /// 存在した（force-ON を `kp_run_inner::consume_force_open_pending` という
-    /// 入力意図に紐づくトリガーへ移行していたため）。2026-08-17、ADR-094 で
-    /// force ポリシー自体を撤去したのに伴い削除した。この関数は
-    /// `ir_stage_notify` の周期リフレッシュに相乗りする経路であり、
-    /// [ADR-086](../../../../docs/adr/086-force-write-trigger-and-target-identity.md)
-    /// INV-15 が禁止する「生の周期タイマー」トリガーに該当する既知の逸脱として
-    /// 残る（ADR-094 参照。`consume_force_open_pending` という INV-15 準拠の
-    /// 代替経路自体も本 ADR で撤去したため、この関数が唯一の force-ON 経路になった）。
-    pub fn apply_force_on_for_imm_broken(&mut self) {
-        if self.can_use_imm32_cross_process() {
-            return;
-        }
-        if self.ime_apply_should_defer() {
-            // settle 中のスキップは必ず settle 明けに refresh で再試行する。
-            // 再試行がないと「belief ON × 実 IME OFF」のまま次の refresh（無保証、
-            // 実測で 8 秒後）まで放置され、最初の打鍵が閉じた IME にリテラル着弾する
-            // （2026-07-07 実機: 仮想デスクトップ切替 → Windows Terminal で
-            // 「これで」が「korede」化。TsfNative は open 状態を読めないため
-            // 観測での自己修復も効かない）。遅延は settle 残余の上限
-            // （= focus_settle_ms）+ タイマー粒度マージン 50ms。
-            self.schedule_settle_retry("apply_force_on_for_imm_broken skipped (settling)");
-            return;
-        }
-        if !(self.engine.is_user_enabled()
-            && self.platform_state.ime.is_eligible_for_ime_force_on())
-        {
-            return;
-        }
-        // ADR-098 決定1-c（BUG-69）: 従来ここは「applied が既に ON なら送らない」
-        // だけの判定だった。決定1-a で TsfNative の `applied` がフォーカス入場後
-        // `Unknown` のまま残るようになると、strategy chain が `Failed` を返した
-        // 場合に `record_ime_apply_result` が `applied = Confirmed{open:false}`
-        // を書き、この従来ガード（Optimistic(true)|Confirmed{open:true} のみ
-        // 見る）を素通りする。`on_ime_apply_complete` は outcome によらず
-        // `post_ime_refresh()` で 20ms 後の再試行を無条件に張り、TsfNative は
-        // それを上書きする周期ポーリングが無い（`reschedule_ime_refresh` が
-        // 早期 return する）ため、実効 50Hz の無限再試行ループになる——
-        // 毎回 `mark_composition_cold`（打鍵中かどうかを問わない）と 2 発目の
-        // eager warmup を伴う BUG-31 族の最悪形。クールダウン + 「未試行なら
-        // 必ず通す」で有界化する（BUG-68 の `DRIFT_CORRECTION_BLIND_REARM_
-        // COOLDOWN_MS` と同じ形）。試行回数の上限は設けない——理由は
-        // `force_on_attempt_allowed`/`FORCE_ON_RETRY_COOLDOWN_MS` の doc 参照。
-        let now_ms = crate::hook::current_tick_ms();
-        if !self.platform_state.ime.force_on_attempt_allowed(now_ms) {
-            return;
-        }
-        // `platform.set_ime_open` は IMM 専用実装で、Imm32Unavailable / TSF-native
-        // プロファイルでは早期 return する — つまり **この関数が対象とする Blacklist
-        // アプリで常に no-op だった**（2026-07-07 実機: BUG-16 の settle 明け再試行が
-        // 律儀に走っても実 IME OFF が直らず「koreha」リテラル化が再発。
-        // 手動 Ctrl+変換 = strategy chain 経由の apply は毎回効いていた）。
-        // strategy chain（MsImeDirect の冪等 VK_DBE_HIRAGANA 等）で apply する。
-        let outcome = self.force_on_and_correct_romaji(
-            crate::state::ime_event::OpenApplyReason::ImmBrokenForceOn,
-        );
-        // UnsafeToToggle（Win キー保持等の genuine skip）は「送っていない」ので
-        // クールダウンの起点にしない——数えると Win 長押し中に次のフォーカス
-        // 変更まで再試行できなくなる。この場合 `applied` も更新されないため
-        // （`record_ime_apply_result` が pending 解放だけして早期 return する）、
-        // 次の 20ms リフレッシュがそのまま再試行する（既存の自己回復を保存）。
-        if outcome != awase::platform::ImeOpenOutcome::UnsafeToToggle {
-            self.platform_state.ime.note_force_on_attempt(now_ms);
-        }
-    }
-
-    /// force-ON を実際に送信し、続けて非ローマ字対応 `input_mode` の補正を行う共通処理。
-    ///
-    /// `apply_force_on_for_imm_broken` から呼ばれる（かつての `conv_mode_policy = force`
-    /// 経路 `consume_force_open_pending` は 2026-08-17、ADR-094 で force ポリシー
-    /// 撤去に伴い削除済み）。
-    fn force_on_and_correct_romaji(
-        &mut self,
-        reason: crate::state::ime_event::OpenApplyReason,
-    ) -> awase::platform::ImeOpenOutcome {
-        let tick_ms = crate::state::TickMs(crate::hook::current_tick_ms());
-        // N1（2026-08-08 2回目 opus アドバーサリアルレビュー新規指摘）:
-        // force-ON の同期 IMC write（`MsImeDirectStrategy`/`ImmCrossProcessStrategy`
-        // 内の `set_ime_romaji_mode()`）を、`kp_stage_idle_conv_check` の汚染
-        // 再検証ガード（shift ガード・`last_explicit_ime_action_ms` 一致・
-        // `last_send` 一致）から見える形にする。呼ばないと、Phase 3 で
-        // idle_conv_check の隣（同一キーイベント内）に移動した force-ON 自身の
-        // 書き込みが「外部観測」として idle-conv-check に誤読される
-        // （`platform_state.rs` の `note_explicit_ime_action` doc 参照）。
-        self.platform_state.ime.note_explicit_ime_action(tick_ms);
-        // N2（2026-08-08 2回目 opus アドバーサリアルレビュー新規指摘）:
-        // `apply_ime_open_with_belief(true, None, belief)` は内部で
-        // `belief_input_mode: InputModeState::Unknown` 固定の view を作るため、
-        // `MsImeDirectStrategy`/`ImmCrossProcessStrategy` の「ユーザーが
-        // 意図的にかな入力を選んでいれば romaji 復元で上書きしない」
-        // （`ObservedKana` 保護）ガードが force-ON 経路では一度も効かなかった。
-        // `belief_input_mode = input_mode()` を明示的に埋めた view を使うことで
-        // 保護を効かせる。`applied` は `shadow_ime_control_view()` の
-        // `Some(applied_pair())` ではなく `None` のまま維持する——GJI の
-        // `shadow_on` スキップ（`GjiDirectStrategy` が「既に ON」と誤認して
-        // VK_IME_ON をスキップする）を意図的に外す既存仕様のため
-        // （ADR-098 決定2 で撤去済みの `ir_post_focus_change_snapshot` 内
-        // TsfNative force-on ブロックも、到達不能になる前は同じ理由で
-        // `None` を使っていた）。
-        let mut view = self.platform.build_ime_control_view(None);
-        view.belief_input_mode = self.platform_state.ime.input_mode();
-        let belief = crate::output::OpenBelief {
-            effective_open: true,
-            confident: true,
-        };
-        // ADR-090 §2.A A-1（shadow）: 実 actuation 入口は `ActuationOrder` を
-        // 起案する。授権が下りなくても書き込みは止めない（A-2 で倒す）。
-        let order = self.issue_actuation_order(true, "force_on_and_correct_romaji");
-        let outcome = self.platform.apply_ime_open_with_view(order, &view, belief);
-        log::info!("force-ON ({reason:?}): apply_ime_open(true) → {outcome:?}");
-        self.on_ime_apply_complete(true, outcome, None, reason);
-        if !self.platform_state.ime.input_mode().is_romaji_capable() {
-            if let Some(new_mode) = self.platform_state.ime.correction_for_imm_broken() {
-                log::info!(
-                    "force-ON ({reason:?}): input_mode → AssumedRomaji (IMM broken, ime_on=true)"
-                );
-                let tick_ms = crate::state::TickMs(crate::hook::current_tick_ms());
-                self.apply_input_mode_correction(
-                    new_mode,
-                    crate::state::ime_event::InputModeApplyStrategy::ImmBrokenCorrection,
-                    tick_ms,
-                );
-            } else {
-                // romaji-capable は外側の if で除外済みなので None = ObservedEisu のみ
-                log::info!(
-                    "force-ON ({reason:?}): input_mode スキップ (belief=ObservedEisu, eisu guard)"
-                );
-            }
-        }
-        outcome
-    }
-
-    /// 未知 Imm32Unavailable アプリで IME 検出が連続失敗したとき、一時 force-ON を試みる。
-    pub fn try_force_on_bootstrap(&mut self) {
-        if self.platform_state.ime.detect_miss_count() >= crate::IME_DETECT_MISS_THRESHOLD
-            && self.engine.is_user_enabled()
-            && self.platform_state.ime.is_eligible_for_ime_force_on()
-            && !self.platform_state.ime.is_force_on_guard_active()
-        {
-            if self.ime_apply_should_defer() {
-                // apply_force_on_for_imm_broken と同じく settle 明けに必ず再試行する。
-                self.schedule_settle_retry("try_force_on_bootstrap skipped (settling)");
-                return;
-            }
-            log::warn!(
-                "IME detection failed {} times, forcing OS ime_on=true (shadow=ON)",
-                self.platform_state.ime.detect_miss_count()
-            );
-
-            // BUG-34 横展開 D: 従来この経路は apply_ime_open_with_belief →
-            // ImeController::apply（同期 chain）を経由し、ImmCrossProcessStrategy::apply
-            // → set_ime_open_cross_process（150ms 宣言タイムアウトの
-            // SendMessageTimeoutW）をエンジンスレッド上で直接ブロックしていた
-            // （ADR-089 §9-21 の訂正どおり、Standard プロファイルでも到達しうる）。
-            // executor.rs::dispatch_ime_set_open の ImmCross async path と同じ構成で
-            // run_open_chain_async へ委譲する: 起案（generation の発行 + pending の
-            // 設置 + warrant order + OutputActiveGuard）は spawn_local の**外**で
-            // 行う（future の中では with_app 再入で ImeStateHub に届かないため、
-            // ADR-090 §4.2）。
-            //
-            // generation は `allocate_event_generation()` を呼ぶだけでなく、
-            // 必ず `ImeApplyRequested` を dispatch して `pending` を実際に立てる
-            // （round-2 premortem で判明: generation を割り当てるだけで
-            // ImeApplyRequested を dispatch しないと `record_ime_apply_result` の
-            // generation 照合が常に不一致になり、完了が全て stale として捨てられる
-            // 「空の generation」になる）。D-prep（pending の期限切れパージ・
-            // UnsafeToToggle での解放・上書き検出ログ）が入っているため、
-            // capture 失敗等で完了が来なかった場合も pending は 1 秒で自然に
-            // パージされる。
-            let now_ms = crate::hook::current_tick_ms();
-            let generation = self.platform_state.ime.allocate_event_generation();
-            self.platform_state.ime.dispatch_event(
-                crate::state::ime_event::ImeEvent::ImeApplyRequested {
-                    target: true,
-                    generation,
-                    ctrl_held: false,
-                },
-                crate::state::TickMs(now_ms),
-            );
-            // ADR-090 §2.A A-1（shadow）。**この入口は差分オラクルが
-            // 「判明した中で最大の挙動変化」と記録している old-1 そのもの**
-            // （`ImmCross` は `default_feedback = Read` なので Step 4c が
-            // 発火せず、観測も意図も guard も無い bootstrap では warrant が
-            // `None` になる）。A-2 で倒すのは**最後**に回すこと（ADR-090 §4.9）。
-            let order = self.issue_actuation_order(true, "try_force_on_bootstrap");
-            let focus_gen = self.platform.output.ime_mode_focus_gen.get();
-            // MsImeDirect/ImmCross の ROMAN 補完と同じ判断（executor.rs
-            // dispatch_ime_set_open の async path 参照）: ObservedKana（ユーザーが
-            // 意図的にかな入力に設定した状態）以外は open と同じ hwnd へ ROMAN
-            // ビットを補完する。
-            let conv_after_open = if matches!(
-                self.platform_state.ime.input_mode(),
-                InputModeState::ObservedKana
-            ) {
-                crate::ime::ConvAfterOpen::Skip
-            } else {
-                crate::ime::ConvAfterOpen::Write(None)
-            };
-            let guard = crate::tsf::probe_bridge::OutputActiveGuard::begin();
-            win32_async::spawn_local(async move {
-                let Some(target) = crate::ime::ActuationTarget::capture(focus_gen).await else {
-                    log::debug!(
-                        "[force-on-bootstrap] capture 失敗（フォーカス無し） → UnsafeToToggle"
-                    );
-                    message_handlers::post_async_ime_apply_complete(
-                        true,
-                        awase::platform::ImeOpenOutcome::UnsafeToToggle,
-                        Some(generation),
-                        crate::state::ime_event::OpenApplyReason::Bootstrap,
-                    );
-                    drop(guard);
-                    return;
-                };
-                let outcome = open_chain::run_open_chain_async(
-                    order,
-                    open_chain::ImmCrossOp::Targeted {
-                        target,
-                        conv_after_open,
-                        focus_gen,
-                    },
-                )
-                .await;
-                log::info!("force-on bootstrap: apply_ime_open(true) → {outcome:?}");
-                message_handlers::post_async_ime_apply_complete(
-                    true,
-                    outcome,
-                    Some(generation),
-                    crate::state::ime_event::OpenApplyReason::Bootstrap,
-                );
-                drop(guard);
-            });
-            self.platform_state.ime.set_force_on_broken_app_bootstrap();
-        }
     }
 
     /// 設定リロード時にレイアウト一覧を再スキャンし、`default_layout` に追従させる。
@@ -998,7 +1280,7 @@ impl Runtime {
     /// 確定させてしまうことを避ける。
     pub(crate) fn reload_layouts(&mut self, layouts: Vec<LayoutEntry>, default_layout: &str) {
         let Some(layouts) = NonEmptyLayouts::new(layouts) else {
-            log::warn!("reload_layouts: no layouts found, keeping current layout");
+            tracing::warn!("reload_layouts: no layouts found, keeping current layout");
             return;
         };
 
@@ -1020,7 +1302,7 @@ impl Runtime {
     /// 配列を動的に切り替える
     pub fn switch_layout(&mut self, index: usize) {
         let Some(entry) = self.layouts.get(index) else {
-            log::warn!("Layout index {index} out of range");
+            tracing::warn!("Layout index {index} out of range");
             return;
         };
 
@@ -1033,7 +1315,7 @@ impl Runtime {
 
         self.platform.tray.set_layout_name(&name);
 
-        log::info!("Switched layout to: {name}");
+        tracing::info!("Switched layout to: {name}");
     }
 
     /// 手動アプリオーバーライドのトグル処理
@@ -1076,7 +1358,7 @@ impl Runtime {
         } else {
             "NonText (engine bypassed)"
         };
-        log::info!("Manual focus override: → {mode_str}");
+        tracing::info!("Manual focus override: → {mode_str}");
     }
 
     /// Sync key 後に遅延されたキーを再処理する。
@@ -1088,7 +1370,7 @@ impl Runtime {
     pub fn process_deferred_keys(&mut self) {
         // Guard を解除し、保留キーを回収
         let keys = self.platform_state.gate.sync_key_gate.deactivate();
-        log::debug!("IME guard OFF (process_deferred_keys)");
+        tracing::debug!("IME guard OFF (process_deferred_keys)");
 
         // Refresh IME state (Observer → ImeObservations → Preconditions)
         // SAFETY: `poll_and_classify_ime` は Win32 IMM API（`ImmGetContext` 等）を呼ぶ unsafe fn。
@@ -1099,6 +1381,7 @@ impl Runtime {
                 self.platform_state.ime.is_force_on_guard_active(),
                 self.platform_state.ime.input_mode(),
                 self.platform_state.ime.belief.prev_conversion_mode(),
+                self.platform.focus.process_name(),
             )
         };
         let tick_ms = crate::state::TickMs(crate::hook::current_tick_ms());
@@ -1110,9 +1393,9 @@ impl Runtime {
 
         // LastAppliedImeState を OS 観測値に同期する。
         // 物理 Kanji キー（sync key）は apply_ime_open を経由しないため last_applied が更新されない。
-        // last_applied が stale なまま Engine が activate → SetOpen(true) → KanjiToggleStrategy が
-        // last_applied(false) != desired(true) と判定して VK_KANJI を余分に送信し、
-        // Chrome では IME が逆転するバグを防ぐ。
+        // last_applied が stale なまま Engine が activate → SetOpen(true) へ進むと、
+        // 直後の force-on / focus-resync が古い状態を根拠に動く。観測済みのOS状態で
+        // mirrorしてから戻すことで、物理キー起点の状態変化をモデルへ反映する。
         //
         // ADR-098 決定5: この関数（`process_deferred_keys`）自体は `SyncKeyGate::
         // activate()`/`try_push()` の呼び出し元が現状ゼロのため本番到達不能——
@@ -1124,23 +1407,20 @@ impl Runtime {
         self.platform_state
             .ime
             .record_confirmed(observed_ime_on, tick_ms.0);
-        log::debug!("[process-deferred] applied_open → {observed_ime_on} (sync with OS poll)");
+        tracing::debug!("[process-deferred] applied_open → {observed_ime_on} (sync with OS poll)");
 
         // Engine に IME 状態変化を即通知する（deferred keys の有無にかかわらず）。
-        // suppress_engine_state_key = true: sync key（Kanji 等）がすでに IME を正しい状態に
-        // 設定しているため、engine_on/off_ime_key（VK_DBE_DBCSCHAR 等）を追加送信しない。
-        // 送ると IME モードが ひらがな→全角英数 等に意図せず変わる可能性がある。
         {
             let ctx = self.build_ctx();
             let decision = self.engine.on_command(EngineCommand::RefreshState, &ctx);
-            self.execute_decision_suppressed(decision);
+            self.execute_decision(decision);
         }
 
         if keys.is_empty() {
             return;
         }
 
-        log::debug!("Processing {} deferred key(s) after IME toggle", keys.len());
+        tracing::debug!("Processing {} deferred key(s) after IME toggle", keys.len());
 
         for (event, _phys) in keys {
             // Build fresh context with updated preconditions
@@ -1176,18 +1456,44 @@ impl Runtime {
                 sync_on_keys,
                 sync_off_keys,
             ),
+            lang_check: lang_check::LangCheck::default(),
             platform_state,
             all_keymaps,
             post_bypass_rules,
             ime_coordinator: ime_coordinator::ImeCoordinator::new(),
             active_actuation: None,
-            dbe_mode_key_policy: awase::config::DbeModeKeyPolicy::default(),
-            half_width_alnum_toggle_policy: awase::config::HalfWidthAlnumTogglePolicy::default(),
-            muhenkan_dedicated_fn_key_is_manual: false,
-            muhenkan_dedicated_fn_key_active: false,
-            muhenkan_solo_tap_is_passthrough: false,
+            key_effect_keymap: crate::state::key_effect_predictor::KeymapCache::default(),
+            last_ime_read_ok: true,
+            key_effect_keymap_native: crate::state::key_effect_predictor::KeymapCache::default(),
+            state_dependent_key_warning:
+                crate::state::state_dependent_key_warning::WarningTracker::default(),
+            state_dependent_key_warning_dialog:
+                crate::state::state_dependent_key_warning::WarningDialogTracker::default(),
+            warn_state_dependent_mode_keys: true,
+            passthrough_thumb_mode_keys: Vec::new(),
+            key_effect_runtime_table: crate::state::key_effect_runtime::RuntimeTableCache::default(
+            ),
+            use_learned_keymap_table: true,
+            predict_henkan_open_in_unreadable_windows: true,
+            key_role_latch: None,
+            muhenkan_dedicated_fn_key_vk: None,
             space_is_thumb_key: false,
+            msime_key_assignment_warned: None,
             keyboard_model: awase::scanmap::KeyboardModel::default(),
+            update_check_enabled: true,
+            kana_lock_hysteresis: KanaLockHysteresis::new(),
+            watchdog_kana_edge: None,
+            drift_giveup_notified_this_focus: false,
+            drift_giveup_started_at: None,
+            hook_guard: None,
+            hook_self_heal_enabled: true,
+            hook_watchdog_confirmed_attempt_count: 0,
+            hook_watchdog_next_retry_at_ms: None,
+            hook_watchdog_reinstall_history_ms: Vec::new(),
+            session_locked: false,
+            hook_watchdog_canary_sent_at_ms: None,
+            hook_watchdog_canary_baseline_alive_ms: None,
+            hook_watchdog_consecutive_alive_ticks: 0,
         }
     }
 
@@ -1199,11 +1505,138 @@ impl Runtime {
         self.keyboard_model = model;
     }
 
-    /// `config.general.dbe_mode_key_policy` を反映する。起動時
-    /// （`bootstrap.rs`、`conv_mode.set_policy` と同じ post-construction 経路）と
-    /// `apply_config_update`（reload 時）の両方から呼ぶ。
-    pub(crate) fn set_dbe_mode_key_policy(&mut self, policy: awase::config::DbeModeKeyPolicy) {
-        self.dbe_mode_key_policy = policy;
+    pub(crate) const fn set_use_learned_keymap_table(&mut self, enabled: bool) {
+        self.use_learned_keymap_table = enabled;
+    }
+
+    pub(crate) const fn set_predict_henkan_open_in_unreadable_windows(&mut self, enabled: bool) {
+        self.predict_henkan_open_in_unreadable_windows = enabled;
+    }
+
+    pub(crate) const fn set_update_check_enabled(&mut self, enabled: bool) {
+        self.update_check_enabled = enabled;
+    }
+
+    pub(crate) const fn set_warn_state_dependent_mode_keys(&mut self, enabled: bool) {
+        self.warn_state_dependent_mode_keys = enabled;
+    }
+
+    /// 状態依存キー警告の対象にする親指キーを、設定（抑止・専用Fnキー・bare `keys.ime_*`）から決める。
+    /// bare の開閉（旧 `*_solo_tap_ime_action` の移行分を含む）を持つキーは awase が単独タップを消費する。
+    /// IME 設定由来の役割は打鍵ごとにしか求まらず静的に判定できないため、ここでは含めない
+    /// （役割のあるキーで警告が出ることがあるが、警告は案内であり動作には影響しない）。
+    pub(crate) fn set_passthrough_thumb_mode_keys(
+        &mut self,
+        general: &awase::config::GeneralConfig,
+    ) {
+        use awase::engine::ModeKeyConfig;
+        // bare の開閉は `set_thumb_forced_open_actions`（起動時・`apply_config_update` の冒頭）が設定済み。
+        let (muhenkan_bare, henkan_bare) = self.engine.thumb_forced_open_actions();
+        self.passthrough_thumb_mode_keys =
+            crate::state::state_dependent_key_warning::passthrough_thumb_vks(
+                ModeKeyConfig::from_legacy_bools(
+                    general.muhenkan_solo_tap_ignore_composing_guard,
+                    general.muhenkan_solo_tap_always_suppress,
+                )
+                .is_passthrough(),
+                general.muhenkan_solo_tap_dedicated_fn_key.is_some() || muhenkan_bare.is_some(),
+                ModeKeyConfig::from_legacy_bools(
+                    general.henkan_solo_tap_ignore_composing_guard,
+                    general.henkan_solo_tap_always_suppress,
+                )
+                .is_passthrough(),
+                henkan_bare.is_some(),
+            );
+    }
+
+    /// ADR192-T5: 状態依存キー警告の判定に使う、採用中の学習表のセル。予測器
+    /// （`kp_predict_key_effect`）と同じ`RuntimeTableCache`・同じ検証キーで引くので、
+    /// 予測器が使う表と警告が見る表は常に一致する（学習表が無効/未採用なら`None`＝同梱表）。
+    fn learned_cells_for_warning(
+        &mut self,
+        now_ms: u64,
+        keymap: Option<&crate::state::key_effect_predictor::KeyEffectKeymap>,
+    ) -> Option<Vec<crate::state::key_effect_predictor::Cell>> {
+        let keymap = keymap?;
+        if !self.use_learned_keymap_table {
+            return None;
+        }
+        self.key_effect_runtime_table
+            .get_for_keymap(now_ms, keymap)
+            .map(<[_]>::to_vec)
+    }
+
+    pub(crate) fn check_state_dependent_mode_keys(&mut self, google_ime: bool) {
+        let (left, right) = crate::hook::thumb_vk_codes();
+        let gji_stamp = google_ime
+            .then(crate::gji_charset_autodetect::config1_db_stamp)
+            .flatten();
+        let now_ms = crate::hook::current_tick_ms();
+        let warnings = if google_ime {
+            let keymap = crate::gji_charset_autodetect::read_key_effect_keymap();
+            let learned = self.learned_cells_for_warning(now_ms, keymap.as_ref());
+            self.state_dependent_key_warning.detect_gji(
+                self.warn_state_dependent_mode_keys,
+                gji_stamp,
+                keymap.as_ref(),
+                learned.as_deref(),
+                [left, right],
+                &self.passthrough_thumb_mode_keys,
+            )
+        } else {
+            // 予測経路・役割判定経路と同じ構築関数を経由する（別々にレジストリを読んで解釈を
+            // ずらさないため、ADR-199 T17 opusレビュー M3）。
+            let (keymap, bits) =
+                crate::msime_key_assignment::read_key_effect_keymap_native_with_reassignment_bits();
+            let learned = self.learned_cells_for_warning(now_ms, Some(&keymap));
+            self.state_dependent_key_warning.detect_msime(
+                self.warn_state_dependent_mode_keys,
+                bits,
+                Some(&keymap),
+                learned.as_deref(),
+                [left, right],
+                &self.passthrough_thumb_mode_keys,
+            )
+        };
+        for warning in &warnings {
+            tracing::warn!(
+                "[state-dependent-mode-key] kind={:?} keys={:?}: {}",
+                warning.kind,
+                warning.keys,
+                warning.message
+            );
+        }
+        let requests = self
+            .state_dependent_key_warning_dialog
+            .select(google_ime, gji_stamp, &warnings);
+        for request in requests {
+            use crate::state::state_dependent_key_warning::WarningDialogAction;
+            let question = match request.action {
+                WarningDialogAction::OpenAwaseSettings => {
+                    "いますぐawaseの設定を開いて、冪等なIME ON/OFF設定へ置き換えますか？"
+                }
+                WarningDialogAction::OpenMsImeSettings => {
+                    "いますぐWindowsのIME設定を開いて、競合するキー割り当てを解除しますか？"
+                }
+            };
+            let text = format!(
+                "{}\n\n対象キー: {:?}\n\n{question}",
+                request.warning.message, request.warning.keys,
+            );
+            let on_yes = move || match request.action {
+                WarningDialogAction::OpenAwaseSettings => {
+                    crate::app::launch_settings_with_args(["--adr192-mode-key-warning".to_owned()]);
+                }
+                WarningDialogAction::OpenMsImeSettings => {
+                    crate::msime_key_assignment::open_ime_settings();
+                }
+            };
+            crate::msime_key_assignment::spawn_yes_dialog(
+                "awase - 状態依存のIMEモードキー",
+                text,
+                on_yes,
+            );
+        }
     }
 
     /// `config.general.half_width_alnum_toggle` を反映する。起動時と reload 時の
@@ -1212,95 +1645,49 @@ impl Runtime {
         &mut self,
         policy: awase::config::HalfWidthAlnumTogglePolicy,
     ) {
-        self.half_width_alnum_toggle_policy = policy;
+        self.platform_state.gate.half_width_alnum.set_policy(policy);
     }
 
-    /// 専用Fnキー変換モード（`muhenkan_solo_tap_dedicated_fn_key`、ADR-091 §D3.2）
-    /// を反映する。`is_manual` は `config.general.muhenkan_solo_tap_dedicated_fn_key`
-    /// が `Some` かどうか（`state::gji_charset_autodetect` が介入してよいかの
-    /// ゲート）。起動時（`bootstrap.rs`）と `apply_config_update`（reload 時）の
-    /// 両方から呼ぶ。
-    pub(crate) fn set_muhenkan_dedicated_fn_key_config(
-        &mut self,
-        vk: Option<VkCode>,
-        is_manual: bool,
-    ) {
+    /// 専用Fnキー変換モード（`muhenkan_solo_tap_dedicated_fn_key`、ADR-091
+    /// §D3.2、config.toml による手動設定のみ）を反映する。起動時
+    /// （`bootstrap.rs`）と `apply_config_update`（reload 時）の両方から呼ぶ。
+    pub(crate) fn set_muhenkan_dedicated_fn_key_config(&mut self, vk: Option<VkCode>) {
         self.engine.set_muhenkan_solo_tap_dedicated_fn_key(vk);
-        self.muhenkan_dedicated_fn_key_is_manual = is_manual;
-        self.muhenkan_dedicated_fn_key_active = vk.is_some();
-    }
-
-    /// `state::gji_charset_autodetect` が GJI 検出/離脱時に専用Fnキー変換モードを
-    /// 自動的に有効化/解除するための入口。手動設定（`muhenkan_dedicated_fn_key_is_manual`）
-    /// が有効な間は何もしない（手動設定が常に優先）。
-    pub(crate) fn set_muhenkan_dedicated_fn_key_auto(&mut self, vk: Option<VkCode>) {
-        if self.muhenkan_dedicated_fn_key_is_manual {
-            return;
+        self.muhenkan_dedicated_fn_key_vk = vk;
+        if let Some(vk) = vk {
+            self.platform_state
+                .keymap
+                .active_keymaps
+                .warn_if_vk_conflicts(
+                    vk,
+                    "muhenkan_solo_tap_dedicated_fn_key",
+                    crate::keymap::KeymapConflictLevel::Warn,
+                );
         }
-        self.engine.set_muhenkan_solo_tap_dedicated_fn_key(vk);
-        self.muhenkan_dedicated_fn_key_active = vk.is_some();
     }
 
-    /// `state::gji_charset_autodetect` が手動設定かどうかを判定するための読み取り専用アクセサ。
+    /// `msime_key_assignment::check_and_warn`の警告デデュープ値を`packed`に
+    /// 更新し、更新前の値を返す（ADR-164フェーズ2、旧`LAST_WARNED`の
+    /// swap操作に対応）。
+    pub(crate) fn swap_msime_key_assignment_warned(&mut self, packed: u8) -> Option<u8> {
+        self.msime_key_assignment_warned.replace(packed)
+    }
+
+    /// `msime_key_assignment::check_and_warn`の警告デデュープ値を未警告へ
+    /// 戻す（ADR-164フェーズ2、旧`LAST_WARNED`のstore(NOT_WARNED)に対応）。
+    pub(crate) fn reset_msime_key_assignment_warned(&mut self) {
+        self.msime_key_assignment_warned = None;
+    }
+
+    /// `muhenkan_solo_tap_dedicated_fn_key`（config.tomlによる手動設定）が
+    /// 有効かどうか。BUG-115: 無変換が親指キーとして設定されておりGJI側の
+    /// IME意味論も検出された場合、これが有効だと無変換側の
+    /// delegate-to-open-axisが優先順位で黙って死ぬ
+    /// （`resolve_pending_thumb_as_single`、専用Fnキーが最優先）ため、
+    /// 警告を出すかどうかの判定に使う。
     #[must_use]
-    pub(crate) const fn muhenkan_dedicated_fn_key_is_manual(&self) -> bool {
-        self.muhenkan_dedicated_fn_key_is_manual
-    }
-
-    /// `gji_charset_autodetect` が config1.db から自動検出した IME ON/OFF/
-    /// トグルキーを反映するための入口（ADR-092 決定D Step4c）。`Engine`側
-    /// （`match_ime_on_off_auto`/`match_ime_toggle_auto`）は手動設定
-    /// （`KeysConfig.ime_on`/`ime_off`/`ime_toggle`）の内容に関わらず常に
-    /// 自動リストも併用する（2026-08-16 ユーザー判断、明示 ∪ 自動）ため、
-    /// ここでは手動設定の有無を確認せずそのまま反映してよい
-    /// （`set_muhenkan_dedicated_fn_key_auto`と異なりRuntime側にゲートは不要）。
-    pub(crate) fn set_gji_ime_on_off_toggle_auto_keys(
-        &mut self,
-        on: Vec<awase::config::ParsedKeyCombo>,
-        off: Vec<awase::config::ParsedKeyCombo>,
-        toggle: Vec<awase::config::ParsedKeyCombo>,
-    ) {
-        self.engine.set_ime_on_auto_keys(on);
-        self.engine.set_ime_off_auto_keys(off);
-        self.engine.set_ime_toggle_auto_keys(toggle);
-    }
-
-    /// GJI 離脱時、`ime_on_auto`/`ime_off_auto`/`ime_toggle_auto`を全て解除する。
-    ///
-    /// `ime_toggle_auto`はMS-IME側（`sync_ime_toggle_auto_detect`）とも共有する
-    /// フィールドだが、`message_handlers::sync_ime_kind_from_observation`が
-    /// GJI側の同期をMS-IME側より**先に**呼ぶ順序になっているため
-    /// （Opusコードレビュー指摘で修正、意図的な順序——詳細は呼び出し元の
-    /// コメント参照）、ここで解除してもGJI→MS-IME遷移では直後にMS-IME側が
-    /// 新しい値で上書きするため破綻しない。GJI→(MS-IMEでもGJIでもない状態)
-    /// では、この解除が無いと専用Fnキー同様にF15-F24のバインドが無関係な
-    /// IMEの文脈に残留してしまう（過去のレビューでこの解除漏れが実際の
-    /// バグとして指摘された）。
-    pub(crate) fn clear_gji_ime_on_off_auto_keys(&mut self) {
-        self.engine.set_ime_on_auto_keys(Vec::new());
-        self.engine.set_ime_off_auto_keys(Vec::new());
-        self.engine.set_ime_toggle_auto_keys(Vec::new());
-    }
-
-    /// `gji_charset_popup` が「専用Fnキー変換が既に有効なら設定支援ポップアップを
-    /// 出さない」判定に使う読み取り専用アクセサ。
-    #[must_use]
-    pub(crate) const fn muhenkan_dedicated_fn_key_active(&self) -> bool {
-        self.muhenkan_dedicated_fn_key_active
-    }
-
-    /// `config.general.muhenkan_solo_tap_always_suppress` の反転値を反映する。
-    /// 起動時（`bootstrap.rs`）と `apply_config_update`（reload 時）の両方から呼ぶ。
-    pub(crate) fn set_muhenkan_solo_tap_is_passthrough(&mut self, is_passthrough: bool) {
-        self.muhenkan_solo_tap_is_passthrough = is_passthrough;
-    }
-
-    /// `gji_charset_popup`（ADR-091 §D3.2「設定未完了時のポップアップ」）が
-    /// 「無変換単独タップが素のパススルー設定になっているか」を判定するための
-    /// 読み取り専用アクセサ。
-    #[must_use]
-    pub(crate) const fn muhenkan_solo_tap_is_passthrough(&self) -> bool {
-        self.muhenkan_solo_tap_is_passthrough
+    pub(crate) const fn muhenkan_dedicated_fn_key_configured(&self) -> bool {
+        self.muhenkan_dedicated_fn_key_vk.is_some()
     }
 
     /// `config.general.left_thumb_key`/`right_thumb_key` 由来のキャッシュを
@@ -1344,7 +1731,7 @@ impl Runtime {
                 let hint = self.platform.injection_hint_for(pid, &class_name);
                 let new_mode = crate::output::types::InjectionMode::from((hint, new_app_kind));
                 self.platform.update_injection_mode(new_mode);
-                log::debug!(
+                tracing::debug!(
                     "[focus-sync] hwnd=0x{:X} class={class_name:?} \
                      app_kind={new_app_kind:?} hint={hint:?} → mode={new_mode:?}",
                     hwnd_id.0
@@ -1358,13 +1745,23 @@ impl Runtime {
                 // cold mark 自体は次に実際に入力するまで何も送信しない遅延フラグなので、
                 // Chrome の連続フォーカスイベントで何度呼ばれても実害はない
                 // （詳細は docs/known-bugs.md BUG-37）。
-                let profile = crate::focus::classify::AppImeProfile::from_class_name(&class_name);
-                if crate::focus::class_names::should_reprime_on_lightweight_focus_sync(
-                    profile,
+                // issue #136 / BUG-90 決定4: `self.platform.focus`（`FocusTracker`）
+                // から正規ルートで取得する（プロセスグローバルは
+                // `ime.rs::read_ime_state_fast`（`self` を持たない）専用）。
+                // `AppImeProfile::resolve` が relay_apps 空の場合に
+                // `get_process_name`（Win32 ハンドルを開くコストがかかる）の
+                // 呼び出し自体を省略する（`ime.rs::read_ime_state_fast` と
+                // 共通化、`/code-review` 指摘）。
+                let relay_apps = self.platform.focus.input_relay_apps();
+                let profile =
+                    crate::focus::classify::AppImeProfile::resolve(&class_name, relay_apps, || {
+                        crate::focus::classify::get_process_name(pid)
+                    });
+                if profile.should_reprime_on_lightweight_focus_sync(
                     &class_name,
                     self.platform_state.ime.effective_open(),
                 ) {
-                    log::debug!(
+                    tracing::debug!(
                         "[focus-sync] belief=ON かつ実状態を問い合わせられないプロファイル \
                          (profile={profile:?}) → 次の入力で再プライムするため cold mark"
                     );
@@ -1388,6 +1785,284 @@ impl Runtime {
             crate::TIMER_HOOK_WATCHDOG,
             std::time::Duration::from_secs(3),
         );
+    }
+
+    /// `bootstrap.rs`が起動時に`install_hook()`直後へ1回だけ呼ぶ。以後は
+    /// `reinstall_keyboard_hook_for_watchdog`が差し替える。
+    pub(crate) fn set_hook_guard(&mut self, guard: crate::hook::HookGuard) {
+        self.hook_guard = Some(guard);
+    }
+
+    /// `bootstrap.rs::run`終了時（`run_message_loop`/`cleanup`の後）に呼び、
+    /// フックを明示的に解除する（旧来の`drop(hook_guard)`と同じタイミング）。
+    pub(crate) fn drop_hook_guard(&mut self) {
+        self.hook_guard = None;
+    }
+
+    /// `[diagnostics] hook_self_heal`を反映する（起動時`bootstrap.rs`、
+    /// リロード時`apply_config_update`の両方から呼ぶ）。
+    pub(crate) const fn set_hook_self_heal_enabled(&mut self, enabled: bool) {
+        self.hook_self_heal_enabled = enabled;
+    }
+
+    /// `WM_WTSSESSION_CHANGE`（`handle_wts_session_change`）から呼び、セッション
+    /// ロック状態を更新する（issue #165 自己修復 F2ガード用）。
+    pub(crate) const fn set_session_locked(&mut self, locked: bool) {
+        self.session_locked = locked;
+    }
+
+    /// hook watchdog が stale_ms<=5000（＝フック生存を確認できた）と判定した
+    /// tick（`message_handlers.rs`の`TIMER_HOOK_WATCHDOG`分岐、else側）で
+    /// 呼ぶ。`state::hook_watchdog::RECOVERY_CONFIRM_TICKS`連続でこれが
+    /// 呼ばれて初めて実際に`note_hook_watchdog_recovered`（バックオフ/
+    /// thrash履歴のリセット）へ進む。
+    ///
+    /// PR #349コードレビュー指摘: 以前は`note_hook_watchdog_recovered`を
+    /// stale_ms<=5000の**最初の1tick**で即座に呼んでいたため、他プロセスの
+    /// フックが打鍵を断続的にしか握りつぶさない「flicker」型のstarvation
+    /// では、1回フックが生き返っただけで段階的バックオフが丸ごと0へ戻り、
+    /// このケースのために存在するはずの段階的抑制が機能しなかった。
+    pub(crate) fn note_hook_watchdog_tick_alive(&mut self) {
+        self.hook_watchdog_consecutive_alive_ticks =
+            self.hook_watchdog_consecutive_alive_ticks.saturating_add(1);
+        if self.hook_watchdog_consecutive_alive_ticks
+            >= crate::state::hook_watchdog::RECOVERY_CONFIRM_TICKS
+        {
+            self.note_hook_watchdog_recovered();
+        }
+    }
+
+    /// hook watchdog が stale_ms>5000（＝フックが生存確認できていない）と
+    /// 判定したtickで呼ぶ。「連続してフック生存を確認できたtick数」の
+    /// カウント（[`note_hook_watchdog_tick_alive`]参照）を途切れさせる。
+    pub(crate) const fn note_hook_watchdog_tick_not_alive(&mut self) {
+        self.hook_watchdog_consecutive_alive_ticks = 0;
+    }
+
+    /// 次に hook_starved を検知したときは新しい episode として扱われ、
+    /// バックオフ/thrash履歴の起点がリセットされる（opus round2 B1(ii)、
+    /// 旧`hook_watchdog_episode_attempted`ラッチの後継）。
+    /// [`note_hook_watchdog_tick_alive`]経由でのみ呼ぶこと（直接呼ぶと
+    /// flicker耐性が失われる）。
+    const fn note_hook_watchdog_recovered(&mut self) {
+        self.hook_watchdog_confirmed_attempt_count = 0;
+        self.hook_watchdog_next_retry_at_ms = None;
+    }
+
+    /// issue #165（hook_starved）の自己修復トリガー判定（opus-adversarial-consult
+    /// round1・round2 指摘対応版）。
+    ///
+    /// `message_handlers.rs`のhook_starved分岐から、`stale_ms>5000 &&
+    /// os_idle_ms<5000`成立時に呼ぶ。環境情報（昇格/セッションロック/
+    /// secure desktop/relayソフト/フック有無/バックオフ/thrash上限）を集めて
+    /// `state::hook_watchdog::decide`（純粋関数）へ渡し、`SendCanary`が返った
+    /// 場合のみ`send_hook_watchdog_canary`を呼ぶ（round2 B1(i)、即座の
+    /// 再インストールではなくカナリア確認を経る）。それ以外のバリアントは
+    /// 全て「何もしない」を意味し、呼び出し元がスキップ理由のログに使う。
+    pub(crate) fn evaluate_hook_watchdog(
+        &mut self,
+        now_ms: u64,
+    ) -> crate::state::hook_watchdog::HookWatchdogAction {
+        let is_elevated_foreground =
+            !crate::is_elevated() && crate::hook::foreground_window_is_elevated();
+        let is_secure_desktop = crate::hook::is_secure_desktop_active();
+        let process_name = self.platform.focus.process_name();
+        let is_relay_or_remap_foreground = self.platform.focus.is_app_disabled()
+            || crate::state::app_suppression::matches_disabled_app(
+                self.platform.focus.input_relay_apps(),
+                process_name,
+            )
+            || crate::app::is_relay_or_remap_software_process(process_name);
+        let reinstalls_in_window = crate::state::hook_watchdog::count_within_window(
+            &self.hook_watchdog_reinstall_history_ms,
+            now_ms,
+            crate::state::hook_watchdog::THRASH_WINDOW_MS,
+        );
+        let action = crate::state::hook_watchdog::decide(
+            self.hook_self_heal_enabled,
+            is_elevated_foreground,
+            self.session_locked,
+            is_secure_desktop,
+            is_relay_or_remap_foreground,
+            self.hook_guard.is_some(),
+            now_ms,
+            self.hook_watchdog_next_retry_at_ms,
+            reinstalls_in_window,
+            crate::state::hook_watchdog::THRASH_LIMIT,
+        );
+        match action {
+            crate::state::hook_watchdog::HookWatchdogAction::SendCanary => {
+                self.send_hook_watchdog_canary(now_ms);
+            }
+            crate::state::hook_watchdog::HookWatchdogAction::ReinstallWithoutCanary => {
+                // opus round1 M1: フック不在時はカナリアを経由しない
+                // （確認相手が無く、Ctrl漏れ/ジグラー化を招くため）。
+                // PR #349コードレビュー指摘: `decide`はこの経路をバックオフ/
+                // thrash上限の対象外としているため、`record_thrash=false`で
+                // 履歴を汚染しない。
+                self.reinstall_keyboard_hook_for_watchdog(now_ms, false);
+            }
+            _ => {}
+        }
+        action
+    }
+
+    /// issue #165 自己修復 round2 B1(i): カナリア（自己注入 Ctrl down+up）を
+    /// 送信し、`state::hook_watchdog::CANARY_CONFIRM_MS`後に
+    /// `confirm_hook_watchdog_canary`で結果を判定できるよう一発タイマーを
+    /// 起動する。
+    ///
+    /// 既に確認待ち（前回のカナリアがまだ`TIMER_HOOK_WATCHDOG_CANARY_CHECK`を
+    /// 待っている）なら二重送信・二重タイマーを避けるため何もしない。3秒周期の
+    /// watchdog tickに対し確認は`CANARY_CONFIRM_MS`（既定200ms）で完了する
+    /// はずなので、通常はここに到達しない防御的ガード。
+    fn send_hook_watchdog_canary(&mut self, now_ms: u64) {
+        if let Some(sent_at_ms) = self.hook_watchdog_canary_sent_at_ms {
+            // opus round1 m2: `SetTimer`（`TIMER_HOOK_WATCHDOG_CANARY_CHECK`）が
+            // 失敗する（戻り値未検査）、またはUSERオブジェクト枯渇等で
+            // `WM_TIMER`自体が届かないと、`confirm_hook_watchdog_canary`が
+            // 一度も呼ばれず確認待ちフラグが永久に残り、以後の自己修復が
+            // 完全に止まる。`CANARY_CONFIRM_MS`の10倍を過ぎてもまだ
+            // 確認待ちのままなら、確認処理が失われたとみなして古い状態を
+            // 破棄し、新しいカナリアを送り直す。
+            let confirm_lost_threshold_ms =
+                crate::state::hook_watchdog::CANARY_CONFIRM_MS.saturating_mul(10);
+            if now_ms.saturating_sub(sent_at_ms) < confirm_lost_threshold_ms {
+                tracing::debug!("[hook-watchdog] カナリア確認待ち中のため送信をスキップ");
+                return;
+            }
+            tracing::warn!(
+                "[hook-watchdog] カナリア確認が{}ms以上届いていない（確認タイマー \
+                 消失の疑い）、状態を破棄して送り直します",
+                now_ms.saturating_sub(sent_at_ms)
+            );
+        }
+        self.hook_watchdog_canary_sent_at_ms = Some(now_ms);
+        // opus round1 B1: 基準値は送信「前」の`hook_alive_tick_ms()`
+        // （この分岐に入る時点で既に5秒以上古い値）。送信「時刻」
+        // （`now_ms`）を基準にすると`GetTickCount64`の分解能（約15.6ms）に
+        // 負けて誤検知する。
+        self.hook_watchdog_canary_baseline_alive_ms = Some(crate::hook::hook_alive_tick_ms());
+        crate::hook::send_hook_watchdog_canary();
+        self.platform.timer.set(
+            crate::TIMER_HOOK_WATCHDOG_CANARY_CHECK,
+            std::time::Duration::from_millis(crate::state::hook_watchdog::CANARY_CONFIRM_MS),
+        );
+    }
+
+    /// issue #165 自己修復 round2 B1(i): `TIMER_HOOK_WATCHDOG_CANARY_CHECK`
+    /// 発火時に`message_handlers.rs`から呼ぶ。カナリア送信後に
+    /// `hook::hook_alive_tick_ms()`が進んでいなければ真の hook_starved と
+    /// 確定し、実際の再インストールへ進む。進んでいれば「hookは生きている
+    /// がユーザーが実キーを打っていないだけ」の偽陽性と分かり、
+    /// バックオフ/thrash履歴を一切消費せずスキップする。
+    pub(crate) fn confirm_hook_watchdog_canary(&mut self, now_ms: u64) {
+        let Some(canary_sent_at_ms) = self.hook_watchdog_canary_sent_at_ms.take() else {
+            // 通常は起こらない（確認タイマーはカナリア送信時にしか起動しない）。
+            return;
+        };
+        // `hook_watchdog_canary_sent_at_ms`と常に同時にSome/Noneが揃う
+        // （どちらも`send_hook_watchdog_canary`でのみSomeになる）。
+        let baseline_hook_alive_ms = self
+            .hook_watchdog_canary_baseline_alive_ms
+            .take()
+            .unwrap_or(canary_sent_at_ms);
+        let hook_alive_tick_ms_after = crate::hook::hook_alive_tick_ms();
+        if crate::state::hook_watchdog::canary_confirmed_starved(
+            hook_alive_tick_ms_after,
+            baseline_hook_alive_ms,
+        ) {
+            tracing::warn!(
+                "[hook-watchdog] カナリア({}ms前送信)が届かず確認 → 真の \
+                 hook_starved と判定、再インストールします",
+                now_ms.saturating_sub(canary_sent_at_ms)
+            );
+            self.reinstall_keyboard_hook_for_watchdog(now_ms, true);
+        } else {
+            tracing::debug!(
+                "[hook-watchdog] カナリアが届いた（フックは生存中）→ \
+                 誤検知として再インストールをスキップ"
+            );
+        }
+    }
+
+    /// issue #165（hook_starved）の自己修復本体。
+    ///
+    /// `confirm_hook_watchdog_canary`がカナリア不着＝本物のstarvationと
+    /// 確定した場合のみ呼ばれる（round2 B1: 誤検知ではepisodeラッチ/
+    /// thrash履歴を一切消費しない設計）。`WH_KEYBOARD_LL`はLIFO（最後に
+    /// 登録したフックが最初に呼ばれる）で配送されるため、旧フックを
+    /// `UnhookWindowsHookEx`してから新しく`SetWindowsHookExW`し直すと、
+    /// このタイミング以降にチェーンへ割り込んでいた他プロセスのフックより
+    /// 手前（先頭）に戻れる。失われた打鍵は戻せないが、同じ停止が続くのを
+    /// 防ぐ。
+    ///
+    /// `install_hook()`が失敗した場合はフック無しの状態になりうる。この場合
+    /// `state::hook_watchdog::decide`の`hook_guard_present=false`分岐が
+    /// バックオフ/thrash上限をバイパスするため、次のwatchdog tick（3秒後）で
+    /// 即座に再試行される（opus round2 M5: 旧実装はエピソードラッチが
+    /// 立ったまま二度とフックが来ないため永久にリトライされなかった）。
+    /// ここでpanicはしない——フック関連の失敗で常駐アプリを丸ごと落とすのは
+    /// 実害が大きすぎる。
+    ///
+    /// `record_thrash`: バックオフ/thrash履歴を更新するか。`true`は
+    /// `confirm_hook_watchdog_canary`（カナリア確認済み、`decide`の
+    /// `hook_guard_present=true`分岐がこの履歴を見て次回の
+    /// SkipBackoffPending/SkipThrashLimitを判定する）から呼ばれた場合。
+    /// `false`は`ReinstallWithoutCanary`（フック不在時の直接再試行、`decide`は
+    /// `hook_guard_present=false`の間バックオフ/thrash上限を無条件バイパス
+    /// する設計）から呼ばれた場合——PR #349コードレビュー指摘: 以前は
+    /// この経路でも無条件に履歴を積んでいたため、フック不在が続いた後に
+    /// 復旧しても、フック不在中に積み上がった履歴のせいで直後の本物の
+    /// starvationがSkipThrashLimit/SkipBackoffPendingで最長1時間直らない
+    /// 「予算の汚染」が起きていた。
+    fn reinstall_keyboard_hook_for_watchdog(&mut self, now_ms: u64, record_thrash: bool) {
+        if record_thrash {
+            // バックオフ/thrash履歴は「カナリア確認済みで実際に試行した」事実
+            // そのものを記録する（install_hook()の成否に関わらず）。
+            let backoff_ms = crate::state::hook_watchdog::backoff_delay_ms(
+                self.hook_watchdog_confirmed_attempt_count,
+            );
+            self.hook_watchdog_confirmed_attempt_count =
+                self.hook_watchdog_confirmed_attempt_count.saturating_add(1);
+            self.hook_watchdog_next_retry_at_ms = Some(now_ms.saturating_add(backoff_ms));
+            self.hook_watchdog_reinstall_history_ms.push(now_ms);
+            // 履歴は thrash 判定用の直近分だけで十分。THRASH_WINDOW_MS より古い
+            // エントリを刈り取り、無期限に肥大化しないようにする。
+            self.hook_watchdog_reinstall_history_ms.retain(|&t| {
+                now_ms.saturating_sub(t) < crate::state::hook_watchdog::THRASH_WINDOW_MS
+            });
+        }
+
+        // 旧ガードをここで明示的にdropしてから新規installする
+        // （両方生存する瞬間を作らない。`WM_QUIT`→スレッドjoin→
+        // `UnhookWindowsHookEx`が完了してから次のSetWindowsHookExWへ進む）。
+        self.hook_guard = None;
+        match crate::hook::install_hook() {
+            Ok(guard) => {
+                self.hook_guard = Some(guard);
+                // issue #165 自己修復 F4（round2 M2で根拠づけを訂正）: この
+                // 関数はカナリアで本物のstarvationと確認できたときにしか
+                // 呼ばれないため（誤検知では呼ばれない）、握りつぶされていた
+                // 間のKeyUp消失で物理キーラッチ（Ctrl/Shift）がスタックした
+                // まま残る（BUG-78/BUG-48と同型）前提が実際に成り立つ。
+                // `reset_physical_key_state()`（全256 VK無条件クリア）は
+                // 誤検知時にも呼ばれていた旧実装では「押されたままのCtrlが
+                // stateだけfalseになりCtrl+Cがローマ字文字と合成される」
+                // 新しい事故を生んでいたため、Ctrl/Shiftのみを対象にする
+                // narrow版に切り替えた。
+                crate::hook::clear_hook_latches_for_watchdog_reinstall();
+                self.platform_state.keymap.keymap_latch.release_all();
+                tracing::warn!(
+                    "[hook-watchdog] キーボードフックを再インストールしました（issue #165 自己修復）"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    "[hook-watchdog] キーボードフックの再インストールに失敗しました: {e}"
+                );
+            }
+        }
     }
 
     /// UIA ワーカースレッドへの送信チャネルを登録する。
@@ -1429,7 +2104,6 @@ impl Runtime {
     ///
     /// FSM パラメータ・出力モード・同期キー・特殊キーコンボ・
     /// アプリオーバーライドをアトミックに適用する。
-    #[allow(unsafe_code)] // normalize_caps_lock_if_needed() が Win32 API を呼ぶ
     pub(crate) fn apply_config_update(
         &mut self,
         config: &ValidatedConfig,
@@ -1437,20 +2111,34 @@ impl Runtime {
         sync_toggle: Vec<VkCode>,
         sync_on: Vec<VkCode>,
         sync_off: Vec<VkCode>,
-    ) {
+    ) -> Vec<String> {
+        // 解決できなかった項目の警告（ADR-201 決定2）。呼び出し元（`reload_config`）が診断へ流す。
+        let mut warnings: Vec<String> = Vec::new();
         let ctx = self.build_ctx();
+        let forced_open_actions = thumb_forced_open_actions(&special_keys);
+        self.engine
+            .set_thumb_forced_open_actions(forced_open_actions.0, forced_open_actions.1);
+        self.engine.set_thumb_role_open_actions(None, None);
         let _ = self.engine.on_command(
             EngineCommand::UpdateFsmParams {
                 threshold_ms: config.general.simultaneous_threshold_ms,
                 confirm_mode: config.general.confirm_mode,
                 speculative_delay_ms: config.general.speculative_delay_ms,
+                timing_margin_percent: config.general.timing_margin_percent,
+                min_overlap_margin_percent: config.general.min_overlap_margin_percent,
             },
             &ctx,
         );
         self.platform_state.focus.focus_debounce_ms = config.general.focus_debounce_ms;
         self.platform_state.focus.ime_poll_interval_ms = config.general.ime_poll_interval_ms;
+        self.set_use_learned_keymap_table(config.general.use_learned_keymap_table);
+        self.set_predict_henkan_open_in_unreadable_windows(
+            config.general.predict_henkan_open_in_unreadable_windows,
+        );
         self.set_keyboard_model(config.general.keyboard_model);
-        self.set_dbe_mode_key_policy(config.general.dbe_mode_key_policy);
+        self.set_update_check_enabled(config.general.update_check);
+        self.set_warn_state_dependent_mode_keys(config.general.warn_state_dependent_mode_keys);
+        self.set_hook_self_heal_enabled(config.diagnostics.hook_self_heal);
         self.set_half_width_alnum_toggle_policy(config.general.half_width_alnum_toggle);
         crate::hook::set_swallow_alt_kana_mode_switch(
             config.general.swallow_alt_kana_input_method_switch,
@@ -1481,19 +2169,6 @@ impl Runtime {
             crate::hook::resolve_thumb_key(&config.general.right_thumb_key),
         ) {
             crate::hook::set_thumb_vk_codes(left, right);
-            // ADR-110 決定4/9/3項目1: key_remap テーブルの再コンパイル・反映
-            // （設定リロード時のホットリロード）。thumb key VK が確定した
-            // 直後に置くことで、決定9の衝突警告が最新の thumb key を見る。
-            crate::hook::set_key_remaps(&crate::state::key_remap::compile_key_remaps(
-                &config.key_remap,
-                left,
-                right,
-                &crate::state::key_remap::modifier_free_hotkey_vks(&config.keys),
-            ));
-            // SAFETY: apply_config_update はメインスレッドから呼ばれる。
-            unsafe {
-                crate::hook::normalize_caps_lock_if_needed();
-            }
             crate::hook::set_alt_impersonation_enabled(
                 left_alt_impersonates,
                 right_alt_impersonates,
@@ -1527,28 +2202,15 @@ impl Runtime {
                 ),
             );
             let manual_fn_key = config.general.muhenkan_solo_tap_dedicated_fn_key.as_deref();
-            if manual_fn_key.is_some() || self.muhenkan_dedicated_fn_key_is_manual() {
-                // 手動設定が今回あるか、直前まで手動設定だった（＝今回外れた）場合
-                // のみ反映する。手動設定が既に無い（自動判定/ポップアップに委ねて
-                // いる）場合はここで触らない — 無関係な設定リロードのたびに
-                // 自動判定/ポップアップが有効化した専用Fnキーを None で
-                // 上書きしてしまう回帰を防ぐ（Opus レビュー指摘）。
-                self.set_muhenkan_dedicated_fn_key_config(
-                    resolve_dedicated_fn_key(manual_fn_key),
-                    manual_fn_key.is_some(),
-                );
-            }
-            self.set_muhenkan_solo_tap_is_passthrough(
-                ModeKeyConfig::from_legacy_bools(
-                    config.general.muhenkan_solo_tap_ignore_composing_guard,
-                    config.general.muhenkan_solo_tap_always_suppress,
-                )
-                .is_passthrough(),
-            );
-            self.set_space_is_thumb_key(
-                config.general.left_thumb_key == "VK_SPACE"
-                    || config.general.right_thumb_key == "VK_SPACE",
-            );
+            let (fn_key, fn_key_warning) = resolve_dedicated_fn_key(manual_fn_key);
+            warnings.extend(fn_key_warning);
+            self.set_muhenkan_dedicated_fn_key_config(fn_key);
+            self.set_passthrough_thumb_mode_keys(&config.general);
+            self.set_space_is_thumb_key(crate::state::alt_impersonation::is_thumb_key_vk(
+                &config.general.left_thumb_key,
+                &config.general.right_thumb_key,
+                crate::vk::VK_SPACE,
+            ));
             let enter_thumb_vk = [left, right]
                 .into_iter()
                 .find(|&vk| vk == crate::vk::VK_RETURN);
@@ -1563,23 +2225,71 @@ impl Runtime {
                 .set_thumb_shift_faces_enabled(crate::app::thumb_shift_faces_enabled_for(
                     left, right,
                 ));
-            log::info!(
+            tracing::info!(
                 "Thumb keys updated: left={:?}, right={:?}",
                 config.general.left_thumb_key,
                 config.general.right_thumb_key,
             );
         } else {
-            log::warn!(
+            tracing::warn!(
                 "Invalid thumb key names: left={:?}, right={:?}",
                 config.general.left_thumb_key,
                 config.general.right_thumb_key,
             );
         }
-        log::info!(
+        // [[keymap]] の再構築（ADR-114 決定8）。`resolve_thumb_key` の if-let
+        // ブロックの**外・後**に置くこと——ブロック内に置くと上の `else`
+        // （"Invalid thumb key names"）に落ちたときに親指 vk が確定せず
+        // reload が丸ごとスキップされる。`hook::thumb_vk_codes()` は
+        // if-let の成否に関わらず現在キャッシュされている値（bootstrap
+        // または直近の成功した reload の値）を返すため、ここで安全に使える。
+        let (left_thumb_vk, right_thumb_vk) = crate::hook::thumb_vk_codes();
+        let (all_keymaps, keymap_warnings) =
+            crate::keymap::KeymapTable::new(&config.keymaps, left_thumb_vk, right_thumb_vk);
+        warnings.extend(keymap_warnings);
+        self.all_keymaps = all_keymaps;
+        self.recompute_active_keymaps();
+        // [[post_bypass]] の再構築（BUG-103）。構築は bootstrap と共通の `compile_all`。
+        let (post_bypass_rules, post_bypass_warnings) = PostBypassEntry::compile_all(config);
+        warnings.extend(post_bypass_warnings);
+        self.post_bypass_rules = post_bypass_rules;
+        tracing::info!(
             "Config applied: threshold={}ms, speculative_delay={}ms",
             config.general.simultaneous_threshold_ms,
             config.general.speculative_delay_ms,
         );
+        warnings
+    }
+
+    /// `active_keymaps` を `all_keymaps` から再計算する（ADR-114 決定8）。
+    ///
+    /// フォーカス変更時（`focus_tracking.rs::enter_focus_scope`）と
+    /// `reload_config` 経路（`apply_config_update`）の両方から呼ぶ、
+    /// 唯一の書き込み点。書き込み点を2つに増やさない（`enter_focus_scope`
+    /// が過去に同種の重複を統合した経緯と同じ理由）。
+    fn recompute_active_keymaps(&mut self) {
+        let process_name = self.platform.focus.process_name().to_owned();
+        self.platform_state.keymap.active_keymaps = self.all_keymaps.filter_active(&process_name);
+        tracing::debug!(
+            "[keymap] active rules recomputed: {} rule(s) for process={:?}",
+            self.platform_state.keymap.active_keymaps.len(),
+            process_name,
+        );
+        // 専用Fnキー（実行時に確定する vk）との衝突も、フォーカス変更・reload の
+        // たびに再チェックする（`warn_if_vk_conflicts` の呼び出しを両 setter
+        // だけに限ると、setter 呼び出し時点の active_keymaps でしか判定できず、
+        // フォーカス変更や reload で新しく衝突するルールが有効になった場合を
+        // 見逃す、ADR-114 実装レビュー指摘）。
+        if let Some(vk) = self.muhenkan_dedicated_fn_key_vk {
+            self.platform_state
+                .keymap
+                .active_keymaps
+                .warn_if_vk_conflicts(
+                    vk,
+                    "muhenkan_solo_tap_dedicated_fn_key",
+                    crate::keymap::KeymapConflictLevel::Debug,
+                );
+        }
     }
 
     /// n-gram モデルをエンジンに適用する。
@@ -1603,11 +2313,11 @@ impl Runtime {
         if requests.is_empty() {
             return;
         }
-        log::debug!("[runtime-outbox] {} request(s) を drain", requests.len());
+        tracing::debug!("[runtime-outbox] {} request(s) を drain", requests.len());
         for request in requests {
             match request {
                 RuntimeRequest::StartTsfProbe => {
-                    log::debug!("[runtime-outbox] StartTsfProbe → pending TSF timer 適用");
+                    tracing::debug!("[runtime-outbox] StartTsfProbe → pending TSF timer 適用");
                     if let Some(cmd) = self.platform.output.pending_tsf_timer() {
                         self.platform.apply_timer_command(cmd);
                     }
@@ -1622,7 +2332,7 @@ impl Runtime {
     /// メッセージループ上で呼ぶこと（ブロッキング OK）。
     #[allow(unsafe_code)] // cancel_ime_composition() が Win32 IMM API を呼ぶ
     pub fn panic_reset(&mut self) {
-        log::warn!("Panic reset triggered!");
+        tracing::warn!("Panic reset triggered!");
 
         // 1. エンジンの保留状態をフラッシュ
         self.invalidate_engine_context(ContextChange::InputLanguageChanged);
@@ -1651,6 +2361,9 @@ impl Runtime {
         // awase 内部の物理キー shadow は解放されないままだったため、明示的にリセットする。
         send_all_modifier_key_ups();
         crate::hook::reset_physical_key_state();
+        // [[keymap]] latch も同じ理由で解放する（ADR-114 決定4「latch
+        // 漏れ対策」経路5）。
+        self.platform_state.keymap.keymap_latch.release_all();
 
         // 4. PlatformState を全面リセット
         // panic_reset 直後に refresh_ime_state_cache() が走ると、ここで書いた
@@ -1658,6 +2371,21 @@ impl Runtime {
         // force_on_guard で 1 サイクルだけ保護し、次の検出成功時に自然に解除する。
         let tick_ms = crate::state::TickMs(crate::hook::current_tick_ms());
         self.platform_state.ime.apply_panic_reset(tick_ms);
+        // 非 Imm32 窓（Chrome/Edge=Imm32Unavailable, TsfNative）では上の OFF→ON が走らず、
+        // belief を ON に戻しただけでは実 IME が開かない（ADR-213 P2c で撤去した ActivationSync が
+        // パニック後の最初の打鍵で肩代わりしていた、BUG-182）。Engine の decision と同じ executor 経路
+        // （`dispatch_ime_set_open`）へ SetOpen(true) を積む。授権は PanicReset ガード（SafetyValve）、
+        // 押下に由来しない起案なので press=None。`apply_panic_reset` が `applied` を未知に落とした後に積む。
+        if !self.can_use_imm32_cross_process() {
+            let mut effects = awase::engine::EffectVec::new();
+            effects.push(awase::engine::Effect::Ime(
+                awase::engine::ImeEffect::SetOpen {
+                    open: true,
+                    press: None,
+                },
+            ));
+            self.execute_decision(awase::engine::Decision::pass_through_with(effects));
+        }
         // Step 4: chord barrier も clear (旧 ctrl_bypass_hold 相当)
         self.platform_state.ime.clear_input_barrier();
         self.platform_state.gate.sync_key_gate.clear();
@@ -1725,7 +2453,7 @@ fn send_all_modifier_key_ups() {
     // OUTPUT_GATE.active=true で INPUT_DEFER に退避する。
     let _guard = crate::tsf::probe_bridge::OutputActiveGuard::begin();
     let _ = crate::win32::send_input_safe(&inputs);
-    log::debug!("Sent KeyUp for all modifier keys");
+    tracing::debug!("Sent KeyUp for all modifier keys");
 }
 
 /// IME の未確定文字列をキャンセルする。
@@ -1761,7 +2489,9 @@ unsafe fn cancel_ime_composition() {
     //         `ImmContextGuard` は RAII で `ImmReleaseContext` を呼ぶため、
     //         コンテキストリークは発生しない。
     let Some(ctx) = (unsafe { crate::imm::ImmContextGuard::new(hwnd) }) else {
-        log::debug!("[ctrl-bypass] ImmGetContext returned NULL for hwnd={hwnd:?}, cancel skipped");
+        tracing::debug!(
+            "[ctrl-bypass] ImmGetContext returned NULL for hwnd={hwnd:?}, cancel skipped"
+        );
         return;
     };
     // NI_COMPOSITIONSTR = 0x15, CPS_CANCEL = 0x04
@@ -1775,7 +2505,7 @@ unsafe fn cancel_ime_composition() {
             0,
         )
     };
-    log::debug!(
+    tracing::debug!(
         "[ctrl-bypass] ImmNotifyIME(CPS_CANCEL) hwnd={hwnd:?} → {}",
         ok.as_bool()
     );
@@ -1803,7 +2533,43 @@ mod layout_entry_tests {
     }
 
     #[test]
-    fn resolve_index_falls_back_to_first_entry_when_no_name_matches() {
+    fn resolve_index_prefers_nicola_keytop_when_default_layout_not_found() {
+        // BUG-104: 独自レイアウトの読込失敗(存在しない/UTF-8でない等)時、
+        // ソート順先頭ではなく nicola_keytop があればそちらへ寄せる。
+        let layouts = [entry("nicola"), entry("nicola_keytop"), entry("nicola_us")];
+        assert_eq!(
+            LayoutEntry::resolve_index(&layouts, "NICOLA＋確定.yab"),
+            1,
+            "should fall back to nicola_keytop, not sort-order-first nicola"
+        );
+    }
+
+    #[test]
+    fn resolve_index_matches_case_insensitive_extension_and_stem() {
+        // /code-review 指摘（PR #131）: default_layout の拡張子/ステムの
+        // 大文字小文字がファイル名と食い違っても、実際に読み込めているファイル
+        // を「読込失敗」と誤警告してはいけない（Windows のファイルシステムは
+        // 大文字小文字を区別しないため）。
+        let layouts = [entry("nicola"), entry("my_nicola")];
+        assert_eq!(LayoutEntry::resolve_index(&layouts, "nicola.YAB"), 0);
+        assert_eq!(LayoutEntry::resolve_index(&layouts, "NICOLA.yab"), 0);
+        assert_eq!(LayoutEntry::resolve_index(&layouts, "My_Nicola.YaB"), 1);
+    }
+
+    #[test]
+    fn strip_yab_extension_is_safe_for_non_ascii_names_without_yab_suffix() {
+        // 境界外パニック回避の回帰テスト: ".yab" で終わらないマルチバイト
+        // 文字列に対して byte-index の char boundary パニックを起こさないこと。
+        assert_eq!(super::strip_yab_extension("設定.toml"), "設定.toml");
+        assert_eq!(super::strip_yab_extension("あ"), "あ");
+        assert_eq!(
+            super::strip_yab_extension("NICOLA＋確定.yab"),
+            "NICOLA＋確定"
+        );
+    }
+
+    #[test]
+    fn resolve_index_falls_back_to_first_entry_when_no_name_matches_and_no_keytop() {
         let layouts = [entry("nicola"), entry("my_nicola")];
         assert_eq!(
             LayoutEntry::resolve_index(&layouts, "does_not_exist.yab"),

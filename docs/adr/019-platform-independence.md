@@ -1,3 +1,12 @@
+---
+id: ADR-019
+title: |-
+  lib クレートのプラットフォーム非依存化
+status: |-
+  採用・実装済み(KeyClassification/ModifierKey/ImeRelevance による事前分類は現存、2026-10-04 確認)。旧: 採用済み
+related_adr: []
+---
+
 # ADR-019: lib クレートのプラットフォーム非依存化
 
 ## ステータス

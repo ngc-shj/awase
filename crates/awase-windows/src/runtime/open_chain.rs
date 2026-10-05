@@ -46,9 +46,7 @@
 //!   （`apply_skipping_imm`）と同じく「完了時点の状態で残り機構を選ぶ」。
 //! - ここに起案時点の `caps(p, k).chain` を渡すと、await 中に profile が
 //!   変わった場合に「完了時点では適用可能な機構が chain に載っていない」
-//!   という新しい取りこぼしが生まれる（例: 起案時 Standard × MS-IME の
-//!   chain は `[ImmCross, KanjiToggle]`。await 中に TsfNative へ移ると
-//!   旧実装は `MsImeDirect` を選ぶが、固定 chain では `KanjiToggle` を送る）。
+//!   という新しい取りこぼしが生まれる。
 //! - `ImeKindId` は推測値である（INV-45 / P20）。await をまたいで K を
 //!   固定するのは「推測値に安全側でないゲートを掛ける」に当たる。
 //!
@@ -66,6 +64,13 @@ use crate::ime::{ActuationOutcome, ActuationTarget, ConvAfterOpen};
 use crate::state::actuation_chain::{
     ActuationOrder, AsyncMechanismWriter, VerifiedTarget, WriteMechanism,
 };
+use crate::state::actuation_decision_record::{
+    ActuationDecisionRecord, ActuationOrderRecord, AttemptRecord, MAX_WRITE_MECHANISMS,
+};
+use crate::state::ime_actuation_decision::{DecisionInputs, DecisionSite, MechanismCommand};
+
+static ACTUATION_DECISION_RECORD_SKIPPED: crate::lifetime_counter::LifetimeCounter =
+    crate::lifetime_counter::LifetimeCounter::new();
 
 /// ImmCross 機構の書き込み方法。呼び出し元が起案時に決める。
 pub(crate) enum ImmCrossOp {
@@ -97,6 +102,8 @@ impl ImmCrossOp {
 struct AsyncChainWriter {
     /// 1 回だけ使える（`Actuation` 値のアフィン性と同じ理由で `Option`）。
     imm: Option<ImmCrossOp>,
+    attempts: [Option<AttemptRecord>; MAX_WRITE_MECHANISMS],
+    attempts_len: usize,
 }
 
 impl AsyncMechanismWriter for AsyncChainWriter {
@@ -128,11 +135,81 @@ impl AsyncMechanismWriter for AsyncChainWriter {
                 let Some(op) = self.imm.take() else {
                     return ImeOpenOutcome::Failed;
                 };
-                imm_cross_write(op, open).await
+                let (outcome, attempt) = imm_cross_write(op, open).await;
+                self.record_attempt(attempt);
+                outcome
             }
-            other => fallback_write(other, open),
+            other => {
+                let (outcome, attempt) = fallback_write(other, open);
+                self.record_attempt(attempt);
+                outcome
+            }
         }
     }
+}
+
+impl AsyncChainWriter {
+    fn record_attempt(&mut self, attempt: Option<AttemptRecord>) {
+        if let Some(attempt) = attempt {
+            if self.attempts_len < MAX_WRITE_MECHANISMS {
+                self.attempts[self.attempts_len] = Some(attempt);
+                self.attempts_len += 1;
+            }
+        }
+    }
+}
+
+fn conv_after_open_id(conv: ConvAfterOpen) -> crate::state::conv_after_open::ConvAfterOpenId {
+    match conv {
+        ConvAfterOpen::Skip => crate::state::conv_after_open::ConvAfterOpenId::Skip,
+        ConvAfterOpen::Write(target_conv) => {
+            crate::state::conv_after_open::ConvAfterOpenId::Write(target_conv)
+        }
+    }
+}
+
+fn all_chain_record() -> [Option<WriteMechanism>; MAX_WRITE_MECHANISMS] {
+    let mut chain = [None; MAX_WRITE_MECHANISMS];
+    for (index, mechanism) in WriteMechanism::ALL.into_iter().enumerate() {
+        chain[index] = Some(mechanism);
+    }
+    chain
+}
+
+// /code-review指摘（S-5、PR #201）: `order: &ActuationOrder`ではなく
+// `ActuationOrderRecord`（Copy、記録に必要な3値のみ）を受け取る——
+// `ActuationOrder`はINV-47（`ActuationOrder::issue`だけが構築できる、
+// warrantを発行せずに起案することが型として書けない）で設計されたアフィン値
+// であり、記録のためだけに`.clone()`でwarrantを複製するのは設計意図に反する。
+// 呼び出し元は`order.into_actuation_shadow()`で`order`を消費する**前**に
+// `ActuationOrderRecord::from(&order)`を作っておく。
+fn async_record(
+    site: DecisionSite,
+    caller: Option<DecisionSite>,
+    gate_inputs: DecisionInputs,
+    order_record: ActuationOrderRecord,
+    attempts: [Option<AttemptRecord>; MAX_WRITE_MECHANISMS],
+    attempts_len: usize,
+) -> ActuationDecisionRecord {
+    ActuationDecisionRecord {
+        site,
+        gate_inputs,
+        order: order_record,
+        chain: all_chain_record(),
+        chain_len: WriteMechanism::ALL.len(),
+        attempts,
+        attempts_len,
+        caller,
+    }
+}
+
+fn record_actuation_decision_skipped(site: DecisionSite) {
+    ACTUATION_DECISION_RECORD_SKIPPED.increment();
+    tracing::debug!(
+        skipped = ACTUATION_DECISION_RECORD_SKIPPED.read(),
+        site = ?site,
+        "actuation decision record skipped because with_app returned None"
+    );
 }
 
 /// ImmCross の実書き込み。旧 `executor.rs` / `key_pipeline.rs` の分岐をそのまま
@@ -142,7 +219,89 @@ impl AsyncMechanismWriter for AsyncChainWriter {
 // （`spawn_local` のシングルスレッド実行が前提、HWND はスレッドアフィニティを
 // 持つ）で Send は要求しない。
 #[allow(clippy::future_not_send)]
-async fn imm_cross_write(op: ImmCrossOp, open: bool) -> ImeOpenOutcome {
+#[tracing::instrument(level = "debug", skip_all, fields(open = open))]
+async fn imm_cross_write(op: ImmCrossOp, open: bool) -> (ImeOpenOutcome, Option<AttemptRecord>) {
+    // issue #136 / BUG-90 決定4（/code-review指摘で追加）: `AsyncChainWriter::
+    // is_applicable(ImmCross)` は `self.imm.is_some()` しか見ておらず profile を
+    // 一切参照しないため、`run_open_chain_async` 冒頭の gate が `with_app` の
+    // 再入失敗で fail-open した場合、この関数まで到達すると以前は無条件で
+    // ImmCross write を実行していた。ここで fresh な view を取り直して
+    // 再検出する（`fallback_write` が GjiDirect/MsImeDirect に
+    // 対して行っているのと同じ防御をImmCrossにも及ぼす）。
+    // /code-review指摘（PR #201 B-1）: `with_app`がNone（再入）を返した場合、
+    // developの元実装は`.unwrap_or(false)`でfail-open（is_input_relay=false、
+    // 実書き込みへ進む）していた。本PRが一度これをfail-closed（即Failed・
+    // 一切書き込まない）に変えてしまっており、再入時にIME切替が無音で
+    // 消える実害のある回帰だった。`inputs`（記録用）と`is_input_relay`
+    // （実書き込み判定）を分離し、`with_app`失敗時は`inputs=None`
+    // （記録できない、163-T6のカウンタ対象）・`is_input_relay=false`
+    // （fail-open、書き込みは続行）に戻す。
+    // ADR-180決定1: この`with_app`クロージャを`run_open_chain_async`冒頭
+    // （下記）と共有ヘルパーへ統合しない。`fallback_write`は既に別の
+    // `with_app`クロージャの中でこの判定を行うため、`with_app`を内包する
+    // ヘルパーを導入すると`fallback_write`から呼んだ瞬間に再入で
+    // `try_borrow_mut`失敗→fail-open→このプロファイル非所有ゲートが
+    // 恒久的に無効化される（issue #136/BUG-90型の回帰）。
+    let gate = crate::with_app(|app| {
+        let view = app.shadow_ime_control_view();
+        let inputs = (&view).into();
+        let is_input_relay = crate::state::ime_actuation_decision::is_input_relay(inputs);
+        (inputs, is_input_relay)
+    });
+    let (inputs, is_input_relay) = if let Some((inputs, is_input_relay)) = gate {
+        (Some(inputs), is_input_relay)
+    } else {
+        tracing::info!(
+            "[apply-ime] ImmCross async: with_app returned None during gate \
+             (fail-open, proceeding without a decision record)"
+        );
+        record_actuation_decision_skipped(DecisionSite::ImmCrossWrite);
+        (None, false)
+    };
+    let command = match &op {
+        ImmCrossOp::Targeted {
+            conv_after_open, ..
+        } => Some(MechanismCommand::SetOpenThenConvForTarget {
+            open,
+            conv_after_open: conv_after_open_id(*conv_after_open),
+        }),
+        ImmCrossOp::Untargeted => Some(MechanismCommand::SetOpenCrossProcessAsyncUntargeted(open)),
+    };
+    if is_input_relay {
+        // `is_input_relay`はgate（`with_app`成功時のみ）由来なので、ここでは
+        // `inputs`が必ず`Some`（`with_app`失敗時は常にfalse、B-1修正参照）。
+        let inputs = inputs.expect("is_input_relay implies with_app succeeded and inputs is Some");
+        return (
+            ImeOpenOutcome::NotOwned,
+            Some(AttemptRecord {
+                inputs,
+                with_app_available: true,
+                mechanism: WriteMechanism::ImmCross,
+                command,
+                outcome: ImeOpenOutcome::NotOwned,
+                shadow_on_before_bug113_override: None,
+                post_failed_reobservation: None,
+            }),
+        );
+    }
+    // ADR-117（issue #138 切り分け: MS-IME「直接入力モード許可」時の英数キー文字消失）:
+    // 報告環境（Standard プロファイル×MS-IME）の主経路。`.await` に入る前の
+    // live 読み取りであることが必須——完了後（`on_ime_apply_complete`）まで待つと
+    // `EVENT_OBJECT_IME_HIDE` によるリセットが既に反映されている可能性があり、
+    // 「送信時点で composition が有効だったか」を判別できなくなる。
+    // `composition_active`/`ime_show_seq`/`ime_change_seq` の解釈上の注意
+    // （MS-IME での信頼性未検証）は `TsfObservations::ime_composition_active` の
+    // doc コメント参照。
+    let obs = crate::tsf::observer::tsf_obs();
+    tracing::info!(
+        "[apply-ime] ImmCross async: open={open} composition_active={} show_seq={} \
+         change_seq={} (issue #138診断)",
+        obs.ime_composition_active(),
+        obs.ime_show_seq(),
+        obs.ime_change_seq(),
+    );
+    // 書き込みが `SendMessageTimeoutW` の時間切れで失敗したか（診断専用。`Targeted` だけが判別できる）。
+    let mut open_timed_out = false;
     let raw = match op {
         ImmCrossOp::Targeted {
             target,
@@ -163,8 +322,9 @@ async fn imm_cross_write(op: ImmCrossOp, open: bool) -> ImeOpenOutcome {
             )
             .await;
             if let Some(conv_outcome) = result.conv {
-                log::debug!("[apply-ime] ROMAN 補完結果: {conv_outcome:?}");
+                tracing::debug!("[apply-ime] ROMAN 補完結果: {conv_outcome:?}");
             }
+            open_timed_out = result.open_timed_out;
             result.open
         }
         ImmCrossOp::Untargeted => {
@@ -176,8 +336,12 @@ async fn imm_cross_write(op: ImmCrossOp, open: bool) -> ImeOpenOutcome {
         }
     };
 
-    match raw {
-        ActuationOutcome::Written => ImeOpenOutcome::Applied,
+    let mut post_failed_reobservation = None;
+    let outcome = match raw {
+        // ADR-167: `imm_cross_write` は常に ImmCrossProcessStrategy（クロス
+        // プロセス IMM32 API のみ、SendInput 皆無）の書き込みであり、実送信を
+        // 意味する `Applied` とは区別する。
+        ActuationOutcome::Written => ImeOpenOutcome::AppliedWithoutSendInput,
         ActuationOutcome::Aborted(reason) => {
             // INV-14: Aborted は「一度も書いていない」ので Applied 扱いにしない。
             // UnsafeToToggle は `on_ime_apply_complete` の C/D（SSOT の
@@ -187,30 +351,62 @@ async fn imm_cross_write(op: ImmCrossOp, open: bool) -> ImeOpenOutcome {
             // 止まる（ADR-089 §2.3）。E（post_ime_refresh）だけは
             // UnsafeToToggle でも走るため Aborted(GenStale) の取りこぼしは
             // 20ms 後の refresh で拾われる。
-            log::debug!("[apply-ime] ImmCross open Aborted({reason:?}) → UnsafeToToggle");
+            // ADR-117: 「送ったが検証失敗で中止した（1バイトも書いていない）」を
+            // `info!` で可視化する（送信直前ログだけが info に残ると、実ユーザー
+            // 報告で「送ったのに文字が消えた」と誤読されるため）。
+            tracing::info!("[apply-ime] ImmCross open Aborted({reason:?}) → UnsafeToToggle");
             ImeOpenOutcome::UnsafeToToggle
         }
         ActuationOutcome::Failed => {
             // SAFETY: `read_ime_state_fast` は Win32 IMM API を呼ぶ。
             //         spawn_local はメインスレッドのメッセージループで実行される。
             let actual = unsafe { crate::ime::read_ime_state_fast() }.ime_on;
-            if actual == Some(open) {
-                log::debug!(
+            post_failed_reobservation = Some(actual);
+            // 判定自体は`state/ime_actuation_decision.rs::
+            // imm_cross_reobservation_already_matches`へ抽出済み（Win32呼び出し
+            // から切り離した純粋関数として、Linuxでもユニットテストできるように
+            // する。docs/tasks/actuation-confluence-already-matched-gap.md参照）。
+            if crate::state::ime_actuation_decision::imm_cross_reobservation_already_matches(
+                actual, open,
+            ) {
+                // ADR-117: 同上、「送信自体が失敗した」を info! で可視化する。
+                tracing::info!(
                     "[apply-ime] ImmCross failed but actual ime_on={actual:?} \
                      already matches desired={open}, skip fallback"
                 );
                 ImeOpenOutcome::AlreadyMatched
             } else {
-                log::debug!(
-                    "[apply-ime] ImmCross failed (async, actual ime_on={actual:?}), \
-                     falling through to next mechanism"
+                // ADR-208 L1 の調査: 送信が時間切れ（`open_timed_out`）だったときのメッセージは取り消されず、IME 窓が
+                // 後で処理しうる。それでも**フォールスルー（VK の追い送り）は止めない**。(1) チェーンの後続機構は
+                // GjiDirect/MsImeDirect だけで、どちらも絶対指定（`VK_IME_ON/OFF`・F21/F22 等）の冪等な書き込みなので、
+                // 遅れて届いた ImmCross と同じ向きに重なるだけで 1 押下 2 回の「開閉」にはならない。(2) 止めると、IME 窓が
+                // 応答しない窓（ここへ来る唯一の理由）で VK へ落ちる収束経路（INV-L2）を失う。(3) 次の押下の書き込みと
+                // 遅れて届いた古いメッセージの順序逆転は、フォールスルーの有無に関わらず起きる（取り消せない）。
+                // 時間切れの頻度は下のログで測る（`open_timed_out`）。
+                tracing::info!(
+                    "[apply-ime] ImmCross failed (async, actual ime_on={actual:?}, \
+                     timed_out={open_timed_out}), falling through to next mechanism"
                 );
                 // `Failed` は `falls_through` が真 → run_chain_async が次の機構へ
                 // 進む（旧 `apply_skipping_imm` と同じ範囲）。
                 ImeOpenOutcome::Failed
             }
         }
-    }
+    };
+    // `inputs`が`None`（gate時点の`with_app`失敗、B-1修正）の場合は記録先の
+    // 決定入力が無いため`AttemptRecord`を作らない——163-T6のカウンタが
+    // 既に`record_actuation_decision_skipped`でこのケースを計上済み。
+    // 実際のImmCross書き込み自体（`outcome`）はfail-openで続行している。
+    let record = inputs.map(|inputs| AttemptRecord {
+        inputs,
+        with_app_available: true,
+        mechanism: WriteMechanism::ImmCross,
+        command,
+        outcome,
+        shadow_on_before_bug113_override: None,
+        post_failed_reobservation,
+    });
+    (outcome, record)
 }
 
 /// ImmCross 以外の機構の同期 write。view は完了時点の状態から作り直す
@@ -248,16 +444,114 @@ async fn imm_cross_write(op: ImmCrossOp, open: bool) -> ImeOpenOutcome {
 /// 捨てられることはなく、次のメッセージループ周回で確実に再処理される。
 /// 「初回のブロックそのもの」は残るが、「ブロック中に他の完了が永久に
 /// 失われる」という round-2 の指摘した最悪の帰結は防げている。
-fn fallback_write(mechanism: WriteMechanism, open: bool) -> ImeOpenOutcome {
+///
+/// # ADR-117（issue #138 切り分け）: この関数が作り直す view の composition 値は
+/// 「送信後」の値でありうる
+///
+/// ここで `shadow_ime_control_view()` が構築する view の `composition_active`/
+/// `ime_show_seq`/`ime_change_seq` は、Standard×MS-IME で ImmCross が `Failed` を
+/// 返した直後（＝`imm_cross_write` の `.await` が完了した後）の live 値である。
+/// これから送る後続機構にとっては「送信前」の値だが、**直前の
+/// ImmCross 試行にとっては「送信後」（tear-down 済みかもしれない）の値でもある**。
+/// ログを見る側は「この値がどちらの送信に対応するか」を混同しないこと
+/// （`imm_cross_write` 冒頭の live 読み取りが ImmCross 自身の送信前の値）。
+#[tracing::instrument(level = "debug", skip_all, fields(open = open, ?mechanism))]
+fn fallback_write(
+    mechanism: WriteMechanism,
+    open: bool,
+) -> (ImeOpenOutcome, Option<AttemptRecord>) {
+    // ADR-180決定1: `imm_cross_write`/`run_open_chain_async`と同じ理由で
+    // `with_app`を内包する共有ゲートヘルパーへは統合しない——この関数自身が
+    // その候補ヘルパーの唯一の再入元になる（下のBUG-113対策の`shadow_on =
+    // None`上書きも`decide_gate`より前に必要なため、単純な委譲にもできない）。
     crate::with_app(|app| {
-        let view = app.shadow_ime_control_view();
-        if crate::ime_controller::mechanism_is_applicable(mechanism, &view) {
-            crate::ime_controller::apply_mechanism(mechanism, open, &view)
-        } else {
-            ImeOpenOutcome::Failed
+        let mut view = app.shadow_ime_control_view();
+        let shadow_on_before_bug113_override = view.control.shadow_on;
+        // BUG-113 追補（Opus 敵対的レビューで発見）: この関数は先行機構が
+        // `Failed` を返した後にしか呼ばれない。`imm_cross_write` の `Failed` は
+        // `read_ime_state_fast()` が `Some` で不一致を確認した場合だけでなく、
+        // `None`（不明）でも返る。したがって
+        // この時点で shadow ベースの already-matched skip
+        // （`gji_direct_already_matches`）を適用する根拠は無い。
+        // `key_pipeline.rs::kp_stage_shadow_ime_toggle` の ImmCross 経路は
+        // actuation の**前**に `record_confirmed(false)` を書くため
+        // （「直後の実 ImmCross apply を伴うため正当」という前提）、ここで
+        // `shadow_ime_control_view()` の実 `applied` をそのまま読むと、
+        // 「自分がこれから送ろうとしている値」を「送信前に書いた belief」で
+        // 握り潰す循環になり、OS がまだ desired でないと確認済みなのに
+        // `GjiDirectStrategy` が `AlreadyMatched` を返してしまう
+        // （実害: IME が閉じないまま awase だけ「収束した」と誤記録する）。
+        // `force_on_and_correct_romaji`（ADR-087 INV-28）と同じ
+        // 「`None` で bypass する」設計語彙に合わせ、shadow_on だけを
+        // 未知に上書きする（`belief_input_mode`/`focus.profile` 等の他
+        // フィールドは `shadow_ime_control_view()` のまま活かす）。
+        //
+        // 上書き前の値は診断用にここで1行記録する（Opus敵対的レビューround3 提案）。
+        tracing::debug!(
+            "[apply-ime] fallback_write: shadow_on={:?} → None で bypass (mechanism={mechanism:?})",
+            view.control.shadow_on
+        );
+        view.control.shadow_on = None;
+        let inputs = (&view).into();
+        // issue #136 / BUG-90 決定4: view はこの関数が完了時点で作り直す
+        // （モジュール doc 参照）ため、起案時点では InputRelay でなかった
+        // フォーカスが await 中に InputRelay へ移った場合もここで再検出できる。
+        // `NotOwned` は `falls_through` が偽なので、GjiDirect/MsImeDirect を
+        // 1つずつ試すことなくチェーンをここで止める。
+        if crate::state::ime_actuation_decision::is_input_relay(inputs) {
+            let outcome = ImeOpenOutcome::NotOwned;
+            return (
+                outcome,
+                Some(AttemptRecord {
+                    inputs,
+                    with_app_available: true,
+                    mechanism,
+                    command: None,
+                    outcome,
+                    shadow_on_before_bug113_override: Some(shadow_on_before_bug113_override),
+                    post_failed_reobservation: None,
+                }),
+            );
         }
+        let (command, outcome) = if crate::ime_controller::mechanism_is_applicable(mechanism, &view)
+        {
+            let (_, command) = crate::state::ime_actuation_decision::decide_attempt(
+                inputs,
+                DecisionSite::Sync,
+                mechanism,
+                open,
+            );
+            (
+                command,
+                crate::ime_controller::apply_mechanism(mechanism, open, &view),
+            )
+        } else {
+            // ADR-117: ImmCross Failed → フォールスルーしたが結局どの機構にも
+            // 到達できなかった無音ケースを可視化する。
+            tracing::info!(
+                "[apply-ime] fallback_write: mechanism={mechanism:?} not applicable → Failed"
+            );
+            (None, ImeOpenOutcome::Failed)
+        };
+        (
+            outcome,
+            Some(AttemptRecord {
+                inputs,
+                with_app_available: true,
+                mechanism,
+                command,
+                outcome,
+                shadow_on_before_bug113_override: Some(shadow_on_before_bug113_override),
+                post_failed_reobservation: None,
+            }),
+        )
     })
-    .unwrap_or(ImeOpenOutcome::Failed)
+    .unwrap_or_else(|| {
+        // ADR-117: `with_app` が `None`（RUNTIME 未初期化/再入等）を返した無音ケース。
+        tracing::info!("[apply-ime] fallback_write: with_app returned None → Failed");
+        record_actuation_decision_skipped(DecisionSite::FallbackWrite);
+        (ImeOpenOutcome::Failed, None)
+    })
 }
 
 /// ImmCross を先頭に含む機構チェーンを非同期に走査する。
@@ -267,18 +561,231 @@ fn fallback_write(mechanism: WriteMechanism, open: bool) -> ImeOpenOutcome {
 // `Send` にならない。`win32_async::spawn_local`（シングルスレッド実行）経由で
 // のみ呼ばれるため実害はない（`ActuationTarget::verify_still_current` と同じ制約）。
 #[allow(clippy::future_not_send)]
-pub(crate) async fn run_open_chain_async(order: ActuationOrder, imm: ImmCrossOp) -> ImeOpenOutcome {
-    // ADR-090 §2.A A-1: 授権は起案側（`ImeStateHub::issue_actuation_order`）で
-    // 発行済み。**shadow モード**なので授権が下りていなくても書き込みは
-    // 止めない（止めるのは A-2）。
+#[tracing::instrument(level = "debug", skip_all)]
+pub(crate) async fn run_open_chain_async(
+    order: ActuationOrder,
+    imm: ImmCrossOp,
+    site: DecisionSite,
+    // ADR-163 Part D S-8対応: `site`は3つの呼び出し元（key_pipeline.rsの
+    // shadow-toggle OFF・runtime/mod.rsのforce-on bootstrap・executor.rsの
+    // dispatch_ime_set_open）のうち後者だけを`DispatchImeSetOpen`として
+    // 区別でき、前者2つは共に`RunOpenChainAsync`を渡すため記録上区別が
+    // つかなかった。`caller`は`ActuationDecisionRecord::caller`へそのまま
+    // 転記する診断専用ラベルで、`site`と違いcommand再計算には一切使わない
+    // （`DecisionInputs`/`DecisionSite`のdoc「ShadowToggleOff/ForceOnBootstrap」節参照）。
+    caller: Option<DecisionSite>,
+) -> ImeOpenOutcome {
+    // issue #136 / BUG-90 決定4: この関数は `order`/`imm` のみを受け取り
+    // `ImeControlView` を持たないため、呼び出し元の分岐（`imm_cross_is_first_
+    // applicable`）でこの経路に入らないよう InputRelay は排除されるのが通常
+    // だが、ここでも念のため fresh な view で確認する（呼び出し元判断と
+    // await 開始の間で focus が変わる race への防御）。`fallback_write` も
+    // 同様の再検出を行う（そちらは各機構ごとに view を作り直すため独立に必要）。
+    // `with_app` が `None`（再入時）なら fail-open（gate 無効化）を選ぶ
+    // （`fail-closed` にして `with_app` 再入を `NotOwned` 化すると、InputRelay
+    // と無関係な通常フォーカスでの再入時にも actuation 自体が止まってしまい、
+    // こちらの副作用の方が大きい）。この場合でも `imm_cross_write` /
+    // `fallback_write` がそれぞれ独立に fresh な view で再検出するため
+    // （/code-review指摘で発見・追加、修正前は `AsyncChainWriter::
+    // is_applicable(ImmCross)` が `self.imm.is_some()` しか見ておらず
+    // profile を素通りしていた）、最終的に write が実行されることはない。
+    // /code-review指摘（PR #201 B-1）: 直前のコメントが明言する「with_appが
+    // Noneならfail-open」を、以前のコードは`Failed`即終了（fail-closed）に
+    // していた——コメントと実装が矛盾する回帰だった。`gate_inputs`を
+    // `Option<DecisionInputs>`にし、`with_app`失敗時は`is_input_relay=false`
+    // （fail-open、下の書き込みへ進む）・`gate_inputs=None`
+    // （記録できない、163-T6のカウンタ対象）に戻す。
+    let gate = crate::with_app(|app| {
+        let view = app.shadow_ime_control_view();
+        let inputs = (&view).into();
+        let is_input_relay = crate::state::ime_actuation_decision::is_input_relay(inputs);
+        (inputs, is_input_relay)
+    });
+    let (gate_inputs, is_input_relay) = if let Some((inputs, is_input_relay)) = gate {
+        (Some(inputs), is_input_relay)
+    } else {
+        // /code-review指摘(PR #201 wave3): ここでカウンタを積むと、下の
+        // `if let Some(gate_inputs) = gate_inputs { .. } else { .. }`が
+        // 同じ`with_app`失敗イベントに対してもう一度カウントし二重加算に
+        // なっていた（`is_input_relay`はgate失敗時に常にfalseなので、この
+        // 分岐に入った場合は必ず下の`else`にも到達する）。163-T6のカウンタは
+        // 下の1箇所のみで積む。
+        tracing::info!(
+            "[apply-ime] run_open_chain_async: with_app returned None during gate \
+             (fail-open, proceeding without a decision record)"
+        );
+        (None, false)
+    };
+    if is_input_relay {
+        // `is_input_relay`はgate（`with_app`成功時のみ）由来なので、ここでは
+        // `gate_inputs`が必ず`Some`（B-1修正参照）。
+        let gate_inputs =
+            gate_inputs.expect("is_input_relay implies with_app succeeded and gate_inputs is Some");
+        let record = async_record(
+            site,
+            caller,
+            gate_inputs,
+            ActuationOrderRecord::from(&order),
+            [None; MAX_WRITE_MECHANISMS],
+            0,
+        );
+        if crate::with_app(|app| {
+            app.platform_state
+                .ime
+                .journal
+                .record(crate::journal::JournalEntry::ActuationDecision { record });
+        })
+        .is_none()
+        {
+            record_actuation_decision_skipped(site);
+        }
+        return ImeOpenOutcome::NotOwned;
+    }
+    // ADR-090 §2.A A-2（2026-09-19、ユーザー指示によりリスクを受容し実機
+    // 検証で確認する方針へ切替）: 授権は起案側
+    // （`ImeStateHub::issue_actuation_order`）で発行済み。ADR-179（旧178）領域A撤去で
+    // 差分オラクルの最大リスク（old-1: bootstrap force-ON、old-2:
+    // `BrokenAppBootstrap`guard）の生産コード上の発火源が既に消えている
+    // ため、残る差分（old-3安全側/new-1意図されたTsfNative Blindフォール
+    // バック）を受容し実際に強制する。
     //
     // なお `order` は起案時点の状態に基づくのに write は完了時点で起きる。
     // await をまたいだ失効の扱いは warrant ではなく**チェーンの再抽選**
     // （ADR-090 項 D、実機ソーク必須のため未実装）で行う。
     crate::ime_controller::log_shadow_warrant("async", &order);
-    let actuation = order.into_actuation_shadow().verify(imm.verified_target());
-    let mut writer = AsyncChainWriter { imm: Some(imm) };
-    actuation
+    // S-5: `order`を`into_actuation()`で消費する前に、記録に必要な
+    // 3値だけを`ActuationOrderRecord`として退避する（`order.clone()`で
+    // warrantを複製しない）。
+    let order_record = ActuationOrderRecord::from(&order);
+    let Some(actuation) = order.into_actuation() else {
+        if let Some(gate_inputs) = gate_inputs {
+            let record = async_record(
+                site,
+                caller,
+                gate_inputs,
+                order_record,
+                [None; MAX_WRITE_MECHANISMS],
+                0,
+            );
+            if crate::with_app(|app| {
+                app.platform_state
+                    .ime
+                    .journal
+                    .record(crate::journal::JournalEntry::ActuationDecision { record });
+            })
+            .is_none()
+            {
+                record_actuation_decision_skipped(site);
+            }
+        } else {
+            record_actuation_decision_skipped(site);
+        }
+        return ImeOpenOutcome::Unwarranted;
+    };
+    let actuation = actuation.verify(imm.verified_target());
+    let mut writer = AsyncChainWriter {
+        imm: Some(imm),
+        attempts: [None; MAX_WRITE_MECHANISMS],
+        attempts_len: 0,
+    };
+    let outcome = actuation
         .run_chain_async(&WriteMechanism::ALL, &mut writer)
-        .await
+        .await;
+    // `gate_inputs`が`None`（gate時点の`with_app`失敗、B-1修正）の場合は
+    // 記録先の決定入力が無いため`ActuationDecisionRecord`を作らず、下の
+    // `else`で163-T6のカウンタを計上する（この1箇所のみ、二重加算修正済み）。
+    // 実際のchain実行自体（`outcome`）はfail-openで続行している。
+    if let Some(gate_inputs) = gate_inputs {
+        let record = async_record(
+            site,
+            caller,
+            gate_inputs,
+            order_record,
+            writer.attempts,
+            writer.attempts_len,
+        );
+        if crate::with_app(|app| {
+            app.platform_state
+                .ime
+                .journal
+                .record(crate::journal::JournalEntry::ActuationDecision { record });
+        })
+        .is_none()
+        {
+            record_actuation_decision_skipped(site);
+        }
+    } else {
+        record_actuation_decision_skipped(site);
+    }
+    outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_actuation_decision_skipped_increments_counter() {
+        let before = ACTUATION_DECISION_RECORD_SKIPPED.read();
+        record_actuation_decision_skipped(DecisionSite::RunOpenChainAsync);
+        let after = ACTUATION_DECISION_RECORD_SKIPPED.read();
+        assert_eq!(after, before + 1);
+    }
+
+    // ADR-163 Part D S-8対応: `run_open_chain_async`の2つの呼び出し元
+    // （key_pipeline.rsのshadow-toggle OFF経路・runtime/mod.rsのforce-on
+    // bootstrap経路）は共に`site=RunOpenChainAsync`を渡すため、以前は
+    // `async_record`が`caller`を常に`None`に固定しており記録上区別できな
+    // かった（`caller`引数を追加する前のS-8指摘そのもの）。`async_record`が
+    // 渡された`caller`をそのまま`ActuationDecisionRecord.caller`へ転記し、
+    // `site`自体は変更しないことを固定する。
+    #[test]
+    fn async_record_carries_caller_label_distinct_from_site() {
+        use crate::focus::class_names::AppImeProfile;
+        use crate::state::actuation_decision_record::EventOriginRecord;
+        use crate::state::event_origin::{EventOrigin, EventSource, Generation};
+        use crate::state::ime_kind::ImeKindId;
+        use awase::engine::InputModeState;
+
+        let gate_inputs = DecisionInputs {
+            profile: AppImeProfile::Standard,
+            kind: ImeKindId::Gji,
+            shadow_on: None,
+            belief_input_mode: InputModeState::Unknown,
+            candidate_was_seen: false,
+        };
+        let order_record = ActuationOrderRecord {
+            open: true,
+            would_have_blocked: false,
+            origin: EventOriginRecord::from(EventOrigin::new(
+                EventSource::Physical,
+                Generation::INITIAL,
+            )),
+        };
+
+        let record = async_record(
+            DecisionSite::RunOpenChainAsync,
+            Some(DecisionSite::ShadowToggleOff),
+            gate_inputs,
+            order_record,
+            [None; MAX_WRITE_MECHANISMS],
+            0,
+        );
+        assert_eq!(record.site, DecisionSite::RunOpenChainAsync);
+        assert_eq!(record.caller, Some(DecisionSite::ShadowToggleOff));
+
+        let other = async_record(
+            DecisionSite::RunOpenChainAsync,
+            Some(DecisionSite::ForceOnBootstrap),
+            gate_inputs,
+            order_record,
+            [None; MAX_WRITE_MECHANISMS],
+            0,
+        );
+        assert_eq!(other.caller, Some(DecisionSite::ForceOnBootstrap));
+        assert_ne!(
+            record.caller, other.caller,
+            "shadow-toggle OFF経路とforce-on bootstrap経路は`caller`で区別できるはず"
+        );
+    }
 }

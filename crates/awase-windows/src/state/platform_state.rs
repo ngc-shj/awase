@@ -12,6 +12,7 @@ use super::ime_event::{
 use super::ime_event_log::ImeEventLog;
 use super::ime_model::{AppliedImeState, ImeApplyAcceptance, ImeModel};
 use super::input_barrier::InputBarrier;
+use super::mode_key_pass::ModeKeyPassLatch;
 use super::scoped_latch::ScopedOneShot;
 use super::{ApplyGeneration, TickMs};
 use crate::journal::{JournalEntry, UnifiedJournal};
@@ -33,6 +34,8 @@ pub(crate) struct ImeStateHub {
     pub(crate) belief: ImeBelief,
     /// IME 状態変更 event のリングバッファ (Step 0)。
     pub(crate) event_log: ImeEventLog,
+    /// 時刻の供給元（実機は実時計、閉ループ・テストは仮想時計。`state/hub_clock.rs`）。
+    pub(crate) clock: super::hub_clock::HubClock,
     /// 統合ジャーナル: エンジン + IME 両イベントを記録する。
     pub(crate) journal: UnifiedJournal,
 
@@ -51,9 +54,8 @@ pub(crate) struct ImeStateHub {
     /// - FocusChanged / Recovery / HwndCache ではリセットしない。
     ///
     /// BUG-48 修正（PR #44）により `Command` ソースは `handle_engine_set_open`
-    /// （`SetOpenOrigin::ExplicitUserAction`）経由でのみ発行されるようになり、
-    /// エンジン内部の対称 echo（`ActivationSync` → `handle_engine_activation_sync`、
-    /// こちらは `write_set_open_request` を呼ばない）とは完全に分離された。
+    /// 経由でのみ発行されるようになり、エンジン内部の対称 echo（旧 `ActivationSync`。
+    /// ADR-213 P2c で撤去済み）とは完全に分離された。
     /// つまり `Command` は「Ctrl+無変換 等デフォルトキーバインドでの明示 IME OFF/ON」を
     /// 表す実ユーザー操作専用ソースであり、SyncKey/PhysicalImeKey と同じ扱いにできる。
     last_user_explicit_off_ms: u64,
@@ -74,6 +76,25 @@ pub(crate) struct ImeStateHub {
     /// まだ無く、Phase 3 本体のスコープ。
     intent_store: super::intent_store::IntentStore,
 
+    /// 無変換/変換の生キーを IME 側へ通過させた直後だけ有効な一回マーク。
+    ///
+    /// ADR-187 follow 方式: 生キー配送の結果は awase には分からないため、短時間だけ
+    /// typing-idle ガードを迂回して観測し、観測成功後に古い明示意図を捨てる。
+    /// 寿命判断そのものは `state/mode_key_pass.rs::ModeKeyPassLatch`（Win32非依存）に委譲する
+    /// （design-patterns-review.md 提案3）。ここは副作用（`intent_store`/`dispatch_event`）を
+    /// 適用する側に回る。
+    mode_key_pass_mark: ModeKeyPassLatch<crate::win32::ForegroundScope>,
+
+    /// 外部注入の IME キー直後だけ開く短い監視窓（ADR-205、BUG-172）。読めない窓（`Imm32Unavailable`）で、
+    /// 窓の中の prefetch 済みの開閉の読みが基準値から変わったときだけ実状態へ追随する。寿命・基準値の判断は
+    /// `state/external_change_watch.rs`（Win32非依存）に委譲し、ここは副作用の適用側。
+    external_change_watch:
+        super::external_change_watch::ExternalChangeWatch<crate::win32::ForegroundScope>,
+
+    /// 最後に外部変化へ追随した時刻（ms）。追随の直後に、閉じる前の GJI I/O 推測が `ObserverPoll(true)` で
+    /// 追随結果を上書きしないための柵（`observe_gji_after_focus` の第1引数）に使う（ADR-205 round3 m1）。
+    last_external_change_ms: u64,
+
     /// `effective_open()` の IntentStore 分岐が `shadow_model` と異なる値を
     /// 返している（＝実際に override している）間 `true`。遷移時のみ INFO
     /// ログを出すための dedup 用（BUG-51 追補 v3）。`&self` の `effective_open()`
@@ -81,9 +102,14 @@ pub(crate) struct ImeStateHub {
     /// （`with_app` パターン）ため `!Sync` でも問題ない。
     intent_override_logged: std::cell::Cell<bool>,
 
+    /// [`ImeStateHub::resolve_warmup_ime_on`] の `off_drift_active` ゲートが
     /// `ApplyGeneration` 専用アロケータ（ADR-106 決定1）。`event_log.next_seq()`
     /// から独立しており、診断ログの記録有無と generation の一意性が無関係になる。
     generation_alloc: super::GenerationAllocator,
+
+    /// 「この押下で既に書いた」の予約（`last_written_press`、ADR-208 決定2 D1）。belief ではない
+    /// （`ImeModel` の外。`ImeEvent` を介さず、order の発行時点で `claim_press_write` が更新する）。
+    press_ledger: super::press_ledger::PressLedger,
 }
 
 /// [`ImeStateHub::capture_poll_state`] で取得する IME ポーリング入力スナップショット。
@@ -98,19 +124,28 @@ pub(crate) struct ImePollState {
     pub(crate) prev_conv: Option<u32>,
 }
 
+/// [`ImeStateHub::check_drift_correction`] の戻り値。定義は ungated な
+/// `state/drift_correction.rs` へ移した（Linux ホストのテストから判定本体を呼ぶため）。
+pub(crate) use super::drift_correction::DriftCorrection;
+
 impl ImeStateHub {
     /// デフォルト値で初期化する。
     pub(crate) fn new() -> Self {
         Self {
             belief: ImeBelief::default(),
             event_log: ImeEventLog::default(),
+            clock: super::hub_clock::HubClock::wall(crate::hook::current_tick_ms),
             journal: UnifiedJournal::default(),
             shadow_model: ImeModel::default(),
             last_user_explicit_off_ms: 0,
             last_explicit_ime_action_ms: 0,
             intent_store: super::intent_store::IntentStore::default(),
+            mode_key_pass_mark: ModeKeyPassLatch::new(),
+            external_change_watch: super::external_change_watch::ExternalChangeWatch::new(),
+            last_external_change_ms: 0,
             intent_override_logged: std::cell::Cell::new(false),
             generation_alloc: super::GenerationAllocator::new(),
+            press_ledger: super::press_ledger::PressLedger::default(),
         }
     }
 }
@@ -140,7 +175,7 @@ impl ImeStateHub {
                     self.last_user_explicit_off_ms = tick_ms.0;
                 }
                 // IntentStore への record() はここでは行わない（BUG-51 追補 v3 で移設）。
-                // Command ソースは conv 由来の内部同期（EngineSync::DirectInput →
+                // Command ソースは conv 由来の内部同期（EngineSync::DirectInput〈ADR-185で撤去済み〉 →
                 // handle_engine_set_open → write_set_open_request）でも dispatch される
                 // ため、このイベントだけでは「本物のユーザー操作」と区別できない。
                 // 記録は実ユーザー操作と確定できる呼び出し元
@@ -149,7 +184,9 @@ impl ImeStateHub {
         }
         let event_for_journal = event.clone();
         let event_for_reduce = event.clone();
-        let time = self.event_log.record(event, tick_ms);
+        let time = self
+            .event_log
+            .record_at(event, tick_ms, self.clock.now_instant());
         let envelope = ImeEventEnvelope {
             time,
             event: event_for_reduce,
@@ -160,11 +197,370 @@ impl ImeStateHub {
         });
     }
 
+    /// 明示キー押下 `press` の向き `open` の書き込みを**予約**する（order の発行直前に呼ぶ。ADR-208 決定2 D1）。
+    ///
+    /// ImmCross の書き込みは async で完了が WM 経由で後から届くので、完了時でなく発行時に予約する
+    /// （同じ打鍵の Engine の `SetOpen` が先に評価されて二重に送るのを防ぐ）。`UnsafeToToggle`/`Failed` で書けなくても
+    /// 予約は解かない（同一押下内の再試行はしない。次の押下で直る）。判定は純粋な [`PressLedger::claim`]。
+    /// 戻り値の `writes()` が `false`（同じ押下で既に書いた）なら、呼び出し側は order を発行せず書かない。
+    /// 押下 ID の無い order（`press=None`）は記録に触れず `Unpressed`（従来どおり `applied` の省略に任せる）。
+    ///
+    /// 衝突（同じ押下で向きが違う経路）はログ（info）と journal に残す。優先順位は Engine の明示コンボ > shadow
+    /// （`state/press_ledger.rs` のモジュール doc）。
+    pub(crate) fn claim_press_write(
+        &mut self,
+        press: Option<awase::types::PressId>,
+        open: bool,
+        source: super::press_ledger::PressSource,
+    ) -> super::press_ledger::PressClaim {
+        let claim = self.press_ledger.claim(press, open, source);
+        if let Some(press) = press {
+            if claim.is_conflict() {
+                tracing::info!(
+                    "[press-ledger] 同一押下で向きが違う書き込み: press={press} source={} open={open} → {}",
+                    source.label(),
+                    claim.label()
+                );
+            } else {
+                tracing::debug!(
+                    "[press-ledger] press={press} source={} open={open} → {}",
+                    source.label(),
+                    claim.label()
+                );
+            }
+            self.journal.record(JournalEntry::PressWriteClaim {
+                press: press.get(),
+                open,
+                source: source.label(),
+                verdict: claim.label(),
+            });
+        }
+        claim
+    }
+
+    /// 同期の書き込みが何も送らなかったとき（`press_ledger::outcome_sent_nothing`）、同一押下の予約を解く
+    /// （次の経路〈同じ押下の Engine 等〉が改めて書ける。ADR-208 L1 / PR #419 Opus M-2）。async は完了が後から届くので解かない。
+    pub(crate) fn release_press_write(&mut self, press: Option<awase::types::PressId>, open: bool) {
+        if self.press_ledger.release(press, open) {
+            if let Some(press) = press {
+                tracing::debug!(
+                    "[press-ledger] press={press} open={open} の書き込みは何も送らなかった → 予約を解く"
+                );
+                self.journal.record(JournalEntry::PressWriteClaim {
+                    press: press.get(),
+                    open,
+                    source: "release",
+                    verdict: "released",
+                });
+            }
+        }
+    }
+
     /// shadow_model から派生した最新の explicit intent。
     ///
     /// (Step 2B 以降の SSOT。Priority 4-5 observer による上書きを block する根拠。)
     pub(crate) fn explicit_intent(&self) -> Option<bool> {
         self.shadow_model.last_intent.as_ref().map(|i| i.target)
+    }
+
+    /// 物理モードキーの打鍵時点で、表から予測した効果をbeliefへ反映する（ADR-191 決定3）。
+    ///
+    /// `ImeEvent::KeyEffectPredicted`の**唯一のdispatch元**。awaseはIMEへ書かない（生キーはそのまま通る）。
+    /// 後から来る観測（settle後）が照合し、食い違えば観測が勝つ（`ImeModel::reduce`のfence）。
+    pub(crate) fn apply_key_effect_prediction(
+        &mut self,
+        prediction: crate::state::key_effect_predictor::Prediction,
+        tick_ms: TickMs,
+    ) {
+        // 開閉・入力モードも追跡状態も変わらない打鍵は何もしない。
+        if prediction.effect.is_noop() && prediction.track == self.shadow_model.key_track() {
+            return;
+        }
+        self.dispatch_event(
+            ImeEvent::KeyEffectPredicted {
+                open: prediction.effect.open,
+                mode: prediction.effect.mode,
+                track: prediction.track,
+            },
+            tick_ms,
+        );
+        // 開閉の予測は、この対象に残る古い明示意図（例: 起動直後の明示IME OFF）を置き換える。
+        // `IntentStore`は`effective_open()`で`shadow_model`より優先されるので、消さないと予測が効かない
+        // （読めないアプリでは観測が来ず、意図のTTL〈約30秒〉が切れるまで開閉の予測が無視される）。
+        // 「同一対象では最新の決定が古い意図を置換する」という`IntentStore`自身の設計と、通過マークの
+        // 観測（`consume_mode_key_pass_mark`）が同じ対象の意図を消す扱いに揃える。
+        if prediction.effect.open.is_some() {
+            if let Some(hwnd) = self.shadow_model.current_focus() {
+                self.intent_store.remove(hwnd);
+            }
+        }
+    }
+
+    // ── 通過マーク（ADR-187）: 寿命判断は `ModeKeyPassLatch`（`state/mode_key_pass.rs`）に委譲する ──
+    //
+    // ここに残るのは、latch が返す判断・`PassEffect` を実際に適用する副作用（`intent_store.remove`・
+    // `dispatch_event(ModeKeyPassedThrough)`）だけ（design-patterns-review.md 提案3）。
+    // 各メソッドのシグネチャは委譲前と変えていない（呼び出し元・テストの変更を避けるため）。
+
+    /// 無変換/変換の生キーを通過させたら呼ぶ（ADR-187）。現在のフォアグラウンドに対する一回マークを立てる。
+    pub(crate) fn arm_mode_key_pass_mark(&mut self, now_ms: u64, readable: bool) {
+        self.mode_key_pass_mark
+            .arm(crate::win32::foreground_scope(), now_ms, readable);
+    }
+
+    /// 立てた時点で読める窓だった通過マークが、窓の終了を待っているとき、その残り時間(ms)。
+    /// 通過の途中で窓が読めなくなった（降格した）場合に、窓の終了時に`expire_mode_key_pass_mark`を呼ぶための
+    /// 起床時刻に使う（読めない窓の`reschedule_ime_refresh`は通過マークが有効な間は何も予約しないため）。
+    pub(crate) fn mode_key_pass_expiry_wait_ms(&mut self, now_ms: u64) -> Option<u64> {
+        self.mode_key_pass_mark.expiry_wait_ms(
+            now_ms,
+            crate::win32::foreground_scope(),
+            crate::tuning::MODE_KEY_PASS_MARK_WINDOW_MS,
+        )
+    }
+
+    /// awaseが実際にIMEへ書いた（`applied`を更新した）ことを、有効な通過マークへ記録する（BUG-158追補2）。
+    fn note_awase_write_for_mode_key_pass(&mut self) {
+        self.note_awase_write_for_mode_key_pass_in_scope(crate::win32::foreground_scope());
+    }
+
+    fn note_awase_write_for_mode_key_pass_in_scope(
+        &mut self,
+        scope: crate::win32::ForegroundScope,
+    ) {
+        self.mode_key_pass_mark.note_awase_write(scope);
+    }
+
+    fn mode_key_pass_mark_live_in_scope(
+        &mut self,
+        now_ms: u64,
+        scope: crate::win32::ForegroundScope,
+    ) -> bool {
+        self.mode_key_pass_mark
+            .live(now_ms, scope, crate::tuning::MODE_KEY_PASS_MARK_WINDOW_MS)
+    }
+
+    /// 通過マークの窓が切れるまでの残り時間(ms)。マークが無い/フォアグラウンドが変わった/窓が切れていれば`None`。
+    /// 観測が失敗した通過の後、読み直しを窓の終了時の1回に絞るために使う（BUG-158）。
+    pub(crate) fn mode_key_pass_window_remaining_ms(&mut self, now_ms: u64) -> Option<u64> {
+        self.mode_key_pass_mark.window_remaining_ms(
+            now_ms,
+            crate::win32::foreground_scope(),
+            crate::tuning::MODE_KEY_PASS_MARK_WINDOW_MS,
+        )
+    }
+
+    /// 通過マークが有効か（消費しない）。フォアグラウンドが変わっていれば`peek`が失効させる。
+    /// typing-idleガードのバイパス判定用（`ir_decide_read_strategy`）。
+    pub(crate) fn mode_key_pass_mark_live(&mut self, now_ms: u64) -> bool {
+        self.mode_key_pass_mark_live_in_scope(now_ms, crate::win32::foreground_scope())
+    }
+
+    fn invalidate_intents_if_mode_key_pass_live_in_scope(
+        &mut self,
+        now_ms: u64,
+        tick_ms: TickMs,
+        scope: crate::win32::ForegroundScope,
+    ) -> bool {
+        self.drop_intents_for_mode_key_pass_in_scope(now_ms, tick_ms, scope, false)
+    }
+
+    /// 通過マークの窓が切れても、観測が一度も成功しなかった（`invalidated`のまま）ときに、古い明示意図を捨てる。
+    ///
+    /// 通過マークは「ユーザーの物理モードキーが通った。結果は分からないので、古い意図を根拠にしない」
+    /// という事実そのものである。意図の破棄を観測の成功だけに頼ると、読み取りが失敗し続ける環境
+    /// （MS-IME本体の`ime_on=None`）で意図が残り、`reschedule_ime_refresh`の早期returnでポーリングが止まったまま
+    /// 次のモードキーまで固まる（BUG-151 原因③の再発、BUG-158）。窓の終了で必ず捨て、ポーリングを再開させる。
+    /// 既に観測の成功で捨てた（`invalidated`）/窓の間は何もしない。
+    pub(crate) fn expire_mode_key_pass_mark(&mut self, now_ms: u64, tick_ms: TickMs) -> bool {
+        self.drop_intents_for_mode_key_pass_in_scope(
+            now_ms,
+            tick_ms,
+            crate::win32::foreground_scope(),
+            true,
+        )
+    }
+
+    /// 判断は `ModeKeyPassLatch::drop_decision`（Win32非依存）。ここは`PassEffect`の適用のみ。
+    fn drop_intents_for_mode_key_pass_in_scope(
+        &mut self,
+        now_ms: u64,
+        tick_ms: TickMs,
+        scope: crate::win32::ForegroundScope,
+        on_expiry: bool,
+    ) -> bool {
+        let Some(effect) = self.mode_key_pass_mark.drop_decision(
+            now_ms,
+            scope,
+            on_expiry,
+            self.shadow_model.last_intent.is_some(),
+            crate::tuning::MODE_KEY_PASS_MARK_WINDOW_MS,
+        ) else {
+            return false;
+        };
+        if effect.remove_intent {
+            if let Some(hwnd) = self.shadow_model.current_focus() {
+                self.intent_store.remove(hwnd);
+            }
+        }
+        if effect.pass_through {
+            // 窓の終了時の破棄（`on_expiry`）は観測を得ていない: 意図だけ捨て、desired は書かない（A-N1）。
+            self.pass_through_observed(tick_ms, !on_expiry, false);
+        }
+        true
+    }
+
+    // ── 外部変化の監視窓（ADR-205、BUG-172）──
+
+    /// 外部注入の IME キーを見たら呼ぶ（読めない窓のみ）。現在のフォアグラウンドに対する監視窓を開く／延ばす。
+    pub(crate) fn arm_external_change_watch(&mut self, now_ms: u64) {
+        self.external_change_watch.arm(
+            crate::win32::foreground_scope(),
+            now_ms,
+            crate::tuning::MODE_KEY_PASS_MARK_WINDOW_MS,
+        );
+    }
+
+    /// 監視窓の基準値(ログ用。ADR-227 の give-up 契機で、追随が起きなかった理由を区別する)。
+    pub(crate) fn external_change_baseline(&self) -> Option<bool> {
+        self.external_change_watch.baseline()
+    }
+
+    /// 監視窓の残り時間(ms)。無い・切れた・フォアグラウンドが変わったなら`None`（`reschedule_ime_refresh`の読み直し予約用）。
+    pub(crate) fn external_change_watch_remaining_ms(&mut self, now_ms: u64) -> Option<u64> {
+        self.external_change_watch.remaining_ms(
+            crate::win32::foreground_scope(),
+            now_ms,
+            crate::tuning::MODE_KEY_PASS_MARK_WINDOW_MS,
+        )
+    }
+
+    /// 最後に外部変化へ追随した時刻（ms）。0 は未追随。
+    pub(crate) const fn last_external_change_ms(&self) -> u64 {
+        self.last_external_change_ms
+    }
+
+    /// prefetch 済みの開閉の読み（`read`）を監視窓に照合し、窓の中で基準値から変わっていれば実状態へ追随する。
+    ///
+    /// 追随 = `ObserverPoll(v)` を記録 → 対象の明示意図（`IntentStore`）を削除 → `ModeKeyPassedThrough{align_desired:true}`
+    /// （`last_intent` を捨て、`desired_open` を観測へ揃え、食い違う `applied` を未確認へ落とす）。awase は IME を書かない。
+    /// 開く・閉じるの両方向を同じ規則で追随する（呼び出し側が GJI × Imm32Unavailable に限る）。戻り値は追随した値。
+    /// どのフォーカスでも直近の読みは記録する（基準値の初期値になる）。
+    pub(crate) fn follow_external_change(
+        &mut self,
+        read: Option<bool>,
+        now_ms: u64,
+        tick_ms: TickMs,
+        accepted: crate::state::probe_admission::AcceptedObservation,
+    ) -> Option<bool> {
+        let scope = crate::win32::foreground_scope();
+        let verdict = self.external_change_watch.observe(
+            scope,
+            now_ms,
+            crate::tuning::MODE_KEY_PASS_MARK_WINDOW_MS,
+            read,
+        );
+        self.external_change_watch.record_read(scope, read);
+        let super::external_change_watch::ChangeVerdict::Changed(v) = verdict else {
+            return None;
+        };
+        self.write_observer_poll(v, tick_ms, accepted);
+        if let Some(hwnd) = self.shadow_model.current_focus() {
+            self.intent_store.remove(hwnd);
+        }
+        self.pass_through_observed(tick_ms, true, true);
+        self.last_external_change_ms = now_ms;
+        Some(v)
+    }
+
+    /// `ModeKeyPassedThrough` のdispatch元（ADR-187の「1箇所に限定」）。reducerは`last_intent`を捨て、
+    /// `desired_open`を観測から導ける開閉へ揃える（BUG-157）。窓の間の揃えと、窓が切れた後の最初の成功観測での
+    /// 揃え（BUG-158追補2）の両方がここを通る。
+    fn pass_through_observed(
+        &mut self,
+        tick_ms: TickMs,
+        align_desired: bool,
+        demote_applied: bool,
+    ) {
+        self.dispatch_event(
+            ImeEvent::ModeKeyPassedThrough {
+                align_desired,
+                demote_applied,
+            },
+            tick_ms,
+        );
+    }
+
+    /// `desired_open` が起動時の初期値のまま（BUG-163）か。`true` の間、`desired_open` は awase の意図ではない。
+    #[must_use]
+    pub(crate) fn desired_is_placeholder(&self) -> bool {
+        self.shadow_model.desired_is_placeholder()
+    }
+
+    /// 起動時の初期値のままの `desired_open` を、最初の成功観測へ**1回だけ**揃える（BUG-163、代案A）。
+    ///
+    /// 初期値 `true` は「観測が無いときの既定」で、awase が IME にそうしたい意図ではない。揃えないと、IME を閉じて起動したとき
+    /// 最初の観測「閉」が初期値 `true` と比べられ、明示意図が無いのに drift 補正が発火する（`ir_apply_drift_correction`）。
+    /// 揃える条件: 初期値のまま（`desired_is_placeholder`）、明示意図が無い（`last_intent`）、観測から導ける開閉
+    /// （`derive_any`）がある。揃えたら（`ModeKeyPassedThrough { align_desired: true }` の reducer 経路、BUG-157 と同じ）
+    /// 揃えた後の `desired_open` を返す。揃えなかったら `None`（読めない窓では観測が来るまで触れない）。
+    pub(crate) fn align_placeholder_desired(
+        &mut self,
+        now: std::time::Instant,
+        tick_ms: TickMs,
+    ) -> Option<bool> {
+        if !self.shadow_model.desired_is_placeholder() || self.shadow_model.last_intent.is_some() {
+            return None;
+        }
+        self.shadow_model.observations.derive_any(now)?;
+        self.pass_through_observed(tick_ms, true, false);
+        Some(self.shadow_model.desired_open())
+    }
+
+    /// 通過マークの窓が**切れた後**の最初の成功観測で、`desired_open`を観測へ揃える（BUG-158追補2）。
+    /// 窓の間の観測が全て時間切れだった通過は、揃える機会が無いまま`observed ≠ desired`が続くため。
+    /// 通過につき1回だけ。通過より後にawaseが書いた/新しい明示意図があるときは揃えない。
+    /// 観測が成功したときに呼ぶ。揃えたら`true`。
+    pub(crate) fn align_after_expired_mode_key_pass(
+        &mut self,
+        now_ms: u64,
+        tick_ms: TickMs,
+    ) -> bool {
+        self.align_after_expired_mode_key_pass_in_scope(
+            now_ms,
+            tick_ms,
+            crate::win32::foreground_scope(),
+        )
+    }
+
+    fn align_after_expired_mode_key_pass_in_scope(
+        &mut self,
+        now_ms: u64,
+        tick_ms: TickMs,
+        scope: crate::win32::ForegroundScope,
+    ) -> bool {
+        if !self.mode_key_pass_mark.align_after_expired(
+            now_ms,
+            scope,
+            self.shadow_model.last_intent.is_some(),
+            crate::tuning::MODE_KEY_PASS_MARK_WINDOW_MS,
+        ) {
+            return false;
+        }
+        self.pass_through_observed(tick_ms, true, false);
+        true
+    }
+
+    pub(crate) fn invalidate_intents_if_mode_key_pass_live(
+        &mut self,
+        now_ms: u64,
+        tick_ms: TickMs,
+    ) -> bool {
+        self.invalidate_intents_if_mode_key_pass_live_in_scope(
+            now_ms,
+            tick_ms,
+            crate::win32::foreground_scope(),
+        )
     }
 
     /// 非同期送信済み・未確認の actuation を記録する（`applied = Optimistic`）。
@@ -190,6 +586,7 @@ impl ImeStateHub {
     /// この5箇所のどれとも異なる新規パターンなら actuation 由来かどうかを
     /// 必ず確認すること。
     pub(crate) fn record_optimistic(&mut self, open: bool) {
+        self.note_awase_write_for_mode_key_pass();
         self.shadow_model.applied = AppliedImeState::Optimistic(open);
         self.clear_pending_if_matches(open);
     }
@@ -200,8 +597,8 @@ impl ImeStateHub {
     /// `at_ms`: 呼び出し元が取得した現在時刻（`GetTickCount64` 由来、非ゼロ）。
     /// INV-A97-1 の既知の例外は `record_optimistic` の doc を参照。
     pub(crate) fn record_confirmed(&mut self, open: bool, at_ms: u64) {
-        self.shadow_model.applied = AppliedImeState::Confirmed { open, at_ms };
-        self.clear_pending_if_matches(open);
+        self.note_awase_write_for_mode_key_pass();
+        self.shadow_model.confirm_applied(open, at_ms);
     }
 
     /// 同じ apply が完了した扱いになったので pending も clear する。
@@ -233,115 +630,33 @@ impl ImeStateHub {
     ///
     /// 戻り値: apply 要求が実行されたか（ログ用）
     ///
-    /// `focus_transition_was_pending`: この event の処理開始時点（`kp_stage_focus_probe`
-    /// が barrier を consume する前）で FocusTransition barrier が settle 期間内だったか。
-    /// 呼び出し元はこの値を event 処理の先頭でスナップショットして渡すこと
-    /// （本関数の呼び出し時点で `is_focus_transition_settling` を評価しても、既に
-    /// consume 済みで false になっているため無意味）。
+    /// ADR-213 P2d-2: settle 中の SetOpen を belief 側でも落としていた
+    /// `focus_transition_was_pending` フィルタは、executor 側の strip と対で撤去した
+    /// （明示操作は settle 中も belief を書き、実書き込みも行う）。
     pub(crate) fn handle_engine_set_open(
         &mut self,
         target: bool,
         ctrl_held: bool,
-        focus_transition_was_pending: bool,
         generation: ApplyGeneration,
         tick_ms: TickMs,
     ) -> bool {
-        if self.is_ctrl_ime_chord_active() && !target {
+        if super::explicit_press::engine_set_open_filtered_by_chord(
+            self.is_ctrl_ime_chord_active(),
+            target,
+        ) {
             // chord transaction 中の二次 IME OFF 要求: フィルタ。
             // ChordEnded（Ctrl KeyUp）が barrier を解除するため、ここでは何もしない。
             //
             // 診断ログ (2026-08-05): 従来ここは完全無音だったため、実機ログだけでは
             // 「明示 OFF がこのフィルタでサイレント無効化された」ケースを他の原因と
             // 区別できなかった。挙動は変更しない。
-            log::info!(
+            tracing::info!(
                 "[chord-filter] SetOpen(false) request filtered: ctrl_ime_chord が既に active \
                  (last_intent/desired_open は更新されない)"
             );
             return false;
         }
-        if focus_transition_was_pending {
-            // belief 保護の最終防衛線（P3-1: 3→2 集約）。
-            //
-            // 一次フィルタは decision からの SetOpen effect 除去
-            // （`runtime::executor::strip_ime_set_open_if_settling`。キーボード経路 =
-            // key_pipeline::kp_run_inner と非キーボード経路 = execute_from_loop の両方から呼ぶ）。
-            // ここは意図が異なり（decision 除去 ≠ belief 汚染防止）、万一その一次フィルタを
-            // すり抜けた SetOpen 要求が belief（desired_open 等）を書き換えるのを防ぐ二重化。
-            //
-            // フォーカス遷移直後（settle_until 未経過）は、Alt+Tab 等の高速な多重フォーカス遷移で
-            // 中間ウィンドウ（Alt+Tab スイッチャー等）の未確定 belief に基づき Engine が SetOpen を
-            // 発行し得る（2026-07-05 実機ログで確認）。barrier consume 時に kick される非同期
-            // focus probe が観測を更新すれば、次の入力イベントで正しい SetOpen が再発行され自己修復する。
-            //
-            // 2026-08-05: 実機再発報告の切り分けのため debug → info に格上げ（頻度は低い）。
-            log::info!(
-                "[focus-settle] SetOpen({target}) request filtered at belief last line of defense \
-                 (focus transition barrier still settling at event start)"
-            );
-            return false;
-        }
         self.write_set_open_request(target, tick_ms);
-        self.on_set_open_requested();
-        self.dispatch_event(
-            ImeEvent::ImeApplyRequested {
-                target,
-                generation,
-                ctrl_held,
-            },
-            tick_ms,
-        );
-        self.last_explicit_ime_action_ms = tick_ms.0;
-        true
-    }
-
-    /// `awase::engine::decision::SetOpenOrigin::ActivationSync` 由来の `SetOpen` を処理する。
-    ///
-    /// `handle_engine_set_open` との違いは唯一つ: `ImeEvent::UserImeSetIntent`（`last_intent`
-    /// を設定する）の代わりに `ImeEvent::EngineActivationSync`（`last_intent` を設定しない）を
-    /// dispatch する点。この SetOpen は Engine の active/inactive 遷移が対称性のために
-    /// 自動発行した echo であり、ユーザーが今このキーで ON/OFF を明示的に選んだわけではない
-    /// （`ctx.ime_on` が観測駆動で変化しただけでも Active/Inactive は遷移しうる）。
-    /// `last_intent` を設定すると、以後の drift correction がこの echo を「ユーザーの本物の
-    /// 意図」として扱ってしまい、ユーザーが明示的に IME を OFF にした直後でも Engine が
-    /// 勝手に ON へ戻る再発を引き起こす（2026-08-04、`docs/known-bugs.md` 参照）。
-    ///
-    /// chord/focus-transition-settling のフィルタ条件は `handle_engine_set_open` と同一
-    /// （どちらも「これから OS へ実 apply する SetOpen 要求」という点は変わらないため）。
-    ///
-    /// `last_explicit_ime_action_ms` は `handle_engine_set_open` と同様に更新する。この
-    /// フィールドの実際の役割は「ユーザーが明示操作したか」ではなく「awase 自身が
-    /// 能動的に IME へ書き込んだか」（`note_explicit_ime_action` の doc 参照）であり、
-    /// この関数も実際に OS へ SetOpen を適用する以上、idle-conv-check が遷移途中の
-    /// conv 値を汚染された観測として拾わないよう抑制窓を効かせる必要がある
-    /// （Opus レビュー 2026-08-04 で指摘: 更新しないと `get_ime_conversion_mode_raw_timeout_async`
-    /// が BUG-34 級にブロックしている間に本関数の SetOpen 適用が挟まった場合、
-    /// idle-conv-check のガード (b)（値一致比較）が素通りし、遷移途中の conv が
-    /// そのまま belief に入りうる）。
-    pub(crate) fn handle_engine_activation_sync(
-        &mut self,
-        target: bool,
-        ctrl_held: bool,
-        focus_transition_was_pending: bool,
-        generation: ApplyGeneration,
-        tick_ms: TickMs,
-    ) -> bool {
-        if self.is_ctrl_ime_chord_active() && !target {
-            // 診断ログ: handle_engine_set_open 側と同じ理由で info に格上げ。
-            log::info!(
-                "[chord-filter] ActivationSync SetOpen(false) request filtered: \
-                 ctrl_ime_chord が既に active"
-            );
-            return false;
-        }
-        if focus_transition_was_pending {
-            // 2026-08-05: 実機再発報告の切り分けのため debug → info に格上げ。
-            log::info!(
-                "[focus-settle] ActivationSync SetOpen({target}) request filtered at belief \
-                 last line of defense (focus transition barrier still settling at event start)"
-            );
-            return false;
-        }
-        self.dispatch_event(ImeEvent::EngineActivationSync { target }, tick_ms);
         self.on_set_open_requested();
         self.dispatch_event(
             ImeEvent::ImeApplyRequested {
@@ -370,7 +685,7 @@ impl ImeStateHub {
             .active_chord_kind()
             .unwrap_or(ChordKind::CtrlMuhenkanImeOff);
         self.dispatch_event(ImeEvent::ChordEnded { kind }, tick_ms);
-        log::debug!("[ctrl-bypass] chord barrier cleared (Ctrl KeyUp vk=0x{vk:02X})");
+        tracing::debug!("[ctrl-bypass] chord barrier cleared (Ctrl KeyUp vk=0x{vk:02X})");
     }
 
     // ── Input barrier ──
@@ -516,32 +831,7 @@ impl ImeStateHub {
     /// (30 秒) を必ず超え、**IntentStore 上書きが一度も発火しない**。合成 tick を
     /// 使うテストは必ず [`Self::effective_open_at`] を呼ぶこと。
     pub(crate) fn effective_open(&self) -> bool {
-        self.effective_open_at(TickMs(crate::hook::current_tick_ms()))
-    }
-
-    /// eager warmup の `ime_on` 入力を解決する（ADR-098 決定1-b、INV-A97-2）。
-    ///
-    /// `applied`（実 actuation の記録）が既知ならそれを、`Unknown` のときだけ
-    /// belief（`effective_open()`）へフォールバックする——**belief を `applied`
-    /// へ書き戻さない**。読む向きだけ belief を見るのが F2（belief を `applied`
-    /// に書いて下流全部を汚染した）との決定的な違いである。
-    ///
-    /// `applied` を引数で受け取るのは、executor が持つスナップショット
-    /// （`applied_snapshot`、batch 内で更新されうる）と hub の live な
-    /// `model().applied` の両方から呼べるようにするため。
-    pub(crate) fn resolve_warmup_ime_on(
-        &self,
-        applied: AppliedImeState,
-    ) -> awase::platform::WarmupImeOn {
-        awase::platform::WarmupImeOn::from_applied_or_belief(
-            applied.applied_open(),
-            self.effective_open(),
-        )
-    }
-
-    /// [`Self::resolve_warmup_ime_on`] を `model().applied` に対して呼ぶ版。
-    pub(crate) fn warmup_ime_on(&self) -> awase::platform::WarmupImeOn {
-        self.resolve_warmup_ime_on(self.model().applied)
+        self.effective_open_at(TickMs(self.clock.now_tick()))
     }
 
     /// [`Self::effective_open`] の判定本体。`now_ms` を明示的に受け取る版。
@@ -554,8 +844,14 @@ impl ImeStateHub {
     /// タイムスタンプを注入する」原則に沿う。`effective_open()` が壁時計を
     /// 読んでいるのは、その 29 箇所ある runtime 側呼び出し元をまだ書き換えて
     /// いないため（追補4 の残タスク、`docs/known-bugs.md` BUG-51 追補4 参照）。
+    ///
+    /// `shadow_model` の根拠判定（観測の鮮度）に使う `Instant` は `self.clock` から取る
+    /// （旧実装は `shadow_model.effective_open()` が壁時計の `Instant::now()` を読んでいたため、
+    /// 仮想時計では `now_ms` と時間軸が食い違った。`state/hub_clock.rs`）。
     pub(crate) fn effective_open_at(&self, now_ms: TickMs) -> bool {
-        let shadow = self.shadow_model.effective_open();
+        let shadow = self
+            .shadow_model
+            .effective_open_at(self.clock.now_instant());
         let decision = self.intent_store.resolve_effective_open(
             self.shadow_model.current_focus(),
             shadow,
@@ -564,7 +860,7 @@ impl ImeStateHub {
         match decision.intent {
             Some(intent) if decision.value != shadow => {
                 if !self.intent_override_logged.get() {
-                    log::info!(
+                    tracing::info!(
                         "[intent-store] effective_open override 開始: hwnd={:?} \
                          intent.open={} (source={:?}, age={}ms) shadow_model={shadow}",
                         intent.target,
@@ -577,13 +873,13 @@ impl ImeStateHub {
             }
             Some(_) => {
                 if self.intent_override_logged.get() {
-                    log::info!("[intent-store] effective_open override 終了 (shadow が一致)");
+                    tracing::info!("[intent-store] effective_open override 終了 (shadow が一致)");
                     self.intent_override_logged.set(false);
                 }
             }
             None => {
                 if self.intent_override_logged.get() {
-                    log::info!(
+                    tracing::info!(
                         "[intent-store] effective_open override 終了 \
                          (intent 消失/期限切れ/フォーカス変更)"
                     );
@@ -637,39 +933,6 @@ impl ImeStateHub {
             input_mode: self.input_mode(),
             prev_conv: self.belief.prev_conversion_mode(),
         }
-    }
-
-    /// `belief.is_japanese_ime() && effective_open()` の複合述語。
-    ///
-    /// `apply_force_on_for_imm_broken` / `try_force_on_bootstrap` で重複していたガード条件。
-    /// `engine.is_user_enabled()` と組み合わせて IME force-ON の前提条件として使う。
-    ///
-    /// **belief 由来の暫定ゲート（ADR-087 §5 Phase 3 item15 で
-    /// `issue_open_warrant()` に置換予定、まだ未配線）。** `effective_open()` は
-    /// belief（間違っていても低リスク）であり、actuation の根拠に直接使うべき
-    /// ではない——これはまさに本関数が持つ構造であり、BUG-63 の原因パターンが
-    /// 実 actuation ゲートとして今も本番で使われている状態を示す。呼び出し元は
-    /// 2箇所（`runtime/mod.rs` の `apply_force_on_for_imm_broken` /
-    /// `try_force_on_bootstrap`）。**旧記載の3箇所目 `consume_force_open_pending`
-    /// は ADR-094（2026-08-17、`conv_mode_policy` force-write 機構の全撤去）で
-    /// 削除済み——doc の記載漏れだったため訂正（2026-08-21）。**
-    pub(crate) fn is_eligible_for_ime_force_on(&self) -> bool {
-        self.belief.is_japanese_ime() && self.effective_open()
-    }
-
-    /// force-ON（`apply_force_on_for_imm_broken`）を今送ってよいか（ADR-098 決定1-c、BUG-69）。
-    pub(crate) fn force_on_attempt_allowed(&self, now_ms: u64) -> bool {
-        crate::state::ime_actuation::force_on_attempt_allowed(
-            self.model().applied,
-            self.model().force_on_retry,
-            now_ms,
-            crate::tuning::FORCE_ON_RETRY_COOLDOWN_MS,
-        )
-    }
-
-    /// force-ON を実際に試行したことを記録する（クールダウンの起点、ADR-098 決定1-c）。
-    pub(crate) fn note_force_on_attempt(&mut self, now_ms: u64) {
-        self.shadow_model.force_on_retry.note_attempt(now_ms);
     }
 
     /// 現在のアプリの focus settle 期間（ms、`AppImePolicy` 由来）。
@@ -781,51 +1044,20 @@ impl ImeStateHub {
 
     /// desired ≠ observed ドリフトが補正閾値を超えているか判定し、超えていれば補正情報を返す。
     ///
-    /// 戻り値: `Some((desired, observed, duration_ms))` — 補正が必要な場合
-    /// `explicit_intent`: `PlatformState::explicit_intent()` の値をそのまま渡す。
+    /// 戻り値: 補正が必要な場合 `Some(DriftCorrection { .. })`。
+    /// `explicit_intent`: [`Self::explicit_intent`] の値をそのまま渡す。
+    ///
+    /// `ConvOpenInference` は根拠にしない（BUG-173 追補3。`state/drift_correction.rs` 参照）。
+    /// `resolve_warmup_ime_on` が同じ述語を `matches!(.., Some(DriftCorrection { desired: false, observed: true, .. }))`
+    /// として使う（ADR-132/INV-B1'）。
     pub(crate) fn check_drift_correction(
         &self,
         now: std::time::Instant,
         explicit_intent: Option<bool>,
-    ) -> Option<(bool, bool, u64)> {
-        let desired = self.shadow_model.desired_open();
-
-        let dur = self.shadow_model.observations.drift_duration(now)?;
-        // last_intent は UserImeSetIntent / UserImeToggleIntent のみが設定する。
-        // PanicReset / HwndCacheRestored は設定しないため、is_some() で十分。
-        // SyncKey / PhysicalImeKey / Command は全て閾値 0 (即時補正) の対象。
-        let is_strong_intent = self.shadow_model.last_intent.is_some();
-        let threshold = if explicit_intent == Some(desired) && is_strong_intent {
-            0
-        } else {
-            u128::from(crate::tuning::DRIFT_CORRECTION_THRESHOLD_MS)
-        };
-        if dur.as_millis() < threshold {
-            return None;
-        }
-
-        let max_age =
-            std::time::Duration::from_millis(crate::tuning::DRIFT_CORRECTION_OBS_MAX_AGE_MS);
-        let trusted = self.shadow_model.observations.most_recent_trusted(now)?;
-        if trusted.age(now) > max_age {
-            return None;
-        }
-        // ConvOpenInference（conv ビットからの間接推測、KatakanaShadowOff/
-        // NativeToggleShadowOff 由来）は、明示的なユーザー意図が一度も無い間は単独で
-        // drift correction を発火させない。desired_open のデフォルト値（起動直後等、
-        // last_intent が一度も設定されていない状態）を conv 由来の推論だけで
-        // actuate すると、ユーザーが望んでもいない ON/OFF の押し付けになりかねない。
-        // 明示意図がある場合（BUG-19 再発の本来のシナリオ: ユーザーが OFF にした
-        // 直後に conv がまだ native/katakana を示す）はこの gate を素通りし、
-        // 既存の `desired`（ユーザーの意図した値）が正しく再適用される。
-        if trusted.source == ObservationSource::ConvOpenInference && explicit_intent.is_none() {
-            return None;
-        }
-        if trusted.open == desired {
-            return None;
-        }
-
-        Some((desired, trusted.open, dur.as_millis() as u64))
+    ) -> Option<DriftCorrection> {
+        // 判定本体は ungated な `state/drift_correction.rs`（Linux の
+        // `tests/closed_loop_scenarios.rs` から呼べるように移した。ロジックは不変）。
+        super::drift_correction::check_drift_correction(&self.shadow_model, now, explicit_intent)
     }
 
     /// IME apply 完了を記録する（D: generation 照合 dispatch）。
@@ -843,19 +1075,10 @@ impl ImeStateHub {
         generation: Option<ApplyGeneration>,
         ts: u64,
     ) -> ImeApplyAcceptance {
-        use awase::platform::ImeOpenOutcome;
-
         let Some(generation) = generation else {
-            if outcome == ImeOpenOutcome::UnsafeToToggle {
+            let Some(effective) = super::ime_model::apply_result_effective_open(open, outcome)
+            else {
                 return ImeApplyAcceptance::NotSent;
-            }
-
-            let effective = match outcome {
-                ImeOpenOutcome::Applied
-                | ImeOpenOutcome::FallbackSent
-                | ImeOpenOutcome::AlreadyMatched => open,
-                ImeOpenOutcome::Failed => !open,
-                ImeOpenOutcome::UnsafeToToggle => unreachable!("上で早期 return 済み"),
             };
             // `ts` は常に `current_tick_ms()`（非ゼロ）由来——`on_ime_apply_complete`
             // の唯一の呼び出し元（`runtime/mod.rs`）がそうしている。よって
@@ -868,7 +1091,7 @@ impl ImeStateHub {
             .shadow_model
             .classify_apply_completion(open, outcome, generation);
         if matches!(acceptance, ImeApplyAcceptance::Stale) {
-            log::debug!(
+            tracing::debug!(
                 "[ime-apply] stale completion ignored for side effects: target={open} \
                  outcome={outcome:?} generation={generation} pending={:?}",
                 self.shadow_model.pending_generation()
@@ -886,15 +1109,6 @@ impl ImeStateHub {
 // 書き込みはすべてここに集約し、PlatformState からは直接 shadow_model を触らない。
 
 impl ImeStateHub {
-    /// `BrokenAppBootstrap` force-on ガードを追加する。
-    pub(crate) fn set_force_on_broken_app_bootstrap(&mut self) {
-        self.shadow_model.force_guards.add(ForceGuard {
-            reason: ForceOnReason::BrokenAppBootstrap,
-            expires_at: None,
-            generation: self.event_log.next_seq(),
-        });
-    }
-
     /// observe_miss_monitor をリセットし、すべての force-on ガードを解除する。
     ///
     /// ユーザー操作（IME トグル・SetOpen 等）で「意図した状態」が確定したときに呼ぶ。
@@ -906,6 +1120,17 @@ impl ImeStateHub {
     /// IME トグルが実際に適用されたことを記録する。
     pub(crate) fn on_ime_toggled(&mut self) {
         self.reset_detect_state();
+    }
+
+    /// conv 観測由来の engine ON 同期（`EngineSync::SetOpen`）が陽性証拠を得たとき、
+    /// `PanicReset` ガードだけを解除する（他 reason のガードは残す）。
+    ///
+    /// 旧 `handle_conv_engine_on_sync` が `on_set_open_requested` 経由で全ガードを
+    /// 消していたうちの、PanicReset 解除だけを引き継ぐ（ADR-213 P2d-1）。
+    pub(crate) fn release_panic_reset_guard_on_positive_evidence(&mut self) {
+        self.shadow_model
+            .force_guards
+            .remove(ForceOnReason::PanicReset);
     }
 
     /// Engine の SetOpen リクエスト直後に呼ぶ。
@@ -981,19 +1206,16 @@ impl ImeStateHub {
         if update.increment_miss_count {
             self.shadow_model
                 .observe_miss_monitor
-                .record_miss(std::time::Instant::now());
+                .record_miss(self.clock.now_instant());
             let miss = self
                 .shadow_model
                 .observe_miss_monitor
                 .consecutive_miss_count;
             if miss == crate::IME_DETECT_MISS_THRESHOLD {
-                log::warn!("IME detection failed {miss} consecutive times, will force IME ON");
+                tracing::warn!(
+                    "IME detection failed {miss} consecutive times (force-ON was removed; recording only)"
+                );
             }
-        }
-        if update.clear_force_on_broken_app_bootstrap {
-            self.shadow_model
-                .force_guards
-                .remove(ForceOnReason::BrokenAppBootstrap);
         }
         if update.clear_force_on_panic_reset {
             self.shadow_model
@@ -1051,7 +1273,7 @@ impl ImeStateHub {
                     self.intent_store
                         .invalidate_for_cache_restore(hwnd, snap.recorded_ms, tick_ms)
                 {
-                    log::info!(
+                    tracing::info!(
                         "[intent-store] cache restore より新しい明示意図を保持 \
                          (cache recorded_ms={} < intent recorded_at_ms={intent_recorded_at_ms})",
                         snap.recorded_ms,
@@ -1097,7 +1319,7 @@ impl ImeStateHub {
             return;
         }
         if let Some(intent) = self.shadow_model.last_intent.as_ref() {
-            log::debug!(
+            tracing::debug!(
                 "Imm32Unavailable entry: preserving ime_on=false (intent source={:?})",
                 intent.source
             );
@@ -1110,7 +1332,7 @@ impl ImeStateHub {
         // 明示意図に勝つ」逆転になるため行わない（pre-mortem #2）。
         if let Some(hwnd) = self.shadow_model.current_focus() {
             if let Some(intent) = self.intent_store.lookup(hwnd, tick_ms) {
-                log::debug!(
+                tracing::debug!(
                     "Imm32Unavailable entry: preserving stored intent open={} (source={:?})",
                     intent.open,
                     intent.source
@@ -1118,7 +1340,7 @@ impl ImeStateHub {
                 return;
             }
         }
-        log::info!(
+        tracing::info!(
             "Imm32Unavailable entry without trusted cache: 安全デフォルト ON を Low confidence \
              observation として記録 (no explicit intent, Japanese layout, IME state \
              uncontrollable in Imm32Unavailable)"
@@ -1138,8 +1360,52 @@ impl ImeStateHub {
         );
     }
 
+    /// awase 起動後に作られたスレッドの IME は「閉」で始まる（`focus/thread_scope.rs`）。
+    /// 純粋な Imm32Unavailable では開閉を読めないため、この規則を根拠に「閉」を Low confidence の
+    /// `HeuristicDefault` として記録する（`reset_stale_ime_on_for_imm_broken` の ON 版と対）。
+    /// ユーザー意図は偽装せず、`desired_open` も書き換えない。明示操作・より強い観測が
+    /// 後から届けばそちらが優先される。
+    pub(crate) fn assume_closed_for_new_thread(
+        &mut self,
+        profile: ImePolicyProfile,
+        tick_ms: TickMs,
+    ) {
+        if !self.belief.is_japanese_ime() {
+            return;
+        }
+        tracing::info!(
+            "new-thread entry: IME は閉で始まる（awase 起動後に作られたスレッド）→ \
+             安全デフォルト OFF を Low confidence observation として記録"
+        );
+        let focus_epoch = self.shadow_model.observations.current_fence().epoch;
+        self.dispatch_event(
+            ImeEvent::ObserverReported(
+                Observed::<evidence::HeuristicDefault>::at_startup(
+                    profile,
+                    false,
+                    HwndId::NULL,
+                    focus_epoch,
+                )
+                .into(),
+            ),
+            tick_ms,
+        );
+    }
+
     pub(crate) fn set_is_japanese_ime(&mut self, value: bool) {
         self.belief.is_japanese_ime = value;
+    }
+
+    /// ADR-223 段階 1: 打鍵の取り込み時に読んだ入力言語で `is_japanese_ime` を更新する。
+    /// 不明(`None`)・同じ値なら何もしない。値が変わったら `true` を返す(呼び出し側が読み直しを 1 回だけ予約する)。
+    pub(crate) fn observe_layout_language(&mut self, read: Option<bool>) -> bool {
+        match read {
+            Some(japanese) if japanese != self.belief.is_japanese_ime => {
+                self.belief.is_japanese_ime = japanese;
+                true
+            }
+            _ => false,
+        }
     }
 
     pub(crate) fn set_prev_conversion_mode(&mut self, value: Option<u32>) {
@@ -1185,7 +1451,7 @@ impl ImeStateHub {
     /// (ADR-087 §5 Phase 1' 配線、BUG-51 追補 v3)。
     ///
     /// `dispatch_event` の `UserImeSetIntent` 分岐で record しないのは、
-    /// `Command` ソースが conv 由来の内部同期（`EngineSync::DirectInput`）でも
+    /// `Command` ソースが conv 由来の内部同期（`EngineSync::DirectInput`（ADR-185で撤去済み））でも
     /// dispatch されるため。呼び出してよいのは以下の3箇所のみ:
     /// - `write_sync_key` / `write_physical_key`（物理 IME キーの shadow toggle。
     ///   `IntentWitness` が「注入されていない実キーイベント」を型で要求する）
@@ -1324,7 +1590,7 @@ impl ImeStateHub {
         reason: crate::state::conv_classify::ConvSyncReason,
         tick_ms: TickMs,
     ) {
-        log::debug!("[conv-open-inference] reason={reason:?} open={open}");
+        tracing::debug!("[conv-open-inference] reason={reason:?} open={open}");
         let focus_epoch = self.shadow_model.observations.current_fence().epoch;
         self.dispatch_event(
             ImeEvent::ObserverReported(
@@ -1349,12 +1615,6 @@ impl ImeStateHub {
 
     pub(crate) fn clear_last_intent_for_test(&mut self) {
         self.shadow_model.last_intent = None;
-    }
-
-    /// 現在呼び出し元がないが診断用アクセサとして残す。
-    #[allow(dead_code)]
-    pub(crate) fn last_intent_source(&self) -> Option<UserIntentSource> {
-        self.shadow_model.last_intent.as_ref().map(|i| i.source)
     }
 }
 
@@ -1431,35 +1691,16 @@ pub(crate) struct GateStore {
     pub post_bypass: ScopedOneShot<crate::win32::ForegroundScope, PostBypassArm>,
     /// IME 同期キー直後のキー保留バッファ（旧 `ime_gate`）。
     pub sync_key_gate: SyncKeyGate,
-    /// 今回の左Shift downが単独タップ候補か（`kp_stage_shift_conv_guard`）。
+    /// 左右Shift単独タップによる「IME-ON 半角英数」持続トグルの全状態
+    /// （旧 `left_shift_tap_candidate`/`right_shift_tap_candidate`/
+    /// `shift_conv_guard_pending`/`half_width_alnum_toggle_active` の4
+    /// フィールドと、旧 `Runtime::half_width_alnum_toggle_policy` を統合）。
     ///
-    /// 左Shift KeyDownでtrueにセットし、Shift保持中に`VK_LSHIFT`/`VK_RSHIFT`以外の
-    /// 非注入物理KeyDownが来たらfalseに倒す（チョード判定）。左Shift KeyUp時に
-    /// これがtrueのままなら「本物の単独タップ」として半角英数トグルの対象にする。
-    pub left_shift_tap_candidate: bool,
-    /// 今回の右Shift downが単独タップ候補か（`kp_stage_shift_conv_guard`）。
-    /// `left_shift_tap_candidate` と対称の判定（右Shift版）。BUG-25追補9で
-    /// 左Shiftチョード（Shift+文字で大文字を打つ）の途中解放がトグルを
-    /// 誤って解除しないよう修正した際、右Shift側にも同じ区別が必要になった
-    /// （右Shift単独タップ＝緊急解除、右Shiftチョード＝トグル持続）。
-    pub right_shift_tap_candidate: bool,
-    /// 今回のShift downに対応する復元処理が必要か（`kp_stage_shift_conv_guard`）。
-    ///
-    /// Shift KeyDownで awase が conv=0x00000000（IME-ON 半角英数）へ切り替えたとき
-    /// true。Shift KeyUpで`std::mem::take`し、trueならKeyUp側の復元/トグル判定を
-    /// 走らせる。**`half_width_alnum_toggle_active`とは独立**（トグルON中の
-    /// Shift downでも必ずtrueにする——立てないとKeyUp側でトグルOFF/右Shift緊急解除が
-    /// 発火しなくなる、2026-07-11 codexレビューで発覚）。
-    pub shift_conv_guard_pending: bool,
-    /// 左Shift単独タップによる「IME-ON半角英数」持続トグルが有効か。
-    ///
-    /// `shift_conv_guard_pending`と違い、Shift keyup後も左Shiftの次の単独タップ
-    /// （または右Shiftタップ/フォーカス変更による緊急解除）まで true であり続ける。
-    /// true の間、`platform_state.ime.input_mode()`はObservedEisuへ誘導され
-    /// Engineが`Inactive(NotRomajiInput)`で素通りになる（IMEはbelief上ONのまま）。
-    /// idle-conv-check / ime_refresh の OS poll を凍結する（`shift_conv_guard_pending`
-    /// と同じ理由: conv=0x0000は awase自身の意図的な状態のため）。
-    pub half_width_alnum_toggle_active: bool,
+    /// `HalfWidthAlnumState` のフィールドは private。読み書きは
+    /// `state/half_width_alnum.rs` のメソッド経由に限定する
+    /// （`tests/architecture_guard.rs` が生フィールド名の本番出現数を
+    /// 0 に固定する）。
+    pub half_width_alnum: crate::state::half_width_alnum::HalfWidthAlnumState,
     /// `kp_stage_idle_conv_check` の conv 読み取り（offload 済み、`SendMessageTimeoutW`
     /// ベース）が in-flight かどうか。spawn 時の `hook::current_tick_ms()` を持つ
     /// （BUG-34 横展開レビュー指摘: 単なる bool だと、完了時に `with_app` が
@@ -1475,6 +1716,9 @@ pub(crate) struct GateStore {
     /// [`IDLE_CONV_CHECK_IN_FLIGHT_STALE_MS`] を超えていれば in-flight とはみなさず
     /// 新規 spawn を許可する（完了取りこぼし時の自己回復）。
     pub idle_conv_check_in_flight_since_ms: Option<u64>,
+    /// BUG-173追補: `shadow_action` を持つ IME 系キーの最初の KeyDown の配送結果（scan_code, Suppress したか）。
+    /// KeyUp を Down に揃えるためのラッチ（`key_effect_runtime::keyup_follows_keydown`）。
+    pub shadow_key_down_disposition: Vec<(awase::types::ScanCode, bool)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1497,11 +1741,9 @@ impl GateStore {
             last_hook_activity_ms: 0,
             post_bypass: ScopedOneShot::new(),
             sync_key_gate: SyncKeyGate::new(),
-            left_shift_tap_candidate: false,
-            right_shift_tap_candidate: false,
-            shift_conv_guard_pending: false,
-            half_width_alnum_toggle_active: false,
+            half_width_alnum: crate::state::half_width_alnum::HalfWidthAlnumState::default(),
             idle_conv_check_in_flight_since_ms: None,
+            shadow_key_down_disposition: Vec::new(),
         }
     }
 }
@@ -1523,6 +1765,8 @@ impl Default for GateStore {
 pub(crate) struct KeymapStore {
     /// 現在のフォーカスアプリに適用されるキーマップルール
     pub active_keymaps: crate::keymap::KeymapTable,
+    /// `[[keymap]]` の KeyUp 回収・自動リピート抑制用 latch（ADR-114 決定4）
+    pub keymap_latch: crate::state::keymap_latch::KeymapLatch,
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1597,6 +1841,36 @@ mod tests {
         ps
     }
 
+    /// `HubClock` が `Instant` の供給元になっている: 手動時計を進めた量だけ、`dispatch_event` が
+    /// 付ける `EventTime::monotonic` が進む（壁時計を読んでいれば実測の数 µs しか進まない）。
+    #[test]
+    fn manual_hub_clock_drives_event_monotonic() {
+        let mut ps = ps_with_shadow(true, None, true);
+        ps.ime.clock = crate::state::hub_clock::HubClock::manual(10_000);
+        ps.ime.dispatch_event(
+            ImeEvent::UserImeSetIntent {
+                target: true,
+                source: UserIntentSource::Command,
+            },
+            TickMs(ps.ime.clock.now_tick()),
+        );
+        ps.ime.clock.advance_ms(500);
+        ps.ime.dispatch_event(
+            ImeEvent::UserImeSetIntent {
+                target: false,
+                source: UserIntentSource::Command,
+            },
+            TickMs(ps.ime.clock.now_tick()),
+        );
+        let recent = ps.ime.event_log.recent_vec(2);
+        let (newer, older) = (recent[0].time, recent[1].time);
+        assert_eq!(
+            newer.monotonic - older.monotonic,
+            std::time::Duration::from_millis(500)
+        );
+        assert_eq!(newer.tick_ms - older.tick_ms, 500);
+    }
+
     // reset_stale_ime_on_for_imm_broken も同様に desired_open を書き換えない。
     #[test]
     fn imm_broken_reset_does_not_touch_desired_open() {
@@ -1613,46 +1887,109 @@ mod tests {
         );
     }
 
-    // ── handle_engine_set_open: focus_transition_was_pending フィルタ ──
-    //
-    // 2026-07-05: Alt+Tab 中の中間ウィンドウ（Alt+Tab スイッチャー等）への一瞬の
-    // フォーカスで Engine が SetOpen を発行し、それが最終的な着地先ウィンドウとは
-    // 無関係な SendInput として実行され、belief と実IME状態が乖離するバグの修正。
-
-    // focus_transition_was_pending=true の場合、SetOpen 要求はフィルタされ
-    // desired_open/last_explicit_ime_action_ms は変化しない。
     #[test]
-    fn handle_engine_set_open_filters_when_focus_transition_was_pending() {
-        let mut ps = ps_with_shadow(false, Some(UserIntentSource::SyncKey), true);
-        let applied = ps.ime.handle_engine_set_open(
-            true,
-            false,
-            true,
-            ApplyGeneration::new(1).unwrap(),
-            TickMs(0),
-        );
-        assert!(!applied, "focus transition pending 中は適用されない");
+    fn new_thread_assumption_makes_effective_open_false_without_changing_desired() {
+        let mut ps = ps_with_shadow(true, None, true);
+
+        ps.ime
+            .assume_closed_for_new_thread(ImePolicyProfile::Imm32Unavailable, TickMs(100));
+
+        assert!(!ps.ime.effective_open_at(TickMs(100)));
         assert!(
-            !ps.ime.model().desired_open(),
-            "フィルタされた SetOpen は desired_open を書き換えない"
+            ps.ime.model().desired_open(),
+            "HeuristicDefault OFF は desired_open を書き換えない"
+        );
+        assert_eq!(
+            ps.ime.explicit_intent(),
+            None,
+            "HeuristicDefault OFF は last_intent を作らない"
         );
     }
 
-    // focus_transition_was_pending=false なら通常通り適用される（回帰防止）。
+    #[test]
+    fn new_thread_assumption_yields_to_last_intent() {
+        let mut ps = ps_with_shadow(true, Some(UserIntentSource::Command), true);
+
+        ps.ime
+            .assume_closed_for_new_thread(ImePolicyProfile::Imm32Unavailable, TickMs(100));
+
+        assert!(ps.ime.effective_open_at(TickMs(100)));
+        assert_eq!(ps.ime.explicit_intent(), Some(true));
+    }
+
+    #[test]
+    fn new_thread_assumption_yields_to_intent_store() {
+        let mut ps = PlatformState::new();
+        ps.ime.belief.is_japanese_ime = true;
+        dispatch_focus_changed(&mut ps, TARGET_HWND, 1, 0);
+        dispatch_and_record_explicit_intent(&mut ps, true, 100);
+        // last_intent と観測を消し、IntentStore だけを優先根拠として残す。
+        dispatch_focus_changed(&mut ps, TARGET_HWND, 2, 200);
+        assert_eq!(ps.ime.explicit_intent(), None);
+
+        ps.ime
+            .assume_closed_for_new_thread(ImePolicyProfile::Imm32Unavailable, TickMs(300));
+
+        assert!(ps.ime.effective_open_at(TickMs(300)));
+    }
+
+    #[test]
+    fn new_thread_assumption_does_nothing_for_non_japanese_ime() {
+        let mut ps = ps_with_shadow(true, None, false);
+
+        ps.ime
+            .assume_closed_for_new_thread(ImePolicyProfile::Imm32Unavailable, TickMs(100));
+
+        assert!(ps.ime.effective_open_at(TickMs(100)));
+        assert!(ps.ime.model().desired_open());
+        assert_eq!(ps.ime.explicit_intent(), None);
+        assert!(
+            ps.ime
+                .shadow_model
+                .observations
+                .per_source
+                .heuristic_default
+                .is_none(),
+            "日本語 IME でなければ HeuristicDefault を記録しない"
+        );
+    }
+
+    // ── handle_engine_set_open: settle 中の明示操作は落とさない（ADR-213 P2d-2）──
+    //
+    // 2026-07-05 に「Alt+Tab 中間窓で Engine の自動遷移が未確定 belief から書く」対策として
+    // 入れた focus_transition_was_pending フィルタは、自動遷移（ActivationSync）の撤去（P2c）後は
+    // settle 中の明示操作（Ctrl+変換等）を黙って捨てるだけになり、実測（Chrome×GJI・MS-IME が
+    // settle 約20ms後の書き込みを受け付ける）で撤去した。settle 中でも belief を書いて適用する。
+    #[test]
+    fn handle_engine_set_open_applies_even_while_focus_transition_settling() {
+        let mut ps = ps_with_shadow(false, Some(UserIntentSource::SyncKey), true);
+        // 将来に開始する barrier: settle_until が必ず now より先になり、settling が確実に true。
+        let started_at = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        ps.ime
+            .try_set_focus_transition_barrier(HwndId::NULL, started_at);
+        assert!(
+            ps.ime
+                .is_focus_transition_settling(std::time::Instant::now()),
+            "前提: settle 中"
+        );
+        let applied =
+            ps.ime
+                .handle_engine_set_open(true, false, ApplyGeneration::new(1).unwrap(), TickMs(0));
+        assert!(applied, "settle 中の明示操作 SetOpen も適用される");
+        assert!(
+            ps.ime.model().desired_open(),
+            "settle 中でも desired_open を書く（belief と実書き込みの非対称を作らない）"
+        );
+    }
+
+    // settle 外でも通常通り適用される。
     #[test]
     fn handle_engine_set_open_applies_when_focus_transition_not_pending() {
         let mut ps = ps_with_shadow(false, Some(UserIntentSource::SyncKey), true);
-        let applied = ps.ime.handle_engine_set_open(
-            true,
-            false,
-            false,
-            ApplyGeneration::new(1).unwrap(),
-            TickMs(0),
-        );
-        assert!(
-            applied,
-            "focus transition が pending でなければ通常通り適用される"
-        );
+        let applied =
+            ps.ime
+                .handle_engine_set_open(true, false, ApplyGeneration::new(1).unwrap(), TickMs(0));
+        assert!(applied);
         assert!(ps.ime.model().desired_open());
     }
 
@@ -1704,6 +2041,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn not_owned_releases_pending_without_mirroring_applied() {
+        let mut ps = PlatformState::new();
+        ps.ime.dispatch_event(
+            ImeEvent::ImeApplyRequested {
+                target: true,
+                generation: ApplyGeneration::new(5).unwrap(),
+                ctrl_held: false,
+            },
+            TickMs(0),
+        );
+
+        let accepted = ps.ime.record_ime_apply_result(
+            true,
+            awase::platform::ImeOpenOutcome::NotOwned,
+            Some(ApplyGeneration::new(5).unwrap()),
+            100,
+        );
+
+        assert_eq!(accepted, ImeApplyAcceptance::NotSent);
+        assert!(ps.ime.model().pending_generation().is_none());
+        assert!(
+            ps.ime.model().applied.applied_open().is_none(),
+            "InputRelay では送っていないため applied はミラーリングしない"
+        );
+    }
+
     /// generation が一致しない UnsafeToToggle 完了は、他の outcome と同様
     /// stale として無視され pending に触れない。
     #[test]
@@ -1734,29 +2098,21 @@ mod tests {
         );
     }
 
-    // 既存の CtrlImeChord フィルタが、focus_transition フィルタ追加後も
+    // 既存の CtrlImeChord フィルタが、settle フィルタの有無によらず
     // 引き続き機能することを確認する回帰テスト。
     #[test]
     fn handle_engine_set_open_ctrl_chord_filter_still_works() {
         let mut ps = ps_with_shadow(true, Some(UserIntentSource::SyncKey), true);
         // 1 回目: IME OFF 要求 + Ctrl 押下中 → chord transaction 開始。
-        let first = ps.ime.handle_engine_set_open(
-            false,
-            true,
-            false,
-            ApplyGeneration::new(1).unwrap(),
-            TickMs(0),
-        );
+        let first =
+            ps.ime
+                .handle_engine_set_open(false, true, ApplyGeneration::new(1).unwrap(), TickMs(0));
         assert!(first, "chord を開始する最初の要求は適用される");
         assert!(ps.ime.is_ctrl_ime_chord_active());
         // 2 回目: chord transaction 中の二次 IME OFF 要求 → フィルタされる。
-        let second = ps.ime.handle_engine_set_open(
-            false,
-            true,
-            false,
-            ApplyGeneration::new(2).unwrap(),
-            TickMs(0),
-        );
+        let second =
+            ps.ime
+                .handle_engine_set_open(false, true, ApplyGeneration::new(2).unwrap(), TickMs(0));
         assert!(
             !second,
             "chord transaction 中の二次 IME OFF 要求はフィルタされる"
@@ -1820,7 +2176,6 @@ mod tests {
         let applied = ps.ime.handle_engine_set_open(
             false,
             false,
-            false,
             ApplyGeneration::new(1).unwrap(),
             TickMs(9_999),
         );
@@ -1833,94 +2188,22 @@ mod tests {
         );
     }
 
-    // ── handle_engine_activation_sync（BUG-48）: handle_engine_set_open と同じ
-    //    filter を独立に実装しているため、乖離を検知できるよう同型のテストを鏡写しで
-    //    用意する（Opus レビュー 2026-08-04 で「コピペされた filter に対応テストが
-    //    無く、2つの実装が乖離しても気づけない」と指摘された）。
+    // ── release_panic_reset_guard_on_positive_evidence（ADR-213 P2d-1）: ──
+    // conv 観測由来の engine ON 同期は PanicReset ガードだけを外し、
+    // last_intent/desired_open/IntentStore は書かない。
 
     #[test]
-    fn handle_engine_activation_sync_filters_when_focus_transition_was_pending() {
-        let mut ps = ps_with_shadow(false, Some(UserIntentSource::SyncKey), true);
-        let applied = ps.ime.handle_engine_activation_sync(
-            true,
-            false,
-            true,
-            ApplyGeneration::new(1).unwrap(),
-            TickMs(0),
-        );
-        assert!(!applied, "focus transition pending 中は適用されない");
-        assert!(
-            !ps.ime.model().desired_open(),
-            "フィルタされた ActivationSync は desired_open を書き換えない \
-             (そもそも desired_open は書き換えない設計だが、フィルタされた場合も \
-             念のため確認する)"
-        );
-    }
-
-    #[test]
-    fn handle_engine_activation_sync_applies_when_focus_transition_not_pending() {
-        let mut ps = ps_with_shadow(false, None, true);
-        let applied = ps.ime.handle_engine_activation_sync(
-            true,
-            false,
-            false,
-            ApplyGeneration::new(1).unwrap(),
-            TickMs(0),
-        );
-        assert!(
-            applied,
-            "focus transition が pending でなければ通常通り適用される"
-        );
-    }
-
-    #[test]
-    fn handle_engine_activation_sync_ctrl_chord_filter_still_works() {
-        let mut ps = ps_with_shadow(false, None, true);
-        // 1 回目: ActivationSync による IME OFF 要求 + Ctrl 押下中 → chord transaction 開始。
-        let first = ps.ime.handle_engine_activation_sync(
-            false,
-            true,
-            false,
-            ApplyGeneration::new(1).unwrap(),
-            TickMs(0),
-        );
-        assert!(first, "chord を開始する最初の要求は適用される");
-        assert!(ps.ime.is_ctrl_ime_chord_active());
-        // 2 回目: chord transaction 中の二次 IME OFF 要求 → フィルタされる。
-        let second = ps.ime.handle_engine_activation_sync(
-            false,
-            true,
-            false,
-            ApplyGeneration::new(2).unwrap(),
-            TickMs(0),
-        );
-        assert!(
-            !second,
-            "chord transaction 中の二次 IME OFF 要求はフィルタされる"
-        );
-    }
-
-    // handle_engine_set_open との核心的な違い: last_intent が既にある間は
-    // desired_open を一切書き換えない（BUG-48 修正の中心的な不変条件）。
-    #[test]
-    fn handle_engine_activation_sync_never_sets_last_intent_or_desired_open() {
+    fn release_panic_guard_never_sets_last_intent_or_desired_open() {
         let mut ps = ps_with_shadow(false, Some(UserIntentSource::PhysicalImeKey), true);
-        let applied = ps.ime.handle_engine_activation_sync(
-            true,
-            false,
-            false,
-            ApplyGeneration::new(1).unwrap(),
-            TickMs(0),
-        );
-        assert!(applied);
+        ps.ime.release_panic_reset_guard_on_positive_evidence();
         assert_eq!(
             ps.ime.model().last_intent.as_ref().map(|i| i.target),
             Some(false),
-            "ActivationSync はユーザーの明示的な OFF 意図 (last_intent) を上書きしない"
+            "PanicReset ガード解除はユーザーの明示的な OFF 意図 (last_intent) を上書きしない"
         );
         assert!(
             !ps.ime.model().desired_open(),
-            "ActivationSync は desired_open も一切書き換えない"
+            "PanicReset ガード解除は desired_open を書き換えない"
         );
         assert!(
             !ps.ime.effective_open(),
@@ -1928,33 +2211,40 @@ mod tests {
         );
     }
 
-    // 修正1a 回帰（BUG-51 追補 v3）: ActivationSync 経由（conv 由来の RomajiRecovered
-    // 相当）は last_intent/desired_open だけでなく IntentStore にも記録されない
-    // こと。v1 のままだと DirectInput/RomajiRecovered が UserImeSetIntent{Command}
-    // を dispatch し IntentStore に「壊れた conv 読み由来の偽の明示意図」が
-    // FocusChanged を生き延びて残ってしまっていた（pre-mortem #1 角度2）。
     #[test]
-    fn handle_engine_activation_sync_does_not_record_intent_store_entry() {
+    fn release_panic_guard_removes_only_panic_reset_reason() {
+        let mut ps = PlatformState::new();
+        let guard = |reason| ForceGuard {
+            reason,
+            expires_at: None,
+            generation: 0,
+        };
+        ps.ime
+            .shadow_model
+            .force_guards
+            .add(guard(ForceOnReason::PanicReset));
+        ps.ime
+            .shadow_model
+            .force_guards
+            .add(guard(ForceOnReason::ProfilePolicy));
+        ps.ime.release_panic_reset_guard_on_positive_evidence();
+        assert_eq!(
+            ps.ime.shadow_model.force_guards.active_reason(),
+            Some(ForceOnReason::ProfilePolicy),
+            "PanicReset だけが外れ、ProfilePolicy ガードは残る"
+        );
+    }
+
+    #[test]
+    fn release_panic_guard_does_not_record_intent_store_entry() {
         let mut ps = PlatformState::new();
         dispatch_focus_changed(&mut ps, TARGET_HWND, 1, 0);
-        let applied = ps.ime.handle_engine_activation_sync(
-            true,
-            false,
-            false,
-            ApplyGeneration::new(1).unwrap(),
-            TickMs(0),
-        );
-        assert!(applied);
-        // IntentStore にエントリが無いことを直接確認する:
-        // conv 観測が effective_open() を反転させても、IntentStore 側からの
-        // 上書きは発生しない（= 生の shadow_model の値がそのまま反映される）。
+        ps.ime.release_panic_reset_guard_on_positive_evidence();
         dispatch_conv_open_inference(&mut ps, true, 100);
         assert_eq!(
             ps.ime.effective_open_at(TickMs(100)),
             ps.ime.model().effective_open(),
-            "ActivationSync は IntentStore に記録しないため、hub 版と生の \
-             ImeModel 版の effective_open() は一致し続ける（IntentStore 由来の \
-             上書きが存在しないことの証拠）"
+            "IntentStore に記録しないため、hub 版と生の ImeModel 版の effective_open() は一致し続ける"
         );
     }
 
@@ -1987,26 +2277,21 @@ mod tests {
         );
     }
 
-    // BUG-19 再発の実ログ相当: last_intent=Some(false) (explicit_intent==desired) なので
-    // threshold=0 となり、conv の一発観測直後でも正しい方向 (false の再送) が返る。
+    // BUG-173 追補3（D4）: conv 由来の open 推論は、明示意図（ユーザーの IME OFF）と食い違っても drift correction を
+    // 発火させない（旧: BUG-19 再発対策として threshold=0 で即時に false を再送していた）。GJI×TsfNative では IME を
+    // 閉じても conv の NATIVE が残り、この推測は `VK_IME_OFF` を何度送っても収束しなかった。
     #[test]
-    fn check_drift_correction_fires_immediately_when_explicit_off_intent_conflicts_with_conv_inference(
-    ) {
+    fn check_drift_correction_ignores_conv_inference_even_when_explicit_off_intent_conflicts() {
         let mut ps = ps_with_shadow(false, Some(UserIntentSource::PhysicalImeKey), true);
         ps.ime
             .report_conv_open_inference(true, ConvSyncReason::NativeToggleShadowOff, TickMs(0));
         let now = std::time::Instant::now();
         let explicit_intent = ps.ime.explicit_intent();
-        match ps.ime.check_drift_correction(now, explicit_intent) {
-            Some((desired, observed, _dur_ms)) => {
-                assert!(!desired, "desired は false のまま保持されている");
-                assert!(observed, "conv 推論が observed=true として記録されている");
-            }
-            None => panic!(
-                "explicit intent が desired と一致する場合は即時 (threshold=0) で \
-                 補正が返るべき"
-            ),
-        }
+        assert_eq!(
+            ps.ime.check_drift_correction(now, explicit_intent),
+            None,
+            "conv 推論だけを根拠にした drift は、明示意図があっても補正を発火させない"
+        );
     }
 
     // 明示意図が一度も無い（起動直後等）状態では、conv 推論単独で drift correction
@@ -2050,33 +2335,81 @@ mod tests {
         );
     }
 
-    // GJI 候補ポップアップの観測が古くなった場合 (DRIFT_CORRECTION_OBS_MAX_AGE_MS 超過)
-    // は、明示意図があっても採用しない（BUG-20 の max_age ガードが ConvOpenInference
-    // にも同じく効くことの確認）。
+    // BUG-110 追補7（issue #189）: `HeuristicDefault`（観測ゼロの安全デフォルト）も
+    // （当時の `ConvOpenInference` と全く同じ理由で）、明示意図が無い間は単独で drift
+    // correction を発火させない。拡張前は、Word 等で明示 OFF → Chrome へ
+    // フォーカス移動 → `reset_stale_ime_on_for_imm_broken` が `HeuristicDefault(true)`
+    // を記録、という経路で `check_drift_correction` が
+    // `Some(desired:false, observed:true)` を返し、（撤去済みの）`apply_force_on_for_imm_broken`
+    // （`effective_open()` 経由で同じ `HeuristicDefault` を信頼して ON を送っていた）と
+    // 反対方向に競合し、短時間の ON/OFF 往復を起こしていた。
     #[test]
-    fn check_drift_correction_ignores_stale_conv_inference_beyond_max_age() {
-        let mut ps = ps_with_shadow(false, Some(UserIntentSource::PhysicalImeKey), true);
+    fn check_drift_correction_ignores_heuristic_default_alone_without_explicit_intent() {
+        let mut ps = PlatformState::new();
+        ps.ime.belief.is_japanese_ime = true;
+        // Word 相当のウィンドウで明示 OFF。
+        dispatch_focus_changed(&mut ps, TARGET_HWND, 1, 0);
         ps.ime
-            .report_conv_open_inference(true, ConvSyncReason::NativeToggleShadowOff, TickMs(0));
-        let stale_at = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_millis(
-                crate::tuning::DRIFT_CORRECTION_OBS_MAX_AGE_MS + 200,
-            ))
-            .expect("test instant can be backdated");
+            .write_sync_key(sync_key_witness(), false, TickMs(100));
+        // Chrome 相当の別ウィンドウへフォーカス移動
+        // （last_intent クリア、対象 hwnd 向けの IntentStore エントリも無い）。
+        // 注（opus-adversarial-consult S3）: `dispatch_focus_changed` ヘルパは
+        // `ImePolicyProfile::TsfNative` 固定で、下の
+        // `reset_stale_ime_on_for_imm_broken` には別途 `Imm32Unavailable` を
+        // 渡している——実際の Chrome 入場（`AppKind: TsfNative` かつ
+        // Imm32Unavailable 扱い）を厳密に再現してはいないが、
+        // `check_drift_correction` は `app_policy` を読まないため本テストの
+        // 検証内容には影響しない。
+        let other_hwnd = HwndId(0x5678);
+        dispatch_focus_changed(&mut ps, other_hwnd, 2, 200);
+        assert!(
+            !ps.ime.effective_open_at(TickMs(200)),
+            "生の desired_open() フォールバックにより false のまま"
+        );
+
         ps.ime
+            .reset_stale_ime_on_for_imm_broken(ImePolicyProfile::Imm32Unavailable, TickMs(300));
+
+        // opus-adversarial-consult S1: `reset_stale_ime_on_for_imm_broken` には
+        // 4つの早期 return があり、将来そのいずれかが誤って成立すると
+        // `HeuristicDefault` が一切記録されなくなる。その場合
+        // `most_recent_trusted()` が `None` を返し、`check_drift_correction` は
+        // 新ガード（本テストが検証したい箇所）より手前の別の分岐で `None` に
+        // なってしまい、テストは「間違った理由で」緑のままになる。観測が
+        // 実際に記録されたことを積極的にアサートしてこれを防ぐ。
+        let recorded = ps
+            .ime
             .shadow_model
             .observations
             .per_source
-            .conv_open_inference
-            .as_mut()
-            .unwrap()
-            .at = stale_at;
+            .heuristic_default
+            .as_ref()
+            .expect("reset_stale_ime_on_for_imm_broken が HeuristicDefault を記録しているはず");
+        assert!(
+            recorded.open,
+            "HeuristicDefault の安全デフォルトは常に true"
+        );
+        assert!(
+            !ps.ime.shadow_model.desired_open(),
+            "desired_open は Word での明示 OFF のまま false（observed との食い違いが本題）"
+        );
+
+        // 明示意図なしでは閾値が DRIFT_CORRECTION_THRESHOLD_MS になる
+        // （ConvOpenInference のテストと同様、実 sleep を避けるためバックデートする）。
+        ps.ime.shadow_model.observations.drift = Some(ImeDrift {
+            started_at: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(
+                    crate::tuning::DRIFT_CORRECTION_THRESHOLD_MS + 50,
+                ))
+                .expect("test instant can be backdated"),
+        });
         let now = std::time::Instant::now();
         let explicit_intent = ps.ime.explicit_intent();
+        assert_eq!(explicit_intent, None);
         assert_eq!(
             ps.ime.check_drift_correction(now, explicit_intent),
             None,
-            "max_age を超えた観測は無視される"
+            "明示意図なしでは HeuristicDefault 単独で補正を発火させない（issue #189）"
         );
     }
 
@@ -2123,6 +2456,21 @@ mod tests {
         );
     }
 
+    /// 強い（High）open 観測を1件流し込む（IMM 直接読み取り相当）。テスト専用の再生口
+    /// （`AnyObservation::restored_from_journal`）を使う。
+    fn write_open_observation_high(ps: &mut PlatformState, open: bool, tick_ms: u64) {
+        ps.ime.dispatch_event(
+            ImeEvent::ObserverReported(evidence::AnyObservation::restored_from_journal(
+                open,
+                ObservationSource::ImmGetOpenStatus,
+                TARGET_HWND,
+                ObservationConfidence::High,
+                1,
+            )),
+            TickMs(tick_ms),
+        );
+    }
+
     /// `IntentWitness`（ADR-089 §2.2）を作るための「注入されていない実キー
     /// イベント」。`write_sync_key` / `write_physical_key` は witness 無しには
     /// 呼べないため、テストからもこの経路を通す。
@@ -2132,6 +2480,8 @@ mod tests {
             ShadowImeAction, VkCode,
         };
         awase::types::RawKeyEvent {
+            was_down: false,
+            press_id: None,
             vk_code: VkCode(0xF2),
             scan_code: ScanCode(0),
             event_type: KeyEventType::KeyDown,
@@ -2145,9 +2495,13 @@ mod tests {
                 is_sync_key: true,
                 sync_direction: Some(ShadowImeAction::TurnOff),
                 is_ime_control: false,
+                is_ime_mode_key: false,
+                layout_japanese: None,
             },
             modifier_key: None,
             modifier_snapshot: ModifierState::default(),
+            left_thumb_down_snapshot: None,
+            right_thumb_down_snapshot: None,
             injected: false,
         }
     }
@@ -2182,6 +2536,132 @@ mod tests {
         );
         ps.ime
             .record_explicit_intent(target, UserIntentSource::Command, TickMs(tick_ms));
+    }
+
+    impl PlatformState {
+        /// テスト専用: `align_after_expired_mode_key_pass` の scope 指定版。
+        fn align_after_expired_pass_for_test(
+            &mut self,
+            now_ms: u64,
+            scope: crate::win32::ForegroundScope,
+        ) -> bool {
+            self.ime
+                .align_after_expired_mode_key_pass_in_scope(now_ms, TickMs(now_ms), scope)
+        }
+    }
+
+    fn arm_mode_key_pass_mark_for_test(
+        ps: &mut PlatformState,
+        scope: crate::win32::ForegroundScope,
+        now_ms: u64,
+    ) {
+        ps.ime.mode_key_pass_mark.arm(scope, now_ms, true);
+    }
+
+    fn test_foreground_scope() -> crate::win32::ForegroundScope {
+        crate::win32::ForegroundScope {
+            pid: 42,
+            hwnd: 0x1234,
+        }
+    }
+
+    fn follow_fence() -> crate::state::probe_admission::AcceptedObservation {
+        crate::state::probe_admission::AcceptedObservation::for_sync(
+            crate::state::probe_admission::FocusFence {
+                epoch: 1,
+                hwnd: TARGET_HWND,
+            },
+        )
+    }
+
+    /// ADR-205 D2/D6: IntentStore に ON の意図がある状態で、監視窓の中の 1→0 を観測すると、意図を捨て desired を
+    /// 実状態へ揃え、`effective_open()` が false になる。追随時刻も記録する（GJI I/O 推測の柵に使う）。
+    #[test]
+    fn follow_external_change_closes_belief_even_with_explicit_on_intent() {
+        let mut ps = PlatformState::new();
+        dispatch_focus_changed(&mut ps, TARGET_HWND, 1, 0);
+        dispatch_and_record_explicit_intent(&mut ps, true, 100);
+        assert!(ps.ime.effective_open_at(TickMs(110)), "明示 ON 直後は true");
+        // awase 自身の直近の書き込みの記録は ON（追随後の実状態 OFF と食い違う → 未確認へ落ちる、D6）。
+        ps.ime.record_confirmed(true, 90);
+        assert!(ps.ime.model().applied_state().applied_open().is_some());
+        // arm 前の直近の読み（基準値になる）。窓が無いので追随しない。
+        assert_eq!(
+            ps.ime
+                .follow_external_change(Some(true), 900, TickMs(900), follow_fence()),
+            None
+        );
+        ps.ime.arm_external_change_watch(1000);
+        assert_eq!(
+            ps.ime
+                .follow_external_change(Some(false), 1032, TickMs(1032), follow_fence()),
+            Some(false)
+        );
+        assert!(
+            !ps.ime.effective_open_at(TickMs(1040)),
+            "IntentStore の ON の意図が残ると belief が ON のまま（ADR-205 R3-1）"
+        );
+        assert!(ps.ime.explicit_intent().is_none());
+        assert_eq!(ps.ime.last_external_change_ms(), 1032);
+        assert_eq!(
+            ps.ime.model().applied_state().applied_open(),
+            None,
+            "追随経路だけが食い違う applied を未確認へ落とす（demote_applied=true、GjiDirect の already-matched を防ぐ）"
+        );
+    }
+
+    /// 監視窓の外（arm していない・窓が切れた後）の読みの変化では追随しない。
+    #[test]
+    fn follow_external_change_ignores_reads_outside_the_window() {
+        let mut ps = PlatformState::new();
+        dispatch_focus_changed(&mut ps, TARGET_HWND, 1, 0);
+        dispatch_and_record_explicit_intent(&mut ps, true, 100);
+        let _ = ps
+            .ime
+            .follow_external_change(Some(true), 900, TickMs(900), follow_fence());
+        // arm していない
+        assert_eq!(
+            ps.ime
+                .follow_external_change(Some(false), 1032, TickMs(1032), follow_fence()),
+            None
+        );
+        // 窓が切れた後（arm 前の直近の読みを 1 にしてから arm し、窓内の最初の読みも 1 = 変化なし）
+        let _ = ps
+            .ime
+            .follow_external_change(Some(true), 1990, TickMs(1990), follow_fence());
+        ps.ime.arm_external_change_watch(2000);
+        let _ = ps
+            .ime
+            .follow_external_change(Some(true), 2010, TickMs(2010), follow_fence());
+        assert_eq!(
+            ps.ime.follow_external_change(
+                Some(false),
+                2000 + crate::tuning::MODE_KEY_PASS_MARK_WINDOW_MS + 1,
+                TickMs(2400),
+                follow_fence()
+            ),
+            None
+        );
+        assert!(ps.ime.effective_open_at(TickMs(2410)), "追随していない");
+        assert_eq!(ps.ime.last_external_change_ms(), 0);
+    }
+
+    /// 開く方向（0→1）も同じ規則で追随する（適用窓の GJI 限定は呼び出し側の `external_change_watch_applies`）。
+    #[test]
+    fn follow_external_change_opens_belief_on_zero_to_one() {
+        let mut ps = PlatformState::new();
+        dispatch_focus_changed(&mut ps, TARGET_HWND, 1, 0);
+        dispatch_and_record_explicit_intent(&mut ps, false, 100);
+        let _ = ps
+            .ime
+            .follow_external_change(Some(false), 900, TickMs(900), follow_fence());
+        ps.ime.arm_external_change_watch(1000);
+        assert_eq!(
+            ps.ime
+                .follow_external_change(Some(true), 1040, TickMs(1040), follow_fence()),
+            Some(true)
+        );
+        assert!(ps.ime.effective_open_at(TickMs(1050)));
     }
 
     /// 中核の回帰テスト: 明示 OFF → 同一対象への FocusChanged（last_intent 消失）→
@@ -2222,6 +2702,324 @@ mod tests {
         );
     }
 
+    /// 読めないアプリ（観測が来ない）で、起動直後の明示OFF意図が開閉の予測を無視させ続けない
+    /// （CI blind: `intent-store` の上書きが約30秒続き、予測でopenにしてもEngineが動かなかった）。
+    #[test]
+    fn key_effect_open_prediction_replaces_stale_explicit_off_intent() {
+        use crate::state::key_effect_predictor::{KeyTrack, PredictedEffect, Prediction, Stage};
+        let mut ps = PlatformState::new();
+        dispatch_focus_changed(&mut ps, TARGET_HWND, 1, 0);
+        dispatch_and_record_explicit_intent(&mut ps, false, 100);
+        assert!(!ps.ime.effective_open_at(TickMs(110)), "明示OFF直後はfalse");
+
+        let open = Prediction {
+            effect: PredictedEffect {
+                open: Some(true),
+                mode: None,
+            },
+            track: KeyTrack {
+                conv: None,
+                stage: Stage::None,
+            },
+        };
+        ps.ime.apply_key_effect_prediction(open, TickMs(120));
+        assert!(
+            ps.ime.effective_open_at(TickMs(130)),
+            "開閉の予測は、同じ対象の古い明示OFF意図（IntentStore）を置き換えてEngineへ効く"
+        );
+    }
+
+    /// 開閉を変えない予測（変換モードだけ等）は、明示意図を消さない。
+    #[test]
+    fn key_effect_prediction_without_open_keeps_explicit_intent() {
+        use crate::state::key_effect_predictor::{KeyTrack, PredictedEffect, Prediction, Stage};
+        let mut ps = PlatformState::new();
+        dispatch_focus_changed(&mut ps, TARGET_HWND, 1, 0);
+        dispatch_and_record_explicit_intent(&mut ps, false, 100);
+        let no_open = Prediction {
+            effect: PredictedEffect {
+                open: None,
+                mode: None,
+            },
+            track: KeyTrack {
+                conv: None,
+                stage: Stage::Typing,
+            },
+        };
+        ps.ime.apply_key_effect_prediction(no_open, TickMs(120));
+        assert!(
+            !ps.ime.effective_open_at(TickMs(130)),
+            "開閉を予測しない打鍵では、明示OFF意図は残る"
+        );
+    }
+
+    #[test]
+    fn mode_key_pass_invalidation_without_mark_keeps_intents() {
+        let mut ps = PlatformState::new();
+        dispatch_focus_changed(&mut ps, TARGET_HWND, 1, 0);
+        dispatch_and_record_explicit_intent(&mut ps, false, 100);
+        dispatch_conv_open_inference(&mut ps, true, 120);
+
+        assert!(
+            !ps.ime.invalidate_intents_if_mode_key_pass_live_in_scope(
+                130,
+                TickMs(130),
+                test_foreground_scope(),
+            ),
+            "通過マークがなければ何もしない"
+        );
+        assert_eq!(ps.ime.explicit_intent(), Some(false));
+        assert!(
+            !ps.ime.effective_open_at(TickMs(130)),
+            "IntentStore の OFF 意図も残る"
+        );
+    }
+
+    #[test]
+    fn mode_key_pass_invalidation_drops_intents_and_follows_observation_within_window() {
+        let mut ps = PlatformState::new();
+        let scope = test_foreground_scope();
+        dispatch_focus_changed(&mut ps, TARGET_HWND, 1, 0);
+        dispatch_and_record_explicit_intent(&mut ps, false, 100);
+        dispatch_conv_open_inference(&mut ps, true, 120);
+        assert!(
+            !ps.ime.effective_open_at(TickMs(120)),
+            "破棄前は IntentStore が観測 true より優先される"
+        );
+
+        arm_mode_key_pass_mark_for_test(&mut ps, scope, 125);
+        assert!(
+            ps.ime
+                .invalidate_intents_if_mode_key_pass_live_in_scope(140, TickMs(140), scope),
+            "live な通過マークは観測成功後に一回だけ消費される"
+        );
+        assert_eq!(ps.ime.explicit_intent(), None);
+        assert!(
+            ps.ime.effective_open_at(TickMs(140)),
+            "古い意図を捨てた後は観測 true に従う"
+        );
+        assert!(
+            ps.ime
+                .invalidate_intents_if_mode_key_pass_live_in_scope(141, TickMs(141), scope),
+            "窓の間はマークを消費せず、観測のたびに再読み取りを続ける(最初の観測が古い状態を読んでも取りこぼさない)"
+        );
+        // 通過より後に記録された意図は、2回目以降の観測で捨てない(意図の破棄は通過ごとに1回)。
+        dispatch_and_record_explicit_intent(&mut ps, false, 150);
+        assert!(
+            ps.ime
+                .invalidate_intents_if_mode_key_pass_live_in_scope(160, TickMs(160), scope),
+            "まだ有効"
+        );
+        assert_eq!(
+            ps.ime.explicit_intent(),
+            Some(false),
+            "通過より後に記録された明示意図は残る"
+        );
+        assert!(
+            !ps.ime.invalidate_intents_if_mode_key_pass_live_in_scope(
+                125 + crate::tuning::MODE_KEY_PASS_MARK_WINDOW_MS,
+                TickMs(500),
+                scope,
+            ),
+            "窓が切れたら止まる"
+        );
+    }
+
+    /// BUG-157 の回帰テスト: 起動直後のVK_IME_OFF（desired=false）の後、ユーザーのひらがなキーで
+    /// 実IMEが開いた。通過マークの観測がこれを確認したら、`desired_open`は開へ揃い、drift correction は
+    /// ユーザーの操作を閉じ直さない（修正前は desired=false のまま「観測 true ≠ desired false」で発火した）。
+    #[test]
+    fn mode_key_pass_observation_aligns_desired_so_drift_correction_does_not_revert_user_key() {
+        let mut ps = PlatformState::new();
+        let scope = test_foreground_scope();
+        dispatch_focus_changed(&mut ps, TARGET_HWND, 1, 0);
+        // 起動直後の明示OFF（スパイク/ユーザー）。desired=false、意図あり。
+        dispatch_and_record_explicit_intent(&mut ps, false, 100);
+        // ユーザーの物理ひらがな（通過）→ 実IMEが開き、強い観測（High、ImmCross読み取り）が届く。
+        arm_mode_key_pass_mark_for_test(&mut ps, scope, 125);
+        write_open_observation_high(&mut ps, true, 130);
+        assert!(ps
+            .ime
+            .invalidate_intents_if_mode_key_pass_live_in_scope(140, TickMs(140), scope));
+        assert!(
+            ps.ime.shadow_model.desired_open(),
+            "通過したモードキーの結果（開）を desired として採る"
+        );
+        // 乖離の継続時間が閾値を超えていても（drift.started_at をバックデートして模す）、
+        // 観測 == desired なので drift correction は発火しない（揃える前は desired=false ≠ 観測 true で発火した）。
+        ps.ime.shadow_model.observations.drift = Some(ImeDrift {
+            started_at: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(
+                    crate::tuning::DRIFT_CORRECTION_THRESHOLD_MS + 50,
+                ))
+                .expect("test instant can be backdated"),
+        });
+        let now = std::time::Instant::now();
+        assert!(
+            ps.ime
+                .check_drift_correction(now, ps.ime.explicit_intent())
+                .is_none(),
+            "揃った後は、観測 == desired なので drift correction は発火しない"
+        );
+    }
+
+    /// 観測が無い窓（読めない窓）では、通過マークがあっても `desired_open` を書かない。
+    #[test]
+    fn mode_key_pass_without_observation_keeps_desired() {
+        let mut ps = PlatformState::new();
+        let scope = test_foreground_scope();
+        dispatch_focus_changed(&mut ps, TARGET_HWND, 1, 0);
+        dispatch_and_record_explicit_intent(&mut ps, false, 100);
+        arm_mode_key_pass_mark_for_test(&mut ps, scope, 125);
+        assert!(ps
+            .ime
+            .invalidate_intents_if_mode_key_pass_live_in_scope(140, TickMs(140), scope));
+        assert!(
+            !ps.ime.shadow_model.desired_open(),
+            "観測が無ければ desired は書かない（awaseが最後に書こうとした意図のまま）"
+        );
+    }
+
+    /// awase が書いた意図（通過マーク無し）が実IMEに届かなかった場合は、従来どおり drift correction が
+    /// 訂正する（BUG-157 の修正が、この必要な訂正を止めない）。
+    #[test]
+    fn drift_correction_still_fires_for_awase_write_without_mode_key_pass() {
+        let mut ps = PlatformState::new();
+        dispatch_focus_changed(&mut ps, TARGET_HWND, 1, 0);
+        dispatch_and_record_explicit_intent(&mut ps, true, 100);
+        write_open_observation_high(&mut ps, false, 130);
+        let now = std::time::Instant::now();
+        let drift = ps.ime.check_drift_correction(now, ps.ime.explicit_intent());
+        assert!(
+            matches!(drift, Some(DriftCorrection { desired: true, observed: false, .. })),
+            "通過マークが無ければ desired（awaseの意図）と観測の乖離は従来どおり補正される: {drift:?}"
+        );
+    }
+
+    /// BUG-158: 通過マークの窓が切れても観測が一度も成功しなかったとき（読み取りが失敗し続ける環境）、
+    /// 古い明示意図を捨てる（捨てないと `reschedule_ime_refresh` の早期returnでポーリングが止まったままになる）。
+    #[test]
+    fn mode_key_pass_expiry_drops_intents_when_no_observation_succeeded() {
+        let mut ps = PlatformState::new();
+        let scope = test_foreground_scope();
+        dispatch_focus_changed(&mut ps, TARGET_HWND, 1, 0);
+        dispatch_and_record_explicit_intent(&mut ps, false, 100);
+        arm_mode_key_pass_mark_for_test(&mut ps, scope, 125);
+        let window = crate::tuning::MODE_KEY_PASS_MARK_WINDOW_MS;
+        // 窓の間は捨てない（観測の成功を待つ）。
+        assert!(!ps
+            .ime
+            .drop_intents_for_mode_key_pass_in_scope(140, TickMs(140), scope, true));
+        assert_eq!(ps.ime.explicit_intent(), Some(false));
+        // 窓が切れたら、観測が成功していなくても捨てる（一度だけ）。
+        assert!(ps.ime.drop_intents_for_mode_key_pass_in_scope(
+            125 + window,
+            TickMs(125 + window),
+            scope,
+            true
+        ));
+        assert_eq!(
+            ps.ime.explicit_intent(),
+            None,
+            "意図が残らないのでポーリングが再開する"
+        );
+        assert!(!ps.ime.drop_intents_for_mode_key_pass_in_scope(
+            126 + window,
+            TickMs(126 + window),
+            scope,
+            true
+        ));
+    }
+
+    /// 観測の成功で既に捨てた通過マークは、窓の終了で再度捨てない（通過より後の明示意図を守る）。
+    #[test]
+    fn mode_key_pass_expiry_does_nothing_after_successful_invalidation() {
+        let mut ps = PlatformState::new();
+        let scope = test_foreground_scope();
+        dispatch_focus_changed(&mut ps, TARGET_HWND, 1, 0);
+        dispatch_and_record_explicit_intent(&mut ps, false, 100);
+        arm_mode_key_pass_mark_for_test(&mut ps, scope, 125);
+        assert!(ps
+            .ime
+            .invalidate_intents_if_mode_key_pass_live_in_scope(140, TickMs(140), scope));
+        dispatch_and_record_explicit_intent(&mut ps, true, 150);
+        let window = crate::tuning::MODE_KEY_PASS_MARK_WINDOW_MS;
+        assert!(!ps.ime.drop_intents_for_mode_key_pass_in_scope(
+            125 + window,
+            TickMs(125 + window),
+            scope,
+            true
+        ));
+        assert_eq!(
+            ps.ime.explicit_intent(),
+            Some(true),
+            "通過より後の意図は残る"
+        );
+    }
+
+    /// BUG-158追補2: 通過→窓の間の観測は全て時間切れ（観測なし）→窓切れ→最初の成功観測で `desired_open` を揃える。
+    /// 揃えた後は通常の drift correction に戻る（2回目は揃えない）。
+    #[test]
+    fn align_after_expired_pass_aligns_once_on_first_successful_observation() {
+        let mut ps = PlatformState::new();
+        let scope = test_foreground_scope();
+        let window = crate::tuning::MODE_KEY_PASS_MARK_WINDOW_MS;
+        dispatch_focus_changed(&mut ps, TARGET_HWND, 1, 0);
+        dispatch_and_record_explicit_intent(&mut ps, false, 100);
+        arm_mode_key_pass_mark_for_test(&mut ps, scope, 125);
+        // 窓の間は観測が無い（全て時間切れ）。窓が切れて意図だけ捨てる（BUG-158）。
+        assert!(ps.ime.drop_intents_for_mode_key_pass_in_scope(
+            125 + window,
+            TickMs(125 + window),
+            scope,
+            true
+        ));
+        assert!(
+            !ps.ime.shadow_model.desired_open(),
+            "観測が無いので desired は古いまま"
+        );
+        // 窓が切れた後の最初の成功観測（実IMEは開）。
+        write_open_observation_high(&mut ps, true, 500);
+        assert!(ps.align_after_expired_pass_for_test(600, scope));
+        assert!(
+            ps.ime.shadow_model.desired_open(),
+            "最初の成功観測で desired を揃える"
+        );
+        // 通常の drift correction へ戻る: 2回目は揃えない。
+        write_open_observation_high(&mut ps, false, 900);
+        assert!(
+            !ps.align_after_expired_pass_for_test(1000, scope),
+            "通過につき1回だけ"
+        );
+        assert!(
+            ps.ime.shadow_model.desired_open(),
+            "2回目の観測では desired を動かさない"
+        );
+    }
+
+    /// 通過より後に awase 自身が書いた（`record_optimistic`）場合は揃えない（実IMEを信用せず drift correction が訂正する）。
+    #[test]
+    fn align_after_expired_pass_skips_when_awase_wrote_after_pass() {
+        let mut ps = PlatformState::new();
+        let scope = test_foreground_scope();
+        let window = crate::tuning::MODE_KEY_PASS_MARK_WINDOW_MS;
+        dispatch_focus_changed(&mut ps, TARGET_HWND, 1, 0);
+        dispatch_and_record_explicit_intent(&mut ps, false, 100);
+        arm_mode_key_pass_mark_for_test(&mut ps, scope, 125);
+        ps.ime.note_awase_write_for_mode_key_pass_in_scope(scope);
+        assert!(ps.ime.drop_intents_for_mode_key_pass_in_scope(
+            125 + window,
+            TickMs(125 + window),
+            scope,
+            true
+        ));
+        write_open_observation_high(&mut ps, true, 500);
+        assert!(
+            !ps.align_after_expired_pass_for_test(600, scope),
+            "awase が書いた後は揃えない"
+        );
+    }
+
     /// 対象が違えば IntentStore は効かない（ADR-087 INV-24(b) の2段判定、BUG-26 非退行）。
     /// 別ウィンドウへの本物のフォーカス変更では、そのウィンドウ自身の観測に従うべき。
     #[test]
@@ -2238,6 +3036,48 @@ mod tests {
             ps.ime.effective_open_at(TickMs(300)),
             "別ウィンドウへの本物のフォーカス変更では、IntentStore は別対象の \
              エントリを漏らさず、その対象の観測（true）に従う"
+        );
+    }
+
+    /// BUG-148/ADR-186 の回帰テスト: 起動時に既に前面にあるアプリでは、最初のプロセス
+    /// 切替（`FocusChanged`）が来なくても `current_focus` が設定され、明示意図が
+    /// `IntentStore` に記録される。
+    ///
+    /// 退行の証拠として「初期フォーカス未設定のままだと `record_explicit_intent` が
+    /// 空振りし、壊れた観測1件で effective_open が true に反転する」ことも固定する
+    /// （CI の E2E で委譲 SetOpen が全て Unwarranted になった機序）。
+    #[test]
+    fn initial_focus_hwnd_lets_explicit_intent_be_recorded_before_first_focus_change() {
+        // `UserImeSetIntent` はモデルの `last_intent` を書くため、`effective_open` は IntentStore に記録されなくても
+        // 直後は明示意図に固定される。IntentStore への記録の有無は、`FocusChanged`（`last_intent` をクリアする）の
+        // 後に観測が入ったときの `effective_open` で区別する（`effective_open_survives_focus_change_via_intent_store` と同じ観点）。
+
+        // 初期フォーカス未設定（BUG-148 の状態）: 意図が IntentStore に記録されず、FocusChanged で意図が消えると観測に従う。
+        let mut ps = PlatformState::new();
+        assert_eq!(ps.ime.model().current_focus(), None);
+        dispatch_and_record_explicit_intent(&mut ps, false, 100);
+        dispatch_focus_changed(&mut ps, TARGET_HWND, 1, 200);
+        dispatch_conv_open_inference(&mut ps, true, 300);
+        assert!(
+            ps.ime.effective_open_at(TickMs(300)),
+            "退行の証拠: current_focus=None のときは record_explicit_intent が空振りし、\
+             明示 OFF 意図が IntentStore に残らない"
+        );
+
+        // 起動時の初期フォーカスを確立した状態: 同じ操作で意図が IntentStore に保持される。
+        let mut ps = PlatformState::new();
+        ps.ime.dispatch_event(
+            ImeEvent::InitialFocusHwndEstablished { hwnd: TARGET_HWND },
+            TickMs(0),
+        );
+        assert_eq!(ps.ime.model().current_focus(), Some(TARGET_HWND));
+        dispatch_and_record_explicit_intent(&mut ps, false, 100);
+        dispatch_focus_changed(&mut ps, TARGET_HWND, 1, 200);
+        dispatch_conv_open_inference(&mut ps, true, 300);
+        assert!(
+            !ps.ime.effective_open_at(TickMs(300)),
+            "初期フォーカス確立後は明示 OFF 意図が IntentStore に記録され、\
+             open_warrant Step 1 の根拠になる"
         );
     }
 
@@ -2284,7 +3124,7 @@ mod tests {
 
     /// 修正1b 回帰: 生の `dispatch_event(UserImeSetIntent)` だけでは IntentStore に
     /// 記録されない（`record_explicit_intent` を経由しない限り）。v1 のままだと
-    /// `EngineSync::DirectInput`（conv 由来、`handle_engine_set_open` 経由で
+    /// `EngineSync::DirectInput`（ADR-185で撤去済み）（conv 由来、`handle_engine_set_open` 経由で
     /// `UserImeSetIntent{Command}` を dispatch する）が壊れた conv 読み1件を
     /// FocusChanged を生き延びる偽の明示意図として永続化してしまっていた
     /// （pre-mortem #1 角度2）。
@@ -2363,6 +3203,7 @@ mod tests {
                 input_mode: InputModeState::ObservedRomaji,
                 recorded_ms: 100,
                 from_explicit_off_intent: false,
+                hwnd: 0,
             }),
             TickMs(600),
         );
@@ -2387,6 +3228,7 @@ mod tests {
                 input_mode: InputModeState::ObservedRomaji,
                 recorded_ms: 500,
                 from_explicit_off_intent: false,
+                hwnd: 0,
             }),
             TickMs(600),
         );
@@ -2420,5 +3262,52 @@ mod tests {
             "IntentStore に有効な OFF エントリがある間は HeuristicDefault(ON) が \
              書かれず、effective_open() は false のまま"
         );
+    }
+
+    // ── ADR-158 TF1: ObservationSource の journal 記録経路 ─────────────────
+    //
+    // ADR-159段階0の当初計画は「JournalEntryに新しいバリアントを1〜2個追加する」
+    // だったが、着手時に確認したところ`ImeEvent::InputModeObserved`が既に
+    // `source: ObservationSource`をフィールドとして持ち、`dispatch_event`が
+    // 無条件で全ImeEventを`JournalEntry::ImeEvent`として記録している（単一の
+    // 合流点、上記`journal.record`呼び出し参照）ため、11バリアントすべてが
+    // 新しい機構なしで既にjournal化されていると判明した。このテストはその
+    // 事実を固定する回帰テストであり、将来`dispatch_event`の記録経路が
+    // 分岐・迂回された場合に検出する。
+
+    /// `InputModeObserved`を`dispatch_event`した場合、`ObservationSource`の値が
+    /// 欠落・置換されずにそのままjournalへ記録されることを確認する
+    /// （11バリアントのうち代表的な3つで検証、新規JournalEntryバリアントは不要）。
+    #[test]
+    fn dispatch_event_journals_observation_source_without_new_journal_entry_variant() {
+        for source in [
+            ObservationSource::Tsf,
+            ObservationSource::GjiIoInference,
+            ObservationSource::HeuristicDefault,
+        ] {
+            let mut ps = PlatformState::new();
+            ps.ime.dispatch_event(
+                ImeEvent::InputModeObserved {
+                    mode: InputModeState::ObservedKana,
+                    source,
+                    confidence: ObservationConfidence::Medium,
+                    at: TickMs(0),
+                },
+                TickMs(0),
+            );
+            let json = ps
+                .ime
+                .journal
+                .to_json()
+                .expect("journal to_json should succeed for a single recorded entry");
+            assert!(
+                json.contains("InputModeObserved"),
+                "source={source:?}: journalにInputModeObservedエントリが記録されていない: {json}"
+            );
+            assert!(
+                json.contains(&format!("{source:?}")),
+                "source={source:?}: journalにObservationSourceの値が記録されていない: {json}"
+            );
+        }
     }
 }

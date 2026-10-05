@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::path::Path;
 
+use crate::key_text::{combo_main_identity, key_identity, split_combo};
 use crate::scanmap::KeyboardModel;
 use crate::types::VkCode;
 
@@ -23,39 +24,25 @@ use crate::types::VkCode;
 // (scanmap の JIS/US テーブル分離・layout/nicola_us.yab 追加) と合わせて
 // 実際に配線した上で再導入した。旧 config.toml の "jis"/"us" はそのまま解釈される。
 
-/// BUG-52 の「DBE レンジ」キーをパススルーしてよいかどうか（隠し設定、上級者向け）。
+/// 打鍵列機能（`.yab` の `CtrlChord`/`InlineSequence`/`MacroRef`）を有効化するか。
 ///
-/// 物理 Hiragana/Katakana/Eisu キー等が生成する `VK_DBE_ALPHANUMERIC` /
-/// `VK_DBE_KATAKANA` / `VK_DBE_SBCSCHAR` / `VK_DBE_DBCSCHAR`
-/// （`crates/awase-windows/src/runtime/transport.rs`）が対象。
-///
-/// `VK_DBE_HIRAGANA`（かな入力キー本来の VK、F2 warmup 関連）はこの設定の
-/// 対象外（別分岐で処理される、`transport.rs` 参照）。
-///
-/// 素のパススルーは、MS-IME の既定キー割当て（無変換単独打鍵→かな切替相当）や
-/// OS 側キーボードレイアウト変換層の状態依存トグル（物理「IME ON」キーが
-/// `VK_DBE_HIRAGANA` の代わりに `VK_DBE_KATAKANA` を生成することがある）に
-/// 横取りされ、awase の管理外で IME モードが切り替わるリスクがある
-/// （2026-08-05 実機、`docs/known-bugs.md` BUG-52）。既定値は `Suppress`
-/// （常に抑制、現状維持）。
-///
-/// **`Passthrough` が実際に緩めるのは限定的**: `shadow_toggle` が発火した
-/// KeyDown（awase 自身が意図した切替）と全 KeyUp は `Passthrough` でも
-/// 引き続き Suppress される（`transport.rs::plan` 参照）。緩むのは
-/// `shadow_toggle` 不発の KeyDown（＝ IME が既に目的の状態にあるのに OS が
-/// 状態依存で `VK_DBE_*` を誤生成したケース、BUG-52 の再現条件そのもの）に
-/// 限られる。また `ImmCross` プロファイル（LINE/Qt 等）では `plan` が
-/// この判定に到達する前に別分岐で Suppress を決定するため、この設定は
-/// そもそも無視される。[ADR-091](../docs/adr/091-idempotent-charset-axis-gji-recommended-msime-self-responsibility.md)
-/// §D3.6 参照。
+/// ADR-115 決定8は既定 `Off` だったが、2026-09-13 に既定 `On` へ変更した
+/// （経緯は ADR-115 決定8追補・ADR-109 参照）。
+/// `CV`+16進数2桁（`CtrlChord`）・セル内 `+` 区切り（`InlineSequence`）・
+/// `@`+マクロ名（`MacroRef`）はいずれも偶然一致しうるほど一般的な文字列ではなく、
+/// 既存のやまぶき派生レイアウトでこの語彙を使うユーザー（Issue #118 報告者）に
+/// とっては「意図しない暴発」ではなく素の目的（`layout/nicola_kakutei.yab` の
+/// 句読点確定を含む）そのものである。`.yab` パーサ自体は常に新構文を認識するが、
+/// `Off` にすると解決パス（`resolve_keystroke_syntax`）が
+/// `CtrlChord`/`InlineSequence`/`MacroRef` を保持している元のセル
+/// 生テキストから `Literal` へ差し替え、この機能導入前の挙動に戻す
+/// （Ctrl+チョード等の解釈自体を望まないユーザー向けの明示的オプトアウト）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum DbeModeKeyPolicy {
-    /// 常に抑制する（OS に一切送出しない、従来動作）。
+pub enum KeystrokeSequencePolicy {
+    Off,
     #[default]
-    Suppress,
-    /// 素の VK をパススルーする（BUG-52 のリスクを引き受ける、上級者向け）。
-    Passthrough,
+    On,
 }
 
 /// 左Shift単独タップによる「IME-ON 半角英数」持続トグルをどの IME で許可するか。
@@ -75,20 +62,32 @@ pub enum HalfWidthAlnumTogglePolicy {
     All,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfirmMode {
     /// 待機モード: タイムアウトまで出力を保留
     #[default]
     Wait,
-    /// 先行確定モード: 即座に出力、同時打鍵時に BS で差し替え
-    Speculative,
-    /// 二段タイマー: 短い待機→投機出力→差し替え
-    TwoPhase,
-    /// 連続中は待機、途切れたら投機
-    AdaptiveTiming,
     /// n-gram 予測で投機/待機を動的切替
     NgramPredictive,
+}
+
+// 旧値 `speculative` / `two_phase` / `adaptive_timing` は v2 で廃止（A2）。
+// 既存 config.toml を読めるよう `Wait` として受ける（`#[serde(alias)]` は
+// キー名用の KEY_ALIASES ガードに数えられるので手書きにしている）。
+// 警告は `AppConfig::from_toml_str` が `load_warnings` に積む。
+impl<'de> Deserialize<'de> for ConfirmMode {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        match s.as_str() {
+            "wait" | "speculative" | "two_phase" | "adaptive_timing" => Ok(Self::Wait),
+            "ngram_predictive" => Ok(Self::NgramPredictive),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["wait", "ngram_predictive"],
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -115,10 +114,25 @@ pub struct GeneralConfig {
     pub ngram_min_threshold_ms: u32,
     /// n-gram 適応閾値の上限（ミリ秒、デフォルト 120ms）
     pub ngram_max_threshold_ms: u32,
+    /// 3キー仲裁のタイミングマージン（%、デフォルト30）。char1→thumb→char2の
+    /// 3キーが来た場合、d1(thumb-char1)とd2(char2-thumb)の差がこの割合を
+    /// 超えればタイミングだけで確定し、n-gramタイブレークを行わない。
+    pub timing_margin_percent: u32,
+    /// 重なり不足判定のマージン（%、デフォルト0）。thumb押下からchar1解放までの
+    /// 物理的な重なり時間が閾値のこの割合未満なら「重なり不足」とみなし、
+    /// n-gramタイブレークに回す（無ければ単独打鍵扱い）。既定値0は
+    /// ADR-112決定1（`docs/adr/112-keyup-lifecycle-fsm-delivery.md`）に合わせて
+    /// 意図的に「常に重なり十分」＝この判定を実質無効化した値。数日の実機ソーク
+    /// （KeyUpがFSMへ実際に届くようになった影響の確認）で不具合報告は無かった
+    /// が、引き締めに必要な実測データ（重なり時間msの分布等）は未取得のため、
+    /// ADR-112決定3は見送り、**この0を恒久的な既定値として確定した**
+    /// （2026-08-31）。将来引き上げを検討する場合は実測データの収集から。
+    /// 上級者設定から手動で上げることはできる。
+    pub min_overlap_margin_percent: u32,
     /// 確定モード（デフォルト: wait）
     pub confirm_mode: ConfirmMode,
-    /// 投機出力までの待機時間（ミリ秒、TwoPhase/AdaptiveTiming と
-    /// NgramPredictive のフォールバック/投機待機で使用）
+    /// 投機出力までの待機時間（ミリ秒、NgramPredictive のフォールバック/
+    /// 投機待機で使用）
     pub speculative_delay_ms: u32,
     /// フォーカス遷移デバウンス時間（ミリ秒）。
     /// Alt-Tab 等でフォーカスが連続変更される際に IME 状態の誤検知を防ぐ。
@@ -128,6 +142,10 @@ pub struct GeneralConfig {
     pub ime_poll_interval_ms: u32,
     /// 自動起動の設定（"enabled" = 有効, "disabled" = 無効）
     pub auto_start: String,
+    /// タスクトレイから右クリックした際に最新バージョンを確認する。
+    pub update_check: bool,
+    /// 状態依存のIMEモードキーを検出したときに警告する（ADR-192）。
+    pub warn_state_dependent_mode_keys: bool,
     /// Linux 入力バックエンド ("evdev", "x11", "libinput")
     pub linux_input_backend: String,
     /// macOS の出力方式（"romaji" または "kana"）。
@@ -218,7 +236,7 @@ pub struct GeneralConfig {
     /// 変換操作そのものが壊れる。そのため既定値は `true`（常時送出）。
     ///
     /// この設定が `true` でも、フォーカス変更等コンテキスト境界を跨ぐフラッシュ
-    /// （`ComposingHint::Unknown`、`nicola_fsm.rs` 参照）では常に suppress される。
+    /// （`ThumbRawVkEmission::Denied`、`nicola_fsm.rs` 参照）では常に suppress される。
     /// 別ウィンドウへの生 VK_SPACE 誤注入を防ぐための安全策で、ユーザーが設定できる
     /// 範囲ではない。
     pub space_thumb_ignore_composing_guard: bool,
@@ -242,7 +260,7 @@ pub struct GeneralConfig {
     /// 無変換キー本来の機能（かな変換の取り消し等）を使いたい場合のみ `true` にする。
     ///
     /// この設定が `true` でも、フォーカス変更等コンテキスト境界を跨ぐフラッシュ
-    /// （`ComposingHint::Unknown`、`nicola_fsm.rs` 参照）では常に suppress される。
+    /// （`ThumbRawVkEmission::Denied`、`nicola_fsm.rs` 参照）では常に suppress される。
     /// 別ウィンドウへの生 VK 誤注入を防ぐための安全策で、ユーザーが設定できる
     /// 範囲ではない。
     pub muhenkan_solo_tap_ignore_composing_guard: bool,
@@ -266,8 +284,8 @@ pub struct GeneralConfig {
     /// `muhenkan_solo_tap_always_suppress`/`muhenkan_solo_tap_ignore_composing_guard`
     /// による従来の抑制/パススルー判定がそのまま適用される。
     ///
-    /// `VkCode::from_name` が受理する完全な VK 名（例: `"VK_F21"`、`"F21"` の
-    /// ような短縮形は不可）を指定する。`validate_dedicated_fn_key` が
+    /// `VkCode::from_name` が受理するキー名（例: `"VK_F21"`、`"F21"`。`VK_` は任意、
+    /// 大文字小文字は問わない。ADR-201）を指定する。`validate_dedicated_fn_key` が
     /// `VK_F15`-`VK_F24`（`VK_F13`/`VK_F14` を除く、物理キー非存在で安全、
     /// ADR-057）の範囲外を警告する（`VK_NONCONVERT`/`VK_IME_ON`/`VK_KANJI` 等の
     /// 危険なキー、およびターミナルエスケープシーケンス漏れが実機確認済みの
@@ -285,10 +303,6 @@ pub struct GeneralConfig {
     /// [ADR-091](../docs/adr/091-idempotent-charset-axis-gji-recommended-msime-self-responsibility.md)
     /// §D3.2 参照。
     pub muhenkan_solo_tap_dedicated_fn_key: Option<String>,
-    /// BUG-52 の DBE レンジ Suppress（`VK_DBE_ALPHANUMERIC`/`KATAKANA`/
-    /// `SBCSCHAR`/`DBCSCHAR`）を無条件抑制のままにするか、パススルーを
-    /// 許すか（隠し設定、上級者向け）。既定値・リスクは [`DbeModeKeyPolicy`] 参照。
-    pub dbe_mode_key_policy: DbeModeKeyPolicy,
     /// 左Shift単独タップによる「IME-ON 半角英数」持続トグルの許可範囲。
     ///
     /// 既定 `ms_ime_only` は従来動作を維持する。設定GUI（上級者向け設定）
@@ -297,6 +311,12 @@ pub struct GeneralConfig {
     /// 既存ユーザーの config.toml に残っている場合のみ意味を持つ
     /// （チェックボックスを一切操作しなければ値は変わらない）。
     pub half_width_alnum_toggle: HalfWidthAlnumTogglePolicy,
+    /// 打鍵列機能（ADR-115）の有効化。既定 `On`（2026-09-13〜、ADR-115 決定8
+    /// 追補）。設定GUI（上級者向け設定）から `off`/`on` の二択チェックボックス
+    /// として操作できる。`off` はこの構文（`.yab` の `CtrlChord`/
+    /// `InlineSequence`/`MacroRef`）の解釈自体を望まないユーザー向けの
+    /// 明示的オプトアウト。
+    pub keystroke_sequence: KeystrokeSequencePolicy,
     /// `left_thumb_key`/`right_thumb_key` に変換(`VK_CONVERT`)を割り当てている
     /// 場合に限り効く設定。無変換キーや Space 等他の VK には一切影響しない。
     ///
@@ -326,7 +346,7 @@ pub struct GeneralConfig {
     /// 操作そのものができなくなってしまう。
     ///
     /// この設定が `true` でも、フォーカス変更等コンテキスト境界を跨ぐフラッシュ
-    /// （`ComposingHint::Unknown`、`nicola_fsm.rs` 参照）では常に suppress される。
+    /// （`ThumbRawVkEmission::Denied`、`nicola_fsm.rs` 参照）では常に suppress される。
     pub enter_thumb_ignore_composing_guard: bool,
     /// `left_thumb_key`/`right_thumb_key` に Enter (`VK_RETURN`) を割り当てている
     /// 場合に限り効く設定。無変換/変換や Space 等他の VK には一切影響しない。
@@ -347,6 +367,41 @@ pub struct GeneralConfig {
     /// 参照）。既定値は `true`（常に無効化）。JIS かな直接入力を意図的に
     /// 使いたい場合（= awase の Engine を OFF にして使う想定）のみ `false` にする。
     pub swallow_alt_kana_input_method_switch: bool,
+
+    /// **非推奨（ADR-206、読み込み専用）**: 無変換単独タップ確定時の IME ON/OFF/Toggle（旧 ADR-153 決定1、隠し設定）。
+    ///
+    /// 値は読み込むが、エンジンには直接渡さない。そのキーが親指キー（`left_thumb_key`/`right_thumb_key`）に
+    /// 割り当てられているときだけ、読込時にメモリ上で `keys.ime_on/off/toggle` に bare で書いたのと同じ扱いへ
+    /// 移し（`GeneralConfig::legacy_thumb_solo_tap_actions`）、`validate` が非推奨の警告を出す。親指キーでなければ
+    /// 効かない（IME が自分で処理する）。config.toml は書き換えない。
+    ///
+    /// 単独タップの扱いは ADR-206 の規則に従う: 開閉の役割（bare `keys.ime_*`、または GJI の CUSTOM 表で無変換/変換が
+    /// トグル）があれば生キーを抑止して awase が絶対指定の ON/OFF を1回書き、なければ `ModeKeyConfig` の
+    /// Suppress/Passthrough に従う。
+    #[serde(default)]
+    pub muhenkan_solo_tap_ime_action: Option<ShadowImeActionConfig>,
+    /// `muhenkan_solo_tap_ime_action` と対称（変換キー用、非推奨）。
+    #[serde(default)]
+    pub henkan_solo_tap_ime_action: Option<ShadowImeActionConfig>,
+    /// ADR-195段階4: `<config dir>/keymap-learn-table.json`（段階3永続化）が存在し
+    /// 検証を通れば、それを`key_effect_predictor`が引く表として同梱表の代わりに使う。
+    /// `false`にすると学習済み表があっても常に同梱表を使う（opt-out、M-b）。
+    /// 現状は`config.toml`を直接編集する以外の切り替え手段は無い
+    /// （awase-settingsのUIチェックボックスは未実装、フォローアップが必要）。
+    #[serde(default = "default_use_learned_keymap_table")]
+    pub use_learned_keymap_table: bool,
+    /// ADR-209: IME の実状態を読めない窓（TSF）で、GJI の MS-IME プリセットの変換キーが IME を開くと
+    /// 予測して Engine を追随させる。`false`で止める（偽 ON が出たとき、ビルドし直さずに戻すため）。
+    #[serde(default = "default_predict_henkan_open_in_unreadable_windows")]
+    pub predict_henkan_open_in_unreadable_windows: bool,
+}
+
+const fn default_predict_henkan_open_in_unreadable_windows() -> bool {
+    true
+}
+
+const fn default_use_learned_keymap_table() -> bool {
+    true
 }
 
 impl Default for GeneralConfig {
@@ -362,11 +417,15 @@ impl Default for GeneralConfig {
             ngram_adjustment_range_ms: 20,
             ngram_min_threshold_ms: 30,
             ngram_max_threshold_ms: 120,
+            timing_margin_percent: 30,
+            min_overlap_margin_percent: 0,
             confirm_mode: ConfirmMode::Wait,
             speculative_delay_ms: 30,
             focus_debounce_ms: 50,
             ime_poll_interval_ms: 500,
             auto_start: "enabled".to_string(),
+            update_check: true,
+            warn_state_dependent_mode_keys: true,
             linux_input_backend: "evdev".to_string(),
             macos_output_style: "romaji".to_string(),
             linux_evdev_device: None,
@@ -376,19 +435,113 @@ impl Default for GeneralConfig {
             muhenkan_solo_tap_ignore_composing_guard: false,
             muhenkan_solo_tap_always_suppress: true,
             muhenkan_solo_tap_dedicated_fn_key: None,
-            dbe_mode_key_policy: DbeModeKeyPolicy::Suppress,
             half_width_alnum_toggle: HalfWidthAlnumTogglePolicy::MsImeOnly,
+            keystroke_sequence: KeystrokeSequencePolicy::On,
             henkan_solo_tap_ignore_composing_guard: false,
             henkan_solo_tap_always_suppress: true,
             enter_thumb_ignore_composing_guard: true,
             enter_thumb_shift_literal: true,
             swallow_alt_kana_input_method_switch: true,
+            muhenkan_solo_tap_ime_action: None,
+            henkan_solo_tap_ime_action: None,
+            use_learned_keymap_table: true,
+            predict_henkan_open_in_unreadable_windows: true,
         }
     }
 }
 
+impl GeneralConfig {
+    /// ADR-206 決定4: 非推奨の `*_solo_tap_ime_action` のうち、そのキーが親指キー
+    /// （`left_thumb_key`/`right_thumb_key`）に割り当てられているものだけを `(無変換, 変換)` で返す。
+    /// 呼び出し側（Platform 層）が、該当キーの bare コンボを `keys.ime_on/off/toggle` に相当する形で
+    /// メモリ上でだけ追加する。親指キーでないキーの旧設定は返さない（読み捨てて警告する）。
+    #[must_use]
+    pub fn legacy_thumb_solo_tap_actions(
+        &self,
+    ) -> (
+        Option<crate::types::ShadowImeAction>,
+        Option<crate::types::ShadowImeAction>,
+    ) {
+        let is_thumb = |canonical: &str| {
+            [self.left_thumb_key.as_str(), self.right_thumb_key.as_str()]
+                .into_iter()
+                .any(|k| key_identity(k) == canonical)
+        };
+        (
+            self.muhenkan_solo_tap_ime_action
+                .filter(|_| is_thumb("NONCONVERT"))
+                .map(ShadowImeActionConfig::to_core),
+            self.henkan_solo_tap_ime_action
+                .filter(|_| is_thumb("CONVERT"))
+                .map(ShadowImeActionConfig::to_core),
+        )
+    }
+}
+
+/// `muhenkan_solo_tap_ime_action`/`henkan_solo_tap_ime_action` のTOML表現
+/// （`"on"`/`"off"`/`"toggle"`、ADR-153 決定1）。
+///
+/// `awase::types::ShadowImeAction` という**プラットフォーム非依存コア型**への
+/// 変換は、ここ（config 側の薄い層）に置く——`ADR-019` の層境界を守るため、
+/// core 型に serde を直接付けない（`deserialize_keymap_to` と同じ様式）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShadowImeActionConfig {
+    On,
+    Off,
+    Toggle,
+}
+
+impl ShadowImeActionConfig {
+    /// `awase::types::ShadowImeAction`（core 型）へ変換する。
+    #[must_use]
+    pub const fn to_core(self) -> crate::types::ShadowImeAction {
+        match self {
+            Self::On => crate::types::ShadowImeAction::TurnOn,
+            Self::Off => crate::types::ShadowImeAction::TurnOff,
+            Self::Toggle => crate::types::ShadowImeAction::Toggle,
+        }
+    }
+}
+
+/// 診断・自己修復系のキルスイッチ設定（issue #165）。
+///
+/// `[general]`（`GeneralConfig`）ではなく独立したセクションにしているのは、
+/// ここに置く項目が「ユーザーの好み」ではなく「不具合発生時にビルド無しで
+/// 無効化できる安全弁」という性質のものだけだから（`awase-settings` GUI には
+/// 当面出さない、上級者向け `config.toml` 直接編集専用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct DiagnosticsConfig {
+    /// hook watchdog（`TIMER_HOOK_WATCHDOG`）が hook_starved（issue #165、他プロセスの
+    /// `WH_KEYBOARD_LL`が`CallNextHookEx`を呼ばず握りつぶす）を検知した際、キーボード
+    /// フックを自己修復（`UnhookWindowsHookEx`→`SetWindowsHookExW`で再インストール）
+    /// するかどうか。既定で有効。誤検知や環境固有の副作用が疑われる場合、この値を
+    /// `false`にすることでビルド無しで無効化できる（自己修復以前の診断ログ出力自体は
+    /// この設定に関係なく継続する）。
+    pub hook_self_heal: bool,
+}
+
+impl Default for DiagnosticsConfig {
+    fn default() -> Self {
+        Self {
+            hook_self_heal: true,
+        }
+    }
+}
+
+// 既定はすべて空（`#[derive(Default)]`）。経緯:
+// - 2026-08-16: 「漢字」（VK_KANJI）を `toggle` の既定から外した。当時 `keys.ime_toggle` が同じ
+//   VK_KANJI を既定で持っており、同一の物理キー押下に対して `kp_stage_shadow_ime_toggle`（このフィールド由来、
+//   belief を反転）と `Engine::apply_special_key_match`（`keys.ime_toggle` 由来、反転後の belief を読んで
+//   逆方向へ再反転しキーを consume）が二重に働き、「押しても IME が動かない」キーになっていた。
+//   （2026-09-29 追記: `keys.ime_toggle` の既定も空になったので、既定同士の衝突は起きない。）
+// - 2026-09-29（ADR-207、所有者決定）: `on`/`off` の既定（`IMEオン`/`IMEオフ` = VK_IME_ON/OFF）も空にした。
+//   hook の静的 `shadow_action` が `kp_stage_shadow_ime_toggle` で `is_japanese_ime()` を問わず採用され
+//   （`vk::is_static_idempotent_open_key`）、同じ追随を担うため冗長だった。明示した値はそのまま尊重される。
+
 /// IME 検出設定（シャドウ IME 状態追跡用キー定義）
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ImeDetectConfig {
     /// Toggle keys (direction unknown, flip shadow state)
@@ -397,28 +550,6 @@ pub struct ImeDetectConfig {
     pub on: Vec<String>,
     /// OFF keys (IME is now OFF / hankaku)
     pub off: Vec<String>,
-}
-
-impl Default for ImeDetectConfig {
-    fn default() -> Self {
-        Self {
-            // 2026-08-16: 「漢字」（VK_KANJI）を既定から外した。
-            // `KeysConfig::default().ime_toggle`（`keys.ime_toggle`、awase
-            // 自身が能動的に漢字キーを消費し冪等な VK_IME_ON/OFF へ変換して
-            // 送出する）が同じ VK_KANJI を既定で持つようになったため、両方が
-            // 既定で有効だと同一の物理キー押下に対して
-            // `kp_stage_shadow_ime_toggle`（このフィールド由来、belief を
-            // 反転）→ `Engine::apply_special_key_match`（`keys.ime_toggle`
-            // 由来、反転後の belief を読んで逆方向へ再反転しキーを consume）
-            // という二重処理が発生し、「押しても IME が動かない」壊れた
-            // キーになっていた（Opusコードレビュー指摘）。`keys.ime_toggle`
-            // が漢字キーを能動的に consume する以上、素通しを前提にした
-            // このフィールドの観測は漢字キーに対しては意味を持たない。
-            toggle: Vec::new(),
-            on: vec!["IMEオン".to_string()],
-            off: vec!["IMEオフ".to_string()],
-        }
-    }
 }
 
 /// キーバインディング設定
@@ -466,21 +597,6 @@ pub struct KeysConfig {
     /// `serde(alias)` で旧名も引き続き受け付ける。
     #[serde(alias = "engine_off_solo_triple")]
     pub engine_off_solo_repeat: Option<String>,
-    /// Engine ON 時に送信する IME モード切り替えキー（None で無効）
-    ///
-    /// エンジンが有効になったとき、このキーを `SendInput` で送信して
-    /// IME を全角/ひらがなモードに強制する。open 軸（IME の開閉）と
-    /// charset 軸（全角/半角モード強制）を1つのキーで束ねる複合副作用キー
-    /// であり、ADR-091 決定1（open 軸は `VK_IME_ON`/`VK_IME_OFF` で決着済み）
-    /// より前の機構の残骸。既定 `None`（ADR-092 決定D Step1、2026-08-15）。
-    /// 上級者が明示的に設定した場合のみ有効化される。
-    pub engine_on_ime_key: Option<String>,
-    /// Engine OFF 時に送信する IME モード切り替えキー（None で無効）
-    ///
-    /// エンジンが無効になったとき、このキーを `SendInput` で送信して
-    /// IME を半角/直接入力モードに強制する。`engine_on_ime_key` と同種の
-    /// 複合副作用キーの残骸。既定 `None`（ADR-092 決定D Step1）。
-    pub engine_off_ime_key: Option<String>,
 }
 
 impl Default for KeysConfig {
@@ -490,14 +606,66 @@ impl Default for KeysConfig {
             engine_off: vec!["Ctrl+Shift+無変換".to_string()],
             ime_on: vec!["Ctrl+変換".to_string()],
             ime_off: vec!["Ctrl+無変換".to_string()],
-            ime_toggle: vec!["VK_KANJI".to_string()],
+            // 既定は空（ADR-199 決定15、2026-09-29 所有者決定で確定）。「IME の設定に従う」
+            // 原則のため、awase 自身の設定としては漢字キー（VK_KANJI）を能動的に
+            // 消費しない。物理の 0x19 は JIS 配列で Alt+半角/全角として届くので、
+            // 無修飾の `VK_KANJI` は Engine の照合（修飾の完全一致）には元々一致せず、
+            // 一致するのはリマッパー等が出す無修飾の 0x19 だけだった。Alt+半角/全角は
+            // `hook.rs` の静的 `Toggle`（GJI は `Hankaku/Zenkaku` 行から役割判定、
+            // ADR-202）が担い続ける。既定に `VK_KANJI` があると、GJI では役割判定が
+            // `explicit_overlap`（`has_bare_ime_combo`）で常に無効化されていた。
+            ime_toggle: Vec::new(),
             ime_detect: ImeDetectConfig::default(),
             engine_off_solo_repeat: Some("VK_INSERT".to_string()),
-            engine_on_ime_key: None,
-            engine_off_ime_key: None,
         }
     }
 }
+
+impl KeysConfig {
+    /// `ime_on`/`ime_off`/`ime_toggle` のいずれかに、修飾キーなしで `canonical`
+    /// （`key_identity` の正規名。無変換=`"NONCONVERT"`、変換=`"CONVERT"`）のキーが入っているか。
+    ///
+    /// 親指の無変換/変換でこれが真なら、単独タップは「`SetOpen` で IME を絶対指定の状態に
+    /// そろえる」動作になり、生キーは IME へ届かない（単独タップを素通しにする設定より優先、ADR-206）。
+    #[must_use]
+    pub fn has_bare_role_key(&self, canonical: &str) -> bool {
+        [&self.ime_on, &self.ime_off, &self.ime_toggle]
+            .into_iter()
+            .flatten()
+            .any(|combo| {
+                let (mods, main) = split_combo(combo);
+                mods.is_empty() && key_identity(main) == canonical
+            })
+    }
+
+    /// v1 の既定値と**ちょうど同じ**値を空として扱う（v2 の既定は空）。
+    ///
+    /// v1 の設定画面は全項目を書き出すので、旧既定（`ime_toggle = ["VK_KANJI"]`、
+    /// `ime_detect` の `IMEオン`/`IMEオフ`）が明示値として config.toml に残っている。
+    /// 尊重して残すと v2 の既定（空）が効かないので、読み込み時に空へ戻し、保存で
+    /// ファイルからも消す（`config_save::remove_retired_default_values`）。
+    pub(crate) fn drop_retired_default_values(&mut self) {
+        fn is_exactly(v: &[String], only: &str) -> bool {
+            matches!(v, [x] if x == only)
+        }
+        if is_exactly(&self.ime_toggle, RETIRED_DEFAULT_IME_TOGGLE) {
+            self.ime_toggle.clear();
+        }
+        if is_exactly(&self.ime_detect.on, RETIRED_DEFAULT_IME_DETECT_ON) {
+            self.ime_detect.on.clear();
+        }
+        if is_exactly(&self.ime_detect.off, RETIRED_DEFAULT_IME_DETECT_OFF) {
+            self.ime_detect.off.clear();
+        }
+    }
+}
+
+/// v1 の `keys.ime_toggle` の既定値（v2 の既定は空）。
+pub(crate) const RETIRED_DEFAULT_IME_TOGGLE: &str = "VK_KANJI";
+/// v1 の `keys.ime_detect.on` の既定値（v2 の既定は空）。
+pub(crate) const RETIRED_DEFAULT_IME_DETECT_ON: &str = "IMEオン";
+/// v1 の `keys.ime_detect.off` の既定値（v2 の既定は空）。
+pub(crate) const RETIRED_DEFAULT_IME_DETECT_OFF: &str = "IMEオフ";
 
 /// アプリオーバーライドのエントリ（プロセス名とクラス名の組み合わせ）
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -507,37 +675,65 @@ pub struct AppOverrideEntry {
 }
 
 /// `[[keymap]]` ショートカットインターセプトルール
+///
+/// `from`/`to` に指定できない vk がある（ADR-114 決定5、`KeymapTable::new` が
+/// `tracing::warn!` して該当ルールを skip する）: 親指キー・IME 制御系 VK・Alt 系
+/// VK（`from` の修飾子としての Alt を含む）・Win 系 VK・`VK_CAPITAL`・
+/// Shift を `from` の主キーにすること。
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct KeymapRule {
-    /// プロセス名（省略=全アプリ、大文字小文字無視）
+    /// プロセス名（省略=全アプリ）。大文字小文字を無視し、末尾の `.exe` の
+    /// 有無どちらでも一致する完全一致（前方一致はしない）。
     #[serde(default)]
     pub app: Option<String>,
-    /// インターセプトするキーコンボ（例: "Ctrl+I"）
+    /// インターセプトするキーコンボ（例: "Ctrl+VK_I"）。主キーは `VK_` 接頭辞
+    /// 付きの名前が必要（`crate::vk::VkCodeExt::from_name` が解決できる形式）。
     pub from: String,
-    /// 再注入するキー（例: "F7"）、省略=消費のみ
-    #[serde(default)]
-    pub to: Option<String>,
+    /// 再注入するキー列（例: `["F7", "F8"]`）。空、または省略=消費のみ。
+    ///
+    /// ADR-130 決定1: deserialize は旧形式 `to = "F7"` と新形式
+    /// `to = ["F7", "F8"]` の両方を受ける。serialize は設定全体の保存時に
+    /// 常に配列形式へ正規化される。
+    #[serde(default, deserialize_with = "deserialize_keymap_to")]
+    pub to: Vec<String>,
 }
 
-/// 物理キー1つを別の物理キーとして常時扱う単純リマップルール（`key_remap`）。
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum KeymapToCompat {
+    Single(String),
+    Many(Vec<String>),
+}
+
+fn deserialize_keymap_to<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(match Option::<KeymapToCompat>::deserialize(deserializer)? {
+        Some(KeymapToCompat::Single(to)) => vec![to],
+        Some(KeymapToCompat::Many(to)) => to,
+        None => Vec::new(),
+    })
+}
+
+/// `[[keystroke_macro]]` 名前付き打鍵列マクロ（ADR-115 決定2b）。
 ///
-/// `[[keymap]]`（[`KeymapRule`]）とは別物: `keymap` はキーコンボ（例: "Ctrl+I"）を
-/// アプリ限定でインターセプトする「ショートカット再割当て」機能。こちらは
-/// 修飾キーとしての役割そのものを恒久的に入れ替える（例: 英数キーを Left Ctrl
-/// として使う、CapsLock を無効化して別のキーにする）ための、アプリ文脈を持たない
-/// より低レベルで単純な機構。エンジンの有効/無効に関わらず常時適用される
-/// （秀Caps・PowerToys 等の一般的なキーリマップツールと同じ「常時そのキーとして
-/// 振る舞う」設計）。
-///
-/// `from`/`to` は `VkCode::from_name` が解決できる VK 名（例: "VK_CAPITAL"、
-/// "VK_DBE_ALPHANUMERIC"、"VK_LCONTROL"）を指定する。解決できない名前・
-/// `from == to`・`from` の重複・上限件数超過のエントリは、起動時に警告ログを
-/// 出したうえで無視される（`crates/awase-windows/src/state/key_remap.rs`
-/// `compile_key_remaps` 参照）。
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct KeyRemapRule {
-    pub from: String,
-    pub to: String,
+/// 複数キーで再利用する列、または将来ステップ種別が増える列を定義する。
+/// 単発・局所的な列（句読点確定等）は `.yab` セル内 `+` 区切り
+/// （`InlineSequence`）で書く——両者は排他ではなく、`+` 区切りの1セグメント
+/// として `@name` を書くこともできる。
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct KeystrokeMacro {
+    /// マクロ名（`.yab` セルから `@name` で参照する）
+    pub name: String,
+    /// 順序付きの出力ステップ列。非ネスト（`@` 参照はマクロ内で禁止）。
+    /// 各要素は `.yab` の1トークンと**全く同じ文字列表記**
+    /// （`"'（'"`/`"CV4D"`/`"左"` 等）。空リスト、または全要素が許可リスト
+    /// （`Literal`/`KeySequence`/`Special`/`CtrlChord`）で拒否された場合は
+    /// バリデーションエラーにせず、そのマクロは `YabValue::None`
+    /// （明示的な無出力）に解決される。
+    #[serde(default)]
+    pub steps: Vec<String>,
 }
 
 /// アプリ別の永続オーバーライド設定
@@ -565,6 +761,12 @@ pub struct AppOverrides {
     /// （`docs/known-bugs.md` BUG-78）。空にすれば無効化できる。
     #[serde(default = "default_disable_apps")]
     pub disable_apps: Vec<String>,
+    /// 入力中継ツールのプロセス名（大文字小文字無視、`.exe` 有無どちらでも一致）。
+    ///
+    /// マッチしたフォーカス先では awase は IME actuation を所有せず、文字変換自体は
+    /// 通常どおり継続する。
+    #[serde(default = "default_input_relay_apps")]
+    pub input_relay_apps: Vec<String>,
 }
 
 impl Default for AppOverrides {
@@ -575,6 +777,7 @@ impl Default for AppOverrides {
             force_vk: Vec::new(),
             force_tsf: Vec::new(),
             disable_apps: default_disable_apps(),
+            input_relay_apps: default_input_relay_apps(),
         }
     }
 }
@@ -582,6 +785,11 @@ impl Default for AppOverrides {
 /// `AppOverrides::disable_apps` の既定値。
 fn default_disable_apps() -> Vec<String> {
     vec!["mstsc.exe".to_string()]
+}
+
+/// `AppOverrides::input_relay_apps` の既定値。
+const fn default_input_relay_apps() -> Vec<String> {
+    Vec::new()
 }
 
 /// Ctrl+key バイパス直後に次キーを NICOLA スキップするルール
@@ -615,7 +823,7 @@ pub struct PostBypassRule {
 ///
 /// レイアウト定義は .yab ファイルから読み込むため、
 /// このファイルにはアプリ全体の設定のみを含む。
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct AppConfig {
     #[serde(default)]
     pub general: GeneralConfig,
@@ -623,14 +831,32 @@ pub struct AppConfig {
     pub keys: KeysConfig,
     #[serde(default)]
     pub app_overrides: AppOverrides,
+    /// 診断・自己修復系のキルスイッチ（issue #165）。
+    #[serde(default)]
+    pub diagnostics: DiagnosticsConfig,
     #[serde(default)]
     pub keymaps: Vec<KeymapRule>,
     /// Ctrl+key バイパス後に次キーを NICOLA スキップするルール一覧
     #[serde(default)]
     pub post_bypass: Vec<PostBypassRule>,
-    /// 物理キーの単純リマップルール一覧（`KeyRemapRule` doc 参照）
+    /// 名前付き打鍵列マクロ一覧（ADR-115 決定2b）。
     #[serde(default)]
-    pub key_remap: Vec<KeyRemapRule>,
+    pub keystroke_macro: Vec<KeystrokeMacro>,
+    /// 旧表記 `[[keymap]]`（ADR-201 決定5）。`alias` にすると `[[keymap]]` と `[[keymaps]]` が
+    /// 両方あるとき serde が読み込み全体を失敗させるので、別のフィールドで受けて
+    /// [`AppConfig::from_toml_str`] が `keymaps` へ合流させる（合流後は空）。保存はしない。
+    #[serde(default, rename = "keymap", skip_serializing)]
+    legacy_keymap: Vec<KeymapRule>,
+    /// 読み込み時に集めた診断（未知のキー・`[[keymap]]` の合流）。`validate()` が警告に加える。
+    /// 設定ファイルの項目ではない（保存しない）。
+    #[serde(skip)]
+    load_warnings: Vec<String>,
+    /// 読み込んだ config.toml に撤去済みで**効果があった**キー（`REMOVED_WITH_NOTICE`）が残っていたときの通知
+    /// （ADR-207）。`load_warnings`（ログだけ）と違い、`validate()` が**警告**として返しトレイに出る。
+    /// 設定の保存（`config_save::save_edit`）が該当キーをファイルから消すので、保存後は
+    /// [`AppConfig::clear_removed_notices`] で落とす。保存しない。
+    #[serde(skip)]
+    removed_notices: Vec<String>,
     /// macOS: 出力文字 → IME に送るローマ字入力列の対応表。
     ///
     /// IME のローマ字テーブル（ATOK のローマ字カスタマイザ等）に登録した
@@ -691,9 +917,122 @@ impl AppConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
-        let config: Self = toml::from_str(&content)
+        let config = Self::from_toml_str(&content)
             .with_context(|| format!("Failed to parse {}", path.display()))?;
         Ok(config)
+    }
+
+    /// 設定テキストを読み込む**唯一の入口**（ADR-201 決定2・5）。
+    ///
+    /// `AppConfig::load`・不具合報告・テストはこれを使う（`toml::from_str` を直接呼ぶと
+    /// `[[keymap]]` の合流も未知キーの検出も通らない）。
+    /// - 未知のキー（`serde_ignored`）は `load_warnings` に入れ、`validate()` が警告に加える。
+    ///   撤去済みのキー（[`crate::config_load_diag::is_removed_key`]）は警告しない。
+    /// - 旧表記 `[[keymap]]` は `keymaps` の後ろへ連結して合流させる（両方あれば連結）。
+    ///
+    /// # Errors
+    ///
+    /// TOML として、または型として読めない場合にエラーを返す。
+    pub fn from_toml_str(text: &str) -> Result<Self, toml::de::Error> {
+        let mut ignored: Vec<String> = Vec::new();
+        let mut config: Self =
+            serde_ignored::deserialize(toml::de::Deserializer::new(text), |p| {
+                ignored.push(p.to_string());
+            })?;
+        let default_table = toml::Table::try_from(Self::default()).unwrap_or_default();
+        for path in ignored {
+            // 効果があった撤去キーは専用の通知（未知キーの提案文より先に判定する。
+            // 接頭辞ルールが `engine_on_ime_key` に `keys.engine_on` を提案してしまうため）。
+            if let Some(msg) = crate::config_load_diag::removed_notice(&path) {
+                config.removed_notices.push(msg.to_string());
+                continue;
+            }
+            if crate::config_load_diag::is_removed_key(&path) {
+                continue;
+            }
+            let (parent, _) = path.rsplit_once('.').unwrap_or(("", &path));
+            let siblings = Self::known_keys_under(&default_table, parent);
+            config
+                .load_warnings
+                .push(crate::config_load_diag::unknown_key_message(
+                    &path, &siblings,
+                ));
+        }
+        let raw_table = toml::from_str::<toml::Table>(text).ok();
+        // 撤去済みで、値が既定でないときだけ効果があった設定（`gji_thumb_key_ime_toggle = true` 等）の通知。
+        if let Some(t) = &raw_table {
+            config
+                .removed_notices
+                .extend(crate::config_load_diag::removed_value_notices(t));
+        }
+        // v1 の設定画面が書き出した旧既定値は、読み込み時に空として扱う（保存で消す）。
+        config.keys.drop_retired_default_values();
+        // 廃止済みの confirm_mode（A2）: serde alias で `Wait` として読まれているので、
+        // 元の文字列を見て警告だけ積む。
+        if let Some(old) = raw_table
+            .as_ref()
+            .and_then(|t| {
+                t.get("general")?
+                    .get("confirm_mode")?
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .filter(|v| matches!(v.as_str(), "speculative" | "two_phase" | "adaptive_timing"))
+        {
+            config.load_warnings.push(format!(
+                "confirm_mode \"{old}\" は廃止されました。wait として扱います\
+                 （使える値は wait / ngram_predictive）"
+            ));
+        }
+        if !config.legacy_keymap.is_empty() {
+            let n = config.legacy_keymap.len();
+            let both = !config.keymaps.is_empty();
+            config.keymaps.append(&mut config.legacy_keymap);
+            config.load_warnings.push(if both {
+                format!(
+                    "[[keymap]] {n} 件を [[keymaps]] と連結して読みました\
+                     （[[keymap]] は旧表記です。[[keymaps]] にまとめてください）"
+                )
+            } else {
+                format!(
+                    "[[keymap]] {n} 件を [[keymaps]] として読みました\
+                     （[[keymap]] は旧表記です）"
+                )
+            });
+        }
+        Ok(config)
+    }
+
+    /// 既定値を TOML の表にしたものから、`parent`（`""` は最上位、`"general"` 等）の
+    /// 直下の既知のキー名を返す。`None` の項目は表に出ないので、提案の候補が少し減るだけ。
+    fn known_keys_under(default_table: &toml::Table, parent: &str) -> Vec<String> {
+        let mut cur = default_table;
+        if !parent.is_empty() {
+            for seg in parent.split('.') {
+                match cur.get(seg).and_then(toml::Value::as_table) {
+                    Some(t) => cur = t,
+                    None => return Vec::new(),
+                }
+            }
+        }
+        cur.keys().cloned().collect()
+    }
+
+    /// 読み込み時の診断（未知のキー・`[[keymap]]` の合流）。`validate()` の警告にも含まれる。
+    #[must_use]
+    pub fn load_warnings(&self) -> &[String] {
+        &self.load_warnings
+    }
+
+    /// 撤去済みで効果があったキーが config.toml に残っていた通知（ADR-207）。`validate()` の警告にも含まれる。
+    #[must_use]
+    pub fn removed_notices(&self) -> &[String] {
+        &self.removed_notices
+    }
+
+    /// 設定の保存で撤去キーがファイルから消えた後に、通知を落とす。
+    pub fn clear_removed_notices(&mut self) {
+        self.removed_notices.clear();
     }
 
     /// 設定を TOML 形式でファイルに保存する
@@ -716,6 +1055,51 @@ impl AppConfig {
         let content = toml::to_string_pretty(self).context("Failed to serialize config")?;
         crate::fs_atomic::write_atomic(path, content.as_bytes())
     }
+
+    /// キーが無いときに serde が読む既定値（`from_toml_str("")` の結果、ADR-201 決定3）。
+    /// `GeneralConfig::default()` や同梱の `config.toml` の値とは食い違いうる。
+    #[must_use]
+    pub fn default_from_empty() -> Self {
+        Self::from_toml_str("").unwrap_or_default()
+    }
+
+    /// `config.toml` を再読み込みし、`general.auto_start` だけを書き換えて保存する。
+    ///
+    /// 自動起動のON/OFFはトレイメニュー（`awase.exe`）と設定画面
+    /// （`awase-settings.exe`、別プロセス）の両方から独立に切り替えられる。
+    /// どちらも「フォームで編集中の他の未保存の変更」を巻き込まないよう、
+    /// in-memory の `AppConfig` をそのまま保存するのではなく、この関数を
+    /// 通して都度ディスクから読み直す（Opus敵対的レビュー指摘 Minor 11、2026-09-07）。
+    ///
+    /// ADR-201 決定3: 保存は `toml_edit`（[`crate::config_save::save_edit`]）で、
+    /// 読み直した値から `auto_start` だけを変えた差分だけを書く（コメント・未知キー・
+    /// 他の項目は触らない。`validate()` の正規化もここでは書かない）。
+    ///
+    /// 戻り値: `Some(warnings)` は保存に成功したことを示す（`warnings` は
+    /// `validate()` が検出した他フィールドの警告、空なら警告なし）。`None`
+    /// は読み込みまたは保存自体が失敗したことを示す（空の `Vec` と区別する
+    /// ため `Option` にしてある — 呼び出し元は「警告0件で成功」と
+    /// 「保存自体が失敗」を混同してはならない）。
+    pub fn save_auto_start(path: &Path, value: &str) -> Option<Vec<String>> {
+        let base = match Self::load(path) {
+            Ok(config) => config,
+            Err(e) => {
+                tracing::error!("Failed to load config for saving auto_start: {e}");
+                return None;
+            }
+        };
+        let mut to_save = base.clone();
+        to_save.general.auto_start = value.to_string();
+        let (_, warnings) = to_save.clone().validate();
+        for w in &warnings {
+            tracing::warn!("Config validation warning while saving auto_start: {w}");
+        }
+        if let Err(e) = crate::config_save::save_edit(&to_save, &base, path) {
+            tracing::error!("Failed to save auto_start config: {e}");
+            return None;
+        }
+        Some(warnings)
+    }
 }
 
 /// 検証済み設定（全値が妥当であることが保証される）
@@ -727,14 +1111,43 @@ pub struct ValidatedConfig {
     pub keys: KeysConfig,
     /// 検証済みのアプリ別オーバーライド
     pub app_overrides: AppOverrides,
+    /// 診断・自己修復系のキルスイッチ（issue #165）。検証は行わない（bool のみ）。
+    pub diagnostics: DiagnosticsConfig,
     /// キーマップインターセプトルール
     pub keymaps: Vec<KeymapRule>,
     /// Ctrl+key バイパス後に次キーを NICOLA スキップするルール
     pub post_bypass: Vec<PostBypassRule>,
-    /// 物理キーの単純リマップルール一覧
-    pub key_remap: Vec<KeyRemapRule>,
+    /// 名前付き打鍵列マクロ一覧（ADR-115 決定2b）。`AppConfig` から単純に
+    /// 転送するのみで検証は行わない（`steps` の中身の妥当性は
+    /// `resolve_keystroke_syntax` が読み込み時に判定し警告する、決定3）。
+    pub keystroke_macro: Vec<KeystrokeMacro>,
     /// macOS: 出力文字 → IME に送るローマ字入力列（`AppConfig` の doc 参照）
     pub macos_symbol_romaji: std::collections::HashMap<String, String>,
+}
+
+impl From<ValidatedConfig> for AppConfig {
+    /// 検証済み設定を保存・再表示可能な `AppConfig` へ戻す。
+    ///
+    /// `validate()` が行った正規化（例: `confirm_mode = "speculative"` →
+    /// `two_phase` + `speculative_delay_ms=0`）を、保存先やUIの表示に
+    /// 反映したい呼び出し元向け（/code-review指摘: `awase-settings` の
+    /// `apply_confirmed()` が以前は警告文の生成にしか `validate()` の
+    /// 戻り値を使わず、保存対象は未検証の生設定のままだった）。
+    fn from(v: ValidatedConfig) -> Self {
+        Self {
+            general: v.general,
+            keys: v.keys,
+            app_overrides: v.app_overrides,
+            diagnostics: v.diagnostics,
+            keymaps: v.keymaps,
+            post_bypass: v.post_bypass,
+            keystroke_macro: v.keystroke_macro,
+            macos_symbol_romaji: v.macos_symbol_romaji,
+            legacy_keymap: Vec::new(),
+            load_warnings: Vec::new(),
+            removed_notices: Vec::new(),
+        }
+    }
 }
 
 impl AppConfig {
@@ -752,6 +1165,36 @@ impl AppConfig {
                 g.speculative_delay_ms, g.simultaneous_threshold_ms
             ));
             g.speculative_delay_ms = 30;
+        }
+        // リセット先は GeneralConfig::default() の値そのものを参照する
+        // （/code-review指摘、PR #127、8回目: ここにハードコードした
+        // リテラルとdefault()の値が別々に管理されると、決定3で
+        // min_overlap_margin_percentの既定値を引き締める際に片方だけ
+        // 更新し忘れ、範囲外値が古い既定へリセットされ続ける事故になる）。
+        let defaults = GeneralConfig::default();
+        Self::validate_percent_field(
+            "timing_margin_percent",
+            &mut g.timing_margin_percent,
+            defaults.timing_margin_percent,
+            w,
+        );
+        Self::validate_percent_field(
+            "min_overlap_margin_percent",
+            &mut g.min_overlap_margin_percent,
+            defaults.min_overlap_margin_percent,
+            w,
+        );
+    }
+
+    /// `0..=100` の範囲外なら警告を積んで `default` にリセットする
+    /// （/code-review指摘、PR #127: `timing_margin_percent`/
+    /// `min_overlap_margin_percent` で同一形の検証がコピペされていた）。
+    fn validate_percent_field(name: &str, value: &mut u32, default: u32, w: &mut Vec<String>) {
+        if *value > 100 {
+            w.push(format!(
+                "{name} ({value}) は 0-100 の範囲外です。{default} にリセットします"
+            ));
+            *value = default;
         }
     }
 
@@ -789,31 +1232,28 @@ impl AppConfig {
     /// （ADR-091 §4 Phase1-3、未実装）が入るまでは、GJI 側の既存キー設定に
     /// 同じ番号が使われていないかをユーザー自身が確認すること。
     fn validate_dedicated_fn_key(g: &GeneralConfig, w: &mut Vec<String>) {
+        // `canonical_key_text` を通した完全一致（`from_name` と規則を揃える。ADR-201 決定1）。
         const SAFE_RANGE: &[&str] = &[
-            "VK_F15", "VK_F16", "VK_F17", "VK_F18", "VK_F19", "VK_F20", "VK_F21", "VK_F22",
-            "VK_F23", "VK_F24",
+            "F15", "F16", "F17", "F18", "F19", "F20", "F21", "F22", "F23", "F24",
         ];
         if let Some(name) = &g.muhenkan_solo_tap_dedicated_fn_key {
-            if !SAFE_RANGE.contains(&name.as_str()) {
+            if !SAFE_RANGE.contains(&key_identity(name).as_str()) {
                 w.push(format!(
-                    "muhenkan_solo_tap_dedicated_fn_key = {name:?} は安全な範囲外です \
-                     （VK_F15〜VK_F24 のうち VK_F13/VK_F14 を除く番号のみ許可、\
-                     ADR-091 §D3.2）。VK_NONCONVERT 等の危険なキーは指定しないこと。\
-                     VK_F13/VK_F14 はターミナルエスケープシーケンス漏れの実機確認が \
-                     あり常に避けること。VK_F21/VK_F22 を使う場合は、GJI 側の既存 \
-                     キー設定（config1.db）で既に別の意味に割り当てられていないか \
-                     確認すること（BUG-64 参照）。"
+                    "muhenkan_solo_tap_dedicated_fn_key = {name:?} は指定できない値です。\
+                     指定できるのは F15〜F24（F13・F14 を除く）のいずれかです \
+                     （例: \"VK_F15\"）。無変換キーなど、他の操作にすでに使われている \
+                     キーは指定できません。F13・F14 は一部のターミナルソフトで別の \
+                     文字として誤認識されることがあるため使用できません。F21・F22 \
+                     を使う場合は、Google 日本語入力（GJI）側の既存のキー設定で、\
+                     同じキーがすでに別の操作に割り当てられていないか確認してください。"
                 ));
             }
         }
     }
 
     fn validate_thumb_keys(g: &GeneralConfig, w: &mut Vec<String>) {
-        if g.left_thumb_key == "Kana"
-            || g.left_thumb_key == "VK_KANA"
-            || g.right_thumb_key == "Kana"
-            || g.right_thumb_key == "VK_KANA"
-        {
+        // `Kana`/`VK_KANA`/`かな`/`カナ`（大文字小文字・空白は問わない）はすべて同じ VK。
+        if key_identity(&g.left_thumb_key) == "KANA" || key_identity(&g.right_thumb_key) == "KANA" {
             w.push(
                 "Kana キーはロック型キーで KeyUp イベントが発生しません。\
                  親指キーとしての使用は推奨しません。"
@@ -822,69 +1262,124 @@ impl AppConfig {
         }
     }
 
-    /// 無変換/変換キーの表記ゆれ（漢字表記 or VK_*識別子）のペア。
-    /// `validate_thumb_key_in_ime_combos`（同一キーかどうかの正規化比較）と
-    /// `validate_keyboard_model`（JIS専用キーの残存検出）の両方で参照する
-    /// 単一の情報源。将来3つ目の別名表記を追加する場合はここに足すだけで
-    /// 両方の検証に反映される。
-    const THUMB_KEY_ALIASES: &[(&str, &str)] =
-        &[("無変換", "VK_NONCONVERT"), ("変換", "VK_CONVERT")];
-
-    /// 無変換/変換の表記ゆれ（漢字表記・エイリアス・`VK_*`識別子）を
-    /// `THUMB_KEY_ALIASES` に基づいて正規化する。一致しなければ入力をそのまま返す
-    /// （`THUMB_KEY_ALIASES` に無い任意のキー名の可能性があるため）。
-    /// `validate_thumb_key_in_ime_combos` が使う単一の情報源。
-    fn canonical_thumb_key_name(s: &str) -> &str {
-        let s = s.trim();
-        for (kanji, vk) in Self::THUMB_KEY_ALIASES {
-            if s == *kanji || s.eq_ignore_ascii_case(vk) {
-                return vk;
-            }
-        }
-        s
-    }
-
     fn validate_thumb_key_in_ime_combos(g: &GeneralConfig, keys: &KeysConfig, w: &mut Vec<String>) {
         fn is_bare_same_key(combo: &str, thumb_key: &str) -> bool {
-            let combo = combo.trim();
-            !combo.contains('+')
-                && AppConfig::canonical_thumb_key_name(combo)
-                    .eq_ignore_ascii_case(AppConfig::canonical_thumb_key_name(thumb_key))
+            // 修飾キーなし（`+` で区切って主キーだけ）で、主キーが親指キーと同じ組。
+            let (mods, main) = split_combo(combo);
+            mods.is_empty() && key_identity(main) == key_identity(thumb_key)
         }
 
-        // `field == "keys.ime_on"` だけ文面を分ける理由: `suppress_ime_combos`
-        // は `engine_active &&` を前提とするため、IME が OFF（engine 非活性）の
-        // 間はこのガードが一切効かず、`keys.ime_on` の bare 親指キーは従来どおり
-        // 発火する。`keys.ime_on` の主目的（IME OFF から ON にする）はまさに
-        // この状態なので、「使われません」は不正確で、正しく動く主用途を
-        // ユーザーが誤って壊しかねない（/code-review 指摘）。一方
-        // `keys.ime_off`/`keys.ime_toggle` は engine 活性中（＝IME が ON で
-        // チョードが成立しうる間）に使うのが主目的であり、その間は本当に
-        // 発火しないため、既存の文面のままで正確。
-        fn warn_for_field(field: &str, combos: &[String], thumb_key: &str, w: &mut Vec<String>) {
+        fn warn_for_field(
+            field: &str,
+            combos: &[String],
+            thumb_key: &str,
+            solo_tap_passthrough: bool,
+            w: &mut Vec<String>,
+        ) {
             if combos
                 .iter()
                 .any(|combo| is_bare_same_key(combo, thumb_key))
             {
-                let detail = if field == "keys.ime_on" {
-                    "IME が ON（同時打鍵が成立しうる間）はチョード判定を優先するため、\
-                     このコンボは発火しません。ただし IME が OFF の間の単独タップでは \
-                     引き続き IME ON として機能します。"
+                let canonical = key_identity(thumb_key);
+                let is_supported = canonical == "NONCONVERT" || canonical == "CONVERT";
+                let detail = if is_supported && solo_tap_passthrough {
+                    "このキーは同時打鍵かどうかの判定後、単独タップ確定時に強制ON/OFFが発火します。\
+                     この場合、単独タップを素通し（パススルー）にする設定は効きません。生のキーは IME に届かず、\
+                     IME が ON のときも ON にそろえる動作になります。IME 側のキー設定で無変換/変換に割り当てた機能を\
+                     使いたい場合は、このキーを keys.ime_on/ime_off/ime_toggle から外してください。"
+                } else if is_supported {
+                    "このキーは同時打鍵かどうかの判定後、単独タップ確定時に強制ON/OFFが発火します。composing中も発火し、未確定文字列が破棄されるか確定されるかはIME実装に依存します。"
+                } else if field == "keys.ime_on" {
+                    "このキーは同時打鍵（親指シフト入力）にも使うキーなので、IME が \
+                     ON になっている間は、まず同時打鍵かどうかの判定が優先されます。\
+                     そのため、IME が ON の状態でこのキーだけを押しても IME は \
+                     ON のままで変化しません（実害はありません。ただし設定した \
+                     つもりの動作にはなりません）。IME が OFF の状態でこのキーだけを \
+                     押した場合は、これまでどおり IME を ON にします（本来の主な \
+                     用途はこちらです）。IME が ON の間もこのキー単体で操作したい \
+                     場合は、他のキーに変更するか、Shift などと組み合わせて \
+                     （例: Shift+このキー）設定し直してください。"
                 } else {
-                    "IME が ON の間は同時打鍵判定を優先するため、このキーは IME ON/OFF \
-                     コンボには使われません。"
+                    "このキーは同時打鍵（親指シフト入力）にも使うキーなので、IME が \
+                     ON になっている間は、まず同時打鍵かどうかの判定が優先されます。\
+                     そのため、IME が ON の間はこの設定が働かず、このキーだけを \
+                     押しても IME の OFF・切り替えはできません（実害はありません。\
+                     ただし設定した意味がありません）。他のキーに変更するか、\
+                     Shift などと組み合わせて（例: Shift+このキー）設定し直して \
+                     ください。"
                 };
                 w.push(format!(
-                    "{field} に親指キー（{thumb_key}）が修飾キーなしで設定されています。\
-                     {detail}"
+                    "{field} に、同時打鍵で使う親指キー（{thumb_key}）が、他のキーとの \
+                     組み合わせなしでそのまま設定されています。{detail}"
                 ));
             }
         }
 
         for thumb_key in [g.left_thumb_key.as_str(), g.right_thumb_key.as_str()] {
-            warn_for_field("keys.ime_on", &keys.ime_on, thumb_key, w);
-            warn_for_field("keys.ime_off", &keys.ime_off, thumb_key, w);
-            warn_for_field("keys.ime_toggle", &keys.ime_toggle, thumb_key, w);
+            let passthrough = match key_identity(thumb_key).as_str() {
+                "NONCONVERT" => !g.muhenkan_solo_tap_always_suppress,
+                "CONVERT" => !g.henkan_solo_tap_always_suppress,
+                _ => false,
+            };
+            warn_for_field("keys.ime_on", &keys.ime_on, thumb_key, passthrough, w);
+            warn_for_field("keys.ime_off", &keys.ime_off, thumb_key, passthrough, w);
+            warn_for_field(
+                "keys.ime_toggle",
+                &keys.ime_toggle,
+                thumb_key,
+                passthrough,
+                w,
+            );
+        }
+    }
+
+    /// 非推奨の `*_solo_tap_ime_action` が残っているときの警告（ADR-206 決定4）。
+    fn validate_legacy_solo_tap_action(g: &GeneralConfig, keys: &KeysConfig, w: &mut Vec<String>) {
+        // 同じキーの bare が `keys.ime_*` に既にあれば、旧設定は移行されず bare が優先される（ADR-206 決定4）。
+        let has_bare = |canonical: &str| {
+            [&keys.ime_on, &keys.ime_off, &keys.ime_toggle]
+                .into_iter()
+                .flatten()
+                .any(|combo| {
+                    let (mods, main) = split_combo(combo);
+                    mods.is_empty() && key_identity(main) == canonical
+                })
+        };
+        let (muhenkan_migrated, henkan_migrated) = g.legacy_thumb_solo_tap_actions();
+        for (field, set, migrated, key_name, bare_present) in [
+            (
+                "muhenkan_solo_tap_ime_action",
+                g.muhenkan_solo_tap_ime_action.is_some(),
+                muhenkan_migrated.is_some(),
+                "無変換",
+                has_bare("NONCONVERT"),
+            ),
+            (
+                "henkan_solo_tap_ime_action",
+                g.henkan_solo_tap_ime_action.is_some(),
+                henkan_migrated.is_some(),
+                "変換",
+                has_bare("CONVERT"),
+            ),
+        ] {
+            if !set {
+                continue;
+            }
+            if migrated && bare_present {
+                w.push(format!(
+                    "general.{field} は非推奨で、`keys.ime_on`/`ime_off`/`ime_toggle` に「{key_name}」が既にあるため無視されます（そちらが優先されます）。削除してください。"
+                ));
+            } else if migrated {
+                w.push(format!(
+                    "general.{field} は非推奨です。`keys.ime_on`/`ime_off`/`ime_toggle` に「{key_name}」を単独で書くか、削除してください。\
+                     現在は、そこに単独で書いたのと同じ扱いで動いています。GJI の CUSTOM 表で{key_name}がトグルなら、設定なしで動きます。"
+                ));
+            } else {
+                w.push(format!(
+                    "general.{field} は非推奨で、{key_name}が親指キーに割り当てられていないため今後は効きません（IME が自分で処理します）。\
+                     半角状態で「@」が出る場合は、{key_name}を親指キーに割り当ててください。"
+                ));
+            }
         }
     }
 
@@ -895,20 +1390,23 @@ impl AppConfig {
             return;
         }
 
-        if g.default_layout.trim_end_matches(".yab") == "nicola" {
-            w.push(
-                "keyboard_model = \"us\" ですが default_layout が JIS 版の \"nicola.yab\" \
-                 のままです。JIS 版は列数が US の上限を超えるためパースに失敗します。\
-                 \"nicola_us.yab\" を指定してください。"
-                    .to_string(),
-            );
+        let jis_only_default = matches!(
+            g.default_layout.trim_end_matches(".yab"),
+            "nicola" | "nicola_keytop" | "nicola_f" | "nicola_kb232" | "nicola_kakutei"
+        );
+        if jis_only_default {
+            w.push(format!(
+                "keyboard_model = \"us\" ですが default_layout が JIS配列専用の \
+                 レイアウト \"{}\" のままです。このレイアウトは US キーボードでは \
+                 正しく読み込めません。\"nicola_us.yab\" を指定してください。",
+                g.default_layout
+            ));
         }
 
-        let mentions_jis_only = |s: &str| {
-            Self::THUMB_KEY_ALIASES
-                .iter()
-                .any(|(kanji, vk)| s.contains(kanji) || s.contains(vk))
-        };
+        // 組み合わせは `split_combo` で主キーを取り出して完全一致（`contains` は使わない。
+        // ADR-201 R3-3）。
+        let mentions_jis_only =
+            |s: &str| matches!(combo_main_identity(s).as_str(), "NONCONVERT" | "CONVERT");
 
         let mut offending_fields: Vec<&str> = Vec::new();
         if mentions_jis_only(&g.left_thumb_key) {
@@ -939,13 +1437,15 @@ impl AppConfig {
 
         if !offending_fields.is_empty() {
             w.push(format!(
-                "keyboard_model = \"us\" ですが、無変換/変換キー前提の既定値が \
+                "keyboard_model = \"us\" ですが、無変換/変換キー前提の初期設定が \
                  次の項目に残っています: {}。US キーボードにはこれらの物理キーが \
-                 存在しないため、config.toml で明示的に上書きしてください。\
-                 注意: VK_LMENU/VK_RMENU（Alt）・VK_LCONTROL/VK_RCONTROL（Ctrl）・ \
-                 VK_LWIN/VK_RWIN（Win）は使用不可（OS 予約修飾キーとして即座に \
-                 素通しされ、同時打鍵検出が機能しない）。プログラマブルキーボードで \
-                 無変換/変換や F13-F24 に物理リマップするか、VK_SPACE を検討してください。",
+                 存在しないため、config.toml で別のキーに変更してください。\
+                 注意: Alt・Ctrl・Win（左右とも）は OS がすでに予約しているキーの \
+                 ため、親指キーとしては使用できません（awase が同時打鍵として \
+                 検出するより先に OS 側の機能として使われてしまいます）。物理的に \
+                 キーを配置し直せるキーボードをお使いであれば無変換/変換や \
+                 F13〜F24 の位置に割り当てる方法もありますが、そうでなければ \
+                 スペースキーを親指キーにする設定を検討してください。",
                 offending_fields.join(", ")
             ));
         }
@@ -982,6 +1482,7 @@ impl AppConfig {
         Self::check_override_list(&overrides.force_vk, "force_vk", w);
         Self::check_override_list(&overrides.force_tsf, "force_tsf", w);
         Self::check_disable_apps_list(&overrides.disable_apps, w);
+        Self::check_input_relay_apps_list(&overrides.input_relay_apps, w);
     }
 
     /// `disable_apps` の空文字列エントリを警告する。
@@ -991,6 +1492,13 @@ impl AppConfig {
     fn check_disable_apps_list(list: &[String], w: &mut Vec<String>) {
         if list.iter().any(String::is_empty) {
             w.push("app_overrides.disable_apps に空のエントリがあります".to_string());
+        }
+    }
+
+    /// `input_relay_apps` の空文字列エントリを警告する。
+    fn check_input_relay_apps_list(list: &[String], w: &mut Vec<String>) {
+        if list.iter().any(String::is_empty) {
+            w.push("app_overrides.input_relay_apps に空のエントリがあります".to_string());
         }
     }
 
@@ -1009,7 +1517,10 @@ impl AppConfig {
     /// 不正な値がある場合は警告メッセージのリストと共に返す（厳密なエラーではなくデフォルト値にフォールバック）。
     #[must_use]
     pub fn validate(self) -> (ValidatedConfig, Vec<String>) {
-        let mut warnings = Vec::new();
+        // 読み込み時の診断（未知のキー・`[[keymap]]` の合流）を先頭に置く。
+        let mut warnings = self.load_warnings;
+        // 撤去済みで効果があったキーの通知は、ログだけの `load_warnings` とは別に**警告**として返す（ADR-207）。
+        warnings.extend(self.removed_notices);
         let mut general = self.general;
         let app_overrides = self.app_overrides;
 
@@ -1018,6 +1529,7 @@ impl AppConfig {
         Self::validate_thumb_keys(&general, &mut warnings);
         Self::validate_dedicated_fn_key(&general, &mut warnings);
         Self::validate_thumb_key_in_ime_combos(&general, &self.keys, &mut warnings);
+        Self::validate_legacy_solo_tap_action(&general, &self.keys, &mut warnings);
         Self::validate_keyboard_model(&general, &self.keys, &mut warnings);
         Self::validate_linux_backend(&mut general, &mut warnings);
         Self::validate_app_override_entries(&app_overrides, &mut warnings);
@@ -1027,14 +1539,104 @@ impl AppConfig {
                 general,
                 keys: self.keys,
                 app_overrides,
+                diagnostics: self.diagnostics,
                 keymaps: self.keymaps,
                 post_bypass: self.post_bypass,
-                key_remap: self.key_remap,
+                keystroke_macro: self.keystroke_macro,
                 macos_symbol_romaji: self.macos_symbol_romaji,
             },
             warnings,
         )
     }
+}
+
+/// コア`awase`クレートに埋め込んだ、出荷時の`config.toml`（ADR-178 決定3）。
+/// `GeneralConfig::default()`のserializeは代用しない
+/// （`GeneralConfig::default()`は`layouts_dir: "config"`だが出荷時は
+/// `"layout"`であり、項目が食い違う）。
+const EMBEDDED_CONFIG_TOML: &str = include_str!("../config.toml");
+
+/// コア`awase`クレートに埋め込んだ、同梱6ファイルの`.yab`（ADR-178 決定3）。
+const EMBEDDED_LAYOUTS: &[(&str, &str)] = &[
+    ("nicola.yab", include_str!("../layout/nicola.yab")),
+    (
+        "nicola_keytop.yab",
+        include_str!("../layout/nicola_keytop.yab"),
+    ),
+    ("nicola_us.yab", include_str!("../layout/nicola_us.yab")),
+    ("nicola_f.yab", include_str!("../layout/nicola_f.yab")),
+    (
+        "nicola_kb232.yab",
+        include_str!("../layout/nicola_kb232.yab"),
+    ),
+    (
+        "nicola_kakutei.yab",
+        include_str!("../layout/nicola_kakutei.yab"),
+    ),
+];
+
+/// `config_path`が存在しなければ、埋め込み既定値（[`EMBEDDED_CONFIG_TOML`]）
+/// から生成する（ADR-178 決定2）。既に存在する場合は内容を一切比較・上書き
+/// せず、何もしない——これが「バックアップと実ファイルの整合を取る」という
+/// 問題自体を発生させない設計の核心（v2〜v13の複雑さの原因だった問題を
+/// 構造的に回避する）。
+///
+/// # Errors
+///
+/// 書き込みに失敗した場合にエラーを返す。呼び出し元は失敗してもpanicせず、
+/// 既存のエラー経路（`find_config_path`の`bail!`等）に委ねること。
+pub fn ensure_config_exists(config_path: &Path) -> Result<()> {
+    if config_path.exists() {
+        return Ok(());
+    }
+    crate::fs_atomic::write_atomic(config_path, EMBEDDED_CONFIG_TOML.as_bytes())
+}
+
+/// `layouts_dir`に`.yab`拡張子のファイルが1本も無い場合、同梱6ファイルを
+/// 埋め込み既定値（[`EMBEDDED_LAYOUTS`]）から生成する（ADR-178 決定2）。
+///
+/// 1本でも存在すれば何もしない——ユーザーが同梱配列の一部を削除して整理した
+/// 状態を復活させないため。中身の妥当性（パース可能かどうか）は判定しない
+/// （シンプルさを優先、v13が持っていた`KeyboardModel`全バリアント試行の
+/// ような複雑な検証は行わない）。
+///
+/// 途中（3本目等）で書き込みが失敗した場合、**それまでに書いた分を削除して
+/// エラーを返す**（`/code-review`指摘、v14 opusレビューMajor M5対応）——
+/// 中途半端な本数のまま抜けると、次回起動時に`has_any_yab`が`true`になり
+/// 「1本でもあれば何もしない」判定で永久に残り4本が生成されなくなる。
+/// 全滅させて0本に戻すことで、次回起動時に全6本の生成を再試行できる。
+///
+/// # Errors
+///
+/// ディレクトリ作成・書き込みに失敗した場合にエラーを返す。呼び出し元は
+/// 失敗してもpanicせず、既存のエラー経路（`show_no_layouts_dialog`等）に
+/// 委ねること。
+pub fn ensure_layouts_exist(layouts_dir: &Path) -> Result<()> {
+    let has_any_yab = std::fs::read_dir(layouts_dir).is_ok_and(|entries| {
+        entries.filter_map(std::result::Result::ok).any(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("yab"))
+        })
+    });
+    if has_any_yab {
+        return Ok(());
+    }
+    std::fs::create_dir_all(layouts_dir)
+        .with_context(|| format!("Failed to create {}", layouts_dir.display()))?;
+    let mut written = Vec::with_capacity(EMBEDDED_LAYOUTS.len());
+    for (name, content) in EMBEDDED_LAYOUTS {
+        let path = layouts_dir.join(name);
+        if let Err(e) = crate::fs_atomic::write_atomic(&path, content.as_bytes()) {
+            for p in &written {
+                let _ = std::fs::remove_file(p);
+            }
+            return Err(e);
+        }
+        written.push(path);
+    }
+    Ok(())
 }
 
 /// キーコンボ（修飾キー + メインキー）のパース済みデータ。
@@ -1160,39 +1762,109 @@ default_layout = "nicola.yab"
         );
     }
 
-    /// ADR-092 決定D Step1: engine_on_ime_key/engine_off_ime_key の既定値は
-    /// 複合副作用キー（open + charset強制を1発で行う）の残骸であり、
-    /// 既定 None に固定する（2026-08-15、実装時に既定値を変更）。
+    /// `keys.ime_detect.{toggle,on,off}` の既定はすべて空（ADR-207、2026-09-29 所有者決定）。
+    /// 旧既定の `IMEオン`/`IMEオフ`（VK_IME_ON/OFF）の追随は hook の静的 `shadow_action` が担う。
+    /// 明示した値は既定と無関係に尊重される（一部の項目だけ書いた場合、残りは空）。
     #[test]
-    fn test_keys_config_default_has_no_engine_ime_mode_keys() {
-        let keys = KeysConfig::default();
-        assert_eq!(keys.engine_on_ime_key, None);
-        assert_eq!(keys.engine_off_ime_key, None);
+    fn test_ime_detect_defaults_are_empty_and_explicit_values_are_respected() {
+        let d = ImeDetectConfig::default();
+        assert!(d.toggle.is_empty() && d.on.is_empty() && d.off.is_empty());
+        let config: AppConfig = toml::from_str("[general]\n").unwrap();
+        assert!(config.keys.ime_detect.on.is_empty() && config.keys.ime_detect.off.is_empty());
+
+        let config: AppConfig =
+            toml::from_str("[general]\n[keys.ime_detect]\non = [\"IMEオン\", \"VK_F16\"]\n")
+                .unwrap();
+        assert_eq!(config.keys.ime_detect.on, vec!["IMEオン", "VK_F16"]);
+        assert!(config.keys.ime_detect.off.is_empty());
     }
 
-    /// 新規インストール（config.toml に該当キー未指定）は None のまま
-    /// パースされる。既存 config.toml に明示値がある場合は
-    /// `AppConfig::save` が全フィールドを明示出力する仕様上、この
-    /// デフォルト変更は新規/未保存ユーザーにのみ効く（ADR-092 決定D Step1）。
+    /// ADR-207: 撤去した `keys.engine_on_ime_key`/`engine_off_ime_key` が旧 config.toml に残っていても
+    /// 読み込みエラーにならず、他の設定が読める。値は無視され、専用の通知（`removed_notices`）だけが積まれる
+    /// （未知キー警告〈`load_warnings`、ログだけ〉にも、近い名前の提案〈`keys.engine_on`〉にもならない）。
     #[test]
-    fn test_parse_app_config_engine_ime_keys_default_to_none() {
-        let toml_str = r#"
-[general]
-"#;
-        let config: AppConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.keys.engine_on_ime_key, None);
-        assert_eq!(config.keys.engine_off_ime_key, None);
+    fn test_removed_engine_ime_keys_are_ignored_with_a_notice() {
+        let c = AppConfig::from_toml_str(
+            "[general]\nleft_thumb_key = \"無変換\"\n[keys]\n\
+             engine_on_ime_key = \"VK_DBE_DBCSCHAR\"\nengine_off_ime_key = \"VK_DBE_SBCSCHAR\"\n\
+             engine_on = [\"Ctrl+A\"]\n",
+        )
+        .expect("撤去したキーが残っていても読める");
+        assert_eq!(c.general.left_thumb_key, "無変換");
+        assert_eq!(c.keys.engine_on, vec!["Ctrl+A"]);
+        assert!(c.load_warnings().is_empty(), "{:?}", c.load_warnings());
+        assert_eq!(c.removed_notices().len(), 2, "{:?}", c.removed_notices());
+        assert!(c
+            .removed_notices()
+            .iter()
+            .all(|m| m.contains("撤去") && !m.contains("間違い")));
+        let (_v, warnings) = c.validate();
+        assert_eq!(
+            warnings.iter().filter(|w| w.contains("撤去")).count(),
+            2,
+            "{warnings:?}"
+        );
+        // 撤去キーが無ければ通知は出ない。
+        let c = AppConfig::from_toml_str("[general]\n").unwrap();
+        assert!(c.removed_notices().is_empty());
     }
 
-    /// `keys.ime_toggle` の既定値は漢字キー（`VK_KANJI`）（2026-08-16
-    /// ユーザー要望）。`VK_KANJI` は ADR-091 §1.2 で「Imm32Unavailable
-    /// プロファイル向けの真のトグル」として既に確立済みの冪等な IME
-    /// ON/OFF トグルキーであり、新設の GUI「IME ON/OFF トグル」欄の
-    /// 既定候補として妥当（`msime_key_assignment.rs`のドキュメント参照）。
+    /// `keys.ime_toggle` の既定値は空（ADR-199 決定15、2026-09-29 所有者決定）。
+    /// 「IME の設定に従う」原則のため、awase 自身は漢字キー（`VK_KANJI`）を能動的に消費しない。
+    /// 0x19（Alt+半角/全角）の開閉は `hook.rs` の静的 `Toggle`／GJI の役割判定（ADR-202）が担う。
+    /// `ime_on`/`ime_off`（awase 自身が actuate する設定）の既定は変えない。
     #[test]
-    fn test_keys_config_default_ime_toggle_is_kanji_key() {
+    fn test_keys_config_default_ime_toggle_is_empty() {
         let keys = KeysConfig::default();
-        assert_eq!(keys.ime_toggle, vec!["VK_KANJI".to_string()]);
+        assert!(keys.ime_toggle.is_empty());
+        assert_eq!(keys.ime_on, vec!["Ctrl+変換".to_string()]);
+        assert_eq!(keys.ime_off, vec!["Ctrl+無変換".to_string()]);
+    }
+
+    /// v1 の設定画面が書き出した旧既定値（`ime_toggle = ["VK_KANJI"]`、`ime_detect` の `IMEオン`/`IMEオフ`）は、
+    /// 読み込み時に空として扱う（v2 の既定が効く）。旧既定と**ちょうど同じ**ときだけで、他の値は尊重する。
+    #[test]
+    fn test_retired_default_values_are_dropped_on_load() {
+        let c = AppConfig::from_toml_str(
+            "[keys]\nime_toggle = [\"VK_KANJI\"]\n[keys.ime_detect]\non = [\"IMEオン\"]\noff = [\"IMEオフ\"]\n",
+        )
+        .unwrap();
+        assert!(c.keys.ime_toggle.is_empty());
+        assert!(c.keys.ime_detect.on.is_empty() && c.keys.ime_detect.off.is_empty());
+        // 旧既定と違う値は尊重する（他のキーを足した場合も、別のキーの場合も）。
+        let c = AppConfig::from_toml_str(
+            "[keys]\nime_toggle = [\"VK_KANJI\", \"VK_F8\"]\n[keys.ime_detect]\non = [\"IMEオン\", \"VK_F16\"]\noff = [\"VK_F17\"]\n",
+        )
+        .unwrap();
+        assert_eq!(c.keys.ime_toggle, vec!["VK_KANJI", "VK_F8"]);
+        assert_eq!(c.keys.ime_detect.on, vec!["IMEオン", "VK_F16"]);
+        assert_eq!(c.keys.ime_detect.off, vec!["VK_F17"]);
+        // [keys] を書いても ime_toggle を省略すれば既定（空）。
+        let c = AppConfig::from_toml_str("[keys]\nime_on = [\"Ctrl+変換\"]\n").unwrap();
+        assert!(c.keys.ime_toggle.is_empty());
+    }
+
+    /// 撤去済みで値が既定でない設定（`gji_thumb_key_ime_toggle = true`、`dbe_mode_key_policy = "passthrough"`）は
+    /// 通知し、既定値（`false`・`"suppress"`。v1 の設定画面が書き出す）では通知しない。
+    #[test]
+    fn test_removed_non_default_settings_notice_only_when_effective() {
+        let c = AppConfig::from_toml_str(
+            "[general]\ngji_thumb_key_ime_toggle = false\ndbe_mode_key_policy = \"suppress\"\n",
+        )
+        .unwrap();
+        assert!(c.removed_notices().is_empty(), "{:?}", c.removed_notices());
+        let c = AppConfig::from_toml_str(
+            "[general]\ngji_thumb_key_ime_toggle = true\ndbe_mode_key_policy = \"passthrough\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.removed_notices().len(), 2, "{:?}", c.removed_notices());
+        assert!(c.load_warnings().is_empty());
+        let (_v, warnings) = c.validate();
+        assert_eq!(
+            warnings.iter().filter(|w| w.contains("撤去")).count(),
+            2,
+            "{warnings:?}"
+        );
     }
 
     /// 撤去済みフィールド（output_mode / hook_mode）が
@@ -1262,6 +1934,54 @@ engine_off_solo_repeat = "VK_F15"
     }
 
     #[test]
+    fn test_validate_us_keyboard_with_nicola_kb232_default_layout_warns() {
+        // /code-review指摘（PR #132）: nicola_kb232.yab追加時にJIS専用一覧への
+        // 追記が漏れていた。nicola_f.yabと同様、keyboard_model="us"では
+        // 列数超過でパースに失敗するため警告対象。
+        let toml_str = r#"
+[general]
+keyboard_model = "us"
+default_layout = "nicola_kb232.yab"
+left_thumb_key = "VK_F16"
+right_thumb_key = "VK_F17"
+
+[keys]
+engine_on = ["Ctrl+Shift+VK_F13"]
+engine_off = ["Ctrl+Shift+VK_F14"]
+ime_on = ["Ctrl+VK_F13"]
+ime_off = ["Ctrl+VK_F14"]
+engine_off_solo_repeat = "VK_F15"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        let (_validated, warnings) = config.validate();
+        assert!(warnings.iter().any(|w| w.contains("nicola_us.yab")));
+    }
+
+    #[test]
+    fn test_validate_us_keyboard_with_nicola_kakutei_default_layout_warns() {
+        // /code-review指摘（PR #217）: nicola_kb232.yab追加時に一度発生した
+        // 「JIS専用一覧への追記漏れ」（PR #132）と同型の見落としを、
+        // nicola_kakutei.yab追加時にも繰り返しかけていた。
+        let toml_str = r#"
+[general]
+keyboard_model = "us"
+default_layout = "nicola_kakutei.yab"
+left_thumb_key = "VK_F16"
+right_thumb_key = "VK_F17"
+
+[keys]
+engine_on = ["Ctrl+Shift+VK_F13"]
+engine_off = ["Ctrl+Shift+VK_F14"]
+ime_on = ["Ctrl+VK_F13"]
+ime_off = ["Ctrl+VK_F14"]
+engine_off_solo_repeat = "VK_F15"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        let (_validated, warnings) = config.validate();
+        assert!(warnings.iter().any(|w| w.contains("nicola_us.yab")));
+    }
+
+    #[test]
     fn test_validate_us_keyboard_with_overridden_thumb_keys_is_clean() {
         let toml_str = r#"
 [general]
@@ -1311,9 +2031,6 @@ engine_off_solo_triple = "VK_NONCONVERT"
     fn test_confirm_mode_all_variants() {
         for (input, expected) in [
             ("wait", ConfirmMode::Wait),
-            ("speculative", ConfirmMode::Speculative),
-            ("two_phase", ConfirmMode::TwoPhase),
-            ("adaptive_timing", ConfirmMode::AdaptiveTiming),
             ("ngram_predictive", ConfirmMode::NgramPredictive),
         ] {
             let toml_str = format!("[general]\nconfirm_mode = \"{input}\"");
@@ -1329,7 +2046,7 @@ engine_off_solo_triple = "VK_NONCONVERT"
             return;
         }
         let config = AppConfig::load(path).unwrap();
-        assert_eq!(config.general.default_layout, "nicola.yab");
+        assert_eq!(config.general.default_layout, "nicola_keytop.yab");
         assert_eq!(config.general.layouts_dir, "layout");
     }
 
@@ -1358,6 +2075,26 @@ engine_off_solo_triple = "VK_NONCONVERT"
     }
 
     #[test]
+    fn test_hook_self_heal_defaults_to_enabled() {
+        // [diagnostics] を含め設定ファイルに一切キーが無い場合でも、既定で有効。
+        let toml_str = r#"
+[general]
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.diagnostics.hook_self_heal);
+    }
+
+    #[test]
+    fn test_hook_self_heal_can_be_disabled() {
+        let toml_str = r#"
+[diagnostics]
+hook_self_heal = false
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.diagnostics.hook_self_heal);
+    }
+
+    #[test]
     fn test_disable_apps_can_be_explicitly_emptied() {
         let toml_str = r#"
 [general]
@@ -1381,6 +2118,63 @@ disable_apps = ["mstsc.exe", "SomeGame.exe"]
         assert_eq!(
             config.app_overrides.disable_apps,
             vec!["mstsc.exe", "SomeGame.exe"]
+        );
+    }
+
+    #[test]
+    fn test_input_relay_apps_defaults_to_empty() {
+        let toml_str = r#"
+[general]
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.app_overrides.input_relay_apps.is_empty());
+    }
+
+    #[test]
+    fn test_input_relay_apps_can_be_added_explicitly() {
+        let toml_str = r#"
+[general]
+
+[app_overrides]
+input_relay_apps = ["powertoys.mousewithoutbordershelper.exe"]
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.app_overrides.input_relay_apps,
+            vec!["powertoys.mousewithoutbordershelper.exe"]
+        );
+    }
+
+    #[test]
+    fn test_input_relay_apps_custom_list_parse() {
+        let toml_str = r#"
+[general]
+
+[app_overrides]
+input_relay_apps = ["relay.exe", "SomeRelayHelper.exe"]
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.app_overrides.input_relay_apps,
+            vec!["relay.exe", "SomeRelayHelper.exe"]
+        );
+    }
+
+    #[test]
+    fn test_input_relay_apps_empty_entry_warns() {
+        let toml_str = r#"
+[general]
+
+[app_overrides]
+input_relay_apps = ["relay.exe", ""]
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        let (_validated, warnings) = config.validate();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("app_overrides.input_relay_apps")),
+            "expected a warning about input_relay_apps, got: {warnings:?}"
         );
     }
 
@@ -1501,6 +2295,47 @@ speculative_delay_ms = 80
         let (validated, warnings) = config.validate();
         assert_eq!(validated.general.speculative_delay_ms, 30);
         assert!(warnings.iter().any(|w| w.contains("speculative_delay_ms")));
+    }
+
+    #[test]
+    fn test_legacy_confirm_mode_values_load_as_wait_with_warning() {
+        for old in ["speculative", "two_phase", "adaptive_timing"] {
+            let c = AppConfig::from_toml_str(&format!(
+                "[general]\nconfirm_mode = \"{old}\"\nspeculative_delay_ms = 30\n"
+            ))
+            .unwrap();
+            assert_eq!(c.general.confirm_mode, ConfirmMode::Wait, "{old}");
+            let (validated, warnings) = c.validate();
+            assert_eq!(validated.general.confirm_mode, ConfirmMode::Wait, "{old}");
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.contains(old) && w.contains("廃止")),
+                "{old}: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_current_confirm_mode_values_load_without_warning() {
+        for v in ["wait", "ngram_predictive"] {
+            let c =
+                AppConfig::from_toml_str(&format!("[general]\nconfirm_mode = \"{v}\"\n")).unwrap();
+            let (_, warnings) = c.validate();
+            assert!(warnings.is_empty(), "{v}: {warnings:?}");
+        }
+    }
+
+    #[test]
+    fn test_validate_confirm_mode_wait_is_untouched() {
+        let toml_str = r#"
+[general]
+confirm_mode = "wait"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        let (validated, warnings) = config.validate();
+        assert_eq!(validated.general.confirm_mode, ConfirmMode::Wait);
+        assert!(warnings.is_empty());
     }
 
     #[test]
@@ -1647,6 +2482,66 @@ default_layout = "nicola.yab"
         }
     }
 
+    /// ADR-201 決定1: `F18` のような `VK_` 無し・小文字の表記も、`from_name` と同じ規則で
+    /// 安全範囲として扱う（以前は `"VK_F18"` の完全一致のみで、`F18` は警告された）。
+    #[test]
+    fn test_validate_dedicated_fn_key_is_lenient_about_notation() {
+        for name in ["F18", "f18", "vk_f18", " VK_F18 ", "F15", "F24"] {
+            let mut general = GeneralConfig::default();
+            general.muhenkan_solo_tap_dedicated_fn_key = Some(name.to_string());
+            let mut warnings = Vec::new();
+            AppConfig::validate_dedicated_fn_key(&general, &mut warnings);
+            assert!(warnings.is_empty(), "{name:?}: {warnings:?}");
+        }
+        for name in ["F14", "f13", "Ctrl+F18", "VK_F25", "無変換"] {
+            let mut general = GeneralConfig::default();
+            general.muhenkan_solo_tap_dedicated_fn_key = Some(name.to_string());
+            let mut warnings = Vec::new();
+            AppConfig::validate_dedicated_fn_key(&general, &mut warnings);
+            assert_eq!(warnings.len(), 1, "{name:?}");
+        }
+    }
+
+    /// ADR-201 決定1: かなキーは `カナ`/`かな`/小文字でも同じ VK（0x15）なので警告する。
+    #[test]
+    fn test_validate_thumb_keys_warns_on_kana_spellings() {
+        for name in ["カナ", "かな", "kana", "vk_kana", " Kana "] {
+            let mut general = GeneralConfig::default();
+            general.left_thumb_key = name.to_string();
+            let mut warnings = Vec::new();
+            AppConfig::validate_thumb_keys(&general, &mut warnings);
+            assert_eq!(warnings.len(), 1, "{name:?}");
+        }
+    }
+
+    /// ADR-201 R3-3: 組み合わせは主キーの完全一致で見る（`contains` ではない）。
+    /// 修飾付きの `Ctrl+変換` も US 配列では JIS 専用キーとして検出し、無関係な名前の
+    /// 一部に「変換」が含まれるだけでは誤検出しない。
+    #[test]
+    fn test_validate_keyboard_model_us_matches_combo_main_key_exactly() {
+        let check = |engine_on: &str| {
+            let mut general = GeneralConfig::default();
+            general.keyboard_model = KeyboardModel::Us;
+            general.left_thumb_key = "VK_SPACE".to_string();
+            general.right_thumb_key = "VK_SPACE".to_string();
+            let mut keys = KeysConfig::default();
+            keys.engine_on = vec![engine_on.to_string()];
+            keys.engine_off = vec![];
+            keys.ime_on = vec![];
+            keys.ime_off = vec![];
+            keys.engine_off_solo_repeat = None;
+            let mut w = Vec::new();
+            AppConfig::validate_keyboard_model(&general, &keys, &mut w);
+            w.iter().any(|m| m.contains("keys.engine_on"))
+        };
+        assert!(check("Ctrl+変換"));
+        assert!(check("ctrl+vk_nonconvert"));
+        assert!(check("Nonconvert"));
+        assert!(!check("Ctrl+VK_F12"));
+        // 名前の一部に「変換」を含むだけの別の名前は誤検出しない。
+        assert!(!check("Ctrl+再変換"));
+    }
+
     /// T-16: IME コンボに bare 親指キーを設定した場合だけ警告する。
     /// Ctrl+無変換のような修飾付きコンボは従来どおり許容する。
     #[test]
@@ -1665,7 +2560,8 @@ ime_toggle = []
         assert!(
             warnings
                 .iter()
-                .any(|w| w.contains("keys.ime_on") && w.contains("親指キー")),
+                .any(|w| w.contains("keys.ime_on")
+                    && w.contains("単独タップ確定時に強制ON/OFFが発火")),
             "bare thumb key in keys.ime_on should warn, got: {warnings:?}"
         );
         assert!(
@@ -1674,9 +2570,178 @@ ime_toggle = []
         );
     }
 
+    /// 無変換が `keys.ime_on` にあり、単独タップがパススルー設定のときだけ「パススルーは効かない」と警告する。
+    #[test]
+    fn test_validate_warns_passthrough_is_overridden_by_bare_role_key() {
+        let toml_str = r#"
+[general]
+left_thumb_key = "無変換"
+muhenkan_solo_tap_always_suppress = false
+
+[keys]
+ime_on = ["VK_NONCONVERT"]
+ime_off = []
+ime_toggle = []
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.keys.has_bare_role_key("NONCONVERT"));
+        assert!(!config.keys.has_bare_role_key("CONVERT"));
+        let (_validated, warnings) = config.validate();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("keys.ime_on")
+                    && w.contains("パススルー）にする設定は効きません")),
+            "passthrough + bare role key should warn, got: {warnings:?}"
+        );
+
+        // 既定（Suppress）なら従来の文言のまま。
+        let config: AppConfig = toml::from_str(&toml_str.replace(
+            "muhenkan_solo_tap_always_suppress = false",
+            "muhenkan_solo_tap_always_suppress = true",
+        ))
+        .unwrap();
+        let (_validated, warnings) = config.validate();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("keys.ime_on")
+                    && !w.contains("パススルー）にする設定は効きません")),
+            "suppress + bare role key keeps the old message, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_legacy_solo_tap_action_migrates_only_for_thumb_keys_and_warns() {
+        let toml_str = r#"
+[general]
+left_thumb_key = "無変換"
+right_thumb_key = "Space"
+muhenkan_solo_tap_ime_action = "off"
+henkan_solo_tap_ime_action = "on"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        // 無変換だけが親指キー。変換は親指に割り当てられていないので移行しない。
+        assert_eq!(
+            config.general.legacy_thumb_solo_tap_actions(),
+            (Some(crate::types::ShadowImeAction::TurnOff), None)
+        );
+        let (_validated, warnings) = config.validate();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("general.muhenkan_solo_tap_ime_action")
+                    && w.contains("非推奨です")
+                    && w.contains("同じ扱いで動いています")),
+            "親指キーの旧設定は移行の警告、got: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("general.henkan_solo_tap_ime_action")
+                    && w.contains("今後は効きません")),
+            "親指でないキーの旧設定は読み捨ての警告、got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_legacy_solo_tap_action_is_ignored_when_bare_combo_exists() {
+        let toml_str = r#"
+[general]
+left_thumb_key = "無変換"
+muhenkan_solo_tap_ime_action = "toggle"
+
+[keys]
+ime_off = ["無変換"]
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        let (_validated, warnings) = config.validate();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("general.muhenkan_solo_tap_ime_action")
+                    && w.contains("無視されます")
+                    && w.contains("優先されます")),
+            "bare が既にあれば旧設定は無視される旨を警告する、got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_no_legacy_warning_without_solo_tap_action() {
+        let (_validated, warnings) = AppConfig::default().validate();
+        assert!(
+            !warnings.iter().any(|w| w.contains("_solo_tap_ime_action")),
+            "旧設定が無ければ警告しない、got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_keeps_legacy_warning_for_non_convert_thumb_key() {
+        let mut config = AppConfig::default();
+        config.general.left_thumb_key = "VK_SPACE".to_string();
+        config.keys.ime_off = vec!["VK_SPACE".to_string()];
+        let (_validated, warnings) = config.validate();
+        assert!(warnings.iter().any(|w| {
+            w.contains("keys.ime_off")
+                && w.contains("他のキーに変更するか")
+                && w.contains("Shift などと組み合わせて")
+        }));
+    }
+
     // parse_key_combo テストは awase-windows に移動済み
 
     // ── engine_on/off_keys デフォルトテスト ──
+
+    /// ADR-191で`apply_calibrated_mode_keys`設定を撤去した。既存の`config.toml`に古いキーが残っていても、
+    /// 起動時に読み込みエラーにならず、無視されて他の設定が読める（`deny_unknown_fields`を付けていない）。
+    #[test]
+    fn test_removed_apply_calibrated_mode_keys_key_is_ignored_on_load() {
+        let toml_str = r#"
+[general]
+apply_calibrated_mode_keys = true
+left_thumb_key = "無変換"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).expect("旧キーが残っていても読める");
+        assert_eq!(config.general.left_thumb_key, "無変換");
+    }
+
+    /// 手動較正(ADR-176)の撤去で`AppConfig::calibration`（`[[calibration]]`）を削除した。
+    /// 旧版が書いた`[[calibration]]`が`config.toml`に残っていても、読み込みエラーにならず、
+    /// 無視されて他の設定が読める（`deny_unknown_fields`を付けていない）。
+    #[test]
+    fn test_removed_calibration_section_is_ignored_on_load() {
+        let toml_str = r#"
+[general]
+left_thumb_key = "無変換"
+
+[[calibration]]
+vk = 29
+result = "On"
+active_ime_kind = "Gji"
+fingerprint_kind = "Gji"
+gji_session_keymap = 3
+gji_relevant_row = "DirectInput\tMuhenkan\tIMEOn"
+confirmed_at_epoch_ms = 1758000000000
+"#;
+        let config: AppConfig =
+            toml::from_str(toml_str).expect("旧[[calibration]]が残っていても読める");
+        assert_eq!(config.general.left_thumb_key, "無変換");
+    }
+
+    /// ADR-191で`dbe_mode_key_policy`（BUG-52のDBEキー Suppress を外す隠し設定）と
+    /// `gji_thumb_key_ime_toggle`を撤去した（レビュー指摘B-M3）。旧`config.toml`にキーが残っていても、
+    /// 読み込みエラーにも警告にもならず、無視されて他の設定が読める。
+    #[test]
+    fn test_removed_dbe_mode_key_policy_and_gji_thumb_key_ime_toggle_are_ignored_on_load() {
+        let toml_str = r#"
+[general]
+dbe_mode_key_policy = "passthrough"
+gji_thumb_key_ime_toggle = true
+left_thumb_key = "無変換"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).expect("旧キーが残っていても読める");
+        assert_eq!(config.general.left_thumb_key, "無変換");
+    }
 
     #[test]
     fn test_engine_toggle_key_defaults() {
@@ -1890,6 +2955,304 @@ right_thumb_key = "VK_KANA"
         assert!(
             !warnings.iter().any(|w| w.contains("ロック型")),
             "default thumb keys must not warn, got: {warnings:?}"
+        );
+    }
+
+    // ── ADR-115: 打鍵列機能 ──
+
+    #[test]
+    fn test_keystroke_sequence_defaults_to_on() {
+        // 2026-09-13 に既定 Off → On へ変更（ADR-115 決定8追補）。
+        let config = AppConfig::default();
+        assert_eq!(
+            config.general.keystroke_sequence,
+            KeystrokeSequencePolicy::On
+        );
+    }
+
+    #[test]
+    fn test_parse_keystroke_macro() {
+        let toml_str = r#"
+[general]
+keystroke_sequence = "on"
+
+[[keystroke_macro]]
+name = "bracket_paren"
+steps = ["'（'", "CV4D", "'）'", "CV4D", "左"]
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.general.keystroke_sequence,
+            KeystrokeSequencePolicy::On
+        );
+        assert_eq!(config.keystroke_macro.len(), 1);
+        assert_eq!(config.keystroke_macro[0].name, "bracket_paren");
+        assert_eq!(
+            config.keystroke_macro[0].steps,
+            vec!["'（'", "CV4D", "'）'", "CV4D", "左"]
+        );
+    }
+
+    #[test]
+    fn test_keystroke_macro_survives_save_load_round_trip() {
+        let mut config = AppConfig::default();
+        config.general.keystroke_sequence = KeystrokeSequencePolicy::On;
+        config.keystroke_macro.push(KeystrokeMacro {
+            name: "bracket_paren".to_string(),
+            steps: vec![
+                "'（'".to_string(),
+                "CV4D".to_string(),
+                "'）'".to_string(),
+                "CV4D".to_string(),
+                "左".to_string(),
+            ],
+        });
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let round_tripped: AppConfig = toml::from_str(&serialized).unwrap();
+
+        assert_eq!(
+            round_tripped.general.keystroke_sequence,
+            KeystrokeSequencePolicy::On
+        );
+        assert_eq!(round_tripped.keystroke_macro.len(), 1);
+        assert_eq!(round_tripped.keystroke_macro[0].name, "bracket_paren");
+        assert_eq!(
+            round_tripped.keystroke_macro[0].steps,
+            config.keystroke_macro[0].steps
+        );
+    }
+
+    #[test]
+    fn test_validated_config_preserves_keystroke_macro() {
+        // ValidatedConfig と AppConfig は別構造体で validate() が手で
+        // 詰め替えているため、keystroke_macro が伝播することを回帰で
+        // 固定する（実装タスクレビュー指摘 C1）。
+        let mut config = AppConfig::default();
+        config.keystroke_macro.push(KeystrokeMacro {
+            name: "confirm".to_string(),
+            steps: vec!["CV4D".to_string()],
+        });
+
+        let (validated, _warnings) = config.validate();
+        assert_eq!(validated.keystroke_macro.len(), 1);
+        assert_eq!(validated.keystroke_macro[0].name, "confirm");
+
+        let round_tripped: AppConfig = validated.into();
+        assert_eq!(round_tripped.keystroke_macro.len(), 1);
+        assert_eq!(round_tripped.keystroke_macro[0].name, "confirm");
+    }
+
+    // ── ensure_config_exists / ensure_layouts_exist（ADR-178 決定2・決定5）──
+
+    fn unique_temp_dir(name: &str) -> std::path::PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "awase_ensure_user_data_test_{name}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn ensure_config_exists_creates_file_when_missing() {
+        let dir = unique_temp_dir("config_missing");
+        let path = dir.join("config.toml");
+        assert!(!path.exists());
+
+        ensure_config_exists(&path).unwrap();
+
+        assert!(path.exists());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            EMBEDDED_CONFIG_TOML
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_config_exists_never_touches_existing_file() {
+        let dir = unique_temp_dir("config_existing");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[general]\nsimultaneous_threshold_ms = 777\n").unwrap();
+
+        ensure_config_exists(&path).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[general]\nsimultaneous_threshold_ms = 777\n",
+            "既存ファイルの内容が変わってはならない（ADR-178 決定2: 比較も上書きもしない）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_layouts_exist_creates_all_bundled_files_when_dir_missing() {
+        let dir = unique_temp_dir("layouts_missing");
+        let layouts_dir = dir.join("layout");
+        assert!(!layouts_dir.exists());
+
+        ensure_layouts_exist(&layouts_dir).unwrap();
+
+        for (name, content) in EMBEDDED_LAYOUTS {
+            let path = layouts_dir.join(name);
+            assert!(path.exists(), "{name} が生成されていない");
+            assert_eq!(&std::fs::read_to_string(&path).unwrap(), content);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_layouts_exist_does_nothing_when_one_yab_already_present() {
+        let dir = unique_temp_dir("layouts_one_present");
+        let layouts_dir = dir.join("layout");
+        std::fs::create_dir_all(&layouts_dir).unwrap();
+        std::fs::write(layouts_dir.join("custom.yab"), "user data").unwrap();
+
+        ensure_layouts_exist(&layouts_dir).unwrap();
+
+        let entries: Vec<_> = std::fs::read_dir(&layouts_dir)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "1本でも.yabが存在するなら同梱6ファイルを生成してはならない（ADR-178 決定2）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_layouts_exist_cleans_up_partial_writes_on_failure() {
+        // /code-review指摘（v14 opusレビューMajor M5対応）: 3本目の書き込みを
+        // write_atomicの内部で使う一時ファイル名（<target>.tmp.<pid>）を狙って
+        // 失敗させる。同名のディレクトリを事前に置くと`File::create`が
+        // 失敗する。（3本目**そのもの**の名前にディレクトリを置く方式だと
+        // has_any_yabの拡張子判定に引っかかり「1本でもある」扱いで
+        // ensure_layouts_existが即Ok(())で返ってしまうため使えない。）
+        // 途中まで書いた分（1・2本目）が削除され、次回呼び出しで再度0本から
+        // 全6本の生成を試みられる状態に戻ることを確認する。
+        let dir = unique_temp_dir("layouts_partial_failure");
+        let layouts_dir = dir.join("layout");
+        std::fs::create_dir_all(&layouts_dir).unwrap();
+        let third_name = EMBEDDED_LAYOUTS[2].0;
+        let blocked_tmp = layouts_dir.join(format!("{third_name}.tmp.{}", std::process::id()));
+        std::fs::create_dir_all(&blocked_tmp).unwrap();
+
+        let result = ensure_layouts_exist(&layouts_dir);
+        assert!(
+            result.is_err(),
+            "3本目の一時ファイル名がディレクトリで塞がれているので失敗するはず"
+        );
+
+        for (i, (name, _)) in EMBEDDED_LAYOUTS.iter().enumerate() {
+            if i < 2 {
+                assert!(
+                    !layouts_dir.join(name).exists(),
+                    "{name}（{i}本目）は途中失敗時に片付けられているべき（ADR-178 v14 M5）"
+                );
+            }
+        }
+        assert!(
+            !layouts_dir.join(third_name).exists(),
+            "3本目自体はFile::create段階で失敗しているので書き込まれていないはず"
+        );
+
+        // 次回呼び出しで「0本」から全6本の再生成を試みられることを確認する
+        // （塞いでいた一時ファイル名のディレクトリを除去してから再実行）。
+        std::fs::remove_dir_all(&blocked_tmp).unwrap();
+        ensure_layouts_exist(&layouts_dir).unwrap();
+        for (name, content) in EMBEDDED_LAYOUTS {
+            assert_eq!(
+                std::fs::read_to_string(layouts_dir.join(name)).unwrap(),
+                *content
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── ADR-201 段階2: from_toml_str（未知キー・[[keymap]] の合流）──
+
+    #[test]
+    fn from_toml_str_warns_unknown_keys_and_suggests() {
+        let c = AppConfig::from_toml_str(
+            "[general]\nsimultaneous_threshold_msx = 80\n[keys]\nime_onn = []\n[futuresection]\na = 1\n",
+        )
+        .unwrap();
+        let w = c.load_warnings().join("\n");
+        assert!(w.contains("general.simultaneous_threshold_msx"), "{w}");
+        assert!(
+            w.contains("simultaneous_threshold_ms\""),
+            "近い名前を示す: {w}"
+        );
+        assert!(w.contains("keys.ime_onn") && w.contains("ime_on\""), "{w}");
+        assert!(w.contains("futuresection"), "{w}");
+        // validate() が警告に加える
+        let (_v, warnings) = c.validate();
+        assert!(warnings.iter().any(|x| x.contains("futuresection")));
+    }
+
+    #[test]
+    fn from_toml_str_does_not_warn_for_removed_keys_or_alias() {
+        let c = AppConfig::from_toml_str(
+            "[general]\napply_calibrated_mode_keys = true\ndbe_mode_key_policy = \"passthrough\"\n\
+             output_mode = \"batched\"\n[keys]\nengine_off_solo_triple = \"VK_INSERT\"\n\
+             [[calibration]]\nvk = 29\n",
+        )
+        .unwrap();
+        assert!(c.load_warnings().is_empty(), "{:?}", c.load_warnings());
+        assert_eq!(c.keys.engine_off_solo_repeat.as_deref(), Some("VK_INSERT"));
+    }
+
+    #[test]
+    fn from_toml_str_merges_legacy_keymap_into_keymaps() {
+        let only_legacy = "[[keymap]]\nfrom = \"Ctrl+VK_I\"\nto = [\"VK_TAB\"]\n";
+        let c = AppConfig::from_toml_str(only_legacy).unwrap();
+        assert_eq!(c.keymaps.len(), 1);
+        assert!(c.load_warnings().iter().any(|w| w.contains("[[keymap]]")));
+
+        // 両方あっても読み込みは失敗せず、連結して警告する（alias にしたときの Dangerous を避ける）
+        let both = "[[keymap]]\nfrom = \"Ctrl+VK_I\"\nto = [\"VK_TAB\"]\n\
+                    [[keymaps]]\nfrom = \"Ctrl+VK_J\"\nto = [\"VK_TAB\"]\n";
+        let c = AppConfig::from_toml_str(both).unwrap();
+        assert_eq!(c.keymaps.len(), 2);
+        assert!(c.load_warnings().iter().any(|w| w.contains("連結")));
+    }
+
+    /// `[[keymap]]` だけのファイル → 読み込み → 保存 → 再読み込みで規則の数が変わらない
+    /// （合流後は `keymaps` に一本化されて書かれ、`keymap` は書かれない）。
+    #[test]
+    fn legacy_keymap_survives_save_and_reload_without_doubling() {
+        let text = "[[keymap]]\nfrom = \"Ctrl+VK_I\"\nto = [\"VK_TAB\"]\n";
+        let c = AppConfig::from_toml_str(text).unwrap();
+        let dir = std::env::temp_dir().join(format!("awase-adr201-s2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        c.save(&path).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("[[keymap]]"), "{saved}");
+        let r = AppConfig::load(&path).unwrap();
+        assert_eq!(r.keymaps.len(), 1);
+        r.save(&path).unwrap();
+        assert_eq!(AppConfig::load(&path).unwrap().keymaps.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 既定値から書き出した設定は、未知キーの警告を出さない（`Option` の `None` などで誤報しない）。
+    #[test]
+    fn from_toml_str_default_roundtrip_has_no_warnings() {
+        let text = toml::to_string_pretty(&AppConfig::default()).unwrap();
+        let c = AppConfig::from_toml_str(&text).unwrap();
+        assert!(c.load_warnings().is_empty(), "{:?}", c.load_warnings());
+        let bundled = AppConfig::from_toml_str(include_str!("../config.toml")).unwrap();
+        assert!(
+            bundled.load_warnings().is_empty(),
+            "{:?}",
+            bundled.load_warnings()
         );
     }
 }

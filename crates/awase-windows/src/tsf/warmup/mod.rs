@@ -26,8 +26,8 @@
 //! - [`cold_warmup`]            — ColdWarmupSequence（`run_start` 単一経路、事前待機なし）
 //! - [`warmup_strategy`]        — ImeWarmupStrategy トレイト, MsImeStrategy
 //!
-//! warm/cold の**判定**（`GjiFsm`）と warmup タイミング FSM（`CompositionFsm`）は
-//! ProbeAction を emit しない判断寄り状態機械のため Layer 2（`tsf` 直下）に残す。
+//! warm/cold の**判定**（`GjiFsm`）は ProbeAction を emit しない判断寄り状態機械のため
+//! Layer 2（`tsf` 直下）に残す。
 
 pub(crate) mod chrome_probe;
 pub(crate) mod cold_warmup;
@@ -37,6 +37,5 @@ pub(crate) mod ms_ime_ready_coro;
 pub(crate) mod probe_coro_state;
 pub(crate) mod probe_fsm;
 pub(crate) mod tickable_fsm;
-pub(crate) mod unicode_cold_warmup_fsm;
 pub(crate) mod unicode_literal_observer;
 pub(crate) mod warmup_strategy;

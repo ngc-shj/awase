@@ -83,7 +83,7 @@ impl InputDeferQueue {
         result.sort_by_key(|ev| ev.timestamp);
         let dropped = self.overflow_count.swap(0, Ordering::Relaxed);
         if dropped > 0 {
-            log::warn!(
+            tracing::warn!(
                 "[input-defer] drain after overflow: took {}, dropped {} (cap={})",
                 result.len(),
                 dropped,
@@ -107,7 +107,7 @@ impl InputDeferQueue {
             let prev = self.overflow_count.fetch_add(1, Ordering::Relaxed);
             let total = prev + 1;
             if prev == 0 || total.is_power_of_two() {
-                log::warn!(
+                tracing::warn!(
                     "[input-defer] overflow: cap {} reached, dropped oldest (total drops since drain: {})",
                     Self::MAX_CAPACITY, total,
                 );
@@ -126,6 +126,8 @@ mod tests {
 
     fn evt(ts: u64) -> RawKeyEvent {
         RawKeyEvent {
+            was_down: false,
+            press_id: None,
             vk_code: VkCode(0x41),
             scan_code: ScanCode(0x1E),
             event_type: KeyEventType::KeyDown,
@@ -136,6 +138,8 @@ mod tests {
             ime_relevance: ImeRelevance::default(),
             modifier_key: None,
             modifier_snapshot: ModifierState::default(),
+            left_thumb_down_snapshot: None,
+            right_thumb_down_snapshot: None,
             injected: false,
         }
     }

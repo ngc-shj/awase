@@ -1,4 +1,22 @@
+---
+id: ADR-101
+title: |-
+  BUG-74 give-up retry と focus guard
+summary: |-
+  BUG-74: RawTsfLiteralRecovery give-up で失われるromajiを、F6 focus世代照合・WM完了通知・Polling中deferred順序保護を前提に通常送信経路で1回だけretryする。ADR-100決定3の却下理由を前提条件として解消し、決定5(F6)も実装する
+status: |-
+  一部撤去(2026-10-04 確認)。give-up 後の VK_IME_OFF→ON reinit と focus-guard 付き retry(`PendingGjiReinitRetry` 等)は ADR-212 P3・P5(0a7f9067、2026-09-30)で撤去され、give-up は BS 掃除だけに縮退。現行コードに `PendingGjiReinitRetry` は無い。
+  旧(2026-10-04 更新前):
+  採用・実装済み（2026-08-24、実機ソーク未実施）
+related_adr:
+  - "ADR-079"
+  - "ADR-100"
+  - "ADR-123"
+---
+
 # ADR-101: BUG-74 give-up retry と focus guard
+
+> 状態更新(2026-10-04): reinit retry は ADR-212 P3(0a7f9067)で撤去済み。
 
 ## ステータス
 
@@ -31,6 +49,8 @@ retry後は必ず `drain_output_post_send_effects` を実行する。これに�
 ### 決定4: poll中の順序反転を防ぐ
 
 retry付き `Polling` 中は、`flush_stale_deferred_vks_after_recovery` による `warmup_coord.pending_deferred` の即時送信を禁止する。`Confirmed` では `retry → post-send effects → deferred flush → guard drop` の順で処理する。`Timeout` では retryせず、focusが一致していれば deferred を送る。`Stale` またはfocus不一致では deferred を破棄し、ログに件数とstatusを残す。
+
+**2026-09-03 訂正注記（ADR-123 round3で発覚）**: 上記「`Confirmed` では `retry → post-send effects → deferred flush`」の記述は設計意図どおりだが、実装上 `flush_deferred_vks_after_gji_reinit_completion` は retry romaji の再送自身が新しい TSF probe を立てる（`has_pending_tsf()` が true になる）ため、`take_pending_deferred_if_probe_idle()` が常に `None` を返し、**構造的に `deferred_flushed=0` になる**（report `01M1KEGZ081YHJ1T2NC765SYYH` の journal で実証）。deferred VK は「retry直後に明示的にflushされる」のではなく、その新しいprobeが完了した後の別経路で回収されている。挙動自体に不具合はないが、本節の記述と実態が食い違っていたため記録する。詳細は [ADR-123](123-focus-resync-and-probe-defer-queue-composition-race.md) 参照。
 
 ### 決定5: SuppressedExistingPollではRAW_TSF_LITERALを汚さない
 

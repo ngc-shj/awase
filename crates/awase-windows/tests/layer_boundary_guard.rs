@@ -372,6 +372,12 @@ fn c6_single_reduce_call_site() {
     );
 }
 
+// ADR-170 決定1(reduce() の大きい分岐の private ヘルパー抽出)が
+// 「ヘルパーは reduce() 本体からのみ呼ばれる」ことを固定する count guard は
+// `tests/architecture_guard.rs::reduce_helpers_are_called_only_from_reduce_body`
+// にある(本体スコープの二重固定に `extract_fn_body` を使うため、それが既に
+// あるファイル側に置いた。opus-adversarial-consult round2 R2-2/R2-3)。
+
 // ───────────────────────── カテゴリ D ─────────────────────────
 
 /// layer-boundaries.md D-1: magic hex を vk.rs 外で書かない。
@@ -385,9 +391,7 @@ fn c6_single_reduce_call_site() {
 /// ない letter key のため暫定的に許容 (本来は vk.rs へ移すのが望ましい既存の借り)。
 #[test]
 fn d1_no_vk_magic_hex_outside_vk_rs() {
-    const ALLOW: &[(&str, &str)] = &[
-        ("output/mod.rs", "const VK_A: VkCode = VkCode(0x41);"), // send_unicode_cold_warmup_keys
-    ];
+    const ALLOW: &[(&str, &str)] = &[];
     let mut files = Vec::new();
     collect_rs(&manifest().join("src"), &mut files);
     files.retain(|f| f.file_name().and_then(|n| n.to_str()) != Some("vk.rs"));

@@ -211,7 +211,7 @@ impl ImeDiagnosticSnapshot {
             |o| if o { "true" } else { "false" }.to_string(),
         );
 
-        log::debug!(
+        tracing::debug!(
             "[ime-diag] label={label} t={t} hwnd={hwnd:#x} pid={pid} tid={tid} class=\"{class}\" \
              hkl={hkl:08x} lang={lang:04x} imm_bridge={bridge} \
              imc_open={imc_open} imc_conv={conv} \
@@ -255,10 +255,11 @@ fn capture_imc(focus_hwnd_raw: usize) -> (Option<bool>, Option<u32>) {
             let Some(ime_wnd) = crate::imm::get_ime_wnd(hwnd) else {
                 return (None, None);
             };
-            let open = crate::imm::send_ime_control(ime_wnd, crate::imm::IMC_GETOPENSTATUS, 0, 50)
-                .map(|v| v != 0);
+            let open =
+                crate::imm::probe_ime_control(ime_wnd, crate::imm::ProbeCmd::GetOpenStatus, 50)
+                    .map(|v| v != 0);
             let conv =
-                crate::imm::send_ime_control(ime_wnd, crate::imm::IMC_GETCONVERSIONMODE, 0, 50)
+                crate::imm::probe_ime_control(ime_wnd, crate::imm::ProbeCmd::GetConversionMode, 50)
                     .map(|v| v as u32);
             (open, conv)
         }
@@ -340,7 +341,7 @@ pub fn log_composition_probe(cold_seq: Generation, label: &'static str) {
         .sentence_mode
         .map_or_else(|| "-".to_string(), |v| format!("{v:#06x}"));
 
-    log::info!(
+    tracing::info!(
         "[comp-probe] {label} cold={cold_seq} hwnd={hwnd_raw:#x} profile={profile} class=\"{class}\" \
          himc_null={himc_null} open={open} conv={conv} sent={sent} \
          comp={comp} comp_read={comp_read} result={result} result_read={result_read} \

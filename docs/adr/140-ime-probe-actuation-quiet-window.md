@@ -1,0 +1,787 @@
+---
+id: ADR-140
+title: |-
+  IME probe/actuation の発行競合 — Step 0（診断ログ）・Step 1（排他機構）とも実装・実機確認済み
+summary: |-
+  BUG-113の「二重actuation」とは独立に残置された、`kp_stage_idle_conv_check`のクロスプロセスprobe読み取りとGJI actuationの発行タイミング競合（真のレースではなく決定論的順序）を扱う。Explore 2体+Opus設計2体の相互批判で、既存フェンス（`conv_mutation_seq`等）は「issue自体を止める機構」を持たないため原理的に検出不能と判明。GJI actuationの発行経路（同期`ImeController::apply`/非同期`open_chain::fallback_write`/`tsf::send::send_eager_warmup_vk_pair`、他にも未監査の経路が残りうる）を実コード照合済みで記録。排他機構（Step 1）は排他窓の量が実測必須（`tuning-constants.md`）のため未着手とし、`win32.rs::send_input_safe`（`IME_KANJI_MARKER`判定）と`imm.rs::send_ime_control`（`now_timestamp_us()`基準の追加ログ、既存`send_health`用`current_tick_ms()`計測は不変）へのStep 0診断ログ追加のみを本ADRで採用
+status: |-
+  採用・実装済み・実機確認済み(Step 0/1/1b、PR #175/#176)、v2.0.0 に含まれる(2026-10-04 コード確認: `probe_actuation_fence` は `platform.rs` で現存)。 (2026-10-04 更新)
+  (以下は更新前の記述)
+  採用。Step 0・Step 1（`probe_actuation_fence`排他機構）・Step 1b（兄弟probe3箇所への拡張、PR #175/#176でdevelopマージ済み）とも実装・実機確認済み
+related_adr:
+  - "ADR-078"
+  - "ADR-119"
+  - "ADR-133"
+  - "ADR-136"
+  - "ADR-138"
+---
+
+# ADR-140: IME probe/actuation の発行競合 — Step 0（診断ログ）・Step 1（排他機構）とも実装・実機確認済み
+
+## ステータス
+
+**採用。Step 0（診断ログ）・Step 1（排他/フェンス機構本体）とも実装済み、
+Step 1は本ADRの主再現手順に対して実機効果確認済み（2026-09-06）。** Step 1は
+確定設計v4（下記「Step 1確定設計」節）どおり`probe_actuation_fence`として
+実装した（実装箇所は同節末尾「実装（2026-09-06）」参照）。dragonflyg4実機で
+BUG-113の主再現手順（物理半角/全角キー1回）による「@」は再発しなくなった
+ことを確認した。ただし半角（直接入力）状態での変換/無変換キー押下では
+「@」単発が残る（大量暴発は解消）——これは本Step1のスコープ
+（`kp_stage_idle_conv_check_inner`のprobe）が対象にしていない別の未特定要因
+であり、`docs/known-bugs.md` BUG-113に残置課題として記録し、本ADRの
+スコープ外の別調査に切り出す。決定Iのabandon率実機ソーク（starvation
+確認）は引き続き未実施。
+
+## Context
+
+[BUG-113](../known-bugs.md)（Windows Terminal + GJIで余分な「@」が出る
+不具合）は、二重actuationの解消（`ImeController::apply`のGJI
+`AlreadyMatched`ガード修正等）については実装・実機確認済みだが、
+「`kp_stage_idle_conv_check`のクロスプロセス読み取り（probe）とGJI
+actuationの時間的競合」という、二重actuationとは独立したもう一つの十分
+条件が未対応のまま残置されている。
+
+Explore 2体 + Opus設計2体による深い調査（相互批判による収束）の結果、
+以下が判明した:
+
+- 競合は真の「レース」（非決定論的な発生順序）ではなく、構造的に決定論的な
+  順序を持つ: `SendInput`（actuation、同期）が先に完了し、次のメッセージ
+  ループでprobeのワーカースレッド（`win32_async::offload`経由）が
+  `WM_IME_CONTROL`（`SendMessageTimeoutW`）を発行する、という順序が
+  ハードウェア/OSスケジューリングに依存せず決まる。
+- 既存の全フェンス（`conv_mutation_seq`、`explicit_action_ms`等）は
+  「spawn時にキャプチャ→apply時に照合」という形で**結果を破棄するだけ**
+  であり、syscall自体の発行（issue）を止める機構が存在しないため、原理的
+  にこの種のバグを検出できない。
+- 修正機構（排他/フェンス方式、非対称: actuationは絶対に待たない）の設計
+  は複数案が検討されたが収束途上であり、**排他窓の量は実測が必須**
+  （[tuning-constants](../../.claude/rules/tuning-constants.md)により、
+  測定なしに値を決め打ちすることは禁止されている）。
+
+## 確定した事実
+
+1. **決定論的順序の機構**: `SendInput`はメインスレッド上で同期的に完了する
+   一方、`SendMessageTimeoutW`によるクロスプロセスprobe/actuationは
+   `win32_async::offload`でワーカースレッドに追い出され、完了は
+   メッセージループへの次のディスパッチを待つ。したがって同一フレーム内で
+   actuationとprobeが両方issueされる場合、actuationのSendInputは常に
+   probeのワーカースレッド起床より先に完了している。
+2. **3つのチェックポイント（spawn/issue/apply）のうち issue だけが無防備**:
+   spawn時点は`conv_mutation_seq`等でキャプチャされ、apply時点は
+   同じ値との照合で守られているが、issue（実際にOS APIを呼ぶ瞬間）を
+   遅延・中断・観測する機構が無い。今回追加するのはこの issue 地点の
+   タイムスタンプだけである（Step 0のスコープ）。
+3. **`offload()`にタイムアウトが無い**: `win32_async::offload`で
+   ワーカースレッドに追い出された`SendMessageTimeoutW`呼び出しは、
+   呼び出し元がタイムアウトして`LEAKED_THREADS`（`crates/win32-async/
+   src/thread_timeout.rs`）に諦めて登録した後も、OS呼び出し自体は
+   ワーカースレッド上で継続し得る。つまり「awase側が待つのをやめた」
+   ことと「OS呼び出しが実際に終わった」ことは別イベントであり、
+   諦めた後に完了したprobeの結果が、その後のactuationと時間的に
+   交錯する余地が残る。
+4. **`kp_apply_conv_engine_sync`が結果を第二のactuationへ増幅する経路**:
+   probeが返した値が「desiredと乖離している」と判定されると、
+   drift correctionが追加のactuationを発行しうる（ADR-078の開閉軸での
+   再発）。ただしこの増幅経路自体の設計変更は本ADRのスコープ外とし、
+   別ADRへ切り出す。
+5. **GJI actuationの発行経路は少なくとも3つ確認されており、他にも
+   存在しうる**（実コード照合済み、以下引用は全てこのタスクで直接
+   確認したfile:line。特に断りのない限り`crates/awase-windows/src/`相対、
+   `src/config.rs`のようにルートクレート`src/`相対のものは都度明記）:
+   - **(a) 同期経路**: `ime_controller.rs:546`の`ImeController::apply`が
+     「同期経路の唯一の合流点」であることは同関数本体のコメント
+     （`ime_controller.rs:548-551`）で明記され、実際の生産コード上の
+     呼び出し元は`runtime/key_pipeline.rs:1311`と`platform.rs:1561`の
+     2箇所のみ（`ime_controller.rs:790`/`:867`はテストのみ）。内部で
+     `apply_mechanism`（`ime_controller.rs:375-382`、dispatch table
+     `:337-344`）→ `GjiDirectStrategy::apply`（`:150-180`）→
+     `crate::ime::send_ime_mode_key`（呼び出しは`:173`、実装は
+     `ime.rs:273`）という経路で実際のVK送信に至る。
+   - **(b) 非同期フォールバック経路**: `runtime/open_chain.rs:297`の
+     `fallback_write`は`apply_mechanism`（`open_chain.rs:337`）を
+     `ImeController::apply`を経由せず直接呼ぶ。これは
+     `architecture_guard.rs:2253`の
+     `raw_mechanism_write_sites_are_confined_to_chain_writers`が
+     「`apply_mechanism(`の生産コード呼び出しは`ime_controller.rs`内
+     （`SyncChainWriter::write`経由）と`open_chain.rs`内
+     （`fallback_write`）の正確に2箇所のみ」と固定していることでも
+     裏付けられる。同ファイルの`imm_cross_write`（`:145`）は
+     `apply_mechanism`を呼ばずIMM専用の書き込み（`ime::
+     set_ime_open_then_conv_for_target`等、`:186`/`:202`）を行うため、
+     GJI actuation経路には含まれない。
+   - **(c) eager warmup経路**: `tsf/send.rs:28`の
+     `send_eager_warmup_vk_pair`は`ImeController::apply`/
+     `apply_mechanism`のいずれも経由せず、`win32::send_input_safe`
+     （呼び出しは`tsf/send.rs:43`）で`VK_IME_ON`を直接送信する。唯一の
+     生産コード呼び出し元は`output/mod.rs:1154`。
+   - `.claude/rules/fix-requires-evidence.md`の「IME actuation 合流点」
+     表は上記(a)(b)に加え`runtime/executor.rs::dispatch_ime_set_open`
+     （`executor.rs:793`、実体はディスパッチャで(a)(b)いずれかへ分岐する
+     だけであり第4の独立な発行地点ではない）を挙げているが、同ルール
+     ファイル自身の「なぜこのルールが必要か」節が「issue #136/ADR-119で
+     実際の呼び出し経路は5つあり、最初は1箇所しか把握していなかった」
+     という過去のインシデントを記録している。したがって本ADRは
+     **「少なくとも3つの経路が確認されている」とのみ記載し、「経路は
+     3つで全てである」という確定的な主張はしない**——`runtime/
+     key_pipeline.rs`のshadow-toggle経路や`runtime/mod.rs:951`の
+     `try_force_on_bootstrap`等、未監査の直接呼び出し箇所が残っている
+     可能性がある。Step 1着手前には改めてこの経路一覧を洗い出し直す
+     必要がある。
+
+## ADR-138との関係（意図的なスコープの違い、無視ではない）
+
+[ADR-138](138-ime-probe-actuation-witness-app-rejected.md)の決定2
+（`docs/adr/138-*.md` 130-141行目）は既に「`imm.rs::send_ime_control`は
+呼び出し元識別子を持たないため、ここへの一括ログでは（ADR-136の）経路A/B
+を区別できない。各呼び出し元に、evidence型・confidence・`SkipTyping`
+消費有無をjournalに出す計装を追加すべき」と決定している。
+
+本タスクが`imm.rs::send_ime_control`に追加する診断ログは、字面としては
+まさにADR-138が「不十分」と評した「一括ログ」そのものである。これは
+ADR-138の決定を見落としたのではなく、**意図的にスコープが異なる**:
+
+- ADR-138の決定2が解決しようとしている問いは「どのevidence型・
+  confidenceの呼び出しか」という**belief/observation層の識別**であり、
+  これには呼び出し元ごとの計装が必須。
+- 本ADR（Step 0）が解決しようとしている問いは「probeとactuationの
+  issueが時間的にどれだけ近接しうるか」という**タイミング測定**の一点
+  のみであり、`ime_wnd`・`thread::current().id()`・`cmd`（probe系
+  IMC_GET*か actuation系 IMC_SET*か）で十分に用が足りる、狭い問いである。
+
+`.claude/rules/experiment-logging.md`が防ごうとしている「過去の決定を
+知らずに再度同じ道を検討する」事故を避けるため、この違いをここに明記する。
+ADR-138決定2（呼び出し元ごとの計装）は依然として未実装のまま有効であり、
+本ADRはそれを代替しない。
+
+## 検討した設計案と却下理由
+
+前回の設計セッション（Opus設計2体、相互批判）で検討され、いずれも
+「実測値が無い状態で機構の形・パラメータを決め打ちすることになる」ため
+採用を見送った案:
+
+- **即時排他ロック方式**: actuation issueの前後で短いロックを取り、
+  probe issueをブロックする。ロック保持時間（=排他窓の量）を決め打ち
+  できず、`tuning-constants.md`の実測義務に反する。また「actuationは
+  絶対に待たない」という非対称要件（actuation側の遅延はUI応答性に
+  直結する一方、probe側は多少遅延しても実害が小さい）を満たすには
+  ロックの向きを非対称にする必要があり、素朴な相互排他プリミティブでは
+  表現できない。
+- **フェンス値のissue時点への前倒し**: 既存の`conv_mutation_seq`等の
+  「spawn時キャプチャ→apply時照合」パターンをissue時点に前倒しする案。
+  spawn自体が既にワーカースレッドへの委譲後であり、issueの瞬間を
+  メインスレッド側から制御する経路が存在しないため、根本的に成立しない
+  （observer/pureな`classify_*`から書き込みを直接操作できないのと同型の
+  制約）。**この却下理由は誤りだったことが後日判明した。下記「追記
+  （2026-09-06）」を参照。**
+- **probe側を完全に非同期化しactuation優先のキューを設ける**: 実質的な
+  Step 1の本体案の一つ。効果は見込めるが、キューの長さ・排他窓の量を
+  実測なしに設計すると、Chrome probe定数が20→100→200→350msと5週間で
+  段階的にエスカレーションした前例（`tuning-constants.md`参照）と同じ
+  「盲目的エスカレーション」を機構レベルで再演するリスクが高いと判断し、
+  Step 0の実測を待つことにした。
+
+## 決定
+
+### 決定1: Step 0（診断ログの追加）のみを本ADRで採用する
+
+以下を追加する（実装詳細はコード参照）:
+
+- `crates/awase-windows/src/win32.rs::send_input_safe`: 送信する`INPUT`が
+  IME actuationか否かを`dwExtraInfo`のマーカーで判定する（VKの固定
+  リストでは`keys.engine_on_ime_key`/`engine_off_ime_key`がユーザー
+  設定可能な自由文字列でF13-F24等にもなりうるため、設定済みマシンで
+  actuationが不可視になり本末転倒——`src/config.rs:550-556`参照）。
+  `dwExtraInfo == tsf::output::IME_KANJI_MARKER`（決定1(a)(b)の
+  `send_ime_mode_key`系）に加え、**`dwExtraInfo == tsf::output::
+  TSF_MARKER`かつVKが`VK_IME_ON`/`VK_IME_OFF`の組み合わせ**
+  （決定1(c)の`send_eager_warmup_vk_pair`）も判定対象に含める
+  （コードレビュー指摘、MAJOR：`IME_KANJI_MARKER`単独では warmup経路が
+  不可視になっていた。`TSF_MARKER`は通常の文字出力にも広く使われる
+  サブシステム単位のマーカーのため、VK限定と組み合わせてノイズを
+  避けている）。該当する場合に`[ime-io] actuation SendInput
+  kind=<kanji_marker|tsf_marker_warmup> issue_us=...`をdebugログ出力する。
+- `crates/awase-windows/src/imm.rs::send_ime_control`: 既存の
+  `start_ms`/`end_ms`（`current_tick_ms()`基準、`send_health::record`が
+  依存する既存のサーキットブレーカ用計測）は変更せず、別に
+  `now_timestamp_us()`基準の高分解能タイムスタンプ（issue直前・
+  elapsed）を追加ログとして出力する。`ime_wnd`・呼び出しスレッドID・
+  `cmd`種別（probe=`IMC_GETOPENSTATUS`/`IMC_GETCONVERSIONMODE`、
+  それ以外=actuation）を含める。
+
+### 決定2: Step 1（機構本体）は未着手のまま持ち越す
+
+Step 1の設計候補は複数存在し収束途上である。将来的な排他窓の定数
+（例えば`IME_ACTUATION_QUIET_MS`のような名前になる可能性がある）の
+**値は本ADRでは一切決めない。書く場合は必ず「未定（Step 0の実測前に
+値を書かない——`tuning-constants.md`の盲目的エスカレーション回避の
+ため）」と明記する。イラストレーション目的であっても具体的な数値を
+一切書かない**——一度でも数値が書かれると、測定なしに後続セッションが
+それをそのまま採用してしまう「アンカー効果」がこのリポジトリで繰り返し
+起きている（Chrome probe定数のエスカレーション事例、
+`tuning-constants.md`参照。数値そのものも本ADRでは引用しない）。
+
+**Step 1候補として追記（2026-09-06、ユーザー提案）**: probe（`kp_stage_idle_conv_check_inner`）
+のライフサイクル（spawn → issue時点の確認 → apply/abandon）を、
+`conv_mutation_seq_at_spawn`等の場当たり的なスナップショット変数を
+`.await`をまたいで持ち回す現状の実装から、`crates/timed-fsm`の
+`StepCoro`（`timed_fsm::coro::StepCoro`）を使った明示的なコルーチンへ
+書き換える案。根拠:
+
+- `timed-fsm`自身のドキュメント（`crates/timed-fsm/src/coro.rs`）が
+  「フェーズが直線的に進む多段ワークフロー」には`StepCoro`が、
+  「どの状態でも同じイベントセットを受け付ける」機械には
+  `TimedStateMachine`（enum状態＋遷移テーブル）が向くと明記している。
+  probeのライフサイクルは前者（直線的な多段ワークフロー）に該当する。
+- このリポジトリには直接の先例がある: `tsf/warmup/probe_fsm.rs`
+  （TSF/Chrome cold-start probe）は元々明示的な`ProbePhase` enumで
+  実装されていたが、`StepCoro`ベースの実装に置き換えられている
+  （同ファイルの module doc「フェーズ遷移はStepCoro async本体に直線記述し、
+  ProbePhase enumは不要」）。
+- `StepCoro`の`step()`はテストから直接呼べる（`timed_fsm::coro`の
+  doctestを参照）ため、両設計案（Opus 2体）が要求していた
+  「Linuxで回帰テスト可能」という条件を、offloadやwin32-asyncの実行時
+  機構なしに満たせる。
+
+**この案の採否は未確定。Step 1着手時に、既存の`ImeIoArbiter`/フェンス
+等価方式（前掲の設計案A〜D）と比較検討すること。** 本ADRのスコープ
+（Step 0のみ）には影響しない。
+
+**Step 1候補・案E として追記（2026-09-06、ユーザー提案）**:
+「使い捨てのフックに処理を登録し、まとめて発火させる」という発想は、
+このリポジトリに既に実例がある——`tsf/warmup/probe_fsm.rs`の
+TSF/Chrome cold-start probeが使っている**`ProbeAction`（宣言的アクション
+enum、`probe_fsm.rs:191`）+ `dispatch_probe_actions`（`VecDeque`で
+1箇所にまとめて処理する dispatcher、`output/probe_io.rs:528`）+
+`ProbeIo`トレイト（Win32副作用の注入点、`probe_io.rs:26`）**という
+3点セットの型である。FSM/コルーチン本体は一切Win32 APIを呼ばず、
+「次に何をすべきか」を`ProbeAction`という**データ**として返すだけで、
+実際の副作用は`dispatch_probe_actions`が`ProbeIo`経由で実行する。
+
+この型をBUG-113のprobe/actuation調停に適用する場合の骨子:
+
+- `kp_stage_idle_conv_check`／`kp_stage_shadow_ime_toggle`等の各stageは
+  `SendInput`/`send_ime_control`を直接呼ぶ代わりに、`KpIoIntent::
+  Actuate{..}` / `KpIoIntent::ProbeConvMode{..}`のような意図を
+  一時的なキューへ**登録**する。
+- **actuation意図は登録直後に即座に発火させる**（決定は変えない——
+  GJIハング時にユーザーの物理IMEキー入力自体が固まる、という
+  却下済み案（対称ロック方式）と同型の新規リグレッションを避けるため。
+  「即座に発火」と「まとめて登録する」は両立する: 登録は監査用の記録、
+  発火のタイミングはactuationについては従来通り即時のままでよい）。
+- probe側の非同期タスクが実際にissueする瞬間、**同じキュー（またはその
+  一時点でのスナップショット）を参照し、自分のspawnからissueまでの間に
+  actuation意図が記録されていないかを確認**する。これは設計案D
+  （フェンス値のissue時点比較）と数学的には同じ判定だが、裸の整数
+  カウンタではなく`ProbeAction`同様の**監査可能な構造化データ**として
+  表現できる利点がある: ログで「何が・いつ・なぜ」を人間が読める形で
+  追え、`ProbeIo`同様のトレイト注入でOS呼び出し無しにLinux上で調停
+  ロジックだけテストできる。特定のprobe/actuationペアに固有の解決策では
+  なく、将来別のペアで同種の問題が起きたときに同じ調停機構を再利用
+  できる点が、フェンス値方式単体より体系的（俯瞰的）である。
+
+**未解決の緊張関係（Step 1着手時に検証必須、2026-09-06検証済み——下記
+「追記」参照）**: 上記「検討した設計案と却下理由」節の「フェンス値の
+issue時点への前倒し」は、「issueの瞬間をメインスレッド側から制御する
+経路が存在しないため根本的に成立しない」として却下されている。しかし
+`explore-timing-model`の調査（本ADR確定事実5参照）によれば、`spawn_local`
+されたfutureの**最初のpollはメインスレッド上で実行され**、`offload_unsafe`
+へのワーカースレッド委譲はそのpollの内部（`.await`に到達した瞬間）で
+初めて起きる。したがって「issueの瞬間（＝pollがofflloadへの委譲に到達
+する直前）をメインスレッド側からチェックする経路」は実際には存在する
+可能性が高く、却下理由の前提が誤っている疑いがある。**Step 1設計者は、
+この却下理由をそのまま信じず、実コードで`spawn_local`/`offload`の呼び出し
+順序を再確認してから案D・案Eの実現可能性を判断すること**（このADR自身が
+「past rejected reasoning」を鵜呑みにするリスクを承知の上で、確認の必要性
+だけを記録し、確定的な結論は出さない）。
+
+## Step 0 データ収集プロトコル
+
+収集するログは`tuning-constants.md`が要求する「測ったもの／数値／導出」
+の3点にそのまま対応するように設計している:
+
+- **測ったもの**: (1) GJI actuation（`SendInput`、`IME_KANJI_MARKER`/
+  `TSF_MARKER`+VK判定）のissueタイムスタンプ、(2) probe/actuation双方の
+  `SendMessageTimeoutW`（`WM_IME_CONTROL`）のissueタイムスタンプと
+  完了までのelapsed。両者とも`now_timestamp_us()`（`Instant`/QPC基準）
+  で同一時間軸に載る。
+- **数値**: 実機の`RUST_LOG=debug`ログから、actuationのissue_usと、
+  時間的に近接するprobeのissue_us/elapsed_usの差分（Δms）を抽出する。
+- **導出**: 収集したΔmsの分布（最大値・p99等）から、Step 1で必要になる
+  排他窓の量を導出する。ここが「実測に基づく値」であり、本ADRでは
+  導出できないため書かない。
+
+**ログ量の注意**: `imm.rs::send_ime_control`はChrome/GJI cold-start
+再初期化ポーリング（10ms間隔）にも乗るチョークポイントであるため、
+`RUST_LOG=debug`での収集は高頻度・大容量になる。journalの
+`DumpTruncated`機構が既存のprobe/actuationログでも切り詰めを起こす
+実績があるため、収集時間を絞る・grepで`[ime-io]`のみに絞る等の対策を
+収集手順に含めること。
+
+**Step 1着手前の必須ゲート条件**（`79134f5`の教訓を明示的なゲートとして
+記載する）: `79134f5`（Chrome probe定数修正）は、Chrome cold-startの
+遅延に見えた症状が実は「probeの計測起点がF2送信より早くずれていた」と
+いう測定基準点のズレであり、対症療法的に定数を増やしただけで根本原因
+（起点のズレ）は放置されていたという教訓を残した。本ADRのStep 0でも
+同じ罠が起こり得る: **観測されたΔmsのギャップは本物か、それとも
+issue時点の計測起点がずれているだけか、をStep 1着手前に必ず問うこと**。
+具体的には、`send_input_safe`内の`IME_KANJI_MARKER`判定とその直後の
+`now_timestamp_us()`呼び出しの間に、他の処理（ロック取得・ログ
+フォーマット等）が挟まっていないか、`imm.rs`側の`issue_us`取得が
+実際の`SendMessageTimeoutW`呼び出し直前かを、Step 1設計前に再確認する。
+
+## ログの読み方に関する注意（相関時）
+
+`imm.rs`の新ログ行は`SendMessageTimeoutW`**復帰後**に出力されるため、
+ログファイル中の行の出現順序は「完了順」であって「発行（issue）順」では
+ない。遅いprobeは、実際には先に発行されたactuationより**後の行として**
+出力されうる。相関は必ず`issue_us`フィールドの値で行い、**行の出現順序
+を根拠にしないこと**。
+
+また、`ime.rs:510`（`IMC_GETCONVERSIONMODE`）→`ime.rs:519`
+（`IMC_SETCONVERSIONMODE`、`modify_conv_mode`内のread-modify-write）は、
+`:510`の呼び出し単体では`kind=probe`とラベルされるが、実際には
+read-modify-write全体の前半であり、この呼び出し対自体がactuationの
+一部である点に注意する。
+
+## やらないこと（本ADRのスコープ外、明示的に除外）
+
+- 排他機構本体の実装（Step 1、実機実測後）
+- `kp_stage_idle_conv_check_inner`へのgate追加や呼び出し順序の変更
+- ADR-078のEvent/Effect分離の一般化（別ADR）
+- `IME_ACTUATION_QUIET_MS`という定数の値を決めること（未定と明記する
+  のみ）
+- 挙動の変更（ログ追加のみ）
+
+## 追記（2026-09-06）: 却下理由の訂正と Step 0 実測データ第一弾
+
+### 却下理由の訂正: 案D（フェンス値のissue時点前倒し）は構造的に実現可能
+
+上記「未解決の緊張関係」節が指摘していた疑問点を、実コード確認で検証した
+（読解のみ、実機不要）。
+
+- `crates/win32-async/src/offload.rs::OffloadFuture::poll`（37-73行目）は、
+  `!this.spawned`のガード（52行目）の直後、`std::thread::spawn`
+  （59行目、実際のワーカースレッド起動＝委譲点）の**直前**にコードを
+  挿入できる、素朴な同期地点である。この`poll()`自体は、`offload()`を
+  `.await`しているfutureが再pollされたときに呼ばれる。
+- `winmsg-executor-0.3.2`（`~/.cargo/registry/src/.../winmsg-executor-0.3.2/
+  src/lib.rs`）の`spawn_unchecked_lifetime`（67-80行目）は`runnable.
+  schedule()`（80行目）を呼ぶだけで、内部で`PostMessageA(hwnd, MSG_ID_WAKE,
+  ..)`（75行目）により実際のrunnable実行を次のメッセージループターンへ
+  遅延させる（`run_loop`の`GetMessageA`/`DispatchMessageA`、162-177行目）。
+  つまり`spawn_local`直後の最初のpollは同一呼び出しスタック内では起きない。
+- しかし、この「遅延された最初のpoll」自体は依然として**メインスレッド上
+  で同期実行**される。したがって`OffloadFuture::poll`内の
+  `std::thread::spawn`直前（＝ワーカースレッドへの実委譲点）は、
+  メインスレッド側からフェンス値を検査し、委譲を中断・延期できる
+  **実在する制御点**である。
+
+結論: 「issueの瞬間をメインスレッド側から制御する経路が存在しない」と
+いう却下理由は**不正確**だった。設計案D（フェンス値のissue時点比較）は
+構造的に実現可能。ただし、ワーカースレッド起動（`std::thread::spawn`）
+から実際の`SendMessageTimeoutW`呼び出しまでの間には、OSのスレッド
+スケジューリングに起因する小さな不確定窓が残ることに注意
+（この窓自体の大きさは未測定、下記「Step 1確定設計」節の追加
+チェックポイントD参照）。
+
+**重要な訂正（下記「Step 1確定設計」節のOpusレビューで判明）**:
+上記「`offload()`（またはこれをラップする形）にチェックを挿入する」
+という結論は誤りだった。`crates/awase-windows/src/ime.rs::offload_unsafe`
+はprobeとactuationの**両方**（8つのasyncラッパー共通）が通る
+ヘルパーであり、ここにフェンスを置くと「actuationがactuationを待つ」
+という、対称ロック方式で既に却下した失敗モードを1階層上で再現する。
+`win32-async`クレート（`offload.rs`含む）は一切変更しない。正しい
+挿入点はprobe側の呼び出し元（`key_pipeline.rs`、詳細は次節）。
+
+### Step 0 実測データ第一弾（dragonflyg4実機、2026-09-06、n=6）
+
+`RUST_LOG=debug`でWindows Terminal + GJI環境の実機から`[ime-io]`ログを
+2セッション分（計277イベント: actuation24件・probe253件）収集した。
+`issue_us`で正しくソートし直し（ログ出現順は完了順であり発行順ではない
+——本ADR「ログの読み方に関する注意」節参照）、種別が異なる隣接イベント間の
+Δを計算した。
+
+- **測ったもの**: 物理IMEキー（変換/無変換の単独打鍵、間隔を変えて複数回
+  ×2セッション）操作時の、actuation（`SendInput`、`kanji_marker`/
+  `tsf_marker_warmup`）issue_usと、直後に発行されたprobe（`imm.rs::
+  send_ime_control`、`cross_process kind=probe`）issue_usの差分。
+- **数値**: 種別の異なる隣接ペア25件中、20ms未満だったのは
+  **actuation→probe方向の6件のみ**（3836us・4063us・4071us・6136us・
+  6549us・8101us、レンジ3.8〜8.1ms）。**probe→actuation方向で20ms未満の
+  ペアは0件**（最小48747us）。この非対称性は、本ADR確定事実1が述べる
+  「actuationのSendInputが先に完了し、次のメッセージループターンで
+  probeのワーカースレッドが起床する」という決定論的順序の理論を実測で
+  裏付ける。
+- **導出**: n=6は`tuning-constants.md`が要求する「盲目的エスカレーション
+  回避」のための分布確認としてはまだ不十分（p99等を語れるサンプル数
+  ではない）。**このADRでは排他窓の量を一切導出・記載しない**——Step 1
+  設計時にさらにデータを収集し、実測分布に基づいて導出すること。
+
+### やらないこと（この追記のスコープ外）
+
+- 排他窓の具体的な定数値の決定（実測不足のため——ただし案Dはms定数を
+  持たないため、この制約は下記「Step 1確定設計」の対象外）
+- Step 1本体の実装（設計はStep 1確定設計節で確定したが、コードはまだ
+  書いていない）
+
+## Step 1確定設計（v4、Opus敵対的レビュー4ラウンドで収束、2026-09-06）
+
+opus-adversarial-consultで4ラウンドの読み取り専用レビュー（設計提案→
+指摘→改訂→再指摘、を実装コード無しで反復）を行い、以下で収束した。
+各ラウンドで実装前提が覆る発見があったため、経過も含めて記録する
+（`experiment-logging.md`と同じ理由——「なぜ前の案を捨てたか」を
+残さないと同じ案を再検討して同じ失敗を踏む）。
+
+### A. 新規フェンスカウンタ
+
+`AtomicU64`（`conv_mutation`と同型）を新設する。**既存の`conv_mutation`
+は流用しない**——`conv_mutation::bump()`のゲート`win32.rs::
+input_may_mutate_conv`（`vk_may_mutate_conv`）はopen専用VK
+（`VK_IME_ON`/`VK_IME_OFF`/`VK_KANJI`）では増分しない仕様（`conv_mutation.rs`
+module doc）。BUG-113のactuationはまさにGJIのopen軸（`IME_KANJI_MARKER`）
+であり、既存フェンスは「issue時点を見ていない」以前に**このactuationを
+1回も数えていない**。本ADR確定事実2（「issueだけが無防備」）に、
+「軸の欠落」という見落としがあったことになる。
+
+### B. bump地点: 物理syscall境界2箇所、syscallの前、同一判定条件を共有
+
+論理呼び出し箇所（`ime_controller.rs::apply`等の3つのチョークポイント）
+を個別にbumpする方式は採らない——未発見の第4・第5経路（本ADR確定事実5が
+「少なくとも3つ確認、全てとは限らない」と明記）があると再びissue #136型の
+「1箇所塞いで別箇所に穴」を再演するため。代わりに、OSに到達する物理境界
+そのもの（唯一のチョークポイント）でbumpする:
+
+- `win32.rs::send_input_safe`: Step 0診断ログの`ime_actuation_marker_kind`
+  判定（`IME_KANJI_MARKER`または`TSF_MARKER`+VK_IME_ON/OFF）と**同一の
+  条件式**でbump。判定を共有することで将来の乖離を防ぐ。
+- `imm.rs::send_ime_control`: Step 0診断ログのkind=actuation判定
+  （`!matches!(cmd, IMC_GETOPENSTATUS | IMC_GETCONVERSIONMODE)`）と
+  **同一の条件式**でbump。これも既存の`imm.rs`側`conv_mutation::bump()`
+  呼び出し（`IMC_SETCONVERSIONMODE`のみ）がopen軸の`IMC_SETOPENSTATUS`を
+  数えていないのと同型の穴であり、新カウンタでは含める。
+
+**要件（偶然の実装詳細ではない）**: bumpは対応するsyscall
+（`SendInput`/`SendMessageTimeoutW`）の**前**でなければならない。
+理由: 下記Dのworkerチェックポイントは「発行済みだがまだ返っていない
+actuationをworker側probeから見える状態にする」ことに依存するため。
+`Ordering::Relaxed`で足りる（単一ロケーションのカウンタで、これ経由で
+他のデータをpublishしないため、`conv_mutation`と同じ理屈）。
+
+### C. 比較点: probe側の呼び出し元（`ime.rs::offload_unsafe`には置かない）
+
+`key_pipeline.rs:665`付近（`kp_stage_idle_conv_check_inner`の
+`spawn_local` body内、probe呼び出しの`.await`直前）でspawn時点に
+キャプチャした値と比較する。`ime.rs::offload_unsafe`はprobe/actuation
+双方が通る共通ヘルパーのため、ここに置くと「actuationがactuationを
+待つ」問題が再発する（上記「重要な訂正」参照）。
+
+### D. 追加2チェックポイント（「次のprobeで再検出」に依存しない）
+
+新カウンタが`AtomicU64`でワーカースレッドからも読めることを利用し、
+3箇所で比較する:
+
+1. **issue(main)**: Cの`.await`直前（主機構）
+2. **issue(worker)**: `offload`に渡すクロージャの中、実際の
+   `SendMessageTimeoutW`呼び出し直前でもう一度比較（コストはアトミック
+   ロード1回。窓が「スレッド起動→syscall全体」から「syscall直前の
+   数命令」まで縮む）
+3. **apply**: 結果が返った後、既存の`conv_mutation_seq`比較
+   （`key_pipeline.rs:805`）と同型の比較を新カウンタでも実施
+
+### E/F. abandon時の3値区別（gate/in-flightフラグとの相互作用）
+
+フェンス不一致（abandon）は、純粋な読み取り失敗（`None`）とは区別可能な
+第三の値として表現し、closureまで運ぶ（案Eの「abandon理由の構造化enum」
+をそのまま使う）:
+
+- **`Abandoned{resync_generation: Some(_)}`**: closure内で**何もせず
+  return**（`close_focus_resync_gate_if_current`を呼ばない＝gateを
+  閉じない）。根拠: `kp_trigger_focus_resync`は spawn時点で同期的に
+  `schedule_focus_resync_deadline()`を武装済み（`app/mod.rs:499-504`）
+  であり、abandonが起きるのはその後の別メッセージループターンなので、
+  「gateを閉じずに戻れば`TIMER_FOCUS_RESYNC`ハンドラ
+  （`message_handlers.rs:551-561`）が`open_if_current`経由で世代照合
+  しつつ必ず引き取る」ことが構造的に保証される（`focus_resync.rs:117-125`
+  の`compare_exchange`により二重drainも起きない）。resync経路で
+  フェンス不一致時にそのままdrainを許す（却下した案(i)）と、
+  「awase自身が書き込み中のIME状態をresyncが読んで信じる」という
+  BUG-113の発生機構そのもの（probeがactuationと交錯→drift correctionが
+  第二のactuationに増幅）をフォーカス変更直後の最も汚染されやすい局面で
+  再演する（BUG-57と同型の入口）。リトライ案（却下した案(ii)）は
+  「回数」で束縛すれば時間定数を持ち込まずに済むが、今回は不要と判断。
+- **`Abandoned{resync_generation: None}`**: in-flightフラグ
+  （`idle_conv_check_in_flight_since_ms`）を解放してreturn。
+- **`None`（純粋な読み取り失敗）**: 現状のまま（`close_focus_resync_gate_
+  if_current`を含む既存パスをそのまま通る）。
+
+**`focus_resync.rs`側にも1行残すこと**: 同ファイルのmodule doc
+（22-35行目）が既に述べる「disarmが未配線でも安全側に働く（ガード4が
+resyncのconv読み取り自体を棄却するので、最大`FOCUS_RESYNC_DEADLINE_MS`
+無駄に待つだけ）」という"待つだけで安全"構造の**2例目**が今回のabandon
+であることを明記する。書かないと、後続セッションが
+「`close_focus_resync_gate_if_current`は必ず通る」という前提で上に
+設計を積んでしまう恐れがある。
+
+### G. `architecture_guard.rs`への双子ガード追加
+
+Bが「物理境界は単一チョークポイント」に依存しているため、両方を
+テストで固定する（`apply_mechanism`の既存ガード`architecture_guard.rs:2253`
+と同型）:
+
+- 「`SendInput(`の生産コード呼び出しは`win32.rs`の1箇所のみ」
+- 「`SendMessageTimeoutW(`の生産コード呼び出しは`imm.rs`の1箇所のみ」
+  （`imm.rs:127-130`のコメントが既に宣言しているが、固定するテストは
+  未設置）
+
+いずれも文字列リテラル・コメント中の偽陽性（`SendInput(`が
+`held_modifiers.rs:143`、`ime.rs:195,314,411`、`ime_controller.rs:287`、
+`transport.rs:199,232`のログ文言・コメントに出現する）を除外すること。
+
+### H. 案E・StepCoro案の扱い
+
+案E（`ProbeAction`/`dispatch_probe_actions`パターン）は、abandon理由の
+構造化enum化（上記E/F）のみ採用する。`VecDeque`によるキュー集約機構は
+導入しない（今回の調停判定には過剰）。StepCoro案（probeライフサイクルの
+明示的コルーチン化）はリファクタであってバグ修正ではないため、別PRに
+切り出す（同一PRに混ぜると`experiment-logging.md`が要求する「何を
+撤回したか」の追跡が効かなくなる）。
+
+### I. 完了条件: abandon率の実測（starvation確認）
+
+案Dはms定数を持たないため`tuning-constants.md`の実測義務は適用されないが、
+別種の実測が新たに必要になる。actuationが常に先行しprobeが永久に不成立
+（starvation）になると、idle-conv-checkの本来の目的（タスクバーからの
+モード変更検知）が静かに死ぬ。**abandonカウンタはresync経路と通常経路を
+分けて数えること**（ユーザー体感コストが桁違い——通常経路のabandonは
+「今回のidle-conv-checkを1回諦めた」だけだが、resync経路のabandonは
+「defer中のキーが`FOCUS_RESYNC_DEADLINE_MS`まで出てこない」という体感
+遅延に直結する。合算した1つのカウンタだと前者に埋もれて後者の頻発を
+見逃す）。`bug_report.rs:127`付近の既存idle-conv-check計装にこの2種の
+abandon回数を追加し、実機ソークで機能不全が起きていないことを確認する
+のをStep 1の完了条件に含める。
+
+### やらないこと（Step 1確定設計のスコープ外）
+
+- 実装そのもの（次のアクション）
+- StepCoro案の実装（別PR）
+- 排他窓の量を表すms定数の導入（案Dは不要）
+
+## 実装（2026-09-06）
+
+確定設計（A〜I）を以下のとおり実装した。実装時に確定設計から意図的に
+逸脱した点のみここに記録する（`experiment-logging.md`と同じ理由）:
+
+- **A/B**: `crates/awase-windows/src/probe_actuation_fence.rs`（新設）。
+  bump地点は`win32.rs::send_input_safe`（`ime_actuation_marker_kind`と
+  同一条件）・`imm.rs::send_ime_control`（`kind=actuation`判定と同一条件）。
+- **C/D**: `runtime/key_pipeline.rs`に新設した`idle_conv_check_probe`
+  （free async fn）が3チェックポイントを実装する。**確定設計からの逸脱**:
+  設計文は`Abandoned{resync_generation: Some(_)/None}`という、abandon
+  理由の enum 自体に`resync_generation`を持たせる形を書いていたが、実装は
+  `enum IdleConvCheckOutcome { Read(Option<u32>), Abandoned }`という
+  resync非依存の単純な形にし、resync/通常の分岐は呼び出し元
+  （`kp_stage_idle_conv_check_inner`、`resync_generation`を元々クロージャ
+  内に保持している）に委ねた。フェンス比較という「メカニズム」と
+  resyncゲートの扱いという「ポリシー」を分離でき、`idle_conv_check_probe`
+  自体はresyncの存在を一切知らなくてよくなる。`Abandoned`到達時の
+  3分岐（resync=gate維持/通常=in-flight解放）の実際の分岐ロジックは
+  設計どおり。
+- **E/F**: 上記のとおり呼び出し元で分岐。checkpoint3（apply、`apply_idle_
+  conv_check`内、既存`conv_mutation_seq`チェックと同型）はresync gateが
+  既にクローズ済みの時点で走るため、gate維持の特別扱いはせず読み取り結果を
+  破棄するのみ（設計の「3. apply」の記述と整合、E/Fの3分岐対象は
+  checkpoint1/2のみ）。
+- **G**: `tests/architecture_guard.rs::
+  send_input_and_send_message_timeout_w_have_single_production_call_site`。
+  `count_real_calls`ではなく新設の`count_real_calls_excluding_string_
+  literals`（同じneedleがtracingフォーマット文字列中に出現する既知の
+  誤検出——`ime.rs`/`held_modifiers.rs`等——を「needleの手前に`"`があるか」
+  で除外）を使う。
+- **H**: 案E（`ProbeAction`/`dispatch_probe_actions`パターン）のキュー集約
+  機構・StepCoro案は実装していない（設計どおり別スコープ）。
+- **I**: `probe_actuation_fence::{abandoned_resync_lifetime_count,
+  abandoned_normal_lifetime_count}`を`BugReportStateSnapshot`の
+  `idle_conv_check_abandoned_resync_count`/`_normal_count`として不具合
+  報告に含めた。
+
+全変更を通じて`crates/win32-async`（`offload.rs`含む）は一切変更していない
+（決定Cが明示的に禁止した`ime::offload_unsafe`への比較挿入も行っていない）。
+
+### 実装レビュー（opus-adversarial-consult、2026-09-06）で発見・修正した点
+
+Blockerは無かったが、Major 3件・Minor 4件の指摘を受けて反映した:
+
+- **M1（Major、分母の欠落）**: 決定Iのabandonカウンタは分子のみで、
+  「idle-conv-check probeを実際にspawnした回数」という分母が無く、
+  abandon率（starvation判定に必須）が算出不能だった。
+  `probe_actuation_fence::{record_spawned, spawned_resync_lifetime_count,
+  spawned_normal_lifetime_count}`を追加し、`BugReportStateSnapshot`にも
+  `idle_conv_check_spawned_resync_count`/`_normal_count`として追加した。
+- **M2（Major、意味論変更の広さが未実測）**: `kp_stage_idle_conv_check`は
+  パイプライン中で`kp_stage_shadow_ime_toggle`等より前段にあるため、
+  同一キーイベントの後続ステージがactuationを発行すると、issue前の
+  checkpoint1で必ずabandonする構造になっている。この構造自体は決定どおりの
+  帰結だが、`should_run_idle_conv_check`の発火条件がeager TSF
+  warmup・force-ONの発火条件と重なるため、abandon率がどの程度になるかは
+  未実測。M1で追加した分母付きカウンタを使い、実機ソークで「@」再発の
+  有無に加えてabandon率を確認すること。**注意（再レビューで判明）**:
+  `spawned - abandoned`は「checkpoint1/2を通過した数」であって「実際に
+  belief適用まで到達した数」ではない——その先に`Read(None)`・epoch棄却・
+  `close_focus_resync_gate_if_current`のfalse・(a)(b)(c)(d) discardが
+  残っているため、適用到達数は新カウンタだけでは算出できない。
+  idle-conv-checkが実際に機能しているか（タスクバーからのモード変更検知が
+  生きているか）は`RUST_LOG=debug`の`[idle-conv-check]`系ログ（discard
+  理由をすべて出力済み）で確認する運用とし、Step1の完了条件としては
+  abandon率の確認で足りるため追加計装は行わない。
+- **M3（Major、決定Iの分離意図の毀損）**: checkpoint3（apply時点、resync
+  gateクローズ**後**に走る）の discard が誤って`record_abandoned`を呼び、
+  体感遅延ゼロのabandonをresyncカウンタに混入させていた。決定Iがカウンタを
+  分けた理由（resync経路のabandonは体感遅延に直結、通常経路は1回諦める
+  だけ）と矛盾するため、checkpoint3では`record_abandoned`を呼ばず、既存の
+  (a)(b)(c) discardと同様に無カウントの破棄のみに統一した。
+- **m1（Minor）**: `record_abandoned`呼び出しが`with_app`クロージャ内に
+  あり、`with_app`再入時（`None`を返す既知のケース）に取りこぼす構造
+  だった。`with_app`の外・`outcome`確定直後に移動して解消。
+- **m2（Minor）**: `count_real_calls_excluding_string_literals`が行末
+  コメント中の言及（`foo(); // SendInput(...)`）を実呼び出しと誤カウント
+  する穴があった。needle手前に`//`があるかも見るよう修正（ブロック
+  コメント等の残る既知の限界はdoc comment化）。
+- **m3（Minor）**: module docの「物理境界は単一チョークポイント」という
+  記述が、syscall発行口の単一性とactuation判定（marker依存）の網羅性を
+  混同しうる書き方だった。shift-conv-guardの`VK_DBE_HIRAGANA`注入
+  （`TSF_MARKER`だが`VK_IME_ON/OFF`ではないためbump対象外、別のガードで
+  実害なし）を具体例として明記し、両者を切り分けた。
+- **m4（Minor）**: 新規ユニットテストがプロセス共有staticカウンタに対して
+  厳密等値でアサートしており、テストバイナリ内の並行実行でflakyになりうる
+  （BUG-65と同型）。`>=`比較に変更。
+
+いずれの指摘も、確定設計A〜Iの決定内容自体を覆すものではなく、実装時の
+反映漏れ（M3）と、決定Iの完了条件を実際に判定可能にするための追加計装
+（M1/M2）だった。再レビュー（同エージェント、同一commit `cfc90403`を
+直接確認）でBlocker・Major無しの収束を確認、Minor 1件（m5）のみ追加で
+検出された:
+
+- **m5（Minor、再レビューで検出）**: m4の`>=`化により、2テスト
+  （`record_abandoned`/`record_spawned`）が「resync/normal を分けて
+  数える」というsplit自体を検証しなくなっていた（両カウンタを無条件に
+  加算する実装に壊れても緑のまま通る）。プロセス共有staticに対して
+  flakyにならずsplitを検証するには専用のローカルインスタンスへの切り出しが
+  要るが、このモジュールの薄さに対して過剰と判断し、テスト名を実態
+  （`record_{abandoned,spawned}_increments_the_counter_matching_its_argument`）
+  に合わせるに留めた。splitの正しさ自体はmodule docの決定Iの記述と
+  呼び出し元（`key_pipeline.rs`）のコードレビューで担保する。
+
+収束（Blocker/Major 0件、Minor全件対応済み）。
+
+## Step1b（2026-09-06、`/code-review max`指摘への対応）
+
+Step1のPRに対する`/code-review max`が、`kp_stage_idle_conv_check_inner`と
+全く同型（`spawn_local`/ポーリングループ→クロスプロセス conv 読み取り→
+`with_app`、focus世代の照合のみ）でありながら`probe_actuation_fence`の
+対象外だった probe 経路を3箇所検出した:
+
+1. `output/probe_io.rs::start_ms_ime_ready_poll`（MS-IME BUG-13
+   confirm-then-transmitゲート、`confirmed=true`を実際に立てる経路）
+2. `output/probe_io.rs::send_chrome_gji_reinit_and_poll`（Chrome
+   cold-reinit時のGJI確認ポーリング）
+3. `platform.rs`のFocusChange直後IMCヒントprobe（hint専用、severity低）
+
+比較ロジック（決定C/D、チェックポイント1/2）を`crate::ime::
+get_ime_conversion_mode_fenced_async`（`crate::probe_actuation_fence::
+FencedProbeOutcome`を返す）として汎用化し、`kp_stage_idle_conv_check_
+inner`を含む4箇所全てがこれを共通の入口として使うよう配線した
+（`crate::ime::offload_unsafe`には引き続き比較を置かない、決定C厳守）。
+
+Abandon時の扱いは呼び出し元ごとに異なる（決定E/Fと同じ「メカニズムと
+ポリシーの分離」方針）:
+
+- `kp_stage_idle_conv_check_inner`: resync gateの非対称扱い（既存どおり）。
+- 上記3箇所: resync gate概念が無いため、いずれも「今回のtickは進展なし、
+  次tickへ継続」として既存の未観測（`with_app`再入等）扱いに合流させる
+  だけでよい。abandon専用カウンタ（決定I相当）は追加していない
+  ——これら3箇所はidle-conv-checkほど高頻度に発火しない（MS-IME
+  confirm-gate/Chrome cold-reinit/FocusChangeの各契機のみ）ため
+  starvationリスクが低く、実機ソークでの`RUST_LOG=debug`ログ確認で
+  足りると判断した。
+
+やらないこと（Step1bのスコープ外）:
+
+- 決定I相当のabandonカウンタを新3箇所へ追加すること（上記理由により
+  見送り、必要になれば追加する）。
+- `/code-review max`が指摘したその他のNit（`probe_actuation_fence.rs`の
+  bump/current・record_abandoned/record_spawnedのボイラープレート重複、
+  `architecture_guard.rs`の`count_real_calls`との重複、`examples/`配下の
+  spike実験バイナリのフェンス対象外化）——正確性・安全性に影響しない
+  純粋なリファクタ/スコープ明確化の提案であり、実装レビューが検証した
+  「Blockerではない」という判定どおり見送った。
+
+### Step1b 実装レビュー（opus-adversarial-consult、near-Blocker 2件を発見・修正）
+
+Step1bの初回実装（`8cd9268f`）に対する実装レビューで、near-Blocker
+（マージ前修正推奨）2件が見つかり反映した:
+
+- **S1（`start_ms_ime_ready_poll`が「必ず終了する」保証を失っていた）**:
+  `Abandoned => MsImePollStatus::Pending`が`with_app`を一切呼ばずに
+  返っていたため、abandonしたtickではdeadlineチェック
+  （`current_tick_ms() >= effective_deadline_ms` →
+  `ms_ime_gate_give_up.set(true)` → `Expired`）が完全にスキップされ、
+  abandonが連続する限りこのタスクが不死になりうる欠陥だった
+  （BUG-114のようなactuationストーム下で顕在化しうる）。deadline判定を
+  `ms_ime_ready_poll_check_deadline`として分離し、conv が信用できない
+  （abandonまたは後述S2のcheckpoint3不一致）場合も必ずこれを呼ぶよう
+  修正した——convは使わないがdeadline判定だけは毎tick行う、という形で
+  終了保証を復元した。
+- **S2（ループ2箇所はcheckpoint1が実質デッドコードで、checkpoint3も
+  無かった）**: `start_ms_ime_ready_poll`/`send_chrome_gji_reinit_and_
+  poll`はいずれも`fence_at_call`を`.await`の直前で取るため、checkpoint1
+  （main、決定Dの1点目）の窓が実質ゼロで、実際に効くのはcheckpoint2
+  （worker、`SendMessageTimeoutW`呼び出し直前）だけだった。かつ、
+  **最も起こりやすい交錯**（probeの`SendMessageTimeoutW`がin-flightの
+  間にメインスレッドがactuationを発行する）はissue前の2チェックでは
+  原理的に捕捉できず、これを捕まえるcheckpoint3相当が2箇所とも未実装
+  だった。read完了直後にフェンスを再比較する処理を両方に追加し、
+  不一致なら既存の「未観測」扱い（`send_chrome_gji_reinit_and_poll`は
+  `None`、`start_ms_ime_ready_poll`はdeadline判定のみ）に合流させた。
+
+いずれもStep1bの初回実装のミスであり、確定設計A〜IやStep1本体の設計を
+覆すものではない。レビューは他に、未フェンスの`get_ime_conversion_
+mode_raw_timeout_async`呼び出し4箇所（診断ログ専用、意図的に非フェンス）
+の確認、型不整合・デッドロック・パニック経路の不在を検証し、収束と判定
+した（Blocker 0件）。
+
+### Step1b マージ前`/code-review max`再確認（checkpoint3欠落と世代照合欠落を検出・修正）
+
+上記S2は`start_ms_ime_ready_poll`/`send_chrome_gji_reinit_and_poll`の2箇所
+だけにcheckpoint3を追加したが、Step1bで新たにフェンスした3箇所目
+`platform.rs`のFocusChange直後IMCヒントprobe（`gji_on_focus_change`内）には
+checkpoint3が入っていなかった——同じ`get_ime_conversion_mode_fenced_async`
+（checkpoint1/2のみ）を使う構造は同型なのに、read完了直後のフェンス再比較
+だけこの1箇所に欠けていた。severityは変わらず低い（`update_ime_mode_hint_
+from_imc`はconfirmedを立てないhint専用のため、汚染された値が適用されても
+BUG-13のconfirm-then-transmitゲートを誤って開けることはない）が、S2と
+同じ交錯防止を3箇所全てで一貫させるため、同型のcheckpoint3チェックを追加した。
+
+同じ再確認で、`start_ms_ime_ready_poll`のabandon分岐（S1でdeadline判定を
+必ず呼ぶよう修正した側）に、good-read分岐が`refresh_ime_mode_if_focus_
+matches`経由で必ず行っていた`ime_mode_focus_gen`世代照合が移植されていない
+欠陥も見つかった。世代照合を欠くと、フォーカスが切り替わった後も生き続ける
+旧世代のこのタスクが、（`probe_actuation_fence`がプロセス全体で1本の共有
+カウンタのため、新フォーカス側の通常のIME操作でも起こりうる）actuationとの
+交錯でabandon分岐に落ち続けた場合、旧世代の`deadline_ms`期限切れを検知した
+瞬間に**現在（新世代）の**`Output.ms_ime_gate_give_up`を誤って立ててしまう
+——新世代は一度もタイムアウトしていないのに、BUG-13のゲートが黙って無効化
+される。今回のS2 checkpoint3欠落（低severity、hint専用）とは異なり、
+こちらは`confirmed=true`を実際に立てて送信可否を決めるゲートそのものを
+壊しうるため severity は高い。abandon分岐にも世代照合を追加し、`gen`不一致
+時は`MsImePollStatus::Stale`で終了するよう修正した（詳細・再現条件は
+[docs/known-bugs.md](../known-bugs.md) BUG-113追記参照）。
+
+## 関連
+
+[docs/known-bugs.md](../known-bugs.md) BUG-113、
+[ADR-138](138-ime-probe-actuation-witness-app-rejected.md)（決定2との
+関係は上記参照）、
+[ADR-133](133-gji-ime-mode-key-sendinput-batch-shape.md)、
+[tuning-constants](../../.claude/rules/tuning-constants.md)、
+[fix-requires-evidence](../../.claude/rules/fix-requires-evidence.md)、
+[experiment-logging](../../.claude/rules/experiment-logging.md)。

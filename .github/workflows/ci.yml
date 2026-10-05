@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, develop, v1-main, v1-develop]
   pull_request:
-    branches: [main, develop]
+    branches: [main, develop, v1-main, v1-develop]
   # mutants ジョブを手動起動するため。push/pull_request では他ジョブと同様に動くが、
   # mutants ジョブ自体は if で workflow_dispatch 起動時のみに絞ってある。
   workflow_dispatch:
@@ -44,7 +44,21 @@ jobs:
       # `#![cfg(windows)]`で消えたクレートを参照してFAILするため、追加するなら
       # `cargo test --doc -p timed-fsm` に限定すること)。
       - run: cargo nextest run --workspace --lib
-      - run: cargo nextest run -p awase-windows --test architecture_guard --test golden_scenarios --test layer_boundary_guard
+      # 2026-10-04: 下の6本(+ガード)は tests/ にありながらどの CI ジョブからも
+      # 実行されていなかった(`--test` に列挙しない統合テストは `--lib` にも含まれず
+      # 黙って走らない)。closed_loop_scenarios はこの穴で ADR-212 の回帰ガードとして
+      # 機能していなかった。追加漏れは ci_test_coverage_guard が検出する。
+      - run: cargo nextest run -p awase-windows --test architecture_guard --test golden_scenarios --test layer_boundary_guard --test closed_loop_scenarios --test journal_replay --test drift_correction_replay --test intent_store_effective_open --test explicit_press_exhaustive --test warmup_gate_focus_scope --test wix_installer_guard --test ci_test_coverage_guard
+      # awase-settings はWindows専用ではなく非Windowsホストでもビルド可能な
+      # ように意図的に維持されている（main.rs内に#[cfg(not(target_os =
+      # "windows"))]の分岐が複数存在）。しかし他のCIジョブは全て
+      # `--target x86_64-pc-windows-msvc` 付きでしかこのcrateをビルドしない
+      # ため、ホストターゲットでのビルド経路がCIに一つも無かった。2026-09-07、
+      # awase-settingsからWindows専用モジュール(awase_windows::autostart、
+      # #[cfg(windows)])を無条件参照するコードが追加され、ホストビルドが
+      # E0433で壊れていたにもかかわらずCIは全green のまま検出できなかった
+      # （Opus敵対的レビューで発覚）。この穴を塞ぐための最小限の1行。
+      - run: cargo check -p awase-settings
 
   windows-cross-check:
     runs-on: ubuntu-latest
@@ -116,8 +130,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # カスタム dylint lint (no_vk_as_scan / ime_event_guard / observation_source_guard)
-      # はレイヤー境界を機械的に強制する。
+      # カスタム dylint lint (no_vk_as_scan / ime_event_guard / observation_source_guard /
+      # actuation_call_guard) はレイヤー境界・actuation合流点を機械的に強制する。
       # rustc_private を使うため nightly + rustc-dev/llvm-tools-preview が必須。
       # toolchain は lints/*/rust-toolchain に固定された値と一致させること（勝手に上げない）。
       - uses: dtolnay/rust-toolchain@master
@@ -174,6 +188,27 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  # ADR-222: services/report-worker（不具合報告の受付 Worker）の型検査とテスト。
+  # これまで CI に無く、Worker の許可項目の追加漏れ（keymap_learn が黙って捨てられていた、
+  # b365324a）のような退行を手元の pnpm test に頼っていた。ローカルでビルド・テストを
+  # しない運用（ストレージと CPU の節約）にするため、CI で必ず走らせる。
+  report-worker:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/report-worker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run typecheck
+      - run: pnpm test
+
   machete:
     runs-on: ubuntu-latest
     steps:
@@ -181,6 +216,58 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-machete
       - run: cargo machete
+
+  # ADR-158 TB2（opus code reviewのM3で追加）: lints/actuation_call_guardの
+  # RESTRICTED_CALLS宣言と architecture_guard.rs のガード期待値が一致しているかを
+  # 機械的に照合する。実行するだけで比較・終了コードを返さなかった旧版の欠陥修正。
+  # ADR-158 TC3も同じバイナリに統合済み: .claude/rules/fix-requires-evidence.md の
+  # 「再発ファミリー」表のファイルパスが .githooks/pre-push の対象正規表現でカバー
+  # されているかも同時に照合する（ADR-156/BUG-116型の「表に追加したが正規表現の
+  # 更新を忘れる」退行を検出する）。
+  adr-evidence-consistency:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run -p xtask-adr-evidence -- .
+
+  # ADR-162 E2/TH2: docs/adr/index.md の行に対応する本文ファイルが実在するかを
+  # 確認する。ADR-151/152は「index.mdに行はあるが本文ファイルが一度もcommitされて
+  # いなかった」まま他ADRから権威として参照され続けた(2026-09-08に判明)。この
+  # チェックはその再発を防ぐ——本文ファイルの追加を起票と同時に強制する形で、
+  # 「本文なき権威」を構造的に作れなくする。Rustのビルドを要さないため独立ジョブとする。
+  adr-index-consistency:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: index.md の各行に対応する本文ファイルが存在することを確認
+        run: |
+          set -euo pipefail
+          missing=0
+          matched=0
+          while IFS= read -r link; do
+            matched=$((matched + 1))
+            file="docs/adr/${link}"
+            if [ ! -f "$file" ]; then
+              echo "::error::docs/adr/index.md が参照する本文ファイルが存在しません: $file"
+              missing=$((missing + 1))
+            fi
+          done < <(grep -oP '^\| \[[0-9A-Za-z]+\]\(\K[^)]+(?=\))' docs/adr/index.md)
+          # opus code review N6: grep が表フォーマット変更等で0行しか拾えなかった場合、
+          # missing=0のまま「全て確認済み」と偽の成功を返す穴があった。下限件数で
+          # サイレント false green を防ぐ（2026-09-09時点で149行、将来増える一方の
+          # はずなので余裕を持たせつつ下限とする）。
+          if [ "$matched" -lt 100 ]; then
+            echo "::error::index.mdの行の抽出結果が異常に少ない($matched件、想定は100件超)。" \
+                 "grepパターンがindex.mdの表フォーマット変更に追随できていない可能性がある。"
+            exit 1
+          fi
+          if [ "$missing" -gt 0 ]; then
+            echo "::error::$missing 件の本文ファイルが欠落しています(ADR-151/152と同型の「本文なき権威」)"
+            exit 1
+          fi
+          echo "全 index.md 行($matched件)に対応する本文ファイルの存在を確認しました"
 
   # push/pull_request 毎にブロッキングで実行する。cargo-audit はコード変更が
   # 無くても新しい advisory の公開だけで赤くなり得るが、他ジョブ(clippy pedantic+
@@ -195,6 +282,14 @@ jobs:
       - uses: taiki-e/install-action@cargo-audit
       - run: cargo audit
 
+  # 2026-09-23: 元は awase.exe ビルド・awase-settings.exe ビルド(LTO込み
+  # settings-release、単独で2分47秒〜3分31秒かかり windows-build job 全体の
+  # 最大の塊だった)・全テスト・パッケージング(zip/MSI)を1ジョブで直列に
+  # 実行しており、windows-latest ランナーの所要時間(6分22秒〜9分15秒)が
+  # そのまま run 全体のボトルネックになっていた(他ジョブは最大でも
+  # dylint の2.3分)。awase-settings.exe のビルドはこのジョブ(awase.exe +
+  # Windows専用テスト)の完了を待つ理由が無いため windows-settings ジョブへ
+  # 分離し、windows-latest ランナー上で並列実行する。
   windows-build:
     runs-on: windows-latest
     steps:
@@ -211,17 +306,10 @@ jobs:
       - name: Build awase.exe
         run: cargo build --release --locked -p awase-windows
 
-      # settings-release: release.yml と同じ理由で専用プロファイルを使う
-      # （[profile.settings-release]、Cargo.toml）。
-      - name: Build awase-settings.exe
-        run: cargo build --profile settings-release --locked -p awase-settings
-
-      # awase-settings は今まで実 Windows でテストが一度も走っていなかった
-      # （build のみで test 未実行）。egui::Grid が行内 add_space() で panic する
-      # 不具合（プレビュータブを開くと無言のまま強制終了）が Linux 上の headless
-      # 再現テストでは検出できても実 Windows で再現するかは未検証だったため追加。
-      - name: Run awase-settings tests (Windows)
-        run: cargo nextest run -p awase-settings
+      # 学習プロセス（release.yml が同梱する。ADR-195/196）。PR で Windows 向けの
+      # ビルド崩れを検知するため、release.yml と同じコマンドでビルドする。
+      - name: Build awase-keymap-learn-win.exe
+        run: cargo build --release --locked -p awase-keymap-learn-win
 
       - name: Install Japanese IME
         shell: pwsh
@@ -258,7 +346,7 @@ jobs:
       # cargo-mutants は既定の `cargo test` を使うため、この2経路では引き続き
       # 本ロックが唯一の防御。ブロック化（continue-on-errorなし）は維持する。
       - name: Run lib unit tests (Windows)
-        run: cargo nextest run --lib -p awase-windows
+        run: cargo nextest run --lib -p awase-windows --no-fail-fast
 
       # ime_key_sequence_golden は #![cfg(windows)] のため Linux の test ジョブでは
       # 0 tests になり、実質どこでも走っていなかった。ここ（実 Windows）で初めて
@@ -271,7 +359,7 @@ jobs:
       # 検出できない。2026-08-20 の独立レビューで発覚、追加）。
       # これらは決定的（環境非依存）なのでブロック化する（continue-on-error なし）。
       - name: Run golden / architecture guard tests (Windows)
-        run: cargo nextest run -p awase-windows --test architecture_guard --test golden_scenarios --test layer_boundary_guard --test ime_key_sequence_golden --test thumb_context_guard
+        run: cargo nextest run -p awase-windows --test architecture_guard --test golden_scenarios --test layer_boundary_guard --test ime_key_sequence_golden --test thumb_context_guard --no-fail-fast
 
       # E2E の決定的テスト（純 Engine の in-process ロジック + SendMessage/WM_CHAR）は
       # フォアグラウンドフォーカス非依存で、実 HWND 生成に失敗しても early-return で
@@ -295,11 +383,84 @@ jobs:
         env:
           RUST_LOG: debug
 
+      # windows-package ジョブがパッケージング用にダウンロードする。
+      - name: Upload awase.exe (for packaging)
+        uses: actions/upload-artifact@v4
+        with:
+          name: awase-exe
+          path: |
+            target/release/awase.exe
+            target/release/awase-keymap-learn-win.exe
+          retention-days: 7
+
+  # awase-settings.exe のビルド(settings-release: LTO=true, codegen-units=1、
+  # [profile.settings-release]、Cargo.toml)は windows-build ジョブの
+  # awase.exe ビルド・Windows専用テストと依存関係が無いため並列実行する。
+  windows-settings:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+
+      # settings-release: release.yml と同じ理由で専用プロファイルを使う
+      # （[profile.settings-release]、Cargo.toml）。
+      - name: Build awase-settings.exe
+        run: cargo build --profile settings-release --locked -p awase-settings
+
+      # awase-settings は今まで実 Windows でテストが一度も走っていなかった
+      # （build のみで test 未実行）。egui::Grid が行内 add_space() で panic する
+      # 不具合（プレビュータブを開くと無言のまま強制終了）が Linux 上の headless
+      # 再現テストでは検出できても実 Windows で再現するかは未検証だったため追加。
+      - name: Run awase-settings tests (Windows)
+        run: cargo nextest run -p awase-settings
+
+      # windows-package ジョブがパッケージング用にダウンロードする。
+      - name: Upload awase-settings.exe (for packaging)
+        uses: actions/upload-artifact@v4
+        with:
+          name: awase-settings-exe
+          path: target/settings-release/awase-settings.exe
+          retention-days: 7
+
+  # 2026-09-23: dist/zip/MSI 配布物は release.yml がタグ push 時に自前で
+  # 別途ビルドしており(ci.yml のこのジョブの成果物を消費する自動化は
+  # リポジトリ内に存在しない)、develop への通常 push で毎回 WiX/MSI 込みの
+  # パッケージングを行う必要は無い。PR・push to main・手動起動では
+  # (パッケージング自体のリグレッション検知のため)引き続き実行する。
+  #
+  # if: に独自条件を書くと needs: に対する GitHub Actions 既定の暗黙
+  # success() チェックが上書きされて消える(needs 先のジョブが失敗していても
+  # このジョブは実行されてしまう)。windows-build/windows-settings が失敗した
+  # 場合に本ジョブが download-artifact でアーティファクト無し失敗という
+  # 無関係なエラーを出し、本当の失敗原因を覆い隠さないよう明示的に
+  # success() を条件へ含める(同種の書き方は e2e-ime.yml に前例あり)。
+  windows-package:
+    needs: [windows-build, windows-settings]
+    if: |
+      success() &&
+      (github.event_name != 'push' || github.ref != 'refs/heads/develop')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: awase-exe
+          path: target/release
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: awase-settings-exe
+          path: target/settings-release
+
       - name: Prepare distribution
         shell: bash
         run: |
           mkdir -p dist/layout dist/data dist/scripts
           cp target/release/awase.exe dist/
+          cp target/release/awase-keymap-learn-win.exe dist/
           cp target/settings-release/awase-settings.exe dist/
           cp config.toml dist/
           cp layout/*.yab dist/layout/
@@ -382,18 +543,30 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-mutants
-      - name: Run cargo-mutants (awase core crate)
-        run: cargo mutants --no-shuffle
+      - name: Run cargo-mutants (awase core crate, shard ${{ matrix.shard }}/4)
+        # 2026-09-23実測: --jobs 4(1 runner)では1194 mutantsが65分で、--jobs無しの
+        # 7月実績(661 mutantsで33分)と1件あたりほぼ同じだった。時間の大半は
+        # mutantごとのbuild(24〜58秒、testは1秒)で、4vCPU上の並列化はCPUを
+        # 取り合うだけだったため、4 runnerへ--shardで分割し、各runnerは--jobs 2にする。
+        # rust-cacheが設定するCARGO_INCREMENTAL=0だとmutantごとに全再ビルドに
+        # なるため、このstepだけ有効化する。
+        env:
+          CARGO_INCREMENTAL: "1"
+        run: cargo mutants --no-shuffle --jobs 2 --shard ${{ matrix.shard }}/4
       - name: Upload mutants report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mutants-report
+          name: mutants-report-shard-${{ matrix.shard }}
           path: mutants.out/
 
   # mutants-windows(self-hosted runner向け)は2026-07に mutants-windows.yml
@@ -403,26 +576,44 @@ jobs:
   # (mutants-windows.yml冒頭のコメント参照)。
 
   # 手動起動専用。対象は awase-windows のうちプラットフォーム非依存な
-  # ~550 mutants のみ（設定は .cargo/mutants-awase-windows.toml）。
-  # awase-windows の大半を占める #[cfg(windows)] コードは Linux 上では
-  # コンパイルされず、無指定で走らせると false MISSED だらけになるため
-  # 明示的なファイル許可リストでスコープを絞ってある（詳細は同 toml 内コメント参照）。
-  # Windows 実機依存のロジック自体のミューテーションテスト(#[cfg(windows)]配下)は
-  # mutants-windows.yml(self-hosted Windows runner)が別途担当する。
+  # ~620 mutants のみ(windows-latest では許可リスト内の #[cfg(windows)] 部分もコンパイルされるため、Linux 時代の~550より増えた。2026-09-23実測624件)（設定は .cargo/mutants-awase-windows.toml）に絞って
+  # あるのは変わらないが（残りの #[cfg(windows)] 本体は mutants-windows.yml
+  # (self-hosted Windows runner)が別途フルスコープで担当）、ランナー自体は
+  # windows-latest(GitHub-hosted、publicリポなら無料)を使う。2026-09-20に
+  # 追加された crates/awase-windows/examples/{ime_key_matrix_spike,
+  # richedit_tsf_probe}.rs が windows クレート(awase-windows/Cargo.toml で
+  # [target.'cfg(windows)'.dependencies])を cfg なしで直接参照しており、
+  # cargo-mutantsのbaselineビルドはpackage全体(examples含む)を対象にするため、
+  # ubuntu-latestだとE0433で即失敗し1件もmutantsをテストできない
+  # (mutants-scope-investigation.yml冒頭コメントに記載の同種症状、examples側の
+  # #![cfg(windows)]化はmain関数が丸ごと消えてE0601になるだけで解決しないことを
+  # 2026-09-23に確認済み)。姉妹ワークフロー
+  # mutants-actuation-confluence-windows.yml / mutants-scope-investigation.yml
+  # が採った解決(windows-latestへ切り替え)に倣う。
   mutants-awase-windows:
     if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-mutants
-      - name: Run cargo-mutants (awase-windows, platform-independent subset)
-        run: cargo mutants -p awase-windows --config .cargo/mutants-awase-windows.toml --no-shuffle
+      - name: Run cargo-mutants (awase-windows, platform-independent subset, shard ${{ matrix.shard }}/8)
+        # 分割・incrementalの理由はmutantsジョブ(coreクレート)のコメント参照。
+        # Windowsはbuildが遅く(baselineだけで131秒)、4 shardでは各56〜60分(2026-09-23
+        # 実測、run 35879891879)で90分上限への余裕が小さいため8 shardにする。
+        shell: pwsh
+        env:
+          CARGO_INCREMENTAL: "1"
+        run: cargo mutants -p awase-windows --config .cargo/mutants-awase-windows.toml --no-shuffle --jobs 2 --shard ${{ matrix.shard }}/8
       - name: Upload mutants report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mutants-report-awase-windows
+          name: mutants-report-awase-windows-shard-${{ matrix.shard }}
           path: mutants.out/

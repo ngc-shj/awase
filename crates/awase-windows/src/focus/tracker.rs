@@ -29,6 +29,7 @@ pub(crate) struct FocusTracker {
     imm_learning: ImmCapabilityStore,
     injection_mode_store: InjectionModeStore,
     hwnd_ime_cache: HwndImeCache,
+    pub(crate) seen_threads: crate::focus::thread_scope::SeenThreads,
 }
 
 impl std::fmt::Debug for FocusTracker {
@@ -52,6 +53,7 @@ impl FocusTracker {
             imm_learning,
             injection_mode_store,
             hwnd_ime_cache: HwndImeCache::new(),
+            seen_threads: crate::focus::thread_scope::SeenThreads::default(),
         }
     }
 
@@ -75,6 +77,16 @@ impl FocusTracker {
 
     pub(crate) const fn current_profile(&self) -> crate::focus::class_names::AppImeProfile {
         self.current.app_profile
+    }
+
+    /// `app_overrides.input_relay_apps`（issue #136 / BUG-90 決定4）。
+    ///
+    /// 正規ルート。`focus/classifier.rs` のプロセスグローバル
+    /// `input_relay_apps_snapshot()` は `self` を持たない `pub unsafe fn`
+    /// （`ime.rs::read_ime_state_fast`）専用であり、`FocusTracker` に到達
+    /// できる呼び出し元はこちらを使うこと。
+    pub(crate) fn input_relay_apps(&self) -> &[String] {
+        self.overrides.input_relay_apps()
     }
 
     pub(crate) fn injection_hint(&self) -> InjectionHint {
@@ -111,20 +123,68 @@ impl FocusTracker {
     /// フォーカス情報を更新する。`app_profile` は `class_name` から自動導出したうえで、
     /// 実測学習（`ImmCapabilityStore`）による降格を適用する。
     pub(crate) fn update(&mut self, pid: u32, class_name: String, hwnd: usize) {
-        self.current.update(pid, class_name, hwnd);
-        let learned = self.imm_learning.get(&self.current.class_name);
+        self.update_with_process_name(pid, class_name, hwnd, None);
+    }
+
+    pub(crate) fn update_with_process_name(
+        &mut self,
+        pid: u32,
+        class_name: String,
+        hwnd: usize,
+        process_name: Option<String>,
+    ) {
+        // BUG-111: このメソッドは実フォーカス変更時だけでなく、`run_ime_refresh` の
+        // 500ms 周期リフレッシュ（`runtime/ime_refresh.rs::ir_stage_focus`）からも
+        // 同一ウィンドウのまま毎ティック呼ばれる（自己修復のため store 再照会自体は
+        // 必要、doc コメント参照）。`self.current.update_with_process_name` は
+        // `app_profile` を毎回いったん静的分類にリセットするため、以前は
+        // 「リセット直後の静的値」対「学習済み降格値」を比較しており、既に
+        // 降格済みで何も変わっていないティックでも INFO ログが再発火し続けていた
+        // （実機で同一ウィンドウ在留中に 500ms おき・42 回連続再発火を確認）。
+        // 直前 tick の実効値（同一 pid/class のときだけ意味を持つ）と比較し、
+        // 本当に遷移した時だけログする。
+        let prev_pid = self.current.pid;
+        let prev_class_name_matches = self.current.class_name == class_name;
+        let prev_profile = self.current.app_profile;
+
+        self.current.update_with_process_name(
+            pid,
+            class_name,
+            hwnd,
+            self.overrides.input_relay_apps(),
+            process_name,
+        );
+        let learned = self
+            .imm_learning
+            .get(&self.current.process_name, &self.current.class_name);
         let overridden = Self::apply_learned_imm_capability(self.current.app_profile, learned);
         if overridden != self.current.app_profile {
-            log::info!(
-                "[imm-learning] profile 降格: class={:?} {:?} → {:?} \
-                 (実測学習 ImmCapability::Unavailable。誤学習なら cache.toml の \
-                 [imm_capability] から該当クラスを削除)",
-                self.current.class_name,
-                self.current.app_profile,
-                overridden,
-            );
+            let same_window = prev_pid == pid && prev_class_name_matches;
+            if Self::should_log_demotion(same_window, prev_profile, overridden) {
+                tracing::info!(
+                    "[imm-learning] profile 降格: process={:?} class={:?} {:?} → {:?} \
+                     (実測学習 ImmCapability::Unavailable。誤学習なら cache.toml の \
+                     [imm_capability] から該当 process/class を削除)",
+                    self.current.process_name,
+                    self.current.class_name,
+                    self.current.app_profile,
+                    overridden,
+                );
+            }
             self.current.app_profile = overridden;
         }
+    }
+
+    /// BUG-111: `[imm-learning] profile 降格` ログを「本当に遷移した時だけ」出す
+    /// 純粋判定。同一ウィンドウ（`same_window`）に在留したまま前回と同じ
+    /// `overridden` 値が再計算されただけなら false（既に一度ログ済み・何も新しい
+    /// 情報が無い）。ウィンドウが変わった、または降格結果自体が変わった場合は true。
+    fn should_log_demotion(
+        same_window: bool,
+        prev_profile: crate::focus::class_names::AppImeProfile,
+        overridden: crate::focus::class_names::AppImeProfile,
+    ) -> bool {
+        !(same_window && prev_profile == overridden)
     }
 
     /// 学習済み IMM 能力による profile 降格の純粋判定。
@@ -136,7 +196,7 @@ impl FocusTracker {
     ///
     /// これにより静的リストに載っていない IMM-broken アプリ（`ImmGetDefaultIMEWnd`
     /// が NULL / IME 検出ミスが閾値超え）でも、ImmCross の無駄な
-    /// `SendMessageTimeoutW` を踏まずに MsImeDirect / GjiDirect / KanjiToggle 系へ
+    /// `SendMessageTimeoutW` を踏まずに MsImeDirect / GjiDirect 系へ
     /// 直行できる。学習の書き手は `focus/imm_learning.rs`（フォーカス時の
     /// `ImmGetDefaultIMEWnd` 判定）と `Runtime::learn_imm_capability_from_miss`
     /// （IME 検出ミス数の閾値超え/回復）。`Works` 回復学習で store が更新されれば
@@ -165,9 +225,14 @@ impl FocusTracker {
     }
 
     /// 現在フォーカス中のプロセスが `disable_apps` にマッチしているか
-    /// （BUG-78 対策、`runtime/focus_tracking.rs` から呼ぶ）。
+    /// （BUG-78 対策、`runtime/focus_tracking.rs` から呼ぶ）。ADR-195段階1の
+    /// 学習プロセス（`awase-keymap-learn-win.exe`）も、注入キーを変換しないよう
+    /// 恒久バイパス対象として扱う。
     pub(crate) fn is_app_disabled(&self) -> bool {
         self.overrides.is_app_disabled(&self.current.process_name)
+            || crate::state::app_suppression::is_keymap_learn_process_name(
+                &self.current.process_name,
+            )
     }
 
     pub(crate) fn cache_insert(
@@ -211,6 +276,7 @@ impl FocusTracker {
             ime_on,
             input_mode,
             from_explicit_off_intent,
+            self.current.hwnd,
         );
     }
 
@@ -224,20 +290,37 @@ impl FocusTracker {
 
     // ── IMM 能力学習 ─────────────────────────────────────────────────────────
 
-    pub(crate) fn imm_capability(&self, class_name: &str) -> Option<ImmCapability> {
-        self.imm_learning.get(class_name)
+    pub(crate) fn imm_capability(
+        &self,
+        process_name: &str,
+        class_name: &str,
+    ) -> Option<ImmCapability> {
+        self.imm_learning.get(process_name, class_name)
     }
 
-    pub(crate) fn learn_imm_capability(&mut self, class_name: String, cap: ImmCapability) {
-        self.imm_learning.learn(class_name, cap);
+    pub(crate) fn learn_imm_capability(
+        &mut self,
+        process_name: String,
+        class_name: String,
+        cap: ImmCapability,
+    ) {
+        self.imm_learning.learn(process_name, class_name, cap);
     }
 
-    pub(crate) fn record_imm_null_probe(&mut self, class_name: String) {
-        self.imm_learning.record_null_probe(class_name);
+    /// 学習済みの IMM 能力を全て捨てる（BUG-108、トレイの学習キャッシュクリア）。
+    /// 捨てた件数と、`cache.toml` へ反映できたかを返す。次の `update` から静的分類に戻る。
+    pub(crate) fn clear_imm_capability_cache(&mut self) -> (usize, bool) {
+        self.imm_learning.clear()
     }
 
-    pub(crate) fn clear_imm_pending_unavailable(&mut self, class_name: &str) {
-        self.imm_learning.clear_pending_unavailable(class_name);
+    pub(crate) fn record_imm_null_probe(&mut self, process_name: String, class_name: String) {
+        self.imm_learning
+            .record_null_probe(process_name, class_name);
+    }
+
+    pub(crate) fn clear_imm_pending_unavailable(&mut self, process_name: &str, class_name: &str) {
+        self.imm_learning
+            .clear_pending_unavailable(process_name, class_name);
     }
 
     // ── Injection モード学習 ────────────────────────────────────────────────
@@ -298,6 +381,42 @@ mod tests {
             FocusTracker::apply_learned_imm_capability(AppImeProfile::Standard, None),
             AppImeProfile::Standard,
         );
+    }
+
+    // ── should_log_demotion（BUG-111: 500ms リフレッシュ毎の再発火防止）───────
+
+    #[test]
+    fn should_log_demotion_suppresses_repeat_on_same_window() {
+        // 同一ウィンドウに在留したまま、前回と同じ降格結果が再計算されただけなら
+        // ログしない（`run_ime_refresh` の 500ms 周期ティックで無条件に再発火して
+        // いた実機バグの再発防止）。
+        assert!(!FocusTracker::should_log_demotion(
+            true,
+            AppImeProfile::Imm32Unavailable,
+            AppImeProfile::Imm32Unavailable,
+        ));
+    }
+
+    #[test]
+    fn should_log_demotion_fires_on_first_transition() {
+        // 別ウィンドウから遷移してきた直後（same_window=false）は、たとえ
+        // 降格結果の値が偶然同じでも「新しい情報」としてログする。
+        assert!(FocusTracker::should_log_demotion(
+            false,
+            AppImeProfile::Standard,
+            AppImeProfile::Imm32Unavailable,
+        ));
+    }
+
+    #[test]
+    fn should_log_demotion_fires_when_result_changes_within_same_window() {
+        // 同一ウィンドウでも、自己修復（`Works` 学習）等で結果自体が変われば
+        // 変化イベントとしてログする。
+        assert!(FocusTracker::should_log_demotion(
+            true,
+            AppImeProfile::Imm32Unavailable,
+            AppImeProfile::Standard,
+        ));
     }
 
     #[test]

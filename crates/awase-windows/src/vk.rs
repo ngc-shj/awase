@@ -15,94 +15,233 @@ pub const LANGID_ENGLISH_US: u32 = 0x0409;
 // 各ファイルに散らばっていた `const VK_FOO: u16 = 0x..` を
 // `VkCode` 型として集約。Windows API 境界では `.0` で剥がす。
 
-pub const VK_BACK: VkCode = VkCode(0x08);
-pub const VK_TAB: VkCode = VkCode(0x09);
-pub const VK_RETURN: VkCode = VkCode(0x0D);
-pub const VK_SHIFT: VkCode = VkCode(0x10);
-pub const VK_CONTROL: VkCode = VkCode(0x11);
-pub const VK_MENU: VkCode = VkCode(0x12);
-pub const VK_CAPITAL: VkCode = VkCode(0x14);
-pub const VK_KANA: VkCode = VkCode(0x15);
-pub const VK_IME_ON: VkCode = VkCode(0x16);
-pub const VK_JUNJA: VkCode = VkCode(0x17);
-pub const VK_KANJI: VkCode = VkCode(0x19);
-pub const VK_IME_OFF: VkCode = VkCode(0x1A);
-pub const VK_ESCAPE: VkCode = VkCode(0x1B);
-pub const VK_CONVERT: VkCode = VkCode(0x1C);
-pub const VK_NONCONVERT: VkCode = VkCode(0x1D);
-pub const VK_SPACE: VkCode = VkCode(0x20);
-pub const VK_PRIOR: VkCode = VkCode(0x21);
-pub const VK_NEXT: VkCode = VkCode(0x22);
-pub const VK_END: VkCode = VkCode(0x23);
-pub const VK_HOME: VkCode = VkCode(0x24);
-pub const VK_LEFT: VkCode = VkCode(0x25);
-pub const VK_UP: VkCode = VkCode(0x26);
-pub const VK_RIGHT: VkCode = VkCode(0x27);
-pub const VK_DOWN: VkCode = VkCode(0x28);
-pub const VK_INSERT: VkCode = VkCode(0x2D);
-pub const VK_DELETE: VkCode = VkCode(0x2E);
+/// VK 定数と、`from_name` が引く名前表を**1か所**で宣言する。
+///
+/// 識別子 `VK_KANA` から、定数 `VK_KANA` と正規名 `"KANA"`(`VK_` を除いた形、
+/// `canonical_key_text` の出力と同じ規則)を作る。`[...]` は別名(`canonical_key_text`
+/// 適用後の形で書く: ASCII は大文字、`VK_` 無し)。定数と `from_name` の表の間で VK 値が
+/// ずれることはない(分類関数 `ImeKeyKind::from_vk` などは今も 16 進を持つ)。
+/// 同じ名前や同じ VK 値が2か所にあると `key_table_names_are_unique_and_canonical` が落ちる。
+/// 同じ VK の2つ目の定数が要るときは、表の外で普通の `pub const` を定義し、名前は別名に書く。
+///
+/// **値の独立した検査**: Windows ターゲットでは、各定数を `windows` crate の同名の
+/// `VIRTUAL_KEY` 定数とコンパイル時に突き合わせる。Microsoft 自身のメタデータが
+/// オラクルになるので、表の値の打ち間違い(`VK_LSHIFT`/`VK_RSHIFT` の入れ替えなど)は
+/// `cargo check --target x86_64-pc-windows-msvc` で検出される。
+///
+/// 表に載せないキー(`VK_JUNJA` 等、`from_name` が受理していなかったもの)は、下で普通の
+/// 定数として定義する。
+macro_rules! vk_keys {
+    ($( $(#[doc = $doc:expr])* $id:ident = $vk:literal $(, [$($alias:literal),* $(,)?])? ; )*) => {
+        $( $(#[doc = $doc])* pub const $id: VkCode = VkCode($vk); )*
+
+        /// `from_name` が引く表。`(識別子, 別名, VK 値)`。
+        const KEY_TABLE: &[KeyEntry] = &[
+            $( KeyEntry { ident: stringify!($id), aliases: &[$($($alias),*)?], vk: $vk } ),*
+        ];
+
+        $(
+            #[cfg(windows)]
+            const _: () = assert!(
+                ::windows::Win32::UI::Input::KeyboardAndMouse::$id.0 == $vk,
+                concat!("VK 値が windows crate の定数と違う: ", stringify!($id))
+            );
+        )*
+    };
+}
+
+struct KeyEntry {
+    /// `"VK_KANA"` のような識別子そのもの。正規名は `VK_` を除いたもの。
+    ident: &'static str,
+    aliases: &'static [&'static str],
+    vk: u16,
+}
+
+impl KeyEntry {
+    /// `canonical_key_text` 適用済みの名前がこの項目を指すか。
+    fn matches(&self, canonical: &str) -> bool {
+        self.ident.strip_prefix("VK_") == Some(canonical) || self.aliases.contains(&canonical)
+    }
+}
+
+vk_keys! {
 /// VK_A (0x41) — 'A' キー。GJI cold-start warmup の犠牲キー (`send_unicode_cold_warmup_keys`) 用途。
-pub const VK_A: VkCode = VkCode(0x41);
-pub const VK_F11: VkCode = VkCode(0x7A);
-pub const VK_F12: VkCode = VkCode(0x7B);
-pub const VK_LSHIFT: VkCode = VkCode(0xA0);
-pub const VK_RSHIFT: VkCode = VkCode(0xA1);
-pub const VK_LCONTROL: VkCode = VkCode(0xA2);
-pub const VK_RCONTROL: VkCode = VkCode(0xA3);
-pub const VK_LMENU: VkCode = VkCode(0xA4);
-pub const VK_RMENU: VkCode = VkCode(0xA5);
-pub const VK_OEM_MINUS: VkCode = VkCode(0xBD);
-pub const VK_LWIN: VkCode = VkCode(0x5B);
-pub const VK_RWIN: VkCode = VkCode(0x5C);
-pub const VK_DBE_ALPHANUMERIC: VkCode = VkCode(0xF0);
-pub const VK_DBE_KATAKANA: VkCode = VkCode(0xF1);
-pub const VK_DBE_HIRAGANA: VkCode = VkCode(0xF2);
-pub const VK_DBE_SBCSCHAR: VkCode = VkCode(0xF3);
-pub const VK_DBE_DBCSCHAR: VkCode = VkCode(0xF4);
+VK_A = 0x41;
+VK_B = 0x42;
+VK_C = 0x43;
+VK_D = 0x44;
+VK_E = 0x45;
+VK_F = 0x46;
+VK_G = 0x47;
+VK_H = 0x48;
+VK_I = 0x49;
+VK_J = 0x4A;
+VK_K = 0x4B;
+VK_L = 0x4C;
+VK_M = 0x4D;
+VK_N = 0x4E;
+VK_O = 0x4F;
+VK_P = 0x50;
+VK_Q = 0x51;
+VK_R = 0x52;
+VK_S = 0x53;
+VK_T = 0x54;
+VK_U = 0x55;
+VK_V = 0x56;
+VK_W = 0x57;
+VK_X = 0x58;
+VK_Y = 0x59;
+VK_Z = 0x5A;
+VK_0 = 0x30;
+VK_1 = 0x31;
+VK_2 = 0x32;
+VK_3 = 0x33;
+VK_4 = 0x34;
+VK_5 = 0x35;
+VK_6 = 0x36;
+VK_7 = 0x37;
+VK_8 = 0x38;
+VK_9 = 0x39;
+VK_OEM_PLUS = 0xBB;
+VK_OEM_COMMA = 0xBC;
+VK_OEM_MINUS = 0xBD;
+VK_OEM_PERIOD = 0xBE;
+VK_OEM_1 = 0xBA;
+VK_OEM_2 = 0xBF;
+VK_OEM_3 = 0xC0;
+VK_OEM_4 = 0xDB;
+VK_OEM_5 = 0xDC;
+VK_OEM_6 = 0xDD;
+VK_OEM_7 = 0xDE;
+VK_OEM_102 = 0xE2;
+VK_SPACE = 0x20;
+VK_RETURN = 0x0D, ["ENTER"];
+VK_TAB = 0x09;
+VK_BACK = 0x08, ["BACKSPACE"];
+VK_ESCAPE = 0x1B, ["ESC"];
+VK_DELETE = 0x2E;
+VK_CONVERT = 0x1C, ["変換"];
+VK_NONCONVERT = 0x1D, ["MUHENKAN", "無変換"];
+VK_KANA = 0x15, ["かな", "カナ"];
+VK_KANJI = 0x19, ["漢字"];
+VK_IME_ON = 0x16, ["IMEON", "IMEオン"];
+VK_IME_OFF = 0x1A, ["IMEOFF", "IMEオフ"];
+VK_DBE_ALPHANUMERIC = 0xF0;
+VK_DBE_KATAKANA = 0xF1;
+VK_DBE_HIRAGANA = 0xF2;
+VK_DBE_SBCSCHAR = 0xF3, ["OEM_AUTO"];
+VK_DBE_DBCSCHAR = 0xF4, ["OEM_ENLW"];
 /// VK_DBE_ROMAN (0xF5) — ローマ字入力モードへの切替（IME open 状態は変えない）。
 ///
 /// `ImeKeyKind`（IME ON/OFF の shadow 追従用）には**含めない**: このキーは
 /// ROMAN ビット（かな入力方式）のみを制御し、`ShadowImeEffect::TurnOn/TurnOff/Toggle`
 /// のいずれにも該当しない。IME 自体の開閉状態を持つ shadow 追従の対象外。
-pub const VK_DBE_ROMAN: VkCode = VkCode(0xF5);
+VK_DBE_ROMAN = 0xF5;
 /// VK_DBE_NOROMAN (0xF6) — JIS かな直接入力モードへの切替（IME open 状態は変えない）。
 /// `VK_DBE_ROMAN` と同じ理由で `ImeKeyKind` には含めない。
-pub const VK_DBE_NOROMAN: VkCode = VkCode(0xF6);
+VK_DBE_NOROMAN = 0xF6;
+VK_SHIFT = 0x10;
+VK_CONTROL = 0x11;
+VK_MENU = 0x12;
+/// VK_CAPITAL (0x14) — CapsLock。JIS キーボードでは Shift+英数 と物理的に
+/// 同一スキャンコード（ADR-111 参照）。`[[keymap]]` の `from`/`to` 禁止対象
+/// （ADR-114 決定5）で名前付き定数として参照するため追加。
+VK_CAPITAL = 0x14;
+VK_LSHIFT = 0xA0;
+VK_RSHIFT = 0xA1;
+VK_LCONTROL = 0xA2;
+VK_RCONTROL = 0xA3;
+VK_LMENU = 0xA4;
+VK_RMENU = 0xA5;
+VK_F1 = 0x70;
+VK_F2 = 0x71;
+VK_F3 = 0x72;
+VK_F4 = 0x73;
+VK_F5 = 0x74;
+VK_F6 = 0x75;
+VK_F7 = 0x76;
+VK_F8 = 0x77;
+VK_F9 = 0x78;
+VK_F10 = 0x79;
+VK_F11 = 0x7A;
+VK_F12 = 0x7B;
+/// F13。役割由来の開閉操作の候補（`is_role_fkey` の先頭、ADR-199 決定18）。
+VK_F13 = 0x7C;
+VK_F14 = 0x7D;
+VK_F15 = 0x7E;
+VK_F16 = 0x7F;
+VK_F17 = 0x80;
+VK_F18 = 0x81;
+VK_F19 = 0x82;
+VK_F20 = 0x83;
+VK_F21 = 0x84;
+VK_F22 = 0x85;
+VK_F23 = 0x86;
+VK_F24 = 0x87;
+VK_LEFT = 0x25;
+VK_UP = 0x26;
+VK_RIGHT = 0x27;
+VK_DOWN = 0x28;
+VK_HOME = 0x24;
+VK_END = 0x23;
+VK_PRIOR = 0x21;
+VK_NEXT = 0x22;
+VK_INSERT = 0x2D;
+VK_SNAPSHOT = 0x2C;
+}
+
+// `from_name` が受理しないキー(表に載せない)。
+pub const VK_JUNJA: VkCode = VkCode(0x17);
+pub const VK_LWIN: VkCode = VkCode(0x5B);
+pub const VK_RWIN: VkCode = VkCode(0x5C);
 pub const VK_NONAME: VkCode = VkCode(0xFC);
+
+// 表外の4定数も、`vk_keys!` と同じく windows crate の定数と突き合わせる。
+#[cfg(windows)]
+const _: () = {
+    use windows::Win32::UI::Input::KeyboardAndMouse as km;
+    assert!(km::VK_JUNJA.0 == VK_JUNJA.0);
+    assert!(km::VK_LWIN.0 == VK_LWIN.0);
+    assert!(km::VK_RWIN.0 == VK_RWIN.0);
+    assert!(km::VK_NONAME.0 == VK_NONAME.0);
+};
 
 // ── IME キー種別 ──────────────────────────────────────────
 
-/// IME の ON/OFF 状態を変更するキーの種別。
+/// IME のモード/開閉に関係しうる物理キーの**同定**（このVKは何のキーか）。
 ///
-/// raw な VK コード (0xF2, 0x19 等) の代わりにパターンマッチで使う。
+/// raw な VK コード (0xF2, 0x19 等) の代わりにパターンマッチで使う。variant 名は VK の名前どおりで、
+/// **効果（ON にする/OFF にする等）を意味しない**。押したときに何が起きるかは IME 種別・キーマップ・状態で変わる
+/// ので、ここでは決め打たず、予測表（`state/key_effect_table.rs`、格子で学習した結果から生成）と観測から引く
+/// （ADR-191 決定6）。効果を静的に持つのは [`ImeKeyKind::shadow_effect`]（IME種別に依らず確定しているキーだけ）と
+/// 役割由来の`shadow_action`（`Runtime::enrich_key_role`、ADR-199）に限る。
+///
+/// 旧名（ADR-191 以前）: `KanjiToggle`→`Kanji`、`Alphanumeric`→`DbeAlphanumeric`、`Katakana`→`DbeKatakana`、
+/// `Activate`→`DbeHiragana`、`Deactivate`→`DbeSbcsChar`、`ActivatePair`→`DbeDbcsChar`。
+/// 旧名は効果を名前に埋め込んでいた（例: 0xF3 を「IME OFF にするキー」と呼ぶ）が、実IMEでは 0xF3/0xF4 は
+/// どちらも開閉トグルである（ADR-186/190）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImeKeyKind {
-    /// VK_KANA (0x15) — カタカナ/ひらがなキー
-    ///
-    /// Microsoft 公式: "The IME On key has the virtual key code VK_KANA (0x15)".
-    /// 単独押下でひらがな入力モードに入る（IME ON）。Shift+ で カタカナモード。
-    /// トグルではなく常に IME ON にする動作。
-    /// wezterm 等のアプリで IME ON キーとして使われる。
+    /// VK_KANA (0x15)。日本語キーボードの「かな」キー。
     Kana,
     /// VK_IME_ON (0x16)
     ImeOn,
-    /// VK_JUNJA (0x17) — IME on 系
+    /// VK_JUNJA (0x17)
     Junja,
-    /// VK_KANJI (0x19) — 半角/全角キー
-    /// 多くの JIS キーボードでは IME ON/OFF のトグルとして動作する。
-    KanjiToggle,
+    /// VK_KANJI (0x19)。「漢字」キー（0xF3/0xF4 の「半角/全角」とは別のVK）。
+    Kanji,
     /// VK_IME_OFF (0x1A)
     ImeOff,
-    /// VK_DBE_ALPHANUMERIC / VK_OEM_ATTN (0xF0) — 英数モード（IME OFF 扱い）
-    Alphanumeric,
-    /// VK_DBE_KATAKANA (0xF1) — カタカナモード（IME ON）
-    Katakana,
-    /// VK_DBE_HIRAGANA (0xF2) — ひらがなモード（IME ON）
-    Activate,
-    /// VK_DBE_SBCSCHAR / VK_OEM_AUTO (0xF3) — 半角モード（IME OFF 扱い）
-    Deactivate,
-    /// VK_DBE_DBCSCHAR / VK_OEM_ENLW (0xF4) — 全角モード（IME ON）
-    ActivatePair,
+    /// VK_DBE_ALPHANUMERIC / VK_OEM_ATTN (0xF0)。「英数」キー。
+    DbeAlphanumeric,
+    /// VK_DBE_KATAKANA (0xF1)。「カタカナ」キー。
+    DbeKatakana,
+    /// VK_DBE_HIRAGANA (0xF2)。「ひらがな」キー。
+    DbeHiragana,
+    /// VK_DBE_SBCSCHAR / VK_OEM_AUTO (0xF3)。「半角/全角」キーの一方（OSが押すたびに 0xF3/0xF4 を交互に見せる）。
+    DbeSbcsChar,
+    /// VK_DBE_DBCSCHAR / VK_OEM_ENLW (0xF4)。「半角/全角」キーのもう一方。
+    DbeDbcsChar,
 }
 
 /// `ImeKeyKind` が IME 状態に与える効果。
@@ -110,6 +249,7 @@ pub enum ImeKeyKind {
 pub enum ShadowImeEffect {
     TurnOn,
     TurnOff,
+    /// 押すたびに開閉が反転する（beliefから目標を決めて冪等な VK_IME_ON/OFF で書く）。
     Toggle,
 }
 
@@ -121,31 +261,65 @@ impl ImeKeyKind {
             0x15 => Some(Self::Kana),
             0x16 => Some(Self::ImeOn),
             0x17 => Some(Self::Junja),
-            0x19 => Some(Self::KanjiToggle),
+            0x19 => Some(Self::Kanji),
             0x1A => Some(Self::ImeOff),
-            0xF0 => Some(Self::Alphanumeric),
-            0xF1 => Some(Self::Katakana),
-            0xF2 => Some(Self::Activate),
-            0xF3 => Some(Self::Deactivate),
-            0xF4 => Some(Self::ActivatePair),
+            0xF0 => Some(Self::DbeAlphanumeric),
+            0xF1 => Some(Self::DbeKatakana),
+            0xF2 => Some(Self::DbeHiragana),
+            0xF3 => Some(Self::DbeSbcsChar),
+            0xF4 => Some(Self::DbeDbcsChar),
             _ => None,
         }
     }
 
-    /// このキーが shadow IME 状態に与える効果。
+    /// このキーが shadow IME 状態に与える効果（IME種別に依らず静的に確定しているものだけ）。
+    ///
+    /// ADR-191: 開閉だけに作用し、どのIMEでも結果が同じキーだけを静的に扱う。
+    /// - `VK_IME_ON`/`VK_IME_OFF`: Windows標準で冪等。
+    /// - `VK_KANJI`(0x19): どのIMEでも開閉トグル（ADR-189。`keys.ime_toggle`の既定は2026-09-29に空へ変更、ADR-199決定15）。ただし GJI のときは
+    ///   `Runtime::enrich_key_role` が `Hankaku/Zenkaku` 行の役割で上書きする（ADR-202。GJI 以外はこの静的値のまま）。
+    ///
+    /// ひらがな・カタカナ・英数・`VK_KANA`など、入力モードも動かしうる/IMEの種類・キーマップ・
+    /// 状態で変わるキーは静的に決め打ちしない（`None`）。生のままIMEへ通し、結果を観測して追随する。
+    /// 半角/全角(0xF3/0xF4)はIME設定ごとの役割判定が要るため`Runtime::enrich_key_role`で扱う（ADR-199）。
     #[must_use]
-    pub const fn shadow_effect(&self) -> ShadowImeEffect {
+    pub const fn shadow_effect(&self) -> Option<ShadowImeEffect> {
         match self {
+            Self::ImeOn => Some(ShadowImeEffect::TurnOn),
+            Self::ImeOff => Some(ShadowImeEffect::TurnOff),
+            Self::Kanji => Some(ShadowImeEffect::Toggle),
             Self::Kana
-            | Self::ImeOn
             | Self::Junja
-            | Self::Katakana
-            | Self::Activate
-            | Self::ActivatePair => ShadowImeEffect::TurnOn,
-            Self::ImeOff | Self::Alphanumeric | Self::Deactivate => ShadowImeEffect::TurnOff,
-            Self::KanjiToggle => ShadowImeEffect::Toggle,
+            | Self::DbeAlphanumeric
+            | Self::DbeKatakana
+            | Self::DbeHiragana
+            | Self::DbeSbcsChar
+            | Self::DbeDbcsChar => None,
         }
     }
+}
+
+/// 役割判定の候補キー（ADR-199 決定4）か。集合の定義は `awase_gji_config::role::ROLE_CANDIDATE_VK_NAMES`
+/// の1箇所だけで、ここでは VK に解決するだけ（定義を2箇所にしない）。全打鍵で通るので解決結果は1度だけ作る。
+#[must_use]
+pub fn is_role_candidate(vk: VkCode) -> bool {
+    static CANDIDATES: std::sync::OnceLock<Vec<VkCode>> = std::sync::OnceLock::new();
+    CANDIDATES
+        .get_or_init(|| {
+            awase_gji_config::role::ROLE_CANDIDATE_VK_NAMES
+                .iter()
+                .filter_map(|name| VkCode::from_name(name))
+                .collect()
+        })
+        .contains(&vk)
+}
+
+/// 役割判定の候補のうち F13〜F24（0x7C〜0x87、ADR-199 決定18）か。半角/全角（0xF3/0xF4）と違い、
+/// 受信そのものが IME の証拠にならず（`is_japanese_ime` を上げない）、自動リピートがあり、書かなかった打鍵は
+/// Suppress してはならない——そのため配送・ラッチ・昇格の各所で半角/全角と別扱いにする。
+#[must_use]
+pub const fn is_role_fkey(vk: VkCode) -> bool {
+    matches!(vk.0, 0x7C..=0x87)
 }
 
 /// VK コードが IME 状態を変更する可能性があるかどうかを判定する。
@@ -155,6 +329,61 @@ pub const fn may_change_ime(vk_code: VkCode) -> bool {
         return true;
     }
     matches!(vk_code.0, 0xF0..=0xF6)
+}
+
+/// OS/IME 側がモード切替として解釈しうる物理キーか
+/// （＝この打鍵の直後は conv の読み取りが信用できないか）。
+///
+/// `may_change_ime`（awase が IME refresh をスケジュールすべきか）とも
+/// `vk_may_mutate_conv`（IMM32 の conv ワードを変えるか、`VK_NONCONVERT`は
+/// 「composition キャンセルキーでありモード選択キーではない」として意図的に
+/// 除外）とも判定軸が異なる。GJI 既定キーマップでは 無変換=直接入力/
+/// 変換=ひらがな であり、`VK_NONCONVERT`(0x1D) は上記2つのどちらにも
+/// 含まれないため、この軸が無いと素の 無変換 の直後に idle-conv-check の
+/// cross-process 読み取りが走り、GJI の TSF composition がまだ遷移中の値を
+/// 拾ってしまう（実機A/Bで確定済みの「@」の独立した十分条件、
+/// docs/known-bugs.md BUG-113参照）。
+///
+/// **`may_change_ime`/`vk_may_mutate_conv` を widen して代用してはならない**——
+/// 前者を広げると `schedule_ime_refresh(20)` の頻度が上がり衝突機会が増え、
+/// 後者を広げると `conv_mutation_seq` 照合とADR-140の判定がずれる。
+#[must_use]
+pub const fn is_ime_mode_key_for_ime(vk_code: VkCode) -> bool {
+    if may_change_ime(vk_code) {
+        return true; // 0x15-0x1A（VK_KANA/IME_ON/JUNJA/KANJI/IME_OFF）+ 0xF0-0xF6
+    }
+    matches!(vk_code.0, 0x1C | 0x1D) // VK_CONVERT / VK_NONCONVERT
+}
+
+/// 通した生キーを再注入（`RawKeyEvent::reinject`）するときの`wScan`。
+///
+/// IMEモードキー（`is_ime_mode_key_for_ime`: 全角/半角・英数・かな・カタカナ・変換・無変換など）は元の
+/// スキャンコードを保つ。**`wScan=0`で再注入すると、実機のGJI（MS-IMEプリセット）で、awase無しなら
+/// IMEを開くひらがな（0xF2）が開かなくなった**（BUG-154、ADR-191 実機検証: awase経由の閉→開が0/6、
+/// スキャンコードを保つと4/4）。それ以外のキー（矢印などの拡張キー）は`KEYEVENTF_EXTENDEDKEY`無しの
+/// scan付き再注入が別のキー（テンキー）に化けうるので、従来どおり0のままにする。
+/// なお判定は**拡張フラグではなくVKの集合**（`is_ime_mode_key_for_ime`）で行う。IMEモードキー
+/// （0x15-0x1A・0x1C・0x1D・0xF0-0xF6）はJIS配列で拡張キーにならないので、VK集合で代用できている。
+#[must_use]
+pub const fn reinject_scan_code(vk_code: VkCode, scan_code: u32) -> u16 {
+    if is_ime_mode_key_for_ime(vk_code) {
+        scan_code as u16
+    } else {
+        0
+    }
+}
+
+/// 生キーを通した直後に実IMEを読み直して追随する（ADR-187のfollow）対象のIMEモードキーか。
+///
+/// ADR-191: IMEモードキー（`is_ime_mode_key_for_ime`）のうち、awase自身が意図を持って書く
+/// （Windows標準で冪等な）`VK_IME_ON`(0x16)/`VK_IME_OFF`(0x1A)を除く全て。無変換・変換・かな・カタカナ・
+/// 英数・半角/全角・漢字などは、静的に意味を決めずIMEへ通し、結果を観測して追随する。
+/// （旧`is_convert_or_nonconvert`は、awaseが方向を決めて書くキーの明示意図まで捨てないよう
+/// 無変換/変換に限っていた。そのキー群は静的な`shadow_action`の撤去で、`shadow_action`を持たない
+/// キーだけがここに来る。呼び出し側は`shadow_action.is_none()`も併せて確認する。）
+#[must_use]
+pub const fn is_followed_mode_key(vk_code: VkCode) -> bool {
+    is_ime_mode_key_for_ime(vk_code) && !matches!(vk_code.0, 0x16 | 0x1A)
 }
 
 /// この VK が IME conv-mode ワード（NATIVE/KATAKANA/FULLSHAPE/ROMAN、
@@ -170,14 +399,12 @@ pub const fn may_change_ime(vk_code: VkCode) -> bool {
 ///   ひらがな/半角/全角/ローマ字/かな直接の各モード切替）。
 /// - `false`（open-only、無害）: `VK_IME_ON`（0x16）・`VK_IME_OFF`（0x1A）・
 ///   `VK_KANJI`（0x19）——これらは IME の開閉のみを切り替え、conv ワードには
-///   触れない（`KanjiToggleStrategy`/`MsImeDirectStrategy` が根拠に使う
-///   前提と同じ）。`VK_NONCONVERT`（0x1D）も対象外——composition のキャンセル
+///   触れない。`VK_NONCONVERT`（0x1D）も対象外——composition のキャンセル
 ///   キーであり mode 選択キーではない。
 ///
-/// `send_ime_mode_key`（`ime.rs`）はユーザー設定 VK（`engine_on_ime_vk`/
-/// `engine_off_ime_vk`）を送るため、同じ関数呼び出しが open-only にも
-/// conv-mutating にもなりうる。呼び出し元（call site）単位では区別できず、
-/// **実際に送信する VK の値**で判定する必要がある——`win32::send_input_safe`
+/// `send_ime_mode_key`（`ime.rs`）は VK_IME_ON/OFF 以外の VK も送りうる（`VK_DBE_*` 等）ため、
+/// 同じ関数呼び出しが open-only にも conv-mutating にもなりうる。呼び出し元（call site）単位では
+/// 区別できず、**実際に送信する VK の値**で判定する必要がある——`win32::send_input_safe`
 /// がこの関数を唯一のゲートとして経由する設計はこのため。
 #[must_use]
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -211,11 +438,11 @@ pub const fn is_synthetic_dbe_ime_hotkey(vk_code: VkCode) -> bool {
     matches!(
         ImeKeyKind::from_vk(vk_code),
         Some(
-            ImeKeyKind::Alphanumeric
-                | ImeKeyKind::Katakana
-                | ImeKeyKind::Activate
-                | ImeKeyKind::Deactivate
-                | ImeKeyKind::ActivatePair
+            ImeKeyKind::DbeAlphanumeric
+                | ImeKeyKind::DbeKatakana
+                | ImeKeyKind::DbeHiragana
+                | ImeKeyKind::DbeSbcsChar
+                | ImeKeyKind::DbeDbcsChar
         )
     )
 }
@@ -233,6 +460,78 @@ pub const fn is_synthetic_dbe_ime_hotkey(vk_code: VkCode) -> bool {
 #[must_use]
 pub const fn should_upgrade_is_japanese_ime(injected: bool, vk_code: VkCode) -> bool {
     !injected && is_synthetic_dbe_ime_hotkey(vk_code)
+}
+
+/// `VK_IME_ON`/`VK_IME_OFF`（0x16/0x1A）か。どの IME でも開閉だけに作用し冪等な、静的に確定しているキー。
+///
+/// `kp_stage_shadow_ime_toggle` はこのキーの静的 `shadow_action` を `is_japanese_ime()` に関係なく採用する
+/// （ADR-207）。`is_japanese_ime()` は awase のワーカースレッドの HKL 由来で偽になりうる
+/// （既定入力言語が en-US で ja-JP + MS-IME を追加した環境など）うえ、ADR-093 の救済
+/// （`should_upgrade_is_japanese_ime`）はこの2キーを対象外にしているため、
+/// `keys.ime_detect` の既定（`IMEオン`/`IMEオフ`）を空にしても従来どおり追随させるための条件。
+/// 0x19（トグル）・役割由来の F13〜F24・0xF3/0xF4 は含めない。
+#[must_use]
+pub const fn is_static_idempotent_open_key(vk_code: VkCode) -> bool {
+    matches!(vk_code.0, 0x16 | 0x1A)
+}
+
+/// 親指キー押下ラッチの識別子（BUG-132）。
+///
+/// `kb.scanCode` に `LLKHF_EXTENDED` を畳み込む。Left Alt / Right Alt のように raw scan が同一で拡張ビットだけが
+/// 異なる別キーを区別するため（scan だけだと片方の KeyUp が他方のラッチを
+/// 解除してしまう）。0 は「非ラッチ」の番兵（このリポジトリの `VkCode(0)` 番兵と
+/// 同じ規約）で、識別子が 0 になる（scan=0・非拡張）キーは武装しない。
+#[must_use]
+pub const fn thumb_latch_identity(
+    scan: awase::types::ScanCode,
+    extended: bool,
+) -> awase::types::ScanCode {
+    awase::types::ScanCode(scan.0 | if extended { 0x100 } else { 0 })
+}
+
+/// 親指キー押下ラッチ（`hook.rs::HookState::left_thumb_down_scan`/
+/// `right_thumb_down_scan`）をこの KeyUp で解除してよいか判定する純粋関数
+/// （BUG-132）。
+///
+/// `VK_DBE_*`（`VK_DBE_HIRAGANA`等）を親指キーに割り当てた構成では、
+/// Windows が KeyDown と KeyUp で異なる vk を合成する非対称性がある
+/// （BUG-131 と同型）。このため解除は vk 一致ではなく、KeyDown 時に記録した
+/// 識別子（`thumb_latch_identity`）との一致で判定する。`armed_identity` が
+/// 0 なら非ラッチで常に false。呼び出し側は物理（非注入）イベントに限って
+/// 呼ぶこと（`hook_callback` の `!is_injected` ブロック内）。
+#[must_use]
+pub const fn should_release_thumb_latch(
+    armed_identity: awase::types::ScanCode,
+    keyup_identity: awase::types::ScanCode,
+) -> bool {
+    armed_identity.0 != 0 && armed_identity.0 == keyup_identity.0
+}
+
+/// 物理キー押下の VK 記録（`hook.rs::HookState::physical_down_vk_by_identity`）の
+/// 添字。`thumb_latch_identity`（scan + 拡張ビット）を 0..512 に写す。scan=0 や
+/// 範囲外は記録しない（`None`、従来どおり VK 単位の判定だけになる）。
+#[must_use]
+pub const fn physical_identity_slot(scan: awase::types::ScanCode, extended: bool) -> Option<usize> {
+    if scan.0 == 0 || scan.0 > 0xFF {
+        return None;
+    }
+    Some(thumb_latch_identity(scan, extended).0 as usize)
+}
+
+/// KeyUp で、同じ物理キーの KeyDown 時に記録した VK の「押下中」枠を落とすべきか
+/// 判定する純粋関数。
+///
+/// `VK_DBE_HIRAGANA` の物理キーは Down=0xF2・Up=0xF0 で届く（BUG-131）ため、
+/// VK 単位の `physical_key_state` だと 0xF2 の枠が Up で落ちず、2 回目以降の Down が
+/// `was_down=true`（自動リピート扱い）になり押下 ID が付かない。`recorded` は Down で
+/// 記録した VK（0 = 記録なし）。記録があり Up の VK と異なるときだけ、その VK を返す。
+#[must_use]
+pub const fn stale_down_vk_on_up(recorded: VkCode, up_vk: VkCode) -> Option<VkCode> {
+    if recorded.0 != 0 && recorded.0 != up_vk.0 {
+        Some(recorded)
+    } else {
+        None
+    }
 }
 
 /// 変換対象外のキー（修飾キー、ファンクションキー等）を判定する
@@ -263,6 +562,13 @@ pub const fn is_passthrough(vk_code: VkCode) -> bool {
 #[must_use]
 pub const fn is_ime_control(vk_code: VkCode) -> bool {
     matches!(vk_code.0, 0x15 | 0x16 | 0x17 | 0x19 | 0x1A | 0xE5)
+}
+
+/// ADR-192の状態依存判定対象のうち、実キーボードに存在してユーザーが押せるIMEモードキーか。
+/// `VK_IME_ON`/`VK_IME_OFF`は合成送出用で物理キーではないため含めない。
+#[must_use]
+pub const fn is_physical_ime_mode_key(vk_code: VkCode) -> bool {
+    matches!(vk_code.0, 0x19 | 0x1C | 0x1D | 0xF3 | 0xF4)
 }
 
 /// IME コンテキストキーかどうかを判定する。
@@ -308,29 +614,6 @@ pub const fn is_ctrl_variant(vk: VkCode) -> bool {
     matches!(vk.0, 0x11 | 0xA2 | 0xA3)
 }
 
-/// この VK を `SendInput`/`keybd_event` で再注入する際、`KEYEVENTF_EXTENDEDKEY`
-/// を立てるべきか（ADR-110 決定6）。
-///
-/// Windows は右 Ctrl/右 Alt・矢印キー・Home/End/PageUp/PageDown/Insert/Delete・
-/// Win キー・NumLock 等を「拡張キー」として扱い、この情報が無いと受信側アプリが
-/// 左修飾キーやテンキーとして誤解釈しうる。テンキーの Enter（VK は通常の
-/// `VK_RETURN` と同一で拡張フラグのみが区別点）はスキャンコード情報が無いと
-/// 判別できないため対象外（`key_remap`/Alt なりすましのいずれの `to` にも
-/// 現状 Enter を割り当てる想定がないため実害は無い）。
-#[must_use]
-pub const fn is_extended_key(vk: VkCode) -> bool {
-    matches!(
-        vk.0,
-        0xA3 | 0xA5 // VK_RCONTROL, VK_RMENU
-        | 0x21
-            ..=0x28 // PRIOR/NEXT/END/HOME/LEFT/UP/RIGHT/DOWN
-        | 0x2D | 0x2E // INSERT, DELETE
-        | 0x5B | 0x5C | 0x5D // LWIN, RWIN, APPS
-        | 0x90 // NUMLOCK
-        | 0x6F // DIVIDE
-    )
-}
-
 /// composition を確定／キャンセルするキー（Space / Enter / Escape）かどうかを判定する。
 ///
 /// これらの KeyDown は IME composition を消費し終わらせるため、TSF
@@ -362,6 +645,7 @@ pub trait VkCodeExt {
     fn is_composition_confirm_key(self) -> bool;
     fn is_modifier_free_char(self, os_modifier_held: bool) -> bool;
     fn may_change_ime(self) -> bool;
+    fn is_ime_mode_key_for_ime(self) -> bool;
     fn classify_modifier(self) -> Option<ModifierKey>;
     fn ime_kind(self) -> Option<ImeKeyKind>;
     fn to_pos(self) -> Option<awase::scanmap::PhysicalPos>;
@@ -396,6 +680,9 @@ impl VkCodeExt for VkCode {
     fn may_change_ime(self) -> bool {
         may_change_ime(self)
     }
+    fn is_ime_mode_key_for_ime(self) -> bool {
+        is_ime_mode_key_for_ime(self)
+    }
     fn classify_modifier(self) -> Option<ModifierKey> {
         classify_modifier(self)
     }
@@ -406,122 +693,61 @@ impl VkCodeExt for VkCode {
         vk_to_pos(self)
     }
     fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "VK_A" => Some(Self(0x41)),
-            "VK_B" => Some(Self(0x42)),
-            "VK_C" => Some(Self(0x43)),
-            "VK_D" => Some(Self(0x44)),
-            "VK_E" => Some(Self(0x45)),
-            "VK_F" => Some(Self(0x46)),
-            "VK_G" => Some(Self(0x47)),
-            "VK_H" => Some(Self(0x48)),
-            "VK_I" => Some(Self(0x49)),
-            "VK_J" => Some(Self(0x4A)),
-            "VK_K" => Some(Self(0x4B)),
-            "VK_L" => Some(Self(0x4C)),
-            "VK_M" => Some(Self(0x4D)),
-            "VK_N" => Some(Self(0x4E)),
-            "VK_O" => Some(Self(0x4F)),
-            "VK_P" => Some(Self(0x50)),
-            "VK_Q" => Some(Self(0x51)),
-            "VK_R" => Some(Self(0x52)),
-            "VK_S" => Some(Self(0x53)),
-            "VK_T" => Some(Self(0x54)),
-            "VK_U" => Some(Self(0x55)),
-            "VK_V" => Some(Self(0x56)),
-            "VK_W" => Some(Self(0x57)),
-            "VK_X" => Some(Self(0x58)),
-            "VK_Y" => Some(Self(0x59)),
-            "VK_Z" => Some(Self(0x5A)),
-            "VK_0" => Some(Self(0x30)),
-            "VK_1" => Some(Self(0x31)),
-            "VK_2" => Some(Self(0x32)),
-            "VK_3" => Some(Self(0x33)),
-            "VK_4" => Some(Self(0x34)),
-            "VK_5" => Some(Self(0x35)),
-            "VK_6" => Some(Self(0x36)),
-            "VK_7" => Some(Self(0x37)),
-            "VK_8" => Some(Self(0x38)),
-            "VK_9" => Some(Self(0x39)),
-            "VK_OEM_PLUS" => Some(Self(0xBB)),
-            "VK_OEM_COMMA" => Some(Self(0xBC)),
-            "VK_OEM_MINUS" => Some(Self(0xBD)),
-            "VK_OEM_PERIOD" => Some(Self(0xBE)),
-            "VK_OEM_2" => Some(Self(0xBF)),
-            "VK_OEM_1" => Some(Self(0xBA)),
-            "VK_OEM_3" => Some(Self(0xC0)),
-            "VK_OEM_4" => Some(Self(0xDB)),
-            "VK_OEM_5" => Some(Self(0xDC)),
-            "VK_OEM_6" => Some(Self(0xDD)),
-            "VK_OEM_7" => Some(Self(0xDE)),
-            "VK_OEM_102" => Some(Self(0xE2)),
-            "VK_SPACE" => Some(Self(0x20)),
-            "VK_RETURN" => Some(Self(0x0D)),
-            "VK_TAB" => Some(Self(0x09)),
-            "VK_BACK" => Some(Self(0x08)),
-            "VK_ESCAPE" => Some(Self(0x1B)),
-            "VK_DELETE" => Some(Self(0x2E)),
-            "VK_CONVERT" | "Convert" | "変換" => Some(Self(0x1C)),
-            "VK_NONCONVERT" | "VK_MUHENKAN" | "Nonconvert" | "無変換" => Some(Self(0x1D)),
-            "VK_KANA" | "Kana" | "かな" | "カナ" => Some(Self(0x15)),
-            "VK_KANJI" | "Kanji" | "漢字" => Some(Self(0x19)),
-            "VK_IME_ON" | "ImeOn" | "IMEオン" => Some(Self(0x16)),
-            "VK_IME_OFF" | "ImeOff" | "IMEオフ" => Some(Self(0x1A)),
-            "VK_DBE_ALPHANUMERIC" => Some(Self(0xF0)),
-            "VK_DBE_KATAKANA" => Some(Self(0xF1)),
-            "VK_DBE_HIRAGANA" => Some(Self(0xF2)),
-            "VK_DBE_SBCSCHAR" | "VK_OEM_AUTO" => Some(Self(0xF3)),
-            "VK_DBE_DBCSCHAR" | "VK_OEM_ENLW" => Some(Self(0xF4)),
-            "VK_DBE_ROMAN" => Some(Self(0xF5)),
-            "VK_DBE_NOROMAN" => Some(Self(0xF6)),
-            "VK_SHIFT" => Some(Self(0x10)),
-            "VK_CONTROL" => Some(Self(0x11)),
-            "VK_MENU" => Some(Self(0x12)),
-            "VK_CAPITAL" => Some(Self(0x14)),
-            "VK_LSHIFT" => Some(Self(0xA0)),
-            "VK_RSHIFT" => Some(Self(0xA1)),
-            "VK_LCONTROL" => Some(Self(0xA2)),
-            "VK_RCONTROL" => Some(Self(0xA3)),
-            "VK_LMENU" => Some(Self(0xA4)),
-            "VK_RMENU" => Some(Self(0xA5)),
-            "VK_LWIN" => Some(Self(0x5B)),
-            "VK_RWIN" => Some(Self(0x5C)),
-            "VK_F1" => Some(Self(0x70)),
-            "VK_F2" => Some(Self(0x71)),
-            "VK_F3" => Some(Self(0x72)),
-            "VK_F4" => Some(Self(0x73)),
-            "VK_F5" => Some(Self(0x74)),
-            "VK_F6" => Some(Self(0x75)),
-            "VK_F7" => Some(Self(0x76)),
-            "VK_F8" => Some(Self(0x77)),
-            "VK_F9" => Some(Self(0x78)),
-            "VK_F10" => Some(Self(0x79)),
-            "VK_F11" => Some(Self(0x7A)),
-            "VK_F12" => Some(Self(0x7B)),
-            "VK_F13" => Some(Self(0x7C)),
-            "VK_F14" => Some(Self(0x7D)),
-            "VK_F15" => Some(Self(0x7E)),
-            "VK_F16" => Some(Self(0x7F)),
-            "VK_F17" => Some(Self(0x80)),
-            "VK_F18" => Some(Self(0x81)),
-            "VK_F19" => Some(Self(0x82)),
-            "VK_F20" => Some(Self(0x83)),
-            "VK_F21" => Some(Self(0x84)),
-            "VK_F22" => Some(Self(0x85)),
-            "VK_F23" => Some(Self(0x86)),
-            "VK_F24" => Some(Self(0x87)),
-            "VK_HOME" => Some(Self(0x24)),
-            "VK_END" => Some(Self(0x23)),
-            "VK_PRIOR" => Some(Self(0x21)),
-            "VK_NEXT" => Some(Self(0x22)),
-            "VK_INSERT" => Some(Self(0x2D)),
-            "VK_SNAPSHOT" => Some(Self(0x2C)),
-            _ => None,
-        }
+        // 最初に `canonical_key_text`（空白除去 → ASCII 大文字化 → 先頭 `VK_` 除去）を通し、
+        // 正規化した名前で引く。表のキーは正規化した形で書く（`VK_A` → `"A"`、
+        // `ImeOn` → `"IMEON"`、`IMEオン` → `"IMEオン"`、`VK_OEM_1` → `"OEM_1"`）。
+        // コアの検証（`awase::key_text::key_identity`）と規則が同じになる（ADR-201 決定1）。
+        // `"Left Alt"`/`"Right Alt"` は VK 名ではないのでここには入れない
+        // （`resolve_thumb_key` が目印として先に処理する）。
+        let canonical = awase::key_text::canonical_key_text(name);
+        KEY_TABLE
+            .iter()
+            .find(|e| e.matches(&canonical))
+            .map(|e| Self(e.vk))
     }
 }
 
 // ── キー名解決（config パース用）──
+
+/// 組み合わせ文字列(`"Ctrl+Shift+F12"`)を修飾キーと主キーの文字列に分解した結果。
+/// [`interpret_combo`] の戻り値。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ComboText<'a> {
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+    /// 主キー(最後のトークン、前後の空白除去済み)。名前の解決はしない。
+    pub main: &'a str,
+    /// 修飾キーの位置に `Ctrl`/`Control`/`Shift`/`Alt` 以外のトークンがあった。
+    pub has_unknown_modifier: bool,
+}
+
+/// 組み合わせ文字列の**修飾キー解釈の唯一の入口**(ADR-201 決定1)。
+///
+/// 区切りは `awase::key_text::split_combo`(コアの検証と共通)。修飾キー名は
+/// `from_name` と同じく ASCII の大文字小文字を区別しない。`parse_key_combo`・
+/// `parse_hotkey`・設定 GUI の `parse_combo_str` がすべてこれを使う(片方の読み手だけが
+/// 寛容だと、手書きの `"ctrl+J"` が実行時には効くのに GUI で開いて保存すると Ctrl が落ちる)。
+#[must_use]
+pub fn interpret_combo(s: &str) -> ComboText<'_> {
+    let (mods, main) = awase::key_text::split_combo(s);
+    let mut out = ComboText {
+        ctrl: false,
+        shift: false,
+        alt: false,
+        main,
+        has_unknown_modifier: false,
+    };
+    for m in mods {
+        match m.to_ascii_uppercase().as_str() {
+            "CTRL" | "CONTROL" => out.ctrl = true,
+            "SHIFT" => out.shift = true,
+            "ALT" => out.alt = true,
+            _ => out.has_unknown_modifier = true,
+        }
+    }
+    out
+}
 
 /// ホットキー文字列をパースして修飾キーフラグと仮想キーコードに変換する。
 ///
@@ -529,59 +755,40 @@ impl VkCodeExt for VkCode {
 /// 依存する唯一の関数のため `#[cfg(windows)]`。`vk` モジュール自体は
 /// この関数以外 windows crate に依存しないため ungated（ADR-082「決定1実施記録」の
 /// 次の一歩、`decide_alt_impersonation` の Linux 化のための下準備）。
+/// 解釈は [`parse_key_combo`] と同じ(BUG-167: 手書きの `F12` と GUI の `VK_F12` の両表記、
+/// `変換` などの日本語名も `from_name` が受理する)。
 #[cfg(windows)]
 #[must_use]
 pub fn parse_hotkey(s: &str) -> Option<(u32, VkCode)> {
     use windows::Win32::UI::Input::KeyboardAndMouse::{MOD_ALT, MOD_CONTROL, MOD_SHIFT};
 
-    let parts: Vec<&str> = s.split('+').map(str::trim).collect();
-    if parts.is_empty() {
-        return None;
-    }
-
+    let k = parse_key_combo(s)?;
     let mut modifiers = 0u32;
-    for &part in &parts[..parts.len() - 1] {
-        match part {
-            "Ctrl" | "Control" => modifiers |= MOD_CONTROL.0,
-            "Shift" => modifiers |= MOD_SHIFT.0,
-            "Alt" => modifiers |= MOD_ALT.0,
-            _ => return None,
-        }
+    if k.ctrl {
+        modifiers |= MOD_CONTROL.0;
     }
-
-    let key_name = format!("VK_{}", parts.last()?);
-    let vk = VkCode::from_name(&key_name)?;
-
-    Some((modifiers, vk))
+    if k.shift {
+        modifiers |= MOD_SHIFT.0;
+    }
+    if k.alt {
+        modifiers |= MOD_ALT.0;
+    }
+    Some((modifiers, k.vk))
 }
 
 /// キーコンボ文字列をパースする
 #[must_use]
 pub fn parse_key_combo(s: &str) -> Option<awase::config::ParsedKeyCombo> {
-    let parts: Vec<&str> = s.split('+').map(str::trim).collect();
-    if parts.is_empty() {
+    let c = interpret_combo(s);
+    if c.has_unknown_modifier {
         return None;
     }
-
-    let mut ctrl = false;
-    let mut shift = false;
-    let mut alt = false;
-    for &part in &parts[..parts.len() - 1] {
-        match part {
-            "Ctrl" | "Control" => ctrl = true,
-            "Shift" => shift = true,
-            "Alt" => alt = true,
-            _ => return None,
-        }
-    }
-
-    let key_name = *parts.last()?;
-    let vk = VkCode::from_name(key_name)?;
+    let vk = VkCode::from_name(c.main)?;
 
     Some(awase::config::ParsedKeyCombo {
-        ctrl,
-        shift,
-        alt,
+        ctrl: c.ctrl,
+        shift: c.shift,
+        alt: c.alt,
         vk,
     })
 }
@@ -594,8 +801,8 @@ pub fn parse_key_combo(s: &str) -> Option<awase::config::ParsedKeyCombo> {
 /// 実装は `awase-vkmap` crate に切り出し済み（2026-08-24、design doc §7.1）。
 /// `awaza`（別リポジトリのTSF実装）が `awase-windows` 一式の重い依存を
 /// 引き込まずにこの表だけを再利用できるようにするため。ここでは
-/// 既存呼び出し元との互換性のためre-exportのみ行う。
-pub use awase_vkmap::vk_to_pos;
+/// `VkCode::to_pos` から使うために取り込むだけで、re-exportはしない。
+use awase_vkmap::vk_to_pos;
 
 // ── 文字→VK 変換テーブル（output/resolve.rs から移動）───────────────────────
 
@@ -722,6 +929,14 @@ pub(crate) fn build_symbol_to_vk() -> HashMap<char, (VkCode, bool)> {
         ('・', 0xBF, false), // / (VK_OEM_2)
         ('「', 0xDB, false), // [ (VK_OEM_4)
         ('」', 0xDD, false), // ] (VK_OEM_6)
+        // '［'（全角角括弧）・'￥'（全角円マーク）は意図的に未登録。
+        // VK_OEM_4/VK_OEM_6（0xDB/0xDD）をそのまま送るとIMEが「「」/「」」
+        // （和字括弧）へ変換してしまい、全角の［／］にはならない（'－'の
+        // コメント参照、同じくIME側の変換規則により送信VKと出力文字が
+        // 一致しない例外）。symbol_to_vk に無い文字は resolve_char が
+        // Unicode 直接注入にフォールバックするため、そちらで正しく
+        // ［／］／￥ を出す（layout/nicola_keytop.yab・layout/nicola_f.yab
+        // で既にこの経路を使用、2026-08-31 Opusレビューで経路を確認済み）。
         // 長音・記号
         ('ー', 0xBD, false), // - (VK_OEM_MINUS)
         ('～', 0xDE, true),  // Shift+^ (VK_OEM_7, JIS)
@@ -823,10 +1038,29 @@ pub(crate) fn build_symbol_to_vk() -> HashMap<char, (VkCode, bool)> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn reinject_keeps_scan_code_only_for_ime_mode_keys() {
+        // かな(0xF2)・英数(0xF0)・半角/全角(0xF4)・無変換・変換は元のscanを保つ。
+        assert_eq!(reinject_scan_code(VkCode(0xF2), 0x70), 0x70);
+        assert_eq!(reinject_scan_code(VkCode(0xF0), 0x3A), 0x3A);
+        assert_eq!(reinject_scan_code(VkCode(0xF4), 0x29), 0x29);
+        assert_eq!(reinject_scan_code(VkCode(0x1D), 0x7B), 0x7B);
+        assert_eq!(reinject_scan_code(VkCode(0x1C), 0x79), 0x79);
+        // 通常キー・拡張キー（矢印: VK_LEFT=0x25）は従来どおり0。
+        assert_eq!(reinject_scan_code(VkCode(0x41), 0x1E), 0);
+        assert_eq!(reinject_scan_code(VkCode(0x25), 0x4B), 0);
+    }
+
     use super::{
-        ascii_to_vk, build_symbol_to_vk, is_synthetic_dbe_ime_hotkey,
-        should_upgrade_is_japanese_ime, vk_may_mutate_conv, vk_pair_to_ascii, ImeKeyKind, VkCode,
+        ascii_to_vk, build_symbol_to_vk, interpret_combo, is_ime_mode_key_for_ime,
+        is_static_idempotent_open_key, is_synthetic_dbe_ime_hotkey, may_change_ime,
+        parse_key_combo, physical_identity_slot, reinject_scan_code, should_release_thumb_latch,
+        should_upgrade_is_japanese_ime, stale_down_vk_on_up, thumb_latch_identity,
+        vk_may_mutate_conv, vk_pair_to_ascii, ImeKeyKind, VkCode, VkCodeExt, VK_A, VK_IME_OFF,
+        VK_IME_ON, VK_LEFT, VK_RETURN, VK_SPACE, VK_UP,
     };
+    use awase::types::ScanCode;
 
     /// `vk_pair_to_ascii` は `ascii_to_vk` の厳密な逆写像である
     /// （2026-08-03 ユーザー報告 BUG-47: 句読点「。」「、」・長音「ー」が
@@ -980,6 +1214,55 @@ mod tests {
         assert!(!vk_may_mutate_conv(VkCode(0xF7)), "0xF6 の直後");
     }
 
+    // ── BUG-113残置課題: is_ime_mode_key_for_ime ──
+
+    /// VK_CONVERT/VK_NONCONVERT は may_change_ime にも vk_may_mutate_conv にも
+    /// 含まれない第3の軸であることを明文化する（将来のwiden防止）。
+    #[test]
+    fn is_ime_mode_key_for_ime_covers_convert_and_nonconvert() {
+        assert!(is_ime_mode_key_for_ime(VkCode(0x1C)), "VK_CONVERT");
+        assert!(is_ime_mode_key_for_ime(VkCode(0x1D)), "VK_NONCONVERT");
+        assert!(
+            !may_change_ime(VkCode(0x1C)),
+            "VK_CONVERTはmay_change_ime対象外のはず"
+        );
+        assert!(
+            !vk_may_mutate_conv(VkCode(0x1D)),
+            "VK_NONCONVERTはvk_may_mutate_conv対象外のはず"
+        );
+    }
+
+    #[test]
+    fn is_ime_mode_key_for_ime_is_superset_of_may_change_ime() {
+        for raw in [0x15u16, 0x16, 0x17, 0x19, 0x1A] {
+            assert!(
+                is_ime_mode_key_for_ime(VkCode(raw)),
+                "0x{raw:02X} は may_change_ime 対象なので is_ime_mode_key_for_ime も true のはず"
+            );
+        }
+        for raw in 0xF0u16..=0xF6 {
+            assert!(
+                is_ime_mode_key_for_ime(VkCode(raw)),
+                "0x{raw:02X} は VK_DBE_ALPHANUMERIC..=NOROMAN の範囲のはず"
+            );
+        }
+    }
+
+    #[test]
+    fn is_ime_mode_key_for_ime_excludes_ordinary_keys() {
+        assert!(!is_ime_mode_key_for_ime(VK_A), "'A'");
+        assert!(!is_ime_mode_key_for_ime(VK_SPACE));
+        assert!(!is_ime_mode_key_for_ime(VK_RETURN));
+        assert!(!is_ime_mode_key_for_ime(VkCode(0x1B)), "VK_ESCAPE");
+    }
+
+    #[test]
+    fn vk_may_mutate_conv_still_excludes_nonconvert_after_new_axis_added() {
+        // is_ime_mode_key_for_ime の追加が vk_may_mutate_conv の判定に
+        // 逆流していないことの回帰防止（3軸が独立であることの固定）。
+        assert!(!vk_may_mutate_conv(VkCode(0x1D)), "VK_NONCONVERT");
+    }
+
     // ── ADR-093: should_upgrade_is_japanese_ime ──
 
     /// 物理（非注入）の5 VK なら true。
@@ -997,10 +1280,176 @@ mod tests {
         assert!(!should_upgrade_is_japanese_ime(true, VkCode(0xF2))); // HIRAGANA, injected
     }
 
+    /// ADR-199 決定18: F13〜F24 は物理キーが実在しうる（プログラマブルキーボード等）ので、受信そのものは
+    /// IME の証拠にならず `is_japanese_ime` を上げてはならない（ADR-093 の基準、BUG-14 と同じ理由）。
+    #[test]
+    fn should_upgrade_is_japanese_ime_false_for_f13_to_f24() {
+        for vk in 0x7C..=0x87 {
+            assert!(
+                !should_upgrade_is_japanese_ime(false, VkCode(vk)),
+                "0x{vk:02X}"
+            );
+        }
+    }
+
+    /// ADR-207: 0x16/0x1A だけが真。0x19（トグル）・半角/全角・F13〜F24・通常キーは偽。
+    #[test]
+    fn is_static_idempotent_open_key_only_ime_on_off() {
+        assert!(is_static_idempotent_open_key(VK_IME_ON));
+        assert!(is_static_idempotent_open_key(VK_IME_OFF));
+        for vk in [
+            0x15, 0x17, 0x19, 0x1C, 0x1D, 0xF0, 0xF2, 0xF3, 0xF4, 0x7C, 0x87, 0x41,
+        ] {
+            assert!(!is_static_idempotent_open_key(VkCode(vk)), "0x{vk:02X}");
+        }
+    }
+
     /// 物理イベントでも、5 VK でなければ false。
     #[test]
     fn should_upgrade_is_japanese_ime_false_for_physical_unrelated_vk() {
         assert!(!should_upgrade_is_japanese_ime(false, VkCode(0x41))); // 'A'
+    }
+
+    // ── BUG-181: stale_down_vk_on_up / physical_identity_slot ──
+
+    /// hook.rs の物理キー状態（VK 単位の was_down 配列 + identity→Down VK 記録）を
+    /// 模した小さな状態機械。`event` は (is_down, vk, scan, extended) で、返り値は
+    /// その Down の `was_down`（Up では false）。
+    struct PhysSim {
+        down: std::collections::HashMap<u16, bool>,
+        rec: std::collections::HashMap<usize, u16>,
+    }
+
+    impl PhysSim {
+        fn new() -> Self {
+            Self {
+                down: std::collections::HashMap::new(),
+                rec: std::collections::HashMap::new(),
+            }
+        }
+
+        fn event(&mut self, is_down: bool, vk: u16, scan: u32, ext: bool) -> bool {
+            let was = self.down.insert(vk, is_down).unwrap_or(false);
+            let slot = physical_identity_slot(ScanCode(scan), ext);
+            if is_down {
+                if !was {
+                    if let Some(i) = slot {
+                        self.rec.insert(i, vk);
+                    }
+                }
+            } else if let Some(i) = slot {
+                let recorded = self.rec.insert(i, 0).unwrap_or(0);
+                if let Some(v) = stale_down_vk_on_up(VkCode(recorded), VkCode(vk)) {
+                    self.down.insert(v.0, false);
+                }
+            }
+            was
+        }
+    }
+
+    #[test]
+    fn hiragana_second_press_is_fresh_after_asymmetric_up() {
+        let mut s = PhysSim::new();
+        assert!(!s.event(true, 0xF2, 0x70, false));
+        s.event(false, 0xF0, 0x70, false);
+        assert!(!s.event(true, 0xF2, 0x70, false));
+    }
+
+    #[test]
+    fn alternating_hankaku_zenkaku_all_fresh() {
+        let mut s = PhysSim::new();
+        for i in 0..8 {
+            let (d, u) = if i % 2 == 0 {
+                (0xF3, 0xF4)
+            } else {
+                (0xF4, 0xF3)
+            };
+            assert!(!s.event(true, d, 0x29, false), "press {i}");
+            s.event(false, u, 0x29, false);
+        }
+    }
+
+    #[test]
+    fn real_auto_repeat_stays_was_down() {
+        let mut s = PhysSim::new();
+        assert!(!s.event(true, 0xF2, 0x70, false));
+        assert!(s.event(true, 0xF2, 0x70, false));
+        assert!(s.event(true, 0xF2, 0x70, false));
+    }
+
+    #[test]
+    fn same_scan_different_extended_do_not_clear_each_other() {
+        let mut s = PhysSim::new();
+        // Left Alt (非拡張) と Right Alt (拡張) は scan 0x38 が同一。
+        s.event(true, 0xA4, 0x38, false);
+        s.event(true, 0xA5, 0x38, true);
+        // Right Alt が Up を 0x12 で受けても Left Alt の枠は落とさない。
+        s.event(false, 0x12, 0x38, true);
+        assert!(s.event(true, 0xA4, 0x38, false), "left alt still down");
+    }
+
+    #[test]
+    fn scan_zero_is_unchanged() {
+        assert_eq!(physical_identity_slot(ScanCode(0), false), None);
+        assert_eq!(physical_identity_slot(ScanCode(0), true), None);
+        let mut s = PhysSim::new();
+        assert!(!s.event(true, 0xF2, 0, false));
+        s.event(false, 0xF0, 0, false);
+        assert!(s.event(true, 0xF2, 0, false), "従来どおり固着する");
+    }
+
+    #[test]
+    fn stale_down_vk_on_up_cases() {
+        assert_eq!(stale_down_vk_on_up(VkCode(0), VkCode(0xF0)), None);
+        assert_eq!(stale_down_vk_on_up(VkCode(0xF0), VkCode(0xF0)), None);
+        assert_eq!(
+            stale_down_vk_on_up(VkCode(0xF2), VkCode(0xF0)),
+            Some(VkCode(0xF2))
+        );
+    }
+
+    // ── BUG-132: should_release_thumb_latch / thumb_latch_identity ──
+
+    fn ident(scan: u32, extended: bool) -> ScanCode {
+        thumb_latch_identity(ScanCode(scan), extended)
+    }
+
+    /// 同じ識別子の KeyUp なら解除してよい（vk は引数に無く、DBE キーの
+    /// Down/Up vk 非対称に依存しない）。
+    #[test]
+    fn should_release_thumb_latch_true_when_identity_matches() {
+        assert!(should_release_thumb_latch(
+            ident(0x70, false),
+            ident(0x70, false)
+        ));
+    }
+
+    /// 別の物理キー（scan 不一致）の KeyUp では解除しない。
+    #[test]
+    fn should_release_thumb_latch_false_when_scan_differs() {
+        assert!(!should_release_thumb_latch(
+            ident(0x70, false),
+            ident(0x1E, false)
+        ));
+    }
+
+    /// Left Alt / Right Alt は raw scan(0x38) が同一で拡張ビットだけが違う。
+    /// 片方を押したまま他方を離してもラッチを解除しない（レビュー指摘）。
+    #[test]
+    fn should_release_thumb_latch_false_for_left_right_alt_sharing_scan() {
+        let left_alt = ident(0x38, false);
+        let right_alt = ident(0x38, true);
+        assert_ne!(left_alt, right_alt);
+        assert!(!should_release_thumb_latch(left_alt, right_alt));
+        assert!(!should_release_thumb_latch(right_alt, left_alt));
+        assert!(should_release_thumb_latch(right_alt, right_alt));
+    }
+
+    /// 非ラッチ（識別子 0）は、識別子 0 の KeyUp が来ても解除扱いにしない。
+    #[test]
+    fn should_release_thumb_latch_false_when_not_armed() {
+        assert!(!should_release_thumb_latch(ScanCode(0), ident(0x70, false)));
+        assert!(!should_release_thumb_latch(ScanCode(0), ScanCode(0)));
     }
 
     /// 2026-08-09 ユーザー報告: 「－」（全角ハイフンマイナス、`layout/nicola.yab`
@@ -1077,4 +1526,322 @@ mod tests {
             }
         }
     }
+
+    /// ADR-191: 静的に確定しているのは `VK_IME_ON`/`VK_IME_OFF`（冪等）と `VK_KANJI`（トグル、ADR-189）だけ。
+    /// 入力モードも動かしうるキー（ひらがな・カタカナ・英数・かな）と半角/全角は静的に決め打ちしない。
+    #[test]
+    fn shadow_effect_is_static_only_for_ime_on_off_and_kanji_toggle() {
+        use super::ShadowImeEffect::{Toggle, TurnOff, TurnOn};
+        assert_eq!(ImeKeyKind::ImeOn.shadow_effect(), Some(TurnOn));
+        assert_eq!(ImeKeyKind::ImeOff.shadow_effect(), Some(TurnOff));
+        assert_eq!(ImeKeyKind::Kanji.shadow_effect(), Some(Toggle));
+        for k in [
+            ImeKeyKind::Kana,
+            ImeKeyKind::Junja,
+            ImeKeyKind::DbeAlphanumeric,
+            ImeKeyKind::DbeKatakana,
+            ImeKeyKind::DbeHiragana,
+            ImeKeyKind::DbeSbcsChar,
+            ImeKeyKind::DbeDbcsChar,
+        ] {
+            assert_eq!(k.shadow_effect(), None, "{k:?} は静的に決め打ちしない");
+        }
+    }
+
+    /// ADR-199 決定4: 候補キーは `ROLE_CANDIDATE_VK_NAMES` から作る（半角/全角・F13〜F24・無変換/変換）。
+    /// ひらがな・カタカナ・英数・0x19（決定14の移行まで）は候補に入れない。
+    #[test]
+    fn role_candidates_come_from_the_shared_name_list() {
+        use super::{is_role_candidate, is_role_fkey, VkCodeExt as _};
+        for name in awase_gji_config::role::ROLE_CANDIDATE_VK_NAMES {
+            let vk = VkCode::from_name(name).expect(name);
+            assert!(is_role_candidate(vk), "{name}");
+        }
+        for vk in [0xF0, 0xF1, 0xF2, 0x19, 0x16, 0x1A, 0x15, 0x20, 0x41] {
+            assert!(!is_role_candidate(VkCode(vk)), "0x{vk:02X}");
+        }
+        // F13〜F24 は候補で、`is_role_fkey` と一致する（0x7B=F12・0x88 は含まない）。
+        for vk in 0x7C..=0x87 {
+            assert!(
+                is_role_candidate(VkCode(vk)) && is_role_fkey(VkCode(vk)),
+                "0x{vk:02X}"
+            );
+        }
+        assert!(!is_role_fkey(VkCode(0x7B)) && !is_role_fkey(VkCode(0x88)));
+        assert!(!is_role_fkey(VkCode(0xF3)));
+    }
+
+    /// BUG-167: 設定 GUI は `Ctrl+Shift+VK_F12`、手書きは `Ctrl+Shift+F12` と書く。
+    /// どちらの表記でも同じ VK に解決される(`VK_VK_F12` にならない)。
+    #[test]
+    fn both_hotkey_spellings_resolve_to_the_same_vk() {
+        let a = parse_key_combo("Ctrl+Shift+F12");
+        let b = parse_key_combo("Ctrl+Shift+VK_F12");
+        assert!(a.is_some());
+        assert_eq!(a, b);
+        assert!(VkCode::from_name("VK_VK_F12").is_none());
+    }
+
+    /// `parse_hotkey`（Windows 専用。Linux では走らず windows-build CI で走る）が
+    /// 両表記・日本語名・大文字小文字で同じ修飾キー・VK を返すこと。
+    #[cfg(windows)]
+    #[test]
+    fn parse_hotkey_accepts_gui_and_handwritten_spellings() {
+        let handwritten = super::parse_hotkey("Ctrl+Shift+F12");
+        let gui = super::parse_hotkey("Ctrl+Shift+VK_F12");
+        assert!(handwritten.is_some());
+        assert_eq!(handwritten, gui);
+        assert_eq!(super::parse_hotkey("ctrl+shift+vk_f12"), gui);
+        let (_, vk) = super::parse_hotkey("Ctrl+Shift+変換").unwrap();
+        assert_eq!(vk, super::VK_CONVERT);
+        assert!(super::parse_hotkey("Ctrl+").is_none());
+        assert!(super::parse_hotkey("Bogus+F12").is_none());
+    }
+
+    /// `interpret_combo` の端の場合(ADR-201「実装時に決める細部」)。
+    #[test]
+    fn interpret_combo_edge_cases() {
+        let c = interpret_combo("F12");
+        assert_eq!(
+            (c.ctrl, c.shift, c.alt, c.main),
+            (false, false, false, "F12")
+        );
+        assert!(!c.has_unknown_modifier);
+        let c = interpret_combo(" ctrl + SHIFT + Alt + VK_A ");
+        assert_eq!((c.ctrl, c.shift, c.alt, c.main), (true, true, true, "VK_A"));
+        let c = interpret_combo("Control+J");
+        assert!(c.ctrl && !c.has_unknown_modifier);
+        // 端の場合: 主キーが空・`+` だけは解決できない。
+        assert!(parse_key_combo("Ctrl+").is_none());
+        assert!(parse_key_combo("+").is_none());
+        assert!(parse_key_combo("").is_none());
+        assert!(parse_key_combo("Bogus+F12").is_none());
+        // `+` の文字そのものは `VK_OEM_PLUS` で書く。
+        assert!(parse_key_combo("Ctrl+VK_OEM_PLUS").is_some());
+    }
+
+    /// ADR-201 決定1: 手書きの表記がすべての入口で効く(今まで無言で無視されていた設定)。
+    #[test]
+    fn lenient_names_resolve_in_parse_key_combo() {
+        let f12 = parse_key_combo("Ctrl+F12").unwrap();
+        assert_eq!((f12.ctrl, f12.vk.0), (true, 0x7B));
+        assert_eq!(parse_key_combo("ctrl+j").unwrap().vk.0, 0x4A);
+        assert_eq!(parse_key_combo("Ctrl+J"), parse_key_combo("Ctrl+VK_J"));
+        assert_eq!(VkCode::from_name("F18").unwrap().0, 0x81);
+        assert_eq!(VkCode::from_name("F13").unwrap().0, 0x7C);
+        assert_eq!(VkCode::from_name(" vk_space ").unwrap(), VK_SPACE);
+        for (alias, canonical) in [
+            ("Enter", "VK_RETURN"),
+            ("Esc", "VK_ESCAPE"),
+            ("Escape", "VK_ESCAPE"),
+            ("Space", "VK_SPACE"),
+            ("Backspace", "VK_BACK"),
+            ("Tab", "VK_TAB"),
+            ("Delete", "VK_DELETE"),
+        ] {
+            assert_eq!(
+                VkCode::from_name(alias),
+                VkCode::from_name(canonical),
+                "{alias}"
+            );
+            assert!(VkCode::from_name(alias).is_some(), "{alias}");
+        }
+        // `Left Alt`/`Right Alt` は VK 名ではない(`resolve_thumb_key` の目印)。
+        assert!(VkCode::from_name("Left Alt").is_none());
+        assert!(VkCode::from_name("Right Alt").is_none());
+    }
+
+    /// 矢印キー（`VK_LEFT`/`UP`/`RIGHT`/`DOWN`）は表に無かった。`VK_` 付き・無し・大文字小文字を問わず
+    /// 解決でき、`parse_key_combo` でも使えること（`[[keymaps]]` の `to`・`from`、ホットキー等）。
+    #[test]
+    fn from_name_resolves_arrow_keys() {
+        for (names, vk) in [
+            (["VK_LEFT", "LEFT", "Left", " vk_left "], 0x25),
+            (["VK_UP", "UP", "Up", " vk_up "], 0x26),
+            (["VK_RIGHT", "RIGHT", "Right", " vk_right "], 0x27),
+            (["VK_DOWN", "DOWN", "Down", " vk_down "], 0x28),
+        ] {
+            for n in names {
+                assert_eq!(VkCode::from_name(n).map(|v| v.0), Some(vk), "{n:?}");
+            }
+        }
+        assert_eq!(parse_key_combo("Ctrl+VK_UP").unwrap().vk.0, 0x26);
+        assert_eq!(parse_key_combo("Alt+Left").unwrap().vk.0, 0x25);
+        // 定数と表が食い違わない。
+        assert_eq!(VkCode::from_name("VK_LEFT"), Some(VK_LEFT));
+        assert_eq!(VkCode::from_name("VK_UP"), Some(VK_UP));
+        // 親指キーの目印 `Left Alt` とは無関係（空白があるので別の名前）。
+        assert_eq!(VkCode::from_name("Left Alt"), None);
+    }
+
+    /// 表の全ての名前が、`VK_` 付き・小文字・`VK_` 無しのどれでも同じ VK に解決される
+    /// (ADR-201 未決事項8。正規化の書き方を誤ると、特定の名前だけ受理されなくなる)。
+    /// 期待値は表自身から取るので、検査するのは `canonical_key_text` と `KeyEntry::matches` の
+    /// 組み合わせだけ。表の値は `vk_keys!` の windows crate 照合が、名前の削除は
+    /// `promised_names_are_still_accepted` が受け持つ(旧 `LEGACY` の撤去、2026-10-02)。
+    #[test]
+    fn key_table_names_resolve_in_every_spelling() {
+        for e in super::KEY_TABLE {
+            let bare = e.ident.strip_prefix("VK_").unwrap();
+            for name in std::iter::once(bare).chain(e.aliases.iter().copied()) {
+                for spelled in [
+                    name.to_string(),
+                    format!("VK_{name}"),
+                    name.to_ascii_lowercase(),
+                    format!("vk_{}", name.to_ascii_lowercase()),
+                    format!("  {name} "),
+                ] {
+                    assert_eq!(
+                        VkCode::from_name(&spelled),
+                        Some(VkCode(e.vk)),
+                        "{spelled:?} ({})",
+                        e.ident
+                    );
+                }
+            }
+        }
+    }
+
+    /// 受理を約束した名前(ADR-201 が残す別名を含む)の一覧。16 進を含まない文字列だけの
+    /// 凍結リストで、表から行や別名を**消したとき**に落ちる(旧 `LEGACY` が兼ねていた役目。
+    /// 値の検査は `vk_keys!` の windows crate 照合が受け持つ)。名前を足したときは
+    /// ここに足さなくてよいが、**消す**ときは意図した受理の取り下げか確認すること。
+    #[test]
+    fn promised_names_are_still_accepted() {
+        const NAMES: &str = "\
+            A B C D E F G H I J K L M N O P Q R S T U V W X Y Z 0 1 2 3 4 5 6 7 8 9 \
+            OEM_PLUS OEM_COMMA OEM_MINUS OEM_PERIOD OEM_1 OEM_2 OEM_3 OEM_4 OEM_5 OEM_6 OEM_7 OEM_102 \
+            SPACE RETURN ENTER TAB BACK BACKSPACE ESCAPE ESC DELETE CONVERT 変換 NONCONVERT MUHENKAN 無変換 \
+            KANA かな カナ KANJI 漢字 IME_ON IMEON IMEオン IME_OFF IMEOFF IMEオフ \
+            DBE_ALPHANUMERIC DBE_KATAKANA DBE_HIRAGANA DBE_SBCSCHAR OEM_AUTO DBE_DBCSCHAR OEM_ENLW \
+            DBE_ROMAN DBE_NOROMAN SHIFT CONTROL MENU CAPITAL LSHIFT RSHIFT LCONTROL RCONTROL LMENU RMENU \
+            F1 F2 F3 F4 F5 F6 F7 F8 F9 F10 F11 F12 F13 F14 F15 F16 F17 F18 F19 F20 F21 F22 F23 F24 \
+            LEFT UP RIGHT DOWN HOME END PRIOR NEXT INSERT SNAPSHOT";
+        let names: Vec<&str> = NAMES.split_whitespace().collect();
+        assert_eq!(names.len(), 126, "名前の数");
+        for name in names {
+            assert!(VkCode::from_name(name).is_some(), "{name}");
+            assert!(
+                VkCode::from_name(&format!("VK_{name}")).is_some(),
+                "VK_{name}"
+            );
+        }
+    }
+
+    /// `vk_keys!` の表の整合性。match と違い、重複した名前はコンパイルでは検出されないので
+    /// ここで見る。(1) 正規名と別名が表全体で一意、(2) 正規名・別名が `canonical_key_text` の
+    /// 出力と同じ形(`"Esc"` や `"VK_ESC"` と書くと永久に一致しない)、(3) VK 値が一意
+    /// (別名は同じ項目に書く)。
+    #[test]
+    fn key_table_names_are_unique_and_canonical() {
+        let mut seen = std::collections::HashMap::new();
+        let mut vks = std::collections::HashSet::new();
+        for e in super::KEY_TABLE {
+            let canonical = e.ident.strip_prefix("VK_").expect("識別子は VK_ で始まる");
+            assert!(vks.insert(e.vk), "VK 値が重複: {} ({:#04X})", e.ident, e.vk);
+            for name in std::iter::once(canonical).chain(e.aliases.iter().copied()) {
+                assert_eq!(
+                    awase::key_text::canonical_key_text(name),
+                    name,
+                    "{}: 名前 {name:?} が canonical_key_text の出力と違う",
+                    e.ident
+                );
+                if let Some(prev) = seen.insert(name, e.ident) {
+                    panic!("名前 {name:?} が {prev} と {} の両方にある", e.ident);
+                }
+            }
+        }
+        // 表が空振りしていないこと(A-Z 26 + 0-9 10 + F1-F24 24 + その他)。
+        assert!(super::KEY_TABLE.len() > 100, "{}", super::KEY_TABLE.len());
+    }
+
+    /// ADR-201 R3-4(見逃し防止の向き): コアの検証が意味を問うキー(かな、F15〜F24、
+    /// 変換、無変換)について、`from_name` がその VK に解決する全ての名前が、コアの
+    /// `key_identity`(`canonical_key_text` + 別名の表)で同じ組に入る。`from_name` に別名を
+    /// 足したときにコア側の追加漏れを検出する。
+    #[test]
+    fn core_key_identity_covers_from_name() {
+        use awase::key_text::key_identity;
+        // (VK, 組の名前, その VK に解決される既知の全名前の候補)
+        let groups: &[(u16, &str)] = &[
+            (0x15, "KANA"),
+            (0x1C, "CONVERT"),
+            (0x1D, "NONCONVERT"),
+            (0x7E, "F15"),
+            (0x7F, "F16"),
+            (0x80, "F17"),
+            (0x81, "F18"),
+            (0x82, "F19"),
+            (0x83, "F20"),
+            (0x84, "F21"),
+            (0x85, "F22"),
+            (0x86, "F23"),
+            (0x87, "F24"),
+        ];
+        // 表の名前 + 大小文字・`VK_` の違いを足した候補全部を総当たりする。
+        let names = LEGACY_AND_NEUTRAL_NAMES;
+        for &(vk, group) in groups {
+            let mut found = 0;
+            for name in names {
+                if VkCode::from_name(name) == Some(VkCode(vk)) {
+                    found += 1;
+                    assert_eq!(key_identity(name), group, "{name} (VK 0x{vk:02X})");
+                }
+            }
+            assert!(found > 0, "{group}: 名前が1つも見つからない");
+        }
+        // 逆向き(補助): 同じ組になる名前は `from_name` でも同じ VK になる。
+        for a in names {
+            for b in names {
+                if key_identity(a) == key_identity(b) {
+                    assert_eq!(VkCode::from_name(a), VkCode::from_name(b), "{a} / {b}");
+                }
+            }
+        }
+    }
+
+    /// `core_key_identity_covers_from_name` が総当たりする名前(意味を問うキーの全綴り)。
+    const LEGACY_AND_NEUTRAL_NAMES: &[&str] = &[
+        "VK_KANA",
+        "Kana",
+        "かな",
+        "カナ",
+        "kana",
+        "vk_kana",
+        "VK_CONVERT",
+        "Convert",
+        "変換",
+        "convert",
+        "VK_NONCONVERT",
+        "VK_MUHENKAN",
+        "Nonconvert",
+        "無変換",
+        "muhenkan",
+        "vk_f15",
+        "VK_F15",
+        "F15",
+        "VK_F16",
+        "F16",
+        "VK_F17",
+        "F17",
+        "VK_F18",
+        "F18",
+        "VK_F19",
+        "F19",
+        "VK_F20",
+        "F20",
+        "VK_F21",
+        "F21",
+        "VK_F22",
+        "F22",
+        "VK_F23",
+        "F23",
+        "VK_F24",
+        "F24",
+        "VK_KANJI",
+        "Kanji",
+        "漢字",
+        "F14",
+        "VK_F13",
+    ];
 }

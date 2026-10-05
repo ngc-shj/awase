@@ -1,7 +1,13 @@
 #![allow(unsafe_code)] // Win32 API 呼び出しに unsafe が必須(lib.rsのクレート全体allowから個別移管、Task #9)
 mod bootstrap;
+mod logging;
 pub(crate) use bootstrap::log_path as bug_report_log_path;
-pub(crate) use bootstrap::{detect_conflicting_software, thumb_shift_faces_enabled_for};
+pub(crate) use bootstrap::{
+    detect_conflicting_software, detect_relay_or_remap_software,
+    is_relay_or_remap_software_process, list_all_running_process_names,
+    thumb_shift_faces_enabled_for,
+};
+pub(crate) use logging::flush_log_writer;
 
 use std::path::PathBuf;
 
@@ -24,9 +30,8 @@ use crate::vk::VkCodeExt;
 use crate::{
     with_app, with_app_or_repost, with_app_or_repost_with, WM_ASYNC_IME_APPLY_COMPLETE,
     WM_DRAIN_OUTPUT_QUEUE, WM_DUMP_JOURNAL, WM_DUPLICATE_INSTANCE, WM_ENGINE_QUIT_REQUEST,
-    WM_EXECUTE_EFFECTS, WM_FOCUS_KIND_UPDATE, WM_GJI_CHARSET_FN_KEY_ACTIVATED,
-    WM_GJI_REINIT_RETRY_COMPLETE, WM_IME_KIND_CHANGED, WM_KEY_FROM_HOOK, WM_PANIC_RESET,
-    WM_RELOAD_CONFIG,
+    WM_EXECUTE_EFFECTS, WM_FOCUS_KIND_UPDATE, WM_HOOK_IME_MODE_DIAGNOSTIC, WM_IME_KIND_CHANGED,
+    WM_KANA_LOCK_WARNING_CHANGED, WM_KEY_FROM_HOOK, WM_PANIC_RESET, WM_RELOAD_CONFIG,
 };
 
 // ── 定数 ──
@@ -72,29 +77,75 @@ unsafe extern "system" {
 
 /// 起動時の警告を集約して報告する診断コレクター
 struct StartupDiagnostics {
+    /// 「設定した機能が働かない」類の警告。ログとトレイ通知に出る。
     warnings: Vec<String>,
+    /// 情報（未知のキー・撤去済みキー・互換表記・「以前は無視されていた設定が有効になった」）。
+    /// ログだけに出し、トレイには出さない（ADR-201 決定2）。
+    notes: Vec<String>,
 }
+
+/// 直近に出したトレイ通知の警告の一覧。`reload_config` のたびに同じバルーンを
+/// 繰り返さないために使う（前回と同じ内容なら出さない。ADR-201 決定2）。
+static LAST_BALLOON_WARNINGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 impl StartupDiagnostics {
     const fn new() -> Self {
         Self {
             warnings: Vec::new(),
+            notes: Vec::new(),
         }
     }
 
     fn warn(&mut self, msg: impl Into<String>) {
         let msg = msg.into();
-        log::warn!("startup: {msg}");
+        tracing::warn!("startup: {msg}");
         self.warnings.push(msg);
     }
 
+    /// ログだけに出す情報。トレイ通知の件数には数えない。
+    fn note(&mut self, msg: impl Into<String>) {
+        let msg = msg.into();
+        tracing::info!("startup note: {msg}");
+        self.notes.push(msg);
+    }
+
+    /// `AppConfig::validate` が返した警告を流す。`load_notes`（`AppConfig::load_warnings`、
+    /// 未知のキー・`[[keymap]]` の合流）に含まれるものは「ログだけ」、それ以外は警告。
+    fn warn_config(&mut self, load_notes: &[String], warnings: Vec<String>) {
+        for w in warnings {
+            if load_notes.contains(&w) {
+                self.note(w);
+            } else {
+                self.warn(w);
+            }
+        }
+    }
+
     fn report(&self) {
+        if !self.notes.is_empty() {
+            tracing::info!("{} startup note(s):", self.notes.len());
+            for n in &self.notes {
+                tracing::info!("  - {n}");
+            }
+        }
+        let unchanged = {
+            let mut last = LAST_BALLOON_WARNINGS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let same = *last == self.warnings;
+            last.clone_from(&self.warnings);
+            same
+        };
         if self.warnings.is_empty() {
             return;
         }
-        log::info!("{} startup warning(s):", self.warnings.len());
+        tracing::info!("{} startup warning(s):", self.warnings.len());
         for w in &self.warnings {
-            log::info!("  - {w}");
+            tracing::info!("  - {w}");
+        }
+        if unchanged {
+            tracing::info!("同じ警告を前回すでに通知したため、トレイ通知は省略します");
+            return;
         }
         let _ = with_app(|app| {
             app.show_tray_balloon(
@@ -114,7 +165,7 @@ impl Drop for HotKeyGuard {
         unsafe {
             let _ = UnregisterHotKey(None, self.0);
         }
-        log::info!("Hotkey {} unregistered", self.0);
+        tracing::info!("Hotkey {} unregistered", self.0);
     }
 }
 
@@ -133,11 +184,25 @@ pub fn run() -> Result<()> {
 // ── 共有ヘルパー（bootstrap + reload_config から使用）──
 
 /// 設定ファイルを読み込む
+///
+/// `find_config_path()`とは違い、これは`awase.exe`の**起動経路専用**
+/// （`bootstrap::run_all`から呼ばれる）。自己修復（`ensure_default_config_exists`）
+/// はここでのみ発火させる——`find_config_path()`自体は`read_bug_report_attachments`
+/// や`tray.rs::save_auto_start_config`からも呼ばれる観測/再読込用の共有
+/// ヘルパーであり、そこに副作用を置くと「不具合報告を開く」「自動起動を
+/// トグルする」操作がユーザー環境のconfig.tomlを書き換えてしまう
+/// （ADR-178 v14 opusレビュー M1対応。特に不具合報告経路は「config.tomlが
+/// 存在しなかった」という最重要の事実が、報告を開いた瞬間に生成された
+/// 工場出荷値で上書きされ消えてしまう）。
 fn load_config() -> Result<AppConfig> {
+    // CLI引数でパスが明示されている場合は自己修復しない（ADR-178 決定2）。
+    if cli_arg_config_path().is_none() {
+        ensure_default_config_exists();
+    }
     let config_path = find_config_path()?;
-    log::info!("Loading config from: {}", config_path.display());
+    tracing::info!("Loading config from: {}", config_path.display());
     let config = AppConfig::load(&config_path)?;
-    log::info!(
+    tracing::info!(
         "Default layout: {}, Threshold: {}ms",
         config.general.default_layout,
         config.general.simultaneous_threshold_ms,
@@ -145,16 +210,27 @@ fn load_config() -> Result<AppConfig> {
     Ok(config)
 }
 
-/// 設定ファイルのパスを探索する
-pub(crate) fn find_config_path() -> Result<PathBuf> {
-    // `--flag` / `--flag value` 形式をスキップし、最初の非フラグ引数をパスとして扱う
+/// CLI引数でconfigパスが明示されていればそれを返す（`--flag`/`--flag value`
+/// 形式はスキップ）。`find_config_path()`とは独立して使う——`find_config_path`
+/// 自体は複数の呼び出し元から使われる副作用のないヘルパーに保つため
+/// （ADR-178 v14 opusレビュー M1対応）。
+pub(super) fn cli_arg_config_path() -> Option<PathBuf> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg.starts_with("--") {
             let _ = args.next(); // value をスキップ
             continue;
         }
-        return Ok(PathBuf::from(arg));
+        return Some(PathBuf::from(arg));
+    }
+    None
+}
+
+/// 設定ファイルのパスを探索する。**副作用を持たない**（ADR-178 v14 opusレビュー
+/// M1対応）——自己修復が必要な起動経路は`load_config()`を使うこと。
+pub(crate) fn find_config_path() -> Result<PathBuf> {
+    if let Some(path) = cli_arg_config_path() {
+        return Ok(path);
     }
     let resolved = resolve_relative("config.toml");
     if resolved.exists() {
@@ -164,6 +240,63 @@ pub(crate) fn find_config_path() -> Result<PathBuf> {
         "Config file not found. Place config.toml next to the executable, \
          or specify path as command line argument."
     )
+}
+
+/// 開発ビルドかどうかを判定する（ADR-178 決定2）。開発ビルドでは
+/// `ensure_config_exists`/`ensure_layouts_exist`を呼ばない——ワークスペース
+/// ルートのリポジトリ追跡対象ファイルをそのまま使うため。実体は
+/// `awase::paths::is_dev_build()`（`resolve_relative_to_exe`のワークスペース
+/// ルート解決と同じ判定基準を共有する、ADR-178 v14 opusレビューM6対応）。
+fn is_dev_build() -> bool {
+    awase::paths::is_dev_build()
+}
+
+/// `current_exe()`の親ディレクトリ。開発ビルドではないことを呼び出し元が
+/// 保証していること（`is_dev_build()`）。
+fn exe_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(std::path::Path::to_path_buf))
+}
+
+/// `config.toml`が実行ファイルの隣に無ければ、埋め込み既定値から生成する
+/// （ADR-178 決定2）。
+fn ensure_default_config_exists() {
+    if is_dev_build() {
+        return;
+    }
+    let Some(exe_dir) = exe_dir() else {
+        return;
+    };
+    let config_path = exe_dir.join("config.toml");
+    if let Err(e) = awase::config::ensure_config_exists(&config_path) {
+        tracing::warn!("Failed to create default config.toml: {e}");
+    }
+}
+
+/// `layouts_dir_raw`（`config.general.layouts_dir`の生文字列）に有効な`.yab`
+/// が1本も無ければ、同梱6ファイルを埋め込み既定値から生成する（ADR-178
+/// 決定2）。生成先は`exe_dir.join(layouts_dir_raw)`（`layouts_dir_raw`が
+/// 絶対パスならそのまま使われる）に固定し、`resolve_relative()`の結果を
+/// 使わない——`resolve_relative_to_exe`は「exe隣に存在しなければCWD相対の
+/// 裸パスへフォールバックする」ため、生成前に`resolve_relative`を呼ぶと
+/// 生成先がCWD相対になってしまう（実機検証2026-09-17で確認した実害:
+/// `layout`が丸ごと無い状態で`resolve_relative`経由のパスへ生成しようと
+/// すると、`awase.exe`のカレントディレクトリ相対に書き込まれ、
+/// `%LOCALAPPDATA%\awase\layout`には何も作られなかった）。呼び出し元は
+/// この関数の**後**で`resolve_relative`を呼んで読み取り先を解決すること
+/// （生成が成功していれば、exe隣が見つかるようになる）。
+pub(super) fn ensure_default_layouts_exist(layouts_dir_raw: &str) {
+    if is_dev_build() {
+        return;
+    }
+    let Some(exe_dir) = exe_dir() else {
+        return;
+    };
+    let target_dir = exe_dir.join(layouts_dir_raw);
+    if let Err(e) = awase::config::ensure_layouts_exist(&target_dir) {
+        tracing::warn!("Failed to create default layout files: {e}");
+    }
 }
 
 /// 相対パスを実行ファイルのディレクトリ基準で解決する
@@ -183,16 +316,16 @@ pub(crate) fn read_bug_report_attachments(
     }) {
         Ok(text) => Some(text),
         Err(e) => {
-            log::warn!("[bug-report] config.toml read failed: {e}");
+            tracing::warn!("[bug-report] config.toml read failed: {e}");
             None
         }
     };
 
     let layout_yab = config_toml.as_deref().and_then(|toml_text| {
-        let parsed: AppConfig = match toml::from_str(toml_text) {
+        let parsed: AppConfig = match AppConfig::from_toml_str(toml_text) {
             Ok(parsed) => parsed,
             Err(e) => {
-                log::warn!("[bug-report] config.toml parse failed: {e}");
+                tracing::warn!("[bug-report] config.toml parse failed: {e}");
                 return None;
             }
         };
@@ -201,14 +334,14 @@ pub(crate) fn read_bug_report_attachments(
         // が反映されず、実際に読まれている .yab と異なる場所を見に行く。
         let (validated, warnings) = parsed.validate();
         for w in &warnings {
-            log::warn!("[bug-report] config.toml validation warning: {w}");
+            tracing::warn!("[bug-report] config.toml validation warning: {w}");
         }
         let layouts_dir = resolve_relative(&validated.general.layouts_dir);
         let yab_path = layouts_dir.join(format!("{active_layout_name}.yab"));
         match std::fs::read_to_string(&yab_path) {
             Ok(text) => Some(text),
             Err(e) => {
-                log::warn!("[bug-report] {} read failed: {e}", yab_path.display());
+                tracing::warn!("[bug-report] {} read failed: {e}", yab_path.display());
                 None
             }
         }
@@ -232,31 +365,54 @@ fn parse_key_combos(
             })
         })
         .collect();
-    log::info!("{label}: {keys:?} ({} parsed)", parsed.len());
+    tracing::info!("{label}: {keys:?} ({} parsed)", parsed.len());
     parsed
 }
 
 /// IME sync キーの初期化（shadow IME 状態追跡用）
+///
+/// `left_thumb_vk`/`right_thumb_vk`（NICOLA チョード判定が消費する親指キー）と
+/// 同じ VK が `keys.ime_detect.{toggle,on,off}` にも登録されている場合は
+/// 除外して警告する（BUG-140）。この重複があると、親指キーを単独タップする
+/// たびに sync key 側が「IMEがONになった」という信号として誤解釈し、
+/// 既にIMEが開いていても `apply_ime_open` を再送し続ける。この再適用が
+/// GJI自身のキーバインド（同じキーに割り当てた変換候補機能等）と競合し、
+/// 変換キーが効かないように見える・意図しない「あ」が混入する、という
+/// 症状の実測済みの原因（`docs/known-bugs/BUG-140.md`）。
 fn init_ime_sync_keys(
     ime_detect: &ImeDetectConfig,
+    left_thumb_vk: VkCode,
+    right_thumb_vk: VkCode,
     diag: &mut StartupDiagnostics,
 ) -> (Vec<VkCode>, Vec<VkCode>, Vec<VkCode>) {
     let mut parse_vk_list = |keys: &[String], label: &str| -> Vec<VkCode> {
         keys.iter()
             .filter_map(|s| {
-                VkCode::from_name(s).or_else(|| {
+                let vk = VkCode::from_name(s).or_else(|| {
                     diag.warn(format!(
                         "keys.ime_detect.{label} のパースに失敗しました: {s}"
                     ));
                     None
-                })
+                })?;
+                if vk == left_thumb_vk || vk == right_thumb_vk {
+                    diag.warn(format!(
+                        "keys.ime_detect.{label} の \"{s}\" は親指キー\
+                         （left_thumb_key/right_thumb_key）と同じキーのため、\
+                         IME同期キーとしては無視します。変換/無変換キー等を\
+                         GJI自身のキーバインドに割り当てている場合、この重複が\
+                         あると単独タップ毎に不要なIME再適用が発生します \
+                         (BUG-140)。"
+                    ));
+                    return None;
+                }
+                Some(vk)
             })
             .collect()
     };
     let toggle = parse_vk_list(&ime_detect.toggle, "toggle");
     let on = parse_vk_list(&ime_detect.on, "on");
     let off = parse_vk_list(&ime_detect.off, "off");
-    log::info!(
+    tracing::info!(
         "IME detect keys: toggle={:?} on={:?} off={:?}",
         ime_detect.toggle,
         ime_detect.on,
@@ -304,7 +460,7 @@ fn init_ngram_validated(config: &ValidatedConfig, diag: &mut StartupDiagnostics)
     let max_us = u64::from(config.general.ngram_max_threshold_ms) * 1000;
     match NgramModel::from_file(&ngram_path, range_us, min_us, max_us) {
         Ok(model) => {
-            log::info!("N-gram model loaded from {}", ngram_path.display());
+            tracing::info!("N-gram model loaded from {}", ngram_path.display());
             let _ = with_app(|app| app.set_ngram_model(model));
         }
         Err(e) => diag.warn(format!("n-gramモデル解析失敗: {e}")),
@@ -316,13 +472,13 @@ pub(crate) fn check_keyboard_layout_on_change() {
     let (is_japanese, lang_id) = ime::keyboard_layout_info();
     if !is_japanese {
         if lang_id == crate::vk::LANGID_ENGLISH_US {
-            log::warn!(
+            tracing::warn!(
                 "Input language changed to English keyboard (101/102). \
                  Thumb-shift requires Japanese keyboard layout (106/109). \
                  LANGID=0x{lang_id:04X}",
             );
         } else {
-            log::warn!(
+            tracing::warn!(
                 "Input language changed to non-Japanese layout (LANGID=0x{lang_id:04X}). \
                  Thumb-shift requires Japanese keyboard layout (106/109).",
             );
@@ -367,15 +523,14 @@ pub(crate) fn dispatch_engine_message(
                 message_handlers::handle_wm_async_ime_apply_complete(app, wparam, lparam);
             });
         }
-        WM_GJI_CHARSET_FN_KEY_ACTIVATED => {
-            let _ = with_app(|app| {
-                message_handlers::handle_wm_gji_charset_fn_key_activated(app, wparam.0);
+        WM_KANA_LOCK_WARNING_CHANGED => {
+            with_app_or_repost(WM_KANA_LOCK_WARNING_CHANGED, |app| {
+                message_handlers::handle_wm_kana_lock_warning_changed(app);
             });
         }
-        WM_GJI_REINIT_RETRY_COMPLETE => {
-            let (wparam, lparam) = (wparam.0, lparam.0);
-            with_app_or_repost_with(WM_GJI_REINIT_RETRY_COMPLETE, wparam, lparam, |app| {
-                message_handlers::handle_wm_gji_reinit_retry_complete(app, wparam, lparam);
+        WM_HOOK_IME_MODE_DIAGNOSTIC => {
+            with_app_or_repost(WM_HOOK_IME_MODE_DIAGNOSTIC, |app| {
+                message_handlers::handle_wm_hook_ime_mode_diagnostic(app);
             });
         }
         WM_PANIC_RESET => {
@@ -431,7 +586,7 @@ pub(crate) fn dispatch_engine_message(
             let dropped = crate::hook_channel::HOOK_KEYS.take_dropped_and_clear_latch();
             if dropped > 0 {
                 crate::runtime::engine_window::mark_needs_engine_resync();
-                log::warn!("[hook-ring] dropped {dropped} key event(s)");
+                tracing::warn!("[hook-ring] dropped {dropped} key event(s)");
             }
             for event in events {
                 handle_hook_key_event(event);
@@ -467,7 +622,9 @@ pub(crate) fn dispatch_engine_message(
     true
 }
 
-fn handle_hook_key_event(event: awase::types::RawKeyEvent) {
+fn handle_hook_key_event(mut event: awase::types::RawKeyEvent) {
+    // ADR-223: 取り込み口で、フォーカス窓のスレッドの入力言語を読み、記録して `event` に載せる(再入時は読まない=不明)。
+    let _ = with_app(|app| app.lang_check_on_keydown(&mut event));
     if matches!(event.event_type, awase::types::KeyEventType::KeyDown) {
         let mods = event.modifier_snapshot;
         if let Some(is_on) = crate::panic_detect::get_panic_trigger_direction(
@@ -567,7 +724,7 @@ pub(crate) fn launch_bug_report(
         args.push("--diagnostics".to_owned());
         args.push(path.to_string_lossy().into_owned());
     }
-    // BUG-34 横展開: journal（構造化イベント）とは別に、実際の log::warn!/info!/
+    // BUG-34 横展開: journal（構造化イベント）とは別に、実際の tracing::warn!/info!/
     // debug! 出力（awase.log）の末尾も添付できるようにする。journal には無い
     // send_health/degrade 系の警告ログを拾うため。
     if let Some(path) = app_log_path {
@@ -577,7 +734,7 @@ pub(crate) fn launch_bug_report(
     launch_settings_with_args(args);
 }
 
-fn launch_settings_with_args(args: impl IntoIterator<Item = String>) {
+pub(crate) fn launch_settings_with_args(args: impl IntoIterator<Item = String>) {
     let args: Vec<String> = args.into_iter().collect();
     let names = if cfg!(windows) {
         vec!["awase-settings.exe"]
@@ -585,21 +742,28 @@ fn launch_settings_with_args(args: impl IntoIterator<Item = String>) {
         vec!["awase-settings"]
     };
     let Ok(exe) = std::env::current_exe() else {
-        log::warn!("awase-settings not found");
+        tracing::warn!("awase-settings not found");
         return;
     };
     let Some(dir) = exe.parent() else {
-        log::warn!("awase-settings not found");
+        tracing::warn!("awase-settings not found");
         return;
     };
     for name in &names {
         let path = dir.join(name);
         if path.exists() {
-            let _ = std::process::Command::new(&path).args(&args).spawn();
+            // stdio null 化の理由は crate::win32::spawn_command_with_null_stdio の
+            // doc 参照（BUG-79追補2/BUG-134）。
+            if let Err(e) = crate::win32::spawn_command_with_null_stdio(&path)
+                .args(&args)
+                .spawn()
+            {
+                tracing::warn!("failed to spawn {name}: {e}");
+            }
             return;
         }
     }
-    log::warn!("awase-settings not found");
+    tracing::warn!("awase-settings not found");
 }
 
 /// 設定ファイルを再読み込みし、エンジンのパラメータを更新する
@@ -607,44 +771,85 @@ pub(crate) fn reload_config() {
     let raw_config = match load_config() {
         Ok(c) => c,
         Err(e) => {
-            log::warn!("Failed to reload config: {e}");
+            tracing::warn!("Failed to reload config: {e}");
             return;
         }
     };
 
-    let (config, config_warnings) = raw_config.validate();
-    for w in &config_warnings {
-        log::warn!("config: {w}");
+    // ADR-116 決定2: 以前はここで3つの独立した StartupDiagnostics
+    // （ngram用・keys用・layout用）を作り、それぞれ report() していたため、
+    // 設定リロード1回でトレイバルーンが最大3回出ていた。1つに統合し、
+    // report() は関数末尾で1回だけ呼ぶ。あわせて config.validate() の
+    // 警告がこれまで tracing::warn! だけでユーザーに一切届いていなかった
+    // 非対称（起動時は diag.warn 経由でトレイバルーンに出る）も解消する。
+    let mut diag = StartupDiagnostics::new();
+
+    let load_notes = raw_config.load_warnings().to_vec();
+    if let Some(n) = crate::config_diagnostics::newly_effective_note(&raw_config) {
+        diag.note(n);
     }
+    let (config, config_warnings) = raw_config.validate();
+    diag.warn_config(&load_notes, config_warnings);
 
-    let mut reload_diag = StartupDiagnostics::new();
-    init_ngram_validated(&config, &mut reload_diag);
-    reload_diag.report();
+    init_ngram_validated(&config, &mut diag);
 
-    let mut key_diag = StartupDiagnostics::new();
-    let engine_on = parse_key_combos(&config.keys.engine_on, "Engine ON keys", &mut key_diag);
-    let engine_off = parse_key_combos(&config.keys.engine_off, "Engine OFF keys", &mut key_diag);
-    let ime_on = parse_key_combos(&config.keys.ime_on, "IME control ON keys", &mut key_diag);
-    let ime_off = parse_key_combos(&config.keys.ime_off, "IME control OFF keys", &mut key_diag);
+    let engine_on = parse_key_combos(&config.keys.engine_on, "Engine ON keys", &mut diag);
+    let engine_off = parse_key_combos(&config.keys.engine_off, "Engine OFF keys", &mut diag);
+    let ime_on = parse_key_combos(&config.keys.ime_on, "IME control ON keys", &mut diag);
+    let ime_off = parse_key_combos(&config.keys.ime_off, "IME control OFF keys", &mut diag);
     let ime_toggle = parse_key_combos(
         &config.keys.ime_toggle,
         "IME control Toggle keys",
-        &mut key_diag,
+        &mut diag,
     );
-    let (toggle, on, off) = init_ime_sync_keys(&config.keys.ime_detect, &mut key_diag);
+    // 親指キーも config reload で変更が反映される
+    // （`Runtime::apply_config_update` が `config.general.{left,right}_thumb_key`
+    // を再解決して `hook::set_thumb_vk_codes` を呼ぶ、本関数より後の処理）。
+    // ここで `hook::thumb_vk_codes()`（前回の起動/reload時点のキャッシュ）を
+    // 読むと、このreload内で親指キー自体を変更した場合に古い値のまま
+    // BUG-140 の重複判定が行われ、新しい親指キーとの重複を見逃す
+    // （code-review指摘、2026-09-13）。`apply_config_update`と同じ解決関数
+    // で新しい config から直接導出し、名前解決に失敗した場合のみ
+    // （`apply_config_update`側も同条件でこのreloadでは古い値を維持する
+    // ため）キャッシュ値にフォールバックする。
+    let (left_thumb_vk, right_thumb_vk) = match (
+        crate::hook::resolve_thumb_key(&config.general.left_thumb_key),
+        crate::hook::resolve_thumb_key(&config.general.right_thumb_key),
+    ) {
+        (Some((left, _)), Some((right, _))) => (left, right),
+        _ => crate::hook::thumb_vk_codes(),
+    };
+    let (toggle, on, off) = init_ime_sync_keys(
+        &config.keys.ime_detect,
+        left_thumb_vk,
+        right_thumb_vk,
+        &mut diag,
+    );
     let panic_trigger_combos = build_panic_trigger_combos(&ime_on, &ime_off);
     crate::panic_detect::set_panic_trigger_combos(panic_trigger_combos);
-    key_diag.report();
 
-    let special_keys = SpecialKeyCombos {
+    crate::keymap::warn_on_engine_hotkey_collision(
+        &config.keymaps,
+        &engine_on,
+        &engine_off,
+        &ime_on,
+        &ime_off,
+        &ime_toggle,
+        config.general.engine_toggle_hotkey.as_deref(),
+    );
+    let mut special_keys = SpecialKeyCombos {
         engine_on,
         engine_off,
         ime_on,
         ime_off,
         ime_toggle,
     };
+    // ADR-206 決定4: 非推奨の `*_solo_tap_ime_action`（親指キーのもの）は bare の開閉として扱う。
+    // `apply_config_update` は冒頭で `thumb_forced_open_actions(&special_keys)` を求めるので、その前に移す。
+    crate::runtime::migrate_legacy_solo_tap_actions(&config.general, &mut special_keys);
+    let mut apply_warnings: Vec<String> = Vec::new();
     let _ = with_app(|app| {
-        app.apply_config_update(&config, special_keys, toggle, on, off);
+        apply_warnings = app.apply_config_update(&config, special_keys, toggle, on, off);
         // ADR-092 決定D Step4b前提条件3: MS-IME レジストリの Ctrl+Space/
         // Shift+Space トグル割当てを設定リロードのたびに再読みする
         // （stale化対策、apply_config_update が space_is_thumb_key を
@@ -660,21 +865,100 @@ pub(crate) fn reload_config() {
         {
             message_handlers::sync_ime_toggle_auto_detect(app);
         }
+        // GJI の config1.db は、打鍵時予測のキャッシュ（`KeymapCache`、版の変化だけで読み直す）が
+        // 自分で追随するので、ここで再読みしない（ADR-191で`gji_charset_autodetect`の設定への反映は撤去済み。
+        // 旧BUG-115 F4のコメントは実体が無くなっていた、レビュー指摘A-m3）。
     });
 
-    let layouts_dir = resolve_relative(&config.general.layouts_dir);
-    let mut layout_diag = StartupDiagnostics::new();
-    match crate::LayoutEntry::scan_all(
-        &layouts_dir,
-        &mut layout_diag,
-        config.general.keyboard_model,
-    ) {
-        Ok(layouts) => {
-            layout_diag.report();
-            let _ = with_app(|app| app.reload_layouts(layouts, &config.general.default_layout));
-        }
-        Err(e) => log::warn!("Failed to rescan layouts on config reload: {e}"),
+    for w in apply_warnings {
+        diag.warn(w);
     }
 
-    log::info!("Config reloaded successfully");
+    let layouts_dir = resolve_relative(&config.general.layouts_dir);
+    match crate::LayoutEntry::scan_all(
+        &layouts_dir,
+        &mut diag,
+        config.general.keyboard_model,
+        &config.keystroke_macro,
+        config.general.keystroke_sequence,
+    ) {
+        Ok(layouts) => {
+            let _ = with_app(|app| app.reload_layouts(layouts, &config.general.default_layout));
+        }
+        Err(e) => tracing::warn!("Failed to rescan layouts on config reload: {e}"),
+    }
+
+    diag.report();
+    tracing::info!("Config reloaded successfully");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// BUG-140: `right_thumb_key`と同じVKが`keys.ime_detect.on`にも登録されて
+    /// いる場合、そのVKをsync keyから除外し警告することを固定する。
+    #[test]
+    fn init_ime_sync_keys_excludes_vk_shared_with_thumb_keys() {
+        let henkan = VkCode::from_name("変換").expect("VK_CONVERT should parse");
+        let muhenkan = VkCode::from_name("無変換").expect("VK_NONCONVERT should parse");
+        let ime_on = VkCode::from_name("IMEオン").expect("VK_IME_ON should parse");
+
+        let ime_detect = ImeDetectConfig {
+            toggle: vec![],
+            on: vec!["IMEオン".to_string(), "変換".to_string()],
+            off: vec![],
+        };
+        let mut diag = StartupDiagnostics::new();
+        let (_toggle, on, _off) = init_ime_sync_keys(&ime_detect, muhenkan, henkan, &mut diag);
+
+        assert_eq!(
+            on,
+            vec![ime_on],
+            "変換キーはthumb keyと重複するため除外される"
+        );
+        assert!(
+            diag.warnings.iter().any(|w| w.contains("BUG-140")),
+            "重複検出時はBUG-140を参照する警告を出す: {:?}",
+            diag.warnings
+        );
+    }
+
+    /// ADR-201 決定2: 未知のキー等(`load_warnings`)はログだけ(`notes`)、それ以外は警告(トレイに出る)。
+    #[test]
+    fn warn_config_routes_load_warnings_to_notes_only() {
+        let mut diag = StartupDiagnostics::new();
+        let load = vec!["未知のキー a".to_string()];
+        diag.warn_config(
+            &load,
+            vec!["未知のキー a".to_string(), "解決できない値 b".to_string()],
+        );
+        assert_eq!(diag.notes, vec!["未知のキー a".to_string()]);
+        assert_eq!(diag.warnings, vec!["解決できない値 b".to_string()]);
+    }
+
+    /// 重複が無い通常設定では、すべてのキーがそのまま採用され警告も出ない。
+    #[test]
+    fn init_ime_sync_keys_keeps_non_overlapping_keys() {
+        let henkan = VkCode::from_name("変換").expect("VK_CONVERT should parse");
+        let muhenkan = VkCode::from_name("無変換").expect("VK_NONCONVERT should parse");
+        let ime_on = VkCode::from_name("IMEオン").expect("VK_IME_ON should parse");
+        let ime_off = VkCode::from_name("IMEオフ").expect("VK_IME_OFF should parse");
+
+        let ime_detect = ImeDetectConfig {
+            toggle: vec![],
+            on: vec!["IMEオン".to_string()],
+            off: vec!["IMEオフ".to_string()],
+        };
+        let mut diag = StartupDiagnostics::new();
+        let (_toggle, on, off) = init_ime_sync_keys(&ime_detect, muhenkan, henkan, &mut diag);
+
+        assert_eq!(on, vec![ime_on]);
+        assert_eq!(off, vec![ime_off]);
+        assert!(
+            diag.warnings.is_empty(),
+            "重複が無ければ警告は出ない: {:?}",
+            diag.warnings
+        );
+    }
 }

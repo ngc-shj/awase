@@ -1,4 +1,28 @@
+---
+id: ADR-100
+title: |-
+  GJI eager warmup キーの再選定と give-up 分岐の retry — 提案の却下・縮小版の実験登録・前提条件の切り出し
+summary: |-
+  ADR-098決定3-c(GJI eager warmupキーをVK_DBE_HIRAGANAからVK_IME_ONへ置換できないかの宿題)とexperiments.mdエントリ16(事前登録)をユーザー発案の2提案とともに引き取り。architect⇔premortem reviewerのOpus2体で2ラウンド討議(ラウンド1: Critical4/Major4/Minor6件、ラウンド2: Major3/Minor5件、いずれも決定は不変で根拠の記述精度のみ訂正)。**F1**: eager warmupは`InjectionMode::Tsf`でのみ発火しChromeは対象外(`AppKind::TsfNative`→`Vk`、実行時学習でも昇格しない)——ADR-098原文の「撤去するとChromeのBUG-02が再燃」という被害例も誤りと判明。**F3/F5/F12**: 初稿はBUG-45実機ログ(自ら引用)と矛盾する誤った事実(「Tsfモードでは撃たれていない」「IMC読み取りは未測定」「give-upはほぼ0件」)を書き、2ラウンドのpremortemで都度訂正(同型の「モード分割の言い切り」誤りを3回犯したことも記録)。決定: 提案1(F2→VK_IME_OFF→VK_IME_ONトグル化)は却下(composition閉鎖の意味論差+confirm実効性の保証欠如+頻度差)、提案2(give-up分岐へのconfirm後retry追加)も却下(完了通知経路が存在しない)だが**代替として案L(give-upで失ったromajiをjournalへ記録、送信ゼロ)を採用**、案J(Unicode退避)・案K(backspace無し)は却下せず保持。決定5〜7は挙動変更ゼロのdoc訂正・known-bugs.md記録。**2026-08-22、決定4-f(`MapVirtualKeyW(VK_IME_ON)`実機測定=0xF2非ゼロ、F17)を経て決定2(`VK_IME_ON`単発、群B)を実機検証(F18、15.6秒・30.3秒放置含むcold=1〜13でgiving up/literal化0件)、ユーザー判断で正式採用・実装済み**(`send_vk_dbe_hiragana_pair`→`send_eager_warmup_vk_pair`に改名、`docs/known-bugs.md`BUG-50追補2)。群A/群Cとの厳密比較は未実施のまま採用、群C(eager warmup完全撤去)はBUG-69依存の懸念により対象外・別課題として保留。BUG-69(ADR-098)修正自体もdragonflyg4で初回実機検証済み(`force-ON (ImmBrokenForceOn)`が物理キー操作なしで自律発火し正しく補正)
+status: |-
+  一部実装・決定2 は撤去済み(2026-10-04 確認)。決定2(eager warmup を `VK_IME_ON` 単発へ置換)の対象だった eager warmup は ADR-212 P0(#398、確定キー)・P4(#401、03a7996f、フォーカス変更時・SetOpen(true) 後)で全撤去され、`send_eager_warmup` は現行コードに無い。決定1・3 は却下確定。決定5-7・案L の実装有無は要確認(本確認では未検証)。
+  旧(2026-10-04 更新前):
+  **決定2実装済み・決定1/3却下確定**（2026-08-22）。決定5-7(記録・doc訂正)と決定3案L(journal記録)は設計のみで未実装。決定2は実機検証(群Bのみ、群A/C比較なし)を経てdragonflyg4実機ビルドでclippy/test(697件)/architecture_guard(38件)/golden(24件)全green確認のうえ採用。群Cの本格実験・BUG-69ソークは今後の課題として残る
+  **追記(2026-09-29)**: eager warmup の Ctrl 解放契機は BUG-174 で撤去済み(本文中の「Ctrl 解放」を契機とする記述は決定当時の記録)。
+related_adr:
+  - "ADR-048"
+  - "ADR-062"
+  - "ADR-079"
+  - "ADR-083"
+  - "ADR-095"
+  - "ADR-096"
+  - "ADR-098"
+  - "ADR-101"
+---
+
 # ADR-100: GJI eager warmup キーの再選定と give-up 分岐の retry — 提案の却下・縮小版の実験登録・前提条件の切り出し
+
+> 状態更新(2026-10-04): eager warmup(決定2 の対象)は ADR-212 P4(03a7996f)で全撤去済み。
 
 ## ステータス
 
@@ -89,6 +113,8 @@ pub const fn can_warmup(&self) -> bool {
 | `platform.rs:1215` | `on_passthrough_key`（`:1173`） | 確定キー KeyDown |
 | `platform.rs:1236` | `on_reinject_key`（`:1199`） | 再注入キー |
 | `output/vk_send.rs:531` | — | `WarmupImeOn::off()` 固定。**「到達不能」という判定は同ファイル 518-528 行のコードコメント（「現状は理論上到達しない」）に依拠しており、本 ADR は独立検証していない**（m12。この1点だけ他の F と検証の質が異なる） |
+
+**（2026-09-29追記: 上表のうち物理 F2・確定キー〈`on_passthrough_key` と reinject〉・Ctrl 解放の `EmitWarmup` は撤去済み〈BUG-173/174〉。残る送信元は FocusChange と `on_ime_applied` の随伴のみ。）**
 
 ADR-098 決定1-b の付け替え表が同じ集合を別の粒度（`composition_confirm_key_up` / `composition_ctrl_up` / `composition_native_f2_down` を含む10サイト）で列挙している。**要点は「フォーカス変更時だけでなく、Enter/Escape 確定・Ctrl 解放・物理 F2・再注入キーのたびに撃たれうる」**ことである。コード上のコメントも「ROMAN ビット確保のみで冪等なため反復送信も無害」と、この高頻度性を前提に書かれている（`output/mod.rs:716-717`）。
 

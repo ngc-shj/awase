@@ -5,6 +5,8 @@ awase の IME ON/OFF 制御・warmup・focus 分類まわりは、Windows / IME 
 別セッションで再検証したり、一度捨てた選択肢に戻ったりする「反転」が繰り返し起きて
 きた。それを見えるようにするのがこのログの目的。
 
+学習(キー効果の学習、`awase-keymap-learn`)の速度・精度の試行は [keymap-learn-experiments.md](keymap-learn-experiments.md) に別途記録している。
+
 ## 書き方
 
 新しい試行を行うたびに 1 行追記する。判定が後日ひっくり返ったら、元の行は消さずに
@@ -25,7 +27,57 @@ awase の IME ON/OFF 制御・warmup・focus 分類まわりは、Windows / IME 
 
 ---
 
-## エントリ 17: BUG-25 GJI 半角英数 entry の本実装（ADR-107 Task 1〜8）
+## エントリ 28: issue #165（hook_starved）自己修復——PR #347 opus round1指摘で一旦分離revert
+
+**背景**: hookスレッドが詰まって`WM_KEYDOWN`が届かなくなる`hook_starved`（issue #165）
+を、`stale_ms>5000 && os_idle_ms<5000`をトリガーにフックを解除・再インストールする
+自己修復で解消しようとした。opus-adversarial-consultによるPR #347レビュー(round1)
+で5件の欠陥（マウスのみ操作での誤発火・UIPI昇格ウィンドウでの無限再試行・Mouse
+Without Borders等への割り込み・KeyUp消失によるCtrl等ラッチのスタック・
+`HookGuard::drop`の無制限`join()`によるハング）が指摘されたため、本体（`2b0aa802`）
+と検証コミット2件（`735fe162`/`7378fdb9`、BUG-170記録含む）を`0de3400a`でrevert。
+
+**opusコードレビュー指摘（このエントリ自体の追加理由）**: `0de3400a`のコミット本文は
+5件の失敗条件を具体的に記述しているが、**いずれもレビューでの指摘であり実機/CIでの
+再現は本文中に明記の通り未実施**。[experiment-logging](../.claude/rules/experiment-logging.md)
+が求める「観測された失敗条件」（アプリ×IME×再現手順）とは性質が異なる（コード
+レビュー指摘 vs 実機観測）ため、本ログへの追記が漏れていた。次にhook self-healを
+再検討するセッションが「これは実機で確認済みの欠陥」と誤解しないよう、ここで
+「未検証の設計上の懸念」であることを明記する。
+
+| 日付 | 仮説 | 環境（アプリ × IME × idle） | 変更 | 観測結果 | 判定 | コミット |
+| --- | --- | --- | --- | --- | --- | --- |
+| 2026-09-28 | stale_ms>5000 && os_idle_ms<5000をトリガーにフックを再インストールすればhook_starvedから自己復帰できる | CI（windows-latest、WinUI3プローブで hook_starved を強制発火）。実機での再現・検証は未実施 | `runtime`にフック解除+再インストールの自己修復を追加(`2b0aa802`)、検証用ブロック窓延長(`735fe162`) | CI上で自己修復の発火自体は確認できたが、opus-adversarial-consult round1で上記5件の未検証な欠陥（レビュー指摘のみ、実機/CI再現なし）が判明 | 撤回（`0de3400a`、`fix/hook-self-heal-v2`で欠陥対応後に再度PR予定） | `0de3400a`（revert対象: `2b0aa802`/`735fe162`/`7378fdb9`） |
+
+---
+
+## エントリ 27: issue #189（BUG-110追補7）修正——調停機構は即日撤回、既存ガード拡張へ
+
+（ADR-158 TD4、2026-09-09: 「エントリ18」を名乗る既存エントリが本ファイル下方
+（`エントリ18: issue #137...`）に既に存在していたため、その場で番号のみ27へ
+訂正した。以下の本文・見出し番号への言及も参照専用のため未変更）
+
+**背景**: MS-IME + Chromeでのdrift correction × force-ON二重SSOT振動
+（BUG-110追補7）に対し、当初「force-ONがdrift correctionの実行中バーストに
+調停で道を譲る」新機構（`DriftBurst`/`force_on_yields_to_drift`/専用
+リトライタイマー/新規チューニング定数）をopus-adversarial-consult 4ラウンドで
+収束させ実装・実機ソークまで完了させたが、ユーザーから「発火する仕組みの上に
+抑止する仕組みを重ねている」と設計複雑化を指摘され、同日中に全面撤回。
+既存の`ConvOpenInference`除外ガードに`HeuristicDefault`を1バリアント
+加えるだけの修正に置き換えた。
+
+| 日付 | 仮説 | 環境（アプリ × IME × idle） | 変更 | 観測結果 | 判定 | コミット |
+| --- | --- | --- | --- | --- | --- | --- |
+| 2026-09-08 | force-ONの書き込みタイミングをdrift correctionのバーストに合わせて調停すれば振動が止まる | Chrome（TsfNative）× MS-IME、Word操作直後にフォーカス移動 | `state/ime_actuation.rs`に`DriftBurst`/`force_on_yields_to_drift`新設、`runtime/mod.rs`にgate配線、`tuning.rs`に`FORCE_ON_DRIFT_YIELD_RETRY_MS`(実測なし暫定200ms) | dragonflyg4実機ソークで`[drift-yield]`ログが設計どおり動作、1ms未満のタイトな往復は解消を確認 | 採用→**即日撤回**（動作はしたが「発火源の上に抑止層を重ねる」設計だとユーザー指摘、round1で判明していた恒真化の知見を踏まえ根本修正へ切替） | `6151cfb4`/`a3d88558`（revert: `12719f54`/`1666262f`） |
+| 2026-09-09 | `check_drift_correction`の既存`ConvOpenInference`除外ガード（BUG-19由来）に`HeuristicDefault`を加えれば、setpointの二重計算自体に触れず振動源を根本から消せる | 同上（実機再ソーク予定） | `state/platform_state.rs::check_drift_correction`のガード条件に`ObservationSource::HeuristicDefault`を追加（2行）、対応ユニットテスト1件追加 | opus-adversarial-consultで機序を確認（実機再ソークは別途実施） | 採用 | TBD |
+
+---
+
+## エントリ 26: BUG-25 GJI 半角英数 entry の本実装（ADR-107 Task 1〜8）
+
+（ADR-158 TD4、2026-09-09: 「エントリ17」を名乗る既存エントリが本ファイル下方
+（`エントリ17: key_remap...撤回`）に既に存在していたため、その場で番号のみ26へ
+訂正した。当該エントリと連番の17〜25は動かしていない）
 
 **背景**: BUG-25 の GJI entry は scan付きF0、IMC write、scan=0 F0 の3案を
 いずれも撤回済み。ADR-107 決定0の2×2実機計測で `IME_KANJI_MARKER` +
@@ -701,3 +753,448 @@ composition context の初期化をトリガーしない」という実機観測
 かは確認できておらず、単純に「5月の結論を覆した」とは言えない。サンプル
 数は決定2 の合格基準（各条件5試行以上、群Aとの同一セッション内比較）に
 遠く届いておらず、群Aとの直接比較は一度も行っていない。
+
+---
+
+## エントリ 17: `key_remap`（ADR-110、物理キー単純リマップ）をバックエンドごと撤回 — Caps(英数)⇔Ctrlプリセット検討中に、既存の失敗例(エントリ07/08/09)を再導入していたと判明
+
+**背景**: ADR-110で「任意の物理キーを別の物理キーとして常時リマップする」汎用機構
+`key_remap`を実装・マージした（PR #120、BUG-100修正PR #121）。その後「人気の
+組み合わせ（Caps(英数)⇔Ctrl）だけをGUIから簡単に設定できるようにしたい」という
+要望を受け、専用プリセットとして絞り込む設計（ADR-111）を進めた。
+
+| 日付 | 仮説 | 変更 | 観測結果 | 判定 | コミット |
+| --- | --- | --- | --- | --- | --- |
+| 2026-08-30 | `key_remap`の3ルール構成（`VK_DBE_ALPHANUMERIC→VK_LCONTROL`、`VK_CAPITAL→VK_LCONTROL`、`VK_LCONTROL→VK_DBE_ALPHANUMERIC`）でCaps(英数)⇔Ctrlの入れ替えとShift分岐（英数単独/Shift+英数で別VKが飛ぶJIS固有仕様）の両方に対応できるはず | ADR-111 r1として設計文書化 | Opus 2体による並列敵対的レビューで、3ルール目（`VK_LCONTROL→VK_DBE_ALPHANUMERIC`、`SendInput`による`VK_DBE_ALPHANUMERIC`注入）が**このリポジトリのエントリ07/08/09で既に3回失敗・撤去済みの手法**（scan値を変えてもawase自身のフックにすら届かない、またはCapsLockを物理的に点灯させる）の無自覚な再導入だったと判明。加えてEisu単独押下のKeyUpがWin32k内部のIME処理でフックに届かない可能性、両ルール同時有効化での相殺想定の誤りも指摘された | 撤回（`key_remap`のCaps/Ctrl方向の利用を断念） | （ADR-111 r2で方針転換） |
+| 2026-08-30 | key_remap方式は諦めるが、Scancode Map方式（レジストリ、ドライバレベル）と併用すれば昇格可否に応じて両方式を選べる | PowerToys KeyboardManager（同種のフック方式）の実装・既知issueを調査 | PowerToys自身が「CapsLock→Ctrl + 日本語IME」の組み合わせで2020年から問題を抱え（Issue #3397、PR #4123でワークアラウンド）、2024年以降も再発報告が続く（Issue #32344）と判明。フックベースでこの特定キー・IME組み合わせを安全に扱う確信が持てないと判断 | 撤回（`key_remap`機能全体をバックエンドごとrevert、`docs/known-bugs.md` BUG-100・`docs/adr/110-*.md`のステータスも「撤回」に更新） | （revert PR、本エントリと同時期） |
+
+**学び**:
+
+- **「汎用機構として実装・マージ済み」であっても、特定用途に絞り込む設計を
+  検討する段階で、その用途特有の危険（今回はJISキーボードのIME制御キー
+  との衝突）が事後に判明することがある。マージ済みだからといって撤回の
+  ハードルを上げてはいけない。** 逆に、実装が既に一定の品質（BUG-100修正・
+  テスト・CI green）を経ていたことは、撤回の判断を「品質が低いから」と
+  混同しないためにも明記しておく価値がある——今回の撤回理由は品質ではなく
+  用途とのミスマッチ。
+- **`docs/experiments.md`の過去エントリ（07/08/09）を読まずに設計すると、
+  既に失敗が確定している手法を無自覚に再導入してしまう。** `.claude/rules/
+  experiment-logging.md`が求める「失敗条件を書き残す」規約は、書いた本人
+  以外の将来のセッション（今回のケースでは同一ユーザー・別セッションの
+  設計検討）にも効く。Opus敵対的レビューが`grep`等でこの文書を横断的に
+  参照したことで再発見できた——レビュー依頼時に「関連する過去の実験ログを
+  確認してほしい」と明示的に伝えると再発見の確度が上がる。
+- **他プロジェクト（PowerToys）の同種実装の実例調査は、自プロジェクトの
+  実機検証が無い状態での判断材料として有効だった。** Microsoft自身のOSS
+  プロジェクトが4年以上同じ問題に苦戦している実例は、「このリポジトリの
+  実機データだけでは確定しない懸念」を補強する独立した証拠として機能した。
+- **将来「アプリケーションごとに動的にキー割当てを変更する」機能を作る際は、
+  今回の`key_remap`（グローバル・静的リマップ）の設計・実装をgit履歴から
+  参照しつつも、IME制御キー（CapsLock位置・英数・かな等）を対象にする場合は
+  本エントリとエントリ07/08/09を先に読み、フックベースでの実現可否を
+  再検討すること。**
+
+---
+
+## エントリ 18: issue #137 設計時に BUG-61/62 の自動復旧不可を再確認し、再試行しないと決定
+
+**背景:** Teams(WebView2/MS-IME) で romaji VK が JIS かな配列として解釈される
+issue #137 の設計時点で、BUG-61/BUG-62 追補4で不可能と確定した自動復旧
+（`ImmSetConversionStatus` 書き込み、`VK_DBE_ROMAN` 注入、言語バー COM 操作）を
+Opus 2体による3ラウンドの敵対的レビューで再検討した。
+
+**結論:** 自動復旧は再試行しない。`GetKeyState(VK_KANA)&1` による検知と、
+既存トレイ右クリックメニュー/ツールチップでの案内だけに限定する。
+
+---
+
+## エントリ 19: GJI 専用Fnキー変換（ADR-091 §D3.2）の自動判定・設定支援ポップアップ・config1.db書き込みを全撤去 — 実験的機能のまま撤去し忘れて出荷、実機でユーザー混乱
+
+**背景**: ADR-091 §D3.2「専用Fnキー変換」（無変換キー単独タップの代わりに
+GJI側でF21にComposition/Conversion限定の`SwitchKanaType`を割り当てる案）は、
+Phase 1の一部（自動判定・設定支援ポップアップ・config1.db書き込み）が
+`develop`未マージのまま実験的に実装され、その後どこかのタイミングで
+（本エントリの調査では特定できず）マージ・出荷されていた。撤去する計画は
+無く、単に「実験を終わらせ忘れた」状態だったと判明した。
+
+| 日付 | 仮説 | 環境（アプリ×IME） | 変更 | 観測結果 | 判定 | コミット |
+| --- | --- | --- | --- | --- | --- | --- |
+| 2026-09-02 | （出荷済みの既存機能）GJI検出時、無変換単独タップが素のパススルー設定のままなら「専用Fnキー(F21)を使った安全な変換方式を有効にしますか」というポップアップを出し、同意するとconfig1.dbに書き込む | Windows、Google日本語入力（キー設定は実際にはカスタム） | （調査対象、変更なし） | ユーザー（Macからの試用者）が起動時ポップアップに「はい」と答えたところ、直後に「Google日本語入力のキー設定がカスタム以外だったので設定を追加できませんでした」という失敗ダイアログが表示された。GJI側のキー設定は実際にはカスタムだったため、判定ロジックの誤診断が疑われる（`crates/awase-gji-config/src/lib.rs`の`session_keymap != Some(SESSION_KEYMAP_CUSTOM)`判定が、CUSTOM=0のprotobufデフォルト値省略により`None`と誤認した可能性）。ユーザーはこの経験から「机上のポップアップ→書き込み失敗という順序自体が不安を煽る設計であり、そもそも実験的機能なら完全に撤去すべき」と判断した | 撤回（機能全体を撤去） | （本コミット） |
+
+**撤去の範囲**: `crates/awase-windows/src/gji_charset_popup.rs`・
+`gji_charset_write.rs`・`crates/awase-gji-config/src/write.rs`を削除。
+`gji_charset_autodetect.rs`からはF21専用Fnキーの自動判定部分
+（`detect_dedicated_fn_key`、`Runtime::set_muhenkan_dedicated_fn_key_auto`/
+`muhenkan_dedicated_fn_key_is_manual`）のみ除去し、同じファイルに同居して
+いたADR-092 決定D Step4c（IME ON/OFF/トグルキーの自動検出、F21とは無関係の
+別機能）は変更していない。`GeneralConfig::muhenkan_solo_tap_dedicated_fn_key`
+による手動設定（config.toml経由）と`nicola_fsm.rs`の専用Fnキー送出ロジック
+自体は残し、上級者が手動で有効化する経路は維持した。
+
+**学び**:
+
+- **「実装済み・develop未マージ」の実験的機能は、マージされた瞬間に
+  「実験」から「本番機能」へ暗黙に昇格する。** ADR本文に「Phase 1実装済み
+  （既定無効）」と書いてあっても、それが実際にリリースされたかどうかを
+  追跡する仕組みが無いと、撤去判断の機会そのものを逃す。
+- **「ポップアップで同意を取ってから失敗を通知する」設計は、たとえ機構が
+  正しく動いていても心理的なコストが高い。** 実行前に前提条件（カスタム
+  キーマップかどうか）を確認し、満たさない場合はそもそも選択肢を見せない
+  （またはポジティブな案内に留める）方が、機構の正しさとは独立に重要な
+  UX原則である。
+- **同じファイル・同じ関数に複数の独立した機能（F21自動判定とADR-092
+  Step4cのIME ON/OFF自動検出）を同居させると、片方だけを安全に撤去する際に
+  「同居している機能まで巻き添えで壊していないか」の確認コストが増える。**
+  今回はADR-092側の呼び出し元・テストを個別に確認した上で分離できたが、
+  次に同種の自動判定機構を追加する際は、GJI検出の合流点は共有しつつも
+  機能ごとに関数を分けておくと、将来の部分撤去が容易になる。
+
+---
+
+## エントリ 20: BUG-113「Windows Terminal + GJI で余分な@」— `send_ime_mode_key` の `wScan=0` 修正は実機A/Bで反証、副産物として BUG-114（drift correction の `FeedbackPolicy::Read` 無限再送）を発見
+
+**背景**: ADR-133 の実機検証（2026-09-05）で、`GjiDirectStrategy::apply
+(open=false)` が `send_ime_mode_key(VK_IME_OFF)` を `wScan=0` で送信して
+いることが BUG-113（Windows Terminal + GJI、Engine 有効時に半角/全角キーで
+「@」が出る）の真因候補と絞り込まれていた。
+
+| 日付 | 仮説 | 環境（アプリ×IME） | 変更 | 観測結果 | 判定 | コミット |
+| --- | --- | --- | --- | --- | --- | --- |
+| 2026-09-05 | `send_ime_mode_key` の mode key 本体（`VK_IME_ON`/`VK_IME_OFF`）を `wScan=0` 固定（`make_key_input_ex()`）から `wVk` 保持＋`MapVirtualKeyW` 実測 scan 埋め込み（`make_scan_key_input()`、`KEYEVENTF_SCANCODE` なし）へ変更すれば「@」が再現しなくなるはず | Windows Terminal（`WindowsTerminal.exe`、`CASCADIA_HOSTING_WINDOW_CLASS`/`Windows.UI.Input.InputSite.WindowClass`）× Google 日本語入力、dragonflyg4実機、`spike/adr133-wt-vk-kana-dbe-hiragana`ブランチ | `send_ime_mode_key`（`ime.rs`）の送信を全呼び出し元（`GjiDirectStrategy`/`MsImeDirectStrategy`/`send_engine_state_ime_key`）に対し既定 on（Windows Terminal 限定 hidden opt-in にはしなかった） | ユーザーが実機で再現手順（Engine有効、半角/全角キー単独押下）を試したところ「何も変化はありませんでした」（@が出る現象そのままだった）。`RUST_LOG=debug`での追加ログ確認で、実際には物理キー1回の押下に対し `[drift] correction: observed=true ≠ desired=false` が **~14秒間、20〜90msおきに連続発火**し、`VK_IME_OFF`を`SendInput`で送り続けていたことが判明（`gave up`ログは0件）。ログの`strategy=`タグは`drift_correction_read`——`caps(TsfNative, Gji)`が本来返すべき`FEEDBACK_BLIND`ではなく`FEEDBACK_READ`が使われていた。コード読解の結果、`focus/class_names.rs::AppImeProfile::from_class_name`がフォールバックで`Standard`を返すケースがあり、`FocusChanged`発火の瞬間にこれが起きると`ImePolicyProfile::ImmCross`→`FEEDBACK_READ`が`app_policy`に焼き付き、以後のフォーカスセッション中ずっと`Read`のまま（`current_app_profile()`自体は後から正しく`TsfNative`を返すのに`app_policy`は`FocusChanged`時のスナップショットしか見ない）になる経路を発見。`Read`は`decide_actuation_action`にGiveUp分岐が無く常に`Send`を返すため、IMMクエリが構造的に不可能な当該クラス（`Skipping IMM query for known-broken class`）では収束観測が一生得られず無限に近い頻度で再送し続ける | 撤回（`send_ime_mode_key`は元の`wScan=0`固定へrevert）。**「@」の真因はこのBUG-114単独ではないと後日判明**（drift correctionが正常に有界動作した回でも「@」は再現した、known-bugs.md BUG-113参照）——BUG-114自体は独立の実在バグとして別途起票、真因候補は後日`send_ime_mode_key`の`SendInput`バッチ形状（ADR-133）へ絞り込まれた | e8aa19b0（元コミット）→（本revertコミット） |
+
+**学び**: 「候補まで絞り込んだ」状態でも実機A/Bを経ずに「全アプリ・既定on」の
+グローバル変更へ踏み切ると、反証されたときの後始末（revert対象の特定・
+docsの巻き戻し）が大きくなる。特にこの変更は Windows Terminal 限定に
+スコープすることもできたが、ユーザー判断で全アプリ適用にした結果、
+反証後は影響範囲の広い変更を丸ごとrevertする必要が生じた。また
+「何も変化がない」という否定的な実機報告こそ、次の仮説を焦って作らず
+`RUST_LOG=debug`のような詳細ログに立ち返って実際に何が起きているかを
+虚心に見直すべきサインだった——今回は debug ログ1回の取得で全く別の、
+より深刻な機構（無限に近い再送ループ）を発見できた。
+
+**追記（2026-09-15、BUG-114除去後のクリーンな条件で再検証・反証を確定）**:
+上表の否定的結果は、同時発生していたBUG-114（drift correctionの無限に
+近いバースト）に汚染されており、「実scanでも効かない」のか「バースト
+という別の交絡因子にかき消されただけ」なのかを当時は区別できていなかった
+——本エントリの「学び」自体もこの点には触れていなかった。BUG-114修正後、
+実scan送信を単発クリーンな条件で再テストしたことは一度もなかったため、
+BUG-033のTsfNative「@」再発調査（2026-09-15、`send_chrome_gji_reinit_
+and_poll`も同じ`wScan=0`固定を使っていたと判明したことがきっかけ）を機に
+再検証した。
+
+| 日付 | 仮説 | 環境（アプリ×IME） | 変更 | 観測結果 | 判定 | コミット |
+| --- | --- | --- | --- | --- | --- | --- |
+| 2026-09-15 | BUG-114除去後のクリーンな条件なら、`wScan=0`→実scan送信で「@」が再現しなくなるはず | Windows Terminal × Google 日本語入力、dragonflyg4実機、`spike/bug033-realscan-ime-mode-key`ブランチ（`send_ime_mode_key`・`send_chrome_gji_reinit_and_poll`の両方の`make_key_input_ex`を`make_scan_key_input`へ差し替え） | 物理半角/全角キー単独タップ | 「あいうab@cあいう」——「あいうabcあいう」と打ったつもりが`b`/`c`間に「@」が混入。エントリ20と異なりBUG-114は既に修正済みのため交絡なし | 反証を確定。`wScan=0`は「@」の必要条件ではないとクリーンな条件で確定した（VK値・`SendInput`バッチ形状に続き、scanコードも機構から除外） | （スパイクのみ、マージなし。`spike/bug033-realscan-ime-mode-key`は結果記録後に破棄） |
+
+**学び（追記）**: 一度「反証された」と記録された仮説でも、その実験に
+既知の別バグが混入していた場合は「本当に反証されたのか」を疑ってよい
+——今回はBUG-033の別調査から偶然この混入に気づけたが、`docs/experiments.md`
+に「この実験は他の未修正バグと同時発生していた」という注記を残す習慣が
+あれば、もっと早く気づけたはずだった。今後、実験結果を記録する際は
+「その試行中に他の既知/未知の異常ログが出ていなかったか」を明記する
+ことを検討する。
+
+---
+
+## エントリ 21: BUG-113「Windows Terminal + GJI で余分な@」— バッチ形状・VK値の両仮説を実機A/Bで反証、PSReadLine相互作用を発見するも「awase側のバグではない」という結論はユーザーレビューで撤回
+
+**背景**: エントリ20・ADR-133 v5 で絞り込んだ「`VK_IME_OFF` 単体
+`SendInput` バッチが真因」という仮説を、`fix/bug113-114-ime-off-batch-
+and-feedback-staleness` ブランチの診断コード（`DIAG_BUG113_*`）で
+実機検証した。
+
+| 日付 | 仮説 | 環境（アプリ×IME） | 変更 | 観測結果 | 判定 | コミット |
+| --- | --- | --- | --- | --- | --- | --- |
+| 2026-09-05 | `SendInput` バッチのイベント数・修飾キーの有無（候補V=分割/A=自己エコー/B3・B4=偽Ctrlブラケット）が「@」の有無を左右する | Windows Terminal × GJI、dragonflyg4実機 | `GjiDirectStrategy::apply(open=false)` の送信方式を候補ごとに自動ローテーション | 候補V/A/B3/B4・baselineすべてで「@」がほぼ毎回出た。当初「Ctrl+無変換では@が一度も出ない」という起点観測自体、実機再確認で「最初の1回がたまたま出なかっただけ」と判明（round1レビューMajor 7の統計的脆弱性指摘が的中） | 反証。バッチ形状は無関係 | 65ba766b |
+| 2026-09-05 | JIS 106配列で「@」キーのスキャンコードが `VK_IME_OFF`(0x1A) の値と一致する（VK値のスキャンコード誤読） | 同上 | `KanjiToggleStrategy`（`VK_KANJI`=0x19、本来「P」）をAlt+物理半角/全角キーで強制発火（D0-3） | 「p」は一切混入せず「@」のみ出力された | 反証。VK値も無関係 | 65ba766b |
+| 2026-09-05 | （コード内在の実装ミス）D0-3自体、1回の物理キー押下で`shadow_toggle_off_sync`/`engine_decision_sync`の2回呼び出しのうち1回目だけを`KanjiToggleStrategy`へ誘導し2回目を吸収し忘れていた | 同上 | episode単位で判定を1回に固定し2回目をno-opで吸収するよう修正 | 修正後、D0-3の観測（上記「p」不出現）は再検証していないが、旧D0-3データの信頼性に疑義が生じた | 診断コード自体のバグとして修正、D0-3は実質未検証のまま持ち越し | 65ba766b |
+
+**PSReadLineとの相互作用発見**: ユーザー観測（awase Engine無効化で
+発生しない、同じWindows Terminal内でもSSH/MSYS2セッションでは発生せず
+PowerShellセッションでのみ発生する）から PSReadLine を疑い、
+`Remove-Module PSReadLine -Force` で無効化したところ「@」が発生しなく
+なることを実機確認した。
+
+**判断ミスと訂正**: この結果を受けてセッション終盤、「真因は GJI と
+PSReadLine の相互作用であり、awase 側のコードバグではない。修正対象
+なし」と結論づけ、known-bugs.md/ADR-133 をクローズ扱いで記録した。
+**この結論は次セッションでユーザーから直接的な指摘を受けて撤回した**
+（「awase側のバグではある。何をどう思ったらバグではない、という結論に
+なるのか」）。トリガーは一貫して「awaseがGJIに対して何らかのIME
+actuationを行うこと」であり、PSReadLine/GJI単体では発生しない——
+「相手の実装が脆弱」であることは、その脆弱性を実際に踏み抜いている
+awase側の送信動作の責任を免除しない。本リポジトリの他のknown-bugs
+エントリ（Chrome cold-start等）でも「相手アプリ/IMEの実装が原因」の
+バグに対してタイミング調整や送信方式変更で緩和策を講じてきており、
+BUG-113だけを例外的に「修正不要」とするのは一貫性を欠いていた。
+
+**学び**:
+- **「外部コンポーネントの脆弱な実装との相互作用」を見つけても、
+  それだけでは「自分のコードの問題ではない」という結論にはならない。**
+  自分のコードがその相互作用を実際にトリガーしている限り、回避策・
+  緩和策を検討する責任は残る。外部要因の発見は「原因の理解が進んだ」
+  ことを意味するのであって、「対応不要」を意味しない。
+- **「バッチ形状もVK値も無関係、PSReadLineとの相互作用が引き金」という
+  事実の記録と、「だから修正しない」という方針判断は別のレイヤーであり、
+  前者が確定しても後者を独断で決めてはいけない。** 方針判断（修正するか、
+  ユーザー側回避策のみで済ませるか）はユーザーに確認してから記録する。
+- 過去に一度だけ「出ない」という結果が出た候補（mode 1: `ImmSetOpenStatus`
+  ベースの `set_ime_open_cross_process`、`SendInput` を使わない経路）が、
+  その後のより統計的に厳密な検証ラウンドでは再検証されずに埋もれていた
+  ——という指摘を一度は次の検証候補として記録したが、ユーザーの指摘で
+  「`AppImeProfile::TsfNative`（Windows Terminal 含む）は
+  `can_use_imm32_cross_process() == false` であり、この API はそもそも
+  TSF アプリに効果を持たない」と判明し、候補自体を除外した。**「過去に
+  一度だけ良い結果が出た」という事実だけでなく、その候補が対象アーキ
+  テクチャ上そもそも意味を持ちうるかを先に確認すべきだった**——確認
+  していれば、意味のない再検証を計画に書く前に気づけた。
+- 呼び出し連鎖を一度も全数調査していなかった。バッチ形状・VK値という
+  「送信の形」だけを可変にしたラウンドを何度も回す一方で、同じ物理
+  キー押下に付随する**別の**Win32/TSF呼び出し（`kp_stage_idle_conv_check`
+  が spawn する cross-process 読み取りクエリ等）が競合している可能性を
+  一度も洗い出していなかった。「候補のバリエーションを増やす」前に
+  「そもそも何が起きているか全数調査する」方が早道だったかもしれない。
+
+---
+
+## エントリ 22: BUG-113「Windows Terminal + GJI で余分な@」— dedup/probe skipの1セッション内自動ローテーション、実装2箇所のバグを経て必要十分条件を実機A/Bで確定
+
+**背景**: エントリ21で見つけた2候補（二重actuationのdedup、
+`kp_stage_idle_conv_check`のcross-process読み取りのskip）を、config編集
+による再起動を挟まず1回のテストセッションで4条件（baseline/dedupのみ/
+probe skipのみ/両方）自動ローテーションして検証したいというユーザーの
+要望を受け、`diag_bug113_combo.rs`を新設した。
+
+| 日付 | 仮説 | 環境 | 変更 | 観測結果 | 判定 | コミット |
+| --- | --- | --- | --- | --- | --- | --- |
+| 2026-09-05 | 単体トグルでdedup=true固定にした先行テストで54エピソード連続@0件だった効果を、1セッション内の4条件自動ローテーションでも再現できるはず | Windows Terminal × GJI × PowerShell(PSReadLine有効)、dragonflyg4実機 | `kp_run_inner`冒頭でKeyDown（非注入）ごとにコンボを進める実装（v1） | ユーザー報告「奇数回目で必ず@が出る」。ログを見るとテスト対象キーと無関係な~30ms間隔の連続イベントでコンボが進んでいた | 反証（実装バグ）。`event.injected`ガード欠如で awase 自身のVK_IME_OFF/ON SendInputループバックがコンボを消費していたと判明 | f28e52e6...現行ブランチ内 |
+| 2026-09-05 | `!event.injected`を追加すれば直る | 同上 | `enrich_ime_relevance`呼び出し後に移動し`shadow_action.is_some()`も追加（v2） | ユーザー報告「全く同じ状態」。ログのvk値を見ると0xF3/0xF4が交互に出ており物理押下は正しく捕捉されていたが、依然「IME OFF方向で必ず@」 | 反証（別の実装バグ）。物理半角/全角キーはTurnOff(0xF3)/TurnOn(0xF4)を厳密に周期2で交互するのに対し、コンボは周期4（2の倍数）で回っていたため、TurnOff方向は構造的に必ず偶数コンボ（dedup=false）にしか当たらないエイリアシングが発生し、dedup=trueは一度もTurnOff方向で検証されていなかった | 同上 |
+| 2026-09-05 | コンボ進行を`shadow_action == Some(TurnOff)`に限定すれば直る | 同上 | v3実装 | ユーザー報告「ビンゴ、1回目と5回目だけ@が出る」→さらに継続テストで「4回に1回、極めて整合的」。各条件15〜16トライアル（TurnOff方向のみ、合計63）で、baseline以外（dedupのみ・probe skipのみ・両方）は「@」0件 | **確定**。二重actuation解消・idle-conv-check probe skipのいずれか単独で「@」を防ぐのに十分 | 8405ce73 |
+
+**学び**:
+- **「1回のテストセッションで複数条件を自動ローテーションする」設計は、
+  単体トグルより効率的だが、対象事象自体が持つ周期性とローテーション
+  周期のエイリアシングという、単体トグルでは起こり得なかった新しい
+  失敗モードを持ち込む。** 今回は「物理キーが2方向に厳密に交互する」
+  という前提を見落としたまま「4条件を均等に回す」設計を組んでしまい、
+  2回の実機ラウンドを無駄にした。複数条件の自動巡回を設計する際は、
+  「巡回対象の物理現象自体に既知の周期性がないか」を先に確認すべき
+  だった。
+- ユーザーの「奇数回目で必ず@が出る」→「つまりIME OFFのときに必ず」
+  という言い換えが、机上のログ解析だけでは気づけなかった「コンボ周期と
+  押下方向周期のエイリアシング」という真の原因への最短経路だった。
+  実機を操作している人間の言葉による現象の言い換えは、ログ解析より
+  先に構造的な仮説を絞り込めることがある。
+- 63トライアルという中規模のサンプルサイズで「baseline以外は0件」という
+  明確な結果が得られたことで、round1レビューMajor 7が繰り返し警告して
+  きた「少数試行での偽陰性」の罠を今回は回避できた——これは実装バグを
+  2回踏んで遠回りした代償として、最終的に十分な試行数を積み上げる
+  結果になったという側面もある。
+
+---
+
+## エントリ 23: BUG-116「Shift+かなでカタカナにならない」— Opus 2体敵対的レビューでv1修正案（Shift弁別軸）を取り下げ、診断スパイクに切り替え
+
+**背景**: ユーザー報告「Shift+かなでカタカナにならない」を発端に調査。
+`git log` の掘り下げで、BUG-52修正（2026-08-05）が `VK_DBE_*` のKeyDownを
+Shift押下有無を見ずに常時Suppressするようにしたリグレッションらしいと
+特定し、`!event.modifier_snapshot.shift` を条件追加するv1修正案を
+ADR-137として起票した。ユーザー指示によりOpus 2体（architect/premortem
+役）で敵対的レビューを4ラウンド実施。
+
+| 日付 | 仮説 | 環境 | 変更 | 観測結果 | 判定 | コミット |
+| --- | --- | --- | --- | --- | --- | --- |
+| 2026-09-05 | 「BUG-52はShiftなし、BUG-116はShiftあり」という前提が正しければ、`is_dbe_mode_key_down`に`!event.modifier_snapshot.shift`を足すだけでBUG-52を再発させずBUG-116が直る | 未検証（実機投入前） | ADR-137 v1として起票、Opus 2体レビューへ | round1でpremortemが「BUG-52実機ログに修飾キー状態が無く前提が未検証、しかもBUG-52自身『0xF1/0xF2交互生成の条件未解明』と矛盾しうる」（B-1）、「`reinject()`は常時`wScan:0`で送るためAllowでも実IMEに届かない可能性」（B-2）、「報告者アプリがStandard/ImmCrossなら無関係」（B-3）、「`modifier_snapshot.shift`のstuck実績でゲートが恒久無効化されうる」（B-4）を指摘。round2でarchitectがB-2を「premortemの想定より深刻（フックは通常時つねに元イベントを消費しCallNextHookExで直接届く経路は存在しない）」と自ら実装確認の上で追認・前回の自分の主張を撤回 | v1修正案を**取り下げ**。「確定した修正」ではなく「実機で検証する診断スパイク」へ方針転換 | ADR-137初版 |
+| 2026-09-05 | ユーザー指示「1回の実機セッションで全判断材料を取り切れる設計に」を受け、環境変数2軸（Allow/Scan）を直交させたスパイクなら1ビルドで複数条件を実機検証できる | 未検証（実機投入前） | round3でpremortemが安全面のBlocker 2件を追加指摘: scan付きDBEキー注入はJISかな入力ロックへの不可逆固着ハザードを持つが、それは`always-scan`固有ではなく`shift-scan`も同じ経路を踏む（SB-1）。復旧に使うAlt+かなはawase自身が既定で常時swallowするため、awase稼働中は復旧操作自体が効かない（SB-2、architectが`hook.rs`実装を確認し「Alt押下の有無に関わらず常時swallow」と裏取り、premortemの想定より深刻と確定） | round4でSB-1（scan付与をVK_DBE_KATAKANA単体・実IME ON判定・かなロック検出abortの3段ゲート付きに限定）・SB-2（手順書冒頭に「awase Exit→Alt+かな→再起動」を必須明記）を反映して収束。実装（`diag/bug116-shift-katakana`ブランチ、2コミット）はcargo check/clippy/fmtすべて通過確認済み | **設計収束・スパイク実装完了。develop非マージ、実機データ待ち** | `diag/bug116-shift-katakana` |
+
+**学び**:
+- **コード読解だけで組み立てた「AとBはXという1軸で区別できる」という
+  弁別仮説は、両方の実機ログに当の軸（今回はShift状態）が実際に記録
+  されているかを確認するまでは「もっともらしい」以上の地位を持たない。**
+  BUG-52の記述に「Shiftなしで」と書かれていても、それ自体が当時の
+  観測者の言葉による要約であって、生ログの`mods(s=)`フィールドを見た
+  結果ではなかった。
+- **「Allowを返せばOSに届く」という配送経路の理解が誤っていたことが、
+  設計全体の前提を揺るがした。** `executor.rs::enqueue_reinject`の
+  docコメントが「通常hook経路ではCallNextHookExで直接届く」と誤って
+  記載しており、この誤解がADR-137 v1の「Shiftで弁別できれば直る」という
+  楽観に無自覚に効いていた。ドキュメントの古い誤りが新しい設計判断を
+  静かに歪める典型例。
+- **「復旧手段そのものをシステム自身が無効化している」という安全設計の
+  穴は、個々の機能（BUG-52対策・BUG-62のAlt+かなswallow）を単体で見ている
+  限り絶対に気づけない。** 両方を横断してレビューして初めて「JISかな
+  固着に落ちたらawase稼働中は復旧不能」という結論が出た。安全性レビューは
+  変更対象の機能だけでなく、その機能が依存する復旧経路・フォールバック
+  経路まで含めて横断的に見る必要がある。
+
+---
+
+## エントリ 24: BUG-116「Shift+かなでカタカナにならない」— 実機投入で決定確定、本実装がBUG-115のdelegate機構との衝突を新たに発見
+
+**背景**: エントリ23の診断スパイク（`diag/bug116-shift-katakana`）を実機
+（TsfNative+GJI）に投入し、v1で取り下げた前提を検証した。並行してdevelopが
+BUG-115（ひらがな/カタカナキーの親指キーdelegate機構）をマージしたため、
+本実装（`fix/bug116-shift-katakana-return`）はこの新機構との整合性を
+新たにOpus 2体（architect/premortem役）でレビューした。
+
+| 日付 | 仮説 | 環境 | 変更 | 観測結果 | 判定 | コミット |
+| --- | --- | --- | --- | --- | --- | --- |
+| 2026-09-05 | `AWASE_BUG116_ALLOW=shift`のみ（scanは変更しない）でShift+かな→カタカナが動くはず | TsfNative×GJI、報告者環境相当 | 環境変数でAllowスコープをShift限定に切替 | ユーザー報告「Shift+かなでカタカナになりました」。ログで`vk=0xF1 shift=true physical=Allow`を確認 | **成立**。scan付与は一切不要と判明、SB-1のハザードあるモードは試す必要なし | `diag/bug116-shift-katakana` |
+| 2026-09-05 | カタカナに入った後、物理かなキー単独でひらがなに戻せるはず | 同上 | （挙動変更なし、観察のみ） | ユーザー報告「カタカナに固着してひらがなに戻せなくなりました」（カタカナ変換モード固着、IME UI操作で復旧） | **反証**。GJI環境で物理`VK_DBE_HIRAGANA`が`needs_f2_probe()`により常時Suppressされる既存仕様が、カタカナ突入を許したことで新たに露出した | 同上 |
+| 2026-09-05 | `effective_open() && !shadow_toggled && is_composition_warm()`条件で`send_gji_half_width_alnum_toggle(Exit)`を能動注入すれば戻せるはず | 同上 | `AWASE_BUG116_HIRAGANA_RETURN=open`でひらがな復元候補を追加 | ユーザー報告「Shift+かなでカタカナになって、かな単独打鍵でちゃんとひらがなに戻りました」。BUG-52非再発（Shiftなし連打で`vk=0xF1`は一度も観測されず）も確認 | **成立**。決定1/2として確定 | 同上 |
+| 2026-09-06 | develop先端（BUG-115マージ後）に本実装をポートするだけで良いはず | コードレビューのみ | `fix/bug116-shift-katakana-return`をdevelop先端から新規作成、Opus 2体で設計レビュー | 両エージェント独立に「ひらがな/カタカナキーを親指キーに設定しBUG-115のdelegateがarmedな構成では、決定2が**NICOLAの打鍵ごとに**`VK_DBE_HIRAGANA`をSendInputする回帰になる」と指摘（B-1）。さらに`half_width_alnum_toggle_active`ガードを`plan()`呼び出し時点のライブ値で読むと、`kp_stage_shadow_ime_toggle`の委譲により同一イベント処理内で必ずfalseに落ちてガードが無効化される実行順序バグ（B-2）も発見。決定2が使う`send_gji_half_width_alnum_toggle`はscan付き注入でありADR-100決定2/ADR-098 F4/BUG-50が意図的に置き換えた注入パターンを別経路で復活させる点も判明（B-3） | Blocker 3件を`is_configured_thumb_key`ガード（決定1/2両方）・`kp_stage_shadow_ime_toggle`実行前のスナップショット・ADR記述訂正で解消して実装確定 | `fix/bug116-shift-katakana-return` |
+
+**学び**:
+- **実機での成功確認は「今の環境で動く」ことの証明であって「安全に出荷
+  できる」ことの証明ではない。** スパイクで実機確認が取れた後も、develop
+  が先に進んでいれば（今回はBUG-115のdelegate機構）新しい衝突面が生まれる。
+  本実装に着手する直前に必ず「この修正が触れるコード領域に、実機検証時点
+  から今までに何が追加されたか」を確認すべきだった。
+- **「カタカナに入れる」修正と「ひらがなに戻せる」修正はワンセットでない
+  と半端な機能になる、という直感は正しかったが、実機で確認するまで
+  気づけなかった。** 机上レビュー（Opus 4ラウンド）ではこの副問題は
+  一度も指摘されず、実機投入して初めて発覚した。「入る/出る」が対称な
+  操作は、片方だけを実機確認して満足せず、往復で確認する習慣が要る。
+- **同じ物理キーがFSM層とtransport層で二重の意味を持ちうる、という
+  アーキテクチャ上の構造的リスクは、新機能（BUG-115）と既存の配送判断
+  （BUG-52対策）が互いを知らないまま独立に開発されたことで顕在化した。**
+  「配送判断とチョード処理は独立レイヤー」という設計原則自体は健全だが、
+  独立しているからこそ「同じキーに二重の意味を持たせる新機能」を追加する
+  際は、既存の配送判断側にその新機能の存在を伝えるガードが必要になる
+  ——独立性は「互いに影響しない」ことではなく「互いを明示的に調整しない
+  限り衝突しうる」ことを意味する。
+
+## エントリ 25: ADR-153決定1「ケース3」— 「@」再現の原因をCtrl+無変換のdevelop回帰と誤診断しかけたが、実機A/B切り分けで単発SendInputが十分条件と確定、ケース3自身の設計欠陥と判明
+
+**背景**: ADR-153決定1（無変換/変換単独タップの明示IME config）実装後の実機
+検証で、ケース3（`"off"`×belief既にOFF）で「@」が再現し続ける未解決症状が
+残った。切り分けのため無関係な既存機能`Ctrl+無変換`を押したところ同様に
+「@」が再現し、当初は「develop側の未解明の回帰」と誤って推測した
+（`docs/known-bugs.md` BUG-113節に一度誤記として記録）。
+
+| 日付 | 仮説 | 環境 | 変更 | 観測結果 | 判定 |
+| --- | --- | --- | --- | --- | --- |
+| 2026-09-08 | コード読解のみ: `explicit_ime_action_target`が修飾キーを見ないため、Ctrl+無変換がケース3に横取りされる | コードレビューのみ | なし | Opus敵対的レビューで「`Ctrl+無変換`は`keys.ime_detect`のSyncKeyではなく`keys.ime_off`の既定コンボであり、`Engine::match_event`の二重処理ガードが`explicit_ime_action_consumed`を素通りするため独立した二重actuationが起きている」と指摘（B1/B2）、加えて救済defer機能の退行（B3）も発見 | **部分的に成立**（横取り自体は事実）だが、「@」の直接原因の説明としては不十分と判定、実機検証が必要と結論 | 
+| 2026-09-08 | config未設定（develop相当）でCtrl+無変換を連続で押すと「@」は最初の1回だけ、config="off"（ケース3有効）だと毎回出るはず | dragonflyg4、Windows Terminal + GJI | `diag/adr153-case3-ctrlmuhenkan-experiment`（診断ログ+`AWASE_DIAG_CASE3_SUPPRESS_ONLY`トグル追加、commit `f8bf6cb0`）でPhase1(config None)/Phase2(config off)を実施 | 予測通り: config Noneでは初回のみ、config offでは毎回「@」再現。ログで「Ctrl+無変換は`keys.ime_off`ホットキーとして毎回decision自体は発生するが、実SendInputは本物のON→OFF遷移時のみ」「ケース3は`shadow_on: None`バイパスで毎回強制actuateする」ことを確認 | **成立**。ケース3の「毎回強制送信」設計が「@」を毎回に格上げしている |
+| 2026-09-08 | 生キーをSuppressしつつ実送信を止めれば（suppress-only）、無変換単独タップの「@」も消えるはず | 同上 | Phase3: `AWASE_DIAG_CASE3_SUPPRESS_ONLY=1`で無変換単独タップ・Ctrl+無変換を実施 | 無変換単独タップは「@」が完全に消えた（実送信ゼロなら誘発しない）。Ctrl+無変換は最初の0〜1回だけ再現（ケース3とは無関係な`keys.ime_off`ホットキー自体の独立した挙動、Phase1と整合） | **成立**。「単発のIME制御SendInputが1回でも飛べば『@』を誘発するのに十分」が確定、二重送信は必要条件ではなかった |
+
+**学び**:
+- **「本ADRのコードとは無関係な既存機能でも症状が再現する」という観察は、
+  「develop側の回帰」を意味しない。** むしろ「これは本当にADR-153固有の
+  問題か、pre-existingのbaseline挙動か」を先に実機A/Bで切り分けるべき
+  だった——コードレビューだけで「二重処理ガードの穴」を見つけた時点で
+  「ケース3が原因」と結論づけたくなるが、実際には「単発SendInputで十分」
+  という、より単純で根本的な機序が背後にあり、二重処理ガードの穴は
+  「occasional→毎回」への格上げ要因の一つに過ぎなかった。
+- **「抑止漏れでもactuation遅延でもない」ことをログで確認しただけでは
+  「原因不明」を確定させない。** 送信自体は設計通り正しく1回だけ発火して
+  いても、その「正しい1回の送信」自体が症状の直接原因でありうる
+  （BUG-113/ADR-149が確立した「重複送信が引き金」という機序モデルは、
+  今回「単発でも十分」という、より緩い十分条件へと更新された）。
+  suppress-onlyのA/Bテスト（生キーSuppress + 実送信ゼロ）が、この
+  区別をつける決め手になった。
+
+**追記（2026-09-08、対応完了・ただし1往復の反転あり）**: 上記の学びに
+基づき、ケース3（"off"×belief既にOFFの強制actuate、`kp_stage_shadow_
+ime_toggle`）を撤回した（`crates/awase-windows/src/runtime/key_
+pipeline.rs`）。Ctrl+無変換の独立バグは`docs/known-bugs.md` BUG-121
+として新規記録し、診断ブランチ`diag/adr153-case3-ctrlmuhenkan-
+experiment`（worktree・ローカル・リモート）は破棄した——実験結果は
+このエントリと known-bugs.md 双方に残っているため、診断コード自体
+（`AWASE_DIAG_CASE3_SUPPRESS_ONLY`等）を保持する必要はないと判断した。
+
+**追記2（2026-09-08、全面撤回が上記Phase3の教訓を見落としていたと判明、
+BUG-124）**: 上記の全面撤回（生キーの抑止も含めて撤去）を実機ビルドし
+再検証したところ、「@」が再現し続けた。原因は、抑止まで撤去した結果、
+GJI自身が無変換/変換キーを生で受け取るようになったこと——**まさに
+上記Phase3の実験結果（「生キーをSuppressし、かつ何も送らなければ
+『@』は完全に消える」）が示していた「抑止自体は無害、問題は強制
+actuateの方」という結論を、全面撤回の設計時に見落としていた**。
+「抑止はする・actuateはしない」の形に再設計し、`docs/known-bugs.md`
+BUG-124として詳細を記録した。この実験ログに実測済みの事実が既に
+書かれていたにも関わらず参照せず早合点したこと自体が教訓——
+実験結果は「その場で使う」だけでなく「次の設計変更の前に読み返す」
+ためのものであることを再確認した。
+
+## エントリ 26: ADR-186「GJI(ATOK)無変換/変換の押下時点belief追随」— 実機E2Eの撤去実験で、必須の仕組み4つ・不要の仕組み1つ・検証不能の領域を確定
+
+**背景**: ADR-184/185/179決定2は「ATOKの無変換はIME ONのまま半角英数にする」を前提に設計していたが、
+awase非依存のスパイク（`crates/awase-windows/examples/ime_key_matrix_spike.rs`）で測ると、実機GJIは公開Mozcの
+`atok.tsv`どおり（入力なしの無変換/変換=開閉トグル、ひらがな=かな⇔半角英数トグル）だった。決定2（親指の単独タップで
+open軸へdelegate）を実機で試すと動かず、E2Eハーネス（`tools/e2e/ime_key_matrix`、SendInput注入+awaseログ照合）で
+切り分けた。以下は実装ブランチにコード撤去（`ablations/`）を当てた実機A/B。
+
+| 日付 | 仮説 | 環境 | 変更 | 観測結果 | 判定 |
+| --- | --- | --- | --- | --- | --- |
+| 2026-09-20 | 決定2が動かない原因は、タイマー(100ms)で解決した単独タップのSetOpenがbelief書き込み・明示意図の記録を持つキーボード経路を通らず、warrantが`Unwarranted`でOFFを拒否すること | Win32 EDIT×GJI(ATOKプリセット)、押下保持180ms、各3回 | E1: delegateを持つ親指の単独タップをKeyUpで解決する述語を元に戻す(`defers_solo_until_release`) | 3/3 FAIL（手順5のOFFが効かず、awaseがONを再送） | **必須**（採用、`2b93e185`） |
+| 2026-09-20 | ATOKでは古い`custom_keymap_table`（`DirectInput Henkan IMEOn`）を読んではいけない | 同上、変換キー | E2: ATOK分類修正(`gji_charset_autodetect.rs`)を戻す | 3/3 FAIL（各5件、変換が`On`と誤分類されbeliefが実IMEのOFFに追随しない） | **必須**（採用、`bff621b5`） |
+| 2026-09-20 | eisu reset抑止（直接入力から無変換でONにしたとき`PostSetOpenEisuReset`でEngineがONになるのを防ぐ、`f5f78dfb`）は必要 | 同上 | E3: 抑止を撤去 | 3/3 ALL PASS。抑止ログ（`reset を抑止`）はE2E全実行で1度も発火せず | **不要**、削除（`3f9b313e`、デッドコード） |
+| 2026-09-20 | eisu resetの全経路(3種)も不要では | 同上 | E4: `eisu_reset_on_ime_on`/`_on_turn_on_while_open`を常にNone | 3/3 ALL PASS | Win32では不要だが**検証不能**（Edge/TsfNative向けの循環デッドロック対策を兼ねる。IMMでconvを読めるEDITでは再読み取りが同じ役割を果たす）。**統合しない** |
+| 2026-09-20 | 物理IMEキー通過後の20ms IME再読み取りは、ひらがなキー後のEngine追随に必要 | 同上 | E5: `schedule_ime_refresh(20)`を撤去 | 3/3 FAIL（手順7・9のEngine追随なし） | **必須**（決定3の予測反転は不要と確定） |
+| 2026-09-20 | idle-conv-checkも不要では | 同上 | E6: `idle_check.rs`を常にfalse | 3/3 ALL PASS | TsfNative限定機構でEDITでは未使用のため**検証不能**。統合しない |
+| 2026-09-20 | opt-in `gji_thumb_key_ime_toggle=true`は不要では | 同上 | E7b: falseで実行 | 3/3 FAIL（`delegated`=0、手順5・6） | **必須** |
+| 2026-09-20 | 押下の取りこぼし(BUG-147)はawase起動時だけ起きる(GJI単体0/12、awase起動6/12失敗) | Win32 EDIT × GJI(ATOK) | 旧A/Bの再検証: 高速ハーネス(`run_loop.sh`、awaseログの物理キー混入を無効判定)で基準ビルド・A7ビルドを測定 | 基準0/24、A7 0/48失敗で再現せず。旧A/Bはawaseログに人の物理入力の混入が7/24回あり、GJI単体側は検査不能で非対称だった。A7(`reinject`の`wScan`引き継ぎ)は採用せず | **旧結論を撤回**(混入が原因の可能性、awase固有ではない) |
+| 2026-09-20 | Shift+無変換はGJI(ATOK)でかな⇔半角英数トグルだが、awaseが開閉トグルとして横取りする | 同上、`gji_thumb_key_ime_toggle=true`、`spike --shiftmuh` 24押下 | 修正前: かなON中に委譲でSetOpen(false)(4/4)、IME OFF中にintent昇格でON(4)。修正: FSMのShift素通し+修飾キー付きは分類上書きなし(`b195b47a`) | 修正後24押下: 開閉が変わった0件・委譲0・昇格0、かなON中は半角英数へ(GJI本来)。通常10手順の回帰12/12 PASS | **採用**(修正済み) |
+| 2026-09-20 | Win32 EDITで通ったモードキーの追随は、TsfNative(Chrome)でも同じ | Chrome(専用プロファイル、scoop版) × GJI(ATOK)、awase起動(Shift修正入り)、`chrome_probe`で8ケース×3周 | 新規: 打った文字で状態を判定するプローブ(`k`,`a`→NICOLA/`か`/`ka`/`kiu`) | 無変換/変換・Shift+無変換のOFF中は18/18 PASS。かな→半角英数(ひらがな/Shift+無変換)はEngine未追随で6/6失敗(`kiu`)。awase停止24/24 PASS。待ち2秒でも4/4失敗(抑止窓1500msでは説明できない) | **BUG-149起票**(決定3の再検討が必要、未修正) |
+
+**学び**:
+- **opusレビューが「問題なし」と判定した実装も、実機E2Eで反証された。** 決定2は押下時点のbelief追随を
+  前提にレビューされたが、実際の失敗はタイマー経路（`execute_from_loop`）に限って起きていた。押下時点/タイマー経路の
+  両方を実機で通すE2Eを持たないと、この差は見えない。
+- **少数回のPASS/FAILで撤去の是非を決めない。** 基準構成にも約27%のフレークがあった（原因は別件、BUG-147、
+  awase起動中のみ物理キー1押下がGJIに届かない）。有効な回（INVALID＝フォーカス移動や物理入力の混入を除く）を数えること。
+- **撤去実験で「効いていない」機構は、効いていないことと検証できないことを分けて書く。** E3は発火ログ0件で
+  デッドコードと証明できたが、E4/E6はEDITでは使われないだけで、TsfNative/Chromeでの要否は未確認のまま残した。
+- 撤去実験は`tools/e2e/ime_key_matrix/ablations/`と`.github/workflows/e2e-ime.yml`（GitHub-hostedのWindowsランナー、
+  `ci/e2e-ime`ブランチ）で再実行できる。実機を占有せず、構成×3回を並列に回せる。
+
+## エントリ 27: ADR-179 Passthrough設定の実験4件(FollowOnly belief追随等)を、developマージ前に撤去(revert)
+
+**背景**: `feat/adr178-mode-key-actuation-and-tsfnative-rescue-teardown`上で、ユーザー指示により、無変換/変換の単独タップを
+Passthroughにする設定(`muhenkan_solo_tap_always_suppress = false`等)を前提とした実験コミット4件を、実機で試していた。
+本ADR(ADR-179)の決定ではない実験のため、developへマージする前に撤去し、既定(Suppress)の挙動へ戻す(ADR-179「実装状況と実験コミット」節のマージ前TODO)。
+
+| 日付 | 仮説 | 環境 | 変更 | 観測結果 | 判定 |
+| --- | --- | --- | --- | --- | --- |
+| 2026-09-19 | 単独タップpassthrough辞退をTurnOff/Toggleにも拡張(`b9e45e55`)、FollowOnly belief追随を新設しToggleは辞退対象から除外(`176d37af`)、親指キー設定×IME OFF時もPhysicalDeliveryに一般化(`c0814776`)、Henkan/MuhenkanのSuppress設定は方向を問わず完全に無視(`f0e36b0e`)すれば、Passthrough設定でもEngineがIME状態に追随する | Windows実機(dragonflyg4)、GJI、Passthrough設定(`*_solo_tap_always_suppress=false`) | 上記4コミット | 実機で試行(ユーザー指示)。**失敗条件の観測は無い**(本ADRの決定ではなく、developへ入れない実験のため撤去する)。ATOKのPassthroughでEngineが追随しない問題は、ADR-186/187のCI実機E2Eで原因(意図の固定・読み直しの契機なし・typing-idleガード)を特定し、別の実装(通過マーク+観測+意図の無効化、`shadow_action`なしのキーに限定)で解決した | 撤回(revert)。ADR-187のfollow方式に置き換え |
+
+**学び**:
+- FollowOnly(方向固定のTurnOn/TurnOffだけbeliefを予測で書く)は、ATOKの状態依存(入力中は開閉が変わらない)のToggleには使えないと分かり、
+  Toggleは観測に基づくfollow(ADR-187)へ、方向固定のキーはbeliefトグル(ADR-189、GJIの半角/全角)へ分けた。
+- 実験コミットをdevelopへ入れる前に撤去する運用(このエントリ)は、同種の実験(Passthrough等)が本決定と混ざらないようにする。
+
+## エントリ 28: ADR-191 半角/全角トグルの「appliedとbeliefの食い違い時は shadow_action を付けず生キーを通す」ガード(`b28c8b9f`)を撤回(`4378b061`)
+
+**背景**: `cal-verify-blind`(Edit→Imm32Unavailable、GJI)のずれが 0%→10〜15% に悪化した(BUG-155)。切り分けで、実IMEが変わらなかった7押下のうち5件は、
+belief=実IME(ON)でトグル(true→false)を決めたのに、GjiDirect が「shadow already OFF, skip」で VK_IME_OFF を送らず、物理キーは Suppress 済みのため実IMEが変わらない、ことが分かった。
+`4378b061` は revert コミットで、本文が `git revert` 自動生成のままだった(experiment-logging 違反)。履歴は書き換えず、失敗条件をここに補う(レビュー指摘B-m1/C-M2)。
+
+| 日付 | 仮説 | 環境 | 変更 | 観測結果 | 判定 |
+| --- | --- | --- | --- | --- | --- |
+| 2026-09-21 | `enrich_ime_relevance` で `belief_conflicts_with_applied`(applied 既知かつ belief と不一致)のとき 0xF3/0xF4 に Toggle の shadow_action を付けず、生キーを IME へ通せば、読めない窓のずれが消える(`b28c8b9f`) | GJI(MS-IME プリセット)、`cal-verify-blind`(Edit→Imm32Unavailable、読めない窓)、awase 起動、半角/全角を交互に押す。失敗した状態: applied=OFF(前回の書込み)のまま belief が予測(`KeyEffectPredicted`)で ON へ動いた後の押下 | 上記ガードを追加(純関数1つ+条件1つ) | ガードは症状(トグルが飛ぶ)を隠すだけで、原因(予測が belief だけを動かし `applied` が古いまま残る=already-matched 判定が誤る)は残った。ユーザー判断「ズレの原因を直すべき(ガードではない)」により撤回し、根本の `ImeModel::reduce` の `KeyEffectPredicted` で `applied` を Unknown に落とす修正(`ba6144a6`、BUG-156)に置き換えた | **撤回**(`4378b061`)。同じ「beliefが怪しいときトグルをやめる」ガードを再導入しないこと |
+
+**学び**:
+- 「送信を省略してよいか」の判定は陽性の確認済み証拠(`applied` の確認済み値)にのみ基づかせる。予測が belief を動かすなら、`applied` も同時に「未知」へ落とす(ADR-098 決定1-b の罠と同型)。
+
+## エントリ 29: フォーカス変更時の強制OFF(`ime_refresh.rs` の `focus_change_enforce_off`)を撤去(`cedcdb04`)
+
+**背景**: 失敗による revert ではなく、実質 no-op の入口の撤去。詳細な試行4件と限界は [ADR-191 補助資料「A/B-1」](adr/191-calibration-experiments.md)。
+
+| 日付 | 仮説 | 環境 | 変更 | 観測結果 | 判定 |
+| --- | --- | --- | --- | --- | --- |
+| 2026-09-25 | 新窓へフォーカスが移った時に belief=OFF を IME へ押し込む書き込みは、撤去しても「Engine OFF なのに IME ON」を悪化させない | GJI(ATOK)、windows-latest CI、pwsh EDIT / notepad、4通りの試行(A/B) | ブロックを撤去 | 意図なし・belief OFF・新窓 ON の場面では warrant が OFF を必ず拒否(`sent=false`)し、撤去前後で差なし。再導入は warrant を緩める=ADR-191決定1違反。未検証: 実機、OFF意図 TTL(30秒)内に同じ窓へ戻る場面(撤去後は drift correction が約400ms遅れて OFF) | 撤去(ユーザー判断)。実機で不具合が出れば BUG 起票して再検討 |
+| 2026-09-29 | ADR-100 F16 群C(eager warmup 全面無効)の一部として、Ctrl↑ 契機の `VK_IME_ON` 再送を撤去しても cold-start が悪化しない | GJI、Windows Terminal(TsfNative)、報告 01M3NJYRQ5ZBYTKV55FV06KETP | `CompositionEvent::CtrlUp` 経路を撤去(BUG-174) | 実機未検証(WezTerm「この→kおの」再発と Ctrl+Shift の「@」消失が未確認) | 未判定 |
+| 2026-09-29 | 物理F2を素通しにし、F2に併走する`VK_IME_ON` warmup・確定キーの二重warmupを撤去しても cold-start が悪化しない（cold-startの安全網はper-VK confirm/literal回収） | GJI、Windows Terminal(TsfNative)、報告 01M3NJ784NKMH120HM6QGKF7W7(v1.21.0) | `plan()`のF2分岐をAllow化、`ConsumeF2`・F2併走warmup・確定キーD段warmupを撤去(BUG-173) | 実機未検証。journalでは46発中、F2併走22・確定キー22(Enter1回で2発)を確認 | 未判定 |
+
+## エントリ 30: 予防的・補正的な IME actuation の撤去(ADR-212 P0〜P6、#398・#401・#402・#403・#404)
+
+**背景**: 所有者方針「awase は IME に書かない」。撤去の前に、全部止めたスパイク版(eager warmup・Unicode long-cold・reinit・drift 補正の書き込み)を CI と実機で develop と比べ、差が出ないことを確認した。詳細と判断は [ADR-212](adr/212-remove-preventive-and-corrective-ime-actuation-in-phases.md)、棚卸しは [actuation-inventory](tasks/actuation-inventory-2026-09-30.md)。
+
+| 日付 | 仮説 | 環境 | 変更 | 観測結果 | 判定 |
+| --- | --- | --- | --- | --- | --- |
+| 2026-09-30 | 確定キー・フォーカス変更・随伴の eager `VK_IME_ON`、give-up 後と Unicode long-cold の reinit(`VK_IME_OFF`→`VK_IME_ON`)、Unicode long-cold の `VK_IME_ON`+`VK_A`+BS と文字の保留、drift 補正の明示意図なしの書き込みを撤去しても、cold 直後の文字欠落・リテラル化は増えない | CI(windows-latest、GJI): sc-*・tsx-* 68 構成、tsx-edit/rich-gji-10ms-idle12s(Unicode 注入、12s idle)。実機 dragonflyg4(WT+GJI、NICOLA ON、10s 以上 idle を挟む `ka`→Enter) | 上記の撤去(#398 確定キー、#401 フォーカス変更・随伴、#402 reinit、#403 Unicode long-cold、#404 drift 補正を明示操作の再試行だけに) | CI: 68 構成が develop と差なし(失敗・リテラル化 0)。実機: eager `VK_IME_ON` 3→0(確定キーは 24→0)、欠落・SuspectedLiteral は増えず。drift 補正は実機の過去ログで書き込み 169 件が全て OFF 方向(開ける方向 0 件) | 採用(撤去済み)。未測定: 実機 LINE(Qt、Unicode 注入)の長い idle 後の1文字目、WezTerm、MS-IME 本体、Chrome の実機。欠けたら #403 を単独で revert |
+| 2026-09-30 | `ActivationSync`(Engine の遷移が自動で `SetOpen` を出す)を止めても壊れない | CI(同上、スパイク) | `engine.rs::transition_activation` で ActivationSync のとき SetOpen を出さない(スパイク、未マージ) | `sc-hz-*`・`sc-kanji-*`(半角/全角・漢字キー)が 3/3 失敗(2回押した後に反転しない)、`tsx-chromepage/tsf-gji-20ms-cold` が 10/10 失敗(リテラル 29)。起動直後の belief 仮定と shadow の同期を ActivationSync の書き込みが担っていた | 却下(単純には止められない)。P2 は設計を組み直す(起動時の実状態の観測、shadow の同期) |
+| 2026-10-01 | `ActivationSync` を `handle_engine_activation_sync` 先頭の gate で棄却すれば書き込みを縮小できる | CI(windows-latest)と実ログ | belief に基づく gate で pending・抑制窓・`EngineActivationSync` の記録を省く(spike、破棄済み) | 無効。`[activation-sync] skipped SetOpen(true)` の直後にも同じ打鍵の `GJI direct: send 0x0016`・`outcome=Applied` があり、decision の effect は `kp_stage_post_decision` の戻り値と無関係に `kp_stage_execute`→executor へ流れて実書き込みが続いた。「921件棄却」「退行なし」は書き込み停止の証拠ではない。spike の run 36790500185・36792622641・36793506089 は PR の土台と異なる古い develop 由来で、この結論の根拠にも使えない | 取り下げ(採用しない) |
+| 2026-10-01 | awase 起動後に作られたスレッドの初期 IME belief を閉と記録すれば、Chrome の最初のトグルを実状態に合わせられる | CI run 36803095123(中間 head)と最終 head の run 36805640317(同じ構成を再実行して同結果)(windows-latest、最新 develop=P0〜P6入り)。実 Chromeをawase起動後に起動し、IME操作なしで `k,a`。対照はawaseなし | GetThreadTimes の作成時刻がawase起動時刻より後で、分類済みhwnd/pidのスレッドを初めて見たとき、Imm32Unavailableのcache missでLow confidenceのHeuristicDefault「閉」を記録。適用は`SPI_GETTHREADLOCALINPUTSETTINGS==0`かつGJIまたは同定済みMS-IME本体(`table_ime_kind()`) | GJIは5/5 `ka`、`[thread-scope] applied=true reason=measured-shared-input-settings-and-ime`。対照はGJI・MS-IMEとも5/5 `ka`。修正前(develop、spike値)はGJI 5/5 `k`のみ、MS-IME 4/5 `kiu`(残り1回は結果行なし)。MS-IME構成はTIPを`MicrosoftIme (Other)`、`ime_kind=None`と同定したため`applied=false reason=unsupported-or-unidentified-ime`で対象外、5/5 `kiu`。Chrome UIスレッドは起動後約10.2秒(MS-IME構成は約11.7秒)に作成され、`snap_open`は読めなかった(TSF-native)。`sc-hz-*`・`sc-kanji-*`・`sc-reopen-*`(期待FAILのf2/nofixを除く)に退行なし。`tsx-chromepage-gji-20ms-cold`、`tsx-chromebar-gji-20ms-cold`、`tsx-edit-{gji,msime}-20ms-cold`、`tsx-rich-{gji,msime}-20ms-cold`、`tsx-tsf-{gji,msime}-20ms-cold`、`tsx-bugreport-{gji,msime}-20ms-cold`の実施10構成は各10回、計100/100、literal=0 | 条件付き採用。GJIはCIで検証済み。同定済みMS-IME本体にも適用されるが、CIのMS-IME構成はTIPを`MicrosoftIme (Other)`（IMM32 HKL）と同定して条件を満たさないため、**同定済みMS-IME本体×新スレッド=閉の経路はCIで一度も通っておらず未検証**。Windows 11実機で`[thread-scope] applied=true ime_kind=Some(MsIme)`→`ka`を確認する。回帰は`sc-p2-initial-chrome-*`(`chrome_probe --initial`)と単体テスト 備考: 最終 head の run 36805640317 で `sc-kanji-gji-atok` が3回中1回「手順の記録が1件もない」で失敗(ハーネスが自分の注入キーを照合できなかった。awase の起動が約8.4秒遅れ、キーフックの順序がハーネスの遅延インストールより後になった競合で、この変更とは無関係。PR ブランチで追加3回・develop で1回は全て成功)。 |
+| 2026-10-01 | shadow toggle の OFF→ON を明示書き込みにし(P2a)、`check_active_transition` 由来の ActivationSync の SetOpen を止めれば(P2b)、書き込み全停止で出た sc-hz/kanji 退行なしに ActivationSync を撤去できる(ADR-213) | CI(windows-latest)`sc-*`、スパイク `spike/adr213-p2ab` 対 同じ土台 develop `59a5072c`(run 36821856542 / 36823311616、再確認 36824786852) | P2a: `kp_shadow_actuate` に ON/OFF 統合・`ShadowToggleOn`・applied 降格・同一目標 SetOpen の strip。P2b: `transition_activation(emit_set_open)` で `check_active_transition` 由来だけ SetOpen を出さない(スパイク→P2a は PR #408) | 期待表は develop と同一(sc-hz/kanji/dbe/shift は MS-IME 本体・GJI+MS-IME・GJI+ATOK で 3/3 PASS)。I2 Unwarranted は develop の複数構成(`sc-reopen-tsf-msime-gap600` 17件・`sc-adr209-chrome-msime` 3件等、全て `origin=ActivationSync`・`execute_from_loop`・`eff=false conf=true`)が 0 件。I3(自己注入)は同数か減、`sc-hz-msime-native` のみ 0→1(新設の明示 ON)。`i4_gji_fsm_off_cold_composition` 超過は develop にも同件数、`sc-reopen-tsf-gji-henkan-gap600` run3 の単発 i4 は再実行 3/3 で再現せず。**未検証**: 実機、起動前から存在する窓の `ka` リテラル(決定6)、StaleConfirm 件数 | 採用(P2a を PR #408 で本実装) |
+| 2026-10-01 | focus 遷移の settle 中に明示操作の SetOpen を落とす strip(`strip_ime_set_open_if_settling`+`handle_engine_set_open` の settle フィルタ、ADR-213 C3)を外しても、Chrome が settle 直後の書き込みを受け付ける(ADR-213 P2d-2) | CI(windows-latest)Chrome×GJI(ATOK プリセット)・Chrome×MS-IME 本体、run 36846631891(`spike/adr213-p2d2-settle-explicit`、マージしない) | `AWASE_SPIKE_NO_SETTLE_STRIP=1` で strip と belief 側 settle フィルタを外す。ハーネス: Chrome 前面化→helper 窓へ focus 外し→T=50/150/300/450ms 後に Ctrl+変換/無変換単独/半角全角を押下(各5回) | Ctrl+変換を focus 検知の約20ms後に押すと strip あり 5/5 が落ちて IME が開かず(`ka`)、strip なしは GJI・MS-IME とも 5/5 受け付けられた。約120ms後(t150)以降は strip が働かず両方 PASS。無変換単独は構成に開閉割り当てが無く測定不能、半角全角は t50 が focus 検知前で測れず。n=5。Alt+Tab 中間窓への明示操作は未測定 | 採用(P2d-2 本実装で strip と settle フィルタを明示操作についてまとめて撤去) |

@@ -262,7 +262,7 @@ fn parse_symbol_romaji(
         .filter_map(|(k, v)| {
             let mut chars = k.chars();
             let (Some(ch), None) = (chars.next(), chars.next()) else {
-                log::warn!("macos_symbol_romaji: key \"{k}\" must be a single character");
+                tracing::warn!("macos_symbol_romaji: key \"{k}\" must be a single character");
                 return None;
             };
             Some((ch, v.clone()))
@@ -272,7 +272,7 @@ fn parse_symbol_romaji(
 
 fn warn_if_key_content_logging_enabled() {
     if awase_macos::diagnostics::key_content_enabled() {
-        log::warn!(
+        tracing::warn!(
             "{}=1: diagnostic logs may contain physical key codes and typed text; \
              do not share them without review",
             awase_macos::diagnostics::KEY_CONTENT_ENV
@@ -280,47 +280,8 @@ fn warn_if_key_content_logging_enabled() {
     }
 }
 
-fn main() -> Result<()> {
-    // 1. Initialize logging
-    // ms 精度: IME 切替の settle 窓（数十 ms）と打鍵の前後関係を読むには
-    // 既定の秒精度では足りない（BUG-101 の調査で判明）
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format_timestamp_millis()
-        .init();
-
-    warn_if_key_content_logging_enabled();
-
-    log::info!("awase-macos starting");
-
-    // 2. Load config
-    let config_path = resolve_resource("config.toml")?;
-    let config = if config_path.exists() {
-        log::info!("Loading config from: {}", config_path.display());
-        AppConfig::load(&config_path)?
-    } else {
-        log::warn!("config.toml not found, using defaults");
-        let toml_str = "[general]";
-        toml::from_str(toml_str).context("Failed to create default config")?
-    };
-    let (config, warnings) = config.validate();
-    for w in &warnings {
-        log::warn!("Config: {w}");
-    }
-
-    // 3. Resolve key names to macOS keycodes
-    let left_thumb = key_name_to_keycode(&config.general.left_thumb_key)
-        .with_context(|| format!("Unknown left thumb key: {}", config.general.left_thumb_key))?;
-    let right_thumb = key_name_to_keycode(&config.general.right_thumb_key).with_context(|| {
-        format!(
-            "Unknown right thumb key: {}",
-            config.general.right_thumb_key
-        )
-    })?;
-
-    // 4. Set thumb keycodes for hook classification
-    awase_macos::hook::set_thumb_keycodes(left_thumb, right_thumb);
-
-    // 5. Load .yab layout
+/// `.yab` レイアウトを読み込み、打鍵列構文を解決し、macOS 向けの置き換えを施す。
+fn load_layout(config: &awase::config::ValidatedConfig) -> Result<YabLayout> {
     // .yab は JIS 物理位置ベースのため Jis 固定（keyboard_model 設定は 2026-07-06 撤去）
     let keyboard_model = KeyboardModel::Jis;
 
@@ -328,9 +289,18 @@ fn main() -> Result<()> {
     let layout_path = resolve_resource(&layout_rel.to_string_lossy())?;
     let mut layout = if layout_path.exists() {
         let content = std::fs::read_to_string(&layout_path)?;
-        YabLayout::parse(&content, keyboard_model)?.resolve_kana()
+        let layout = YabLayout::parse(&content, keyboard_model)?.resolve_kana();
+        let (layout, keystroke_warnings) = awase::yab::resolve_keystroke_syntax(
+            layout,
+            &config.keystroke_macro,
+            config.general.keystroke_sequence,
+        );
+        for w in &keystroke_warnings {
+            tracing::warn!("Layout ({}): {w}", layout_path.display());
+        }
+        layout
     } else {
-        log::warn!(
+        tracing::warn!(
             "Layout file not found: {}, using empty layout",
             layout_path.display()
         );
@@ -348,6 +318,63 @@ fn main() -> Result<()> {
             *value = awase::yab::YabValue::Literal("・".to_string());
         }
     }
+
+    Ok(layout)
+}
+
+/// ms 精度: IME 切替の settle 窓（数十 ms）と打鍵の前後関係を読むには
+/// 秒精度では足りない（BUG-187 の調査で判明）。tracing_subscriber の既定の
+/// タイマーは µs 精度なのでそのまま使う。出力先は従来どおり stderr
+fn init_logging() {
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .finish()
+        .init();
+}
+
+fn main() -> Result<()> {
+    // 1. Initialize logging
+    init_logging();
+
+    warn_if_key_content_logging_enabled();
+
+    tracing::info!("awase-macos starting");
+
+    // 2. Load config
+    let config_path = resolve_resource("config.toml")?;
+    let config = if config_path.exists() {
+        tracing::info!("Loading config from: {}", config_path.display());
+        AppConfig::load(&config_path)?
+    } else {
+        tracing::warn!("config.toml not found, using defaults");
+        let toml_str = "[general]";
+        toml::from_str(toml_str).context("Failed to create default config")?
+    };
+    let (config, warnings) = config.validate();
+    for w in &warnings {
+        tracing::warn!("Config: {w}");
+    }
+
+    // 3. Resolve key names to macOS keycodes
+    let left_thumb = key_name_to_keycode(&config.general.left_thumb_key)
+        .with_context(|| format!("Unknown left thumb key: {}", config.general.left_thumb_key))?;
+    let right_thumb = key_name_to_keycode(&config.general.right_thumb_key).with_context(|| {
+        format!(
+            "Unknown right thumb key: {}",
+            config.general.right_thumb_key
+        )
+    })?;
+
+    // 4. Set thumb keycodes for hook classification
+    awase_macos::hook::set_thumb_keycodes(left_thumb, right_thumb);
+
+    // 5. Load .yab layout
+    let layout = load_layout(&config)?;
 
     // 6. Build Engine (NicolaFsm + InputTracker + empty ImeSyncKeys/SpecialKeyCombos)
     let mut fsm = NicolaFsm::new(
@@ -368,11 +395,14 @@ fn main() -> Result<()> {
     );
     // 親指キーが 英数/かな（kVK_JIS_Eisu / kVK_JIS_Kana）そのものなら、非活性化
     // フラッシュで捨てずに送出させる。macOS では親指キーが IME 切替キーを兼ねる
-    // ため、捨てるとユーザーの切替操作が消える（BUG-103）。Space 等の文字キーを
+    // ため、捨てるとユーザーの切替操作が消える（BUG-189）。Space 等の文字キーを
     // 割り当てた構成では false のままにする — 生キー送出の誤注入を防ぐ抑制が
     // 本来の目的どおり効くべきなので（`thumb_keys_are_ime_switch` の doc 参照）
     let is_switch_key = |kc: u16| matches!(kc, KEYCODE_EISU | KEYCODE_KANA);
     fsm.set_thumb_keys_are_ime_switch(is_switch_key(left_thumb.0) && is_switch_key(right_thumb.0));
+    // timing_margin_percent / min_overlap_margin_percent 等の調整値
+    // （Windows の bootstrap.rs と同じ配線）
+    fsm.apply_general_config(&config.general);
 
     // [keys] のコンボ設定を macOS keycode に解決して Engine に渡す
     let parse_combos = |keys: &[String], label: &str| {
@@ -381,12 +411,12 @@ fn main() -> Result<()> {
             .filter_map(|s| {
                 let combo = awase_macos::vk::parse_key_combo(s);
                 if combo.is_none() {
-                    log::warn!("keys.{label}: cannot parse combo \"{s}\" on macOS, ignoring");
+                    tracing::warn!("keys.{label}: cannot parse combo \"{s}\" on macOS, ignoring");
                 }
                 combo
             })
             .collect();
-        log::info!("keys.{label}: {keys:?} ({} parsed)", parsed.len());
+        tracing::info!("keys.{label}: {keys:?} ({} parsed)", parsed.len());
         parsed
     };
     let engine = Engine::new(
@@ -446,7 +476,7 @@ fn run_event_loop(
 
     let app = Rc::new(RefCell::new(app::App::new(engine, output, tray)));
 
-    log::info!("awase-macos running (menu bar icon: あ). Quit from the menu or Ctrl+C.");
+    tracing::info!("awase-macos running (menu bar icon: あ). Quit from the menu or Ctrl+C.");
     let mut event_loop = awase_macos::event_loop::EventLoop::new();
     event_loop.run(app, poll_interval)
 }
@@ -459,7 +489,7 @@ fn run_event_loop(
     _output_style: awase_macos::output::OutputStyle,
     _symbol_romaji: std::collections::HashMap<char, String>,
 ) -> Result<()> {
-    log::warn!("awase-macos event loop is only available on macOS");
+    tracing::warn!("awase-macos event loop is only available on macOS");
     Ok(())
 }
 
@@ -469,7 +499,7 @@ mod app {
 
     use awase::engine::{
         Decision, Effect, Engine, EngineCommand, ImeEffect, InputContext, InputEffect,
-        InputModeState, ModifierState, SetOpenOrigin, TimerEffect, UiEffect,
+        InputModeState, ModifierState, TimerEffect, UiEffect,
     };
     use awase::types::{
         KeyClassification, KeyEventType, ModifierKey, RawKeyEvent, ScanCode, Timestamp, VkCode,
@@ -495,7 +525,7 @@ mod app {
     ///
     /// 実測では張り直しは毎回 ~20ms で成功しているので 1 回で足りるが、
     /// `EXPECTATION_GRACE` を実測最大 +59ms まで詰めた分、期限の空振りが
-    /// キュー破棄（＝入力消失）に直結しないよう 2 回まで許す（BUG-101）。
+    /// キュー破棄（＝入力消失）に直結しないよう 2 回まで許す（BUG-187）。
     const MAX_SWITCH_REASSERTS: u8 = 2;
 
     /// 親指キー 1 本の押下状態。
@@ -503,7 +533,7 @@ mod app {
     /// macOS では親指キーが IME 切替キー（英数/かな）を兼ねるため、「切替として
     /// 消費された押下」と「親指シフトとしての押下」を区別する必要がある。前者を
     /// 押下として数えると、切替直後の文字が意図せず親指シフト面で解決される
-    /// （BUG-105: 英数 → かな と押して「きょう」を打つと、かな 押下中の 2 文字が
+    /// （BUG-191: 英数 → かな と押して「きょう」を打つと、かな 押下中の 2 文字が
     /// シフト面になり `ゔ` `い` が出た）。その押下は既に「IME を切り替える」役割を
     /// 果たして OS へ渡っており、同じ押下をシフトにも数えるのは二重計上。
     ///
@@ -639,13 +669,13 @@ mod app {
         deferred_focus_pid: Option<i32>,
         /// 保留を始めた時点で待っていた IME 状態。`is_switch_pending` は
         /// 「切替が完了した」と「猶予切れで諦めた」を区別しないため、
-        /// フラッシュ直前に観測がこれと一致するかを確かめる（BUG-101）。
+        /// フラッシュ直前に観測がこれと一致するかを確かめる（BUG-187）。
         deferred_expect_on: Option<bool>,
         /// 保留を始めた時刻（フラッシュまでの実待ち時間をログに残す）
         deferred_since: Option<Instant>,
         /// 観測されない切替を `TISSelectInputSource` で張り直した回数
         deferred_switch_reasserts: u8,
-        /// 保留キューが空のまま失敗した切替を張り直した回数（BUG-102）。
+        /// 保留キューが空のまま失敗した切替を張り直した回数（BUG-188）。
         /// 切替キーを新たに観測するたびに 0 に戻す
         switch_recoveries: u8,
     }
@@ -698,7 +728,7 @@ mod app {
                         && self.ime.set_ime_on(expected)
                     {
                         self.deferred_switch_reasserts += 1;
-                        log::warn!(
+                        tracing::warn!(
                             "IME switch to open={expected} not observed; re-asserting it and \
                              holding {} deferred key action(s)",
                             self.deferred_keys.len()
@@ -720,16 +750,16 @@ mod app {
                 (Some(expected), Some(current)) if expected == current
             );
             if !same_focus {
-                log::warn!(
+                tracing::warn!(
                     "Discarding {} deferred key action(s): frontmost app changed or \
                      unknown during IME switch",
                     keys.len()
                 );
                 return;
             }
-            // settle 定数の実測用（BUG-101）。保留開始から実際に送出するまでの
+            // settle 定数の実測用（BUG-187）。保留開始から実際に送出するまでの
             // 実待ち時間を残す
-            log::debug!(
+            tracing::debug!(
                 "Flushing {} deferred key action(s) {}ms after the switch was expected",
                 keys.len(),
                 held.unwrap_or_default().as_millis(),
@@ -738,7 +768,7 @@ mod app {
         }
 
         /// この切替アクションが、より後に押された反対側の親指キーに
-        /// 追い越されているか（BUG-103 追補）。
+        /// 追い越されているか（BUG-189 追補）。
         ///
         /// 両親指が押されている間だけ判定する。押下時刻の新しい方がユーザーの
         /// 最終意図なので、古い方の切替キーを送ると結果が逆になる。
@@ -758,7 +788,7 @@ mod app {
             })
         }
 
-        /// 観測されないまま猶予切れした切替を張り直す（BUG-102）。
+        /// 観測されないまま猶予切れした切替を張り直す（BUG-188）。
         ///
         /// 保留キューがあるときは `maybe_flush_deferred` が回数制限付きで面倒を
         /// 見るので、ここは「切替キーが効かなかったが、まだ何も打鍵していない」
@@ -778,14 +808,14 @@ mod app {
             }
             if self.ime.set_ime_on(expected) {
                 self.switch_recoveries += 1;
-                log::warn!("IME switch to open={expected} not observed; re-asserting it");
+                tracing::warn!("IME switch to open={expected} not observed; re-asserting it");
             }
         }
 
         /// 保留出力を破棄する（クリック等でフォーカス・キャレットが動いた場合）。
         fn discard_deferred(&mut self, reason: &str) {
             if !self.deferred_keys.is_empty() {
-                log::warn!(
+                tracing::warn!(
                     "Discarding {} deferred key action(s): {reason}",
                     self.deferred_keys.len()
                 );
@@ -823,17 +853,17 @@ mod app {
                         // 打鍵がリテラルで漏れる事例を実測）
                         if actions.iter().any(is_ime_switch_action) {
                             // 保留から遅れて出てきた切替キーは、その間に押された
-                            // 反対側の親指に追い越される（BUG-103 追補: 英数 →
+                            // 反対側の親指に追い越される（BUG-189 追補: 英数 →
                             // 42ms 後に かな と打つと、flush された 英数 が かな の
                             // 後に着地して IME が意図と逆の OFF に落ちた）。
                             // 後から押された方をユーザーの最終意図とみなして捨てる
                             if self.is_superseded_switch(actions) {
                                 if awase_macos::diagnostics::key_content_enabled() {
-                                    log::debug!(
+                                    tracing::debug!(
                                         "Dropping superseded IME switch action(s): {actions:?}"
                                     );
                                 } else {
-                                    log::debug!(
+                                    tracing::debug!(
                                         "Dropping {} superseded IME switch action(s)",
                                         actions.len()
                                     );
@@ -859,7 +889,7 @@ mod app {
                                 self.deferred_since = Some(Instant::now());
                             }
                             if self.deferred_keys.len() + actions.len() > DEFER_CAP {
-                                log::warn!(
+                                tracing::warn!(
                                     "Deferred key queue over {DEFER_CAP} actions, \
                                      dropping new output"
                                 );
@@ -871,7 +901,7 @@ mod app {
                             // settle を実測で詰めるため、切替からの経過を残す
                             // （消えた／化けた打鍵がここの何 ms かを突き合わせる）
                             if let Some(since) = self.ime.since_switch_confirmed() {
-                                log::debug!(
+                                tracing::debug!(
                                     "sending {} action(s) {}ms after the switch settled",
                                     actions.len(),
                                     since.as_millis(),
@@ -891,24 +921,15 @@ mod app {
                         self.timers.set(*id, *duration);
                     }
                     Effect::Timer(TimerEffect::Kill(id)) => self.timers.kill(*id),
-                    Effect::Ime(ImeEffect::SetOpen { open, origin }) => match origin {
-                        // 明示的なユーザー操作（ime_on/off/toggle コンボ等）のみ実行する
-                        SetOpenOrigin::ExplicitUserAction => {
-                            if self.ime.set_ime_on(*open) {
-                                log::debug!("IME set_open({open}) via TISSelectInputSource");
-                            } else {
-                                log::warn!("IME set_open({open}) failed: no matching input source");
-                            }
+                    // ADR-213 以降 SetOpen は Engine の明示的な意図だけ（activation 遷移の
+                    // echo は出なくなった）なので、そのまま実行する
+                    Effect::Ime(ImeEffect::SetOpen { open, .. }) => {
+                        if self.ime.set_ime_on(*open) {
+                            tracing::debug!("IME set_open({open}) via TISSelectInputSource");
+                        } else {
+                            tracing::warn!("IME set_open({open}) failed: no matching input source");
                         }
-                        // ActivationSync は activation 遷移の echo（SetOpenOrigin の doc
-                        // 参照）。macOS では ctx.ime_on が毎イベント TIS 観測で得た
-                        // 実状態そのものなので、echo を TISSelectInputSource で実行する
-                        // と OS/IME 自身の切替と競合する（ATOK が OS 標準 IME に
-                        // 化ける等）。観測駆動の macOS では無視するのが正しい。
-                        SetOpenOrigin::ActivationSync => {
-                            log::trace!("IME set_open({open}) echo (ActivationSync) ignored");
-                        }
-                    },
+                    }
                     Effect::Ui(UiEffect::EngineStateChanged { enabled, .. }) => {
                         self.tray.set_enabled(*enabled);
                     }
@@ -1032,9 +1053,9 @@ mod app {
                 // 注入イベントが OS のイベントストリームに実在した証跡
                 // （CGEventPost 後の消失と IME 側での無視を切り分ける）
                 if awase_macos::diagnostics::key_content_enabled() {
-                    log::debug!("inj-tap 0x{keycode:02X} {etype:?}");
+                    tracing::debug!("inj-tap 0x{keycode:02X} {etype:?}");
                 } else {
-                    log::debug!("inj-tap {etype:?}");
+                    tracing::debug!("inj-tap {etype:?}");
                 }
                 if matches!(etype, CGEventType::KeyDown) {
                     self.expect_ime_from_key(keycode);
@@ -1060,7 +1081,20 @@ mod app {
             let is_modifier_key = hook::classify_modifier(keycode).is_some();
             let is_down = matches!(event_type, KeyEventType::KeyDown);
 
+            // ADR-169/206: 直前に同じキーが押されたままだったか。KeyUp は定義上 true、
+            // KeyDown は OS の auto-repeat 印で判定する（FlagsChanged はリピートしない）
+            let was_down = match event_type {
+                KeyEventType::KeyUp => true,
+                KeyEventType::KeyDown => {
+                    matches!(etype, CGEventType::KeyDown)
+                        && event.get_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT) != 0
+                }
+            };
+
             let raw = RawKeyEvent {
+                was_down,
+                // ADR-208: 押下 ID は Windows のフックだけが振る（Linux と同じ）
+                press_id: None,
                 vk_code: VkCode(keycode),
                 scan_code: ScanCode(u32::from(keycode)),
                 event_type,
@@ -1071,6 +1105,9 @@ mod app {
                 ime_relevance: hook::classify_ime_relevance(keycode),
                 modifier_key: hook::classify_modifier(keycode),
                 modifier_snapshot: self.modifiers,
+                // ADR-129: 親指状態は `make_ctx` が `ThumbHold` から自前で読む（Linux と同じ）
+                left_thumb_down_snapshot: None,
+                right_thumb_down_snapshot: None,
                 // CGEventTap では他プロセス注入の確実な識別手段がないため false 固定
                 injected: false,
             };
@@ -1095,11 +1132,11 @@ mod app {
                 Decision::Consume { .. } => "consume",
             };
             if awase_macos::diagnostics::key_content_enabled() {
-                log::debug!(
+                tracing::debug!(
                     "phys 0x{keycode:02X} {event_type:?} {key_classification:?} -> {decision_name}"
                 );
             } else {
-                log::debug!("phys {event_type:?} {key_classification:?} -> {decision_name}");
+                tracing::debug!("phys {event_type:?} {key_classification:?} -> {decision_name}");
             }
             let action = self.apply_decision(decision);
 
@@ -1174,7 +1211,7 @@ mod app {
     mod tests {
         use super::{passthrough_moves_focus, KeyEventType, ModifierState, TapAction, ThumbHold};
 
-        /// BUG-105: IME 切替として使い切った親指打鍵は、離すまで親指シフトとして
+        /// BUG-191: IME 切替として使い切った親指打鍵は、離すまで親指シフトとして
         /// 数えない。数えると切替直後の文字がシフト面で解決される
         /// （英数 → かな と押して「きょう」を打つと `ゔ` `い` になった）。
         #[test]

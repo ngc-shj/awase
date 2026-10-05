@@ -273,7 +273,7 @@ mod imp {
             // CFRunLoopTimer はそのまま発火する。メニューバーのメニュー追跡には
             // NSApplication のイベントループが必要なので CFRunLoop::run_current では
             // なくこちらを使う。
-            log::info!("Event tap installed, entering NSApplication run loop");
+            tracing::info!("Event tap installed, entering NSApplication run loop");
             {
                 use objc2::MainThreadMarker;
                 use objc2_app_kit::NSApplication;
@@ -291,7 +291,7 @@ mod imp {
                 etype,
                 CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
             ) {
-                log::warn!("Event tap disabled by OS ({etype:?}), re-enabling");
+                tracing::warn!("Event tap disabled by OS ({etype:?}), re-enabling");
                 TAP_PORT.with(|p| {
                     if let Some(port) = *p.borrow() {
                         unsafe { CGEventTapEnable(port, true) };
@@ -335,7 +335,7 @@ impl EventLoop {
     ///
     /// スタブのため常に成功する。
     pub fn run(&mut self) -> anyhow::Result<()> {
-        log::warn!("macOS event loop is only available on macOS");
+        tracing::warn!("macOS event loop is only available on macOS");
         Ok(())
     }
 }

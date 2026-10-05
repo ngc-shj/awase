@@ -32,7 +32,7 @@ awase の IME 制御は 6 つの責務レイヤーに分かれている。
 ┌──────────────────────────────────────────────────────┐
 │  Controller 層   ime_controller.rs                   │
 │  Strategy Pattern で制御方式を選択                    │
-│  ImmCross → GjiDirect → KanjiToggle                 │
+│  ImmCross → GjiDirect → MsImeDirect                 │
 └──────────────────────────────────────────────────────┘
          ↕ Windows API
 ┌──────────────────────────────────────────────────────┐
@@ -180,16 +180,14 @@ ImeController::apply(desired_open, view)
   │
   ├─ [2] GjiDirectStrategy          ← Google日本語入力専用（全プロファイル共通）
   │       is_applicable(): gji_monitor_ok == true
-  │       実装: post_gji_ime_on() / post_gji_ime_off()
+  │       実装: send_ime_mode_key(VK_IME_ON) / send_ime_mode_key(VK_IME_OFF)
+  │       （旧 post_gji_ime_on/off は本番呼び出し元ゼロのためADR-168で削除）
   │         IME ON  → SendInput(VK_IME_ON=0x16)   // GJI ひらがなへ（冪等）
   │         IME OFF → SendInput(VK_IME_OFF=0x1A)  // GJI IME-OFF（冪等）
   │
-  └─ [3] KanjiToggleStrategy        ← 最終フォールバック
-          is_applicable(): 常に true
-          実装: post_kanji_toggle_to_focused()
-            effective_shadow (shadow || candidate_visible || candidate_was_seen) == desired
-              → AlreadyMatched
-            else → SendInput(VK_KANJI) with IME_KANJI_MARKER
+  └─ [3] MsImeDirectStrategy        ← MS-IME（または互換 IME）向け
+          is_applicable(): active_ime_kind == MicrosoftIme
+          実装: send_ime_mode_key(VK_IME_ON/OFF)
 ```
 
 **フォールスルー規則:**
@@ -198,21 +196,21 @@ ImeController::apply(desired_open, view)
 |------------------|---------------|
 | `Applied` | 停止（確認済み成功） |
 | `AlreadyMatched` | 停止（no-op） |
-| `FallbackSent` | 停止（未確認だが送信済み。追加送信は危険） |
 | `Failed` | 次の戦略へ進む |
 | `UnsafeToToggle`（将来追加） | 停止・guard 設定 |
 
-**重要:** `FallbackSent`（VK_KANJI 送信済み）でも次の戦略には進まない。
-IME 操作は「確認できないからもう一発」が最も危険（toggle 系なら反転する）。
+**重要:** 送信できていない `UnsafeToToggle` は次の戦略へ進まない。
+未適用シグナルをフォールスルーさせると、`applied_snapshot` をラッチしないための
+意味が壊れる。
 ImmCross が `Applied` を返した場合も同様に後続戦略はスキップされる。
 
 ### アプリプロファイル分類（focus/class_names.rs）
 
 | AppImeProfile | 対象アプリ | 使用戦略 |
 |---------------|------------|----------|
-| `Standard` | メモ帳, etc. | ImmCross → GJI → KANJI |
-| `Imm32Unavailable` | Chrome, Edge | GJI → KANJI |
-| `TsfNative` | WezTerm, Windows Terminal, UWP | GJI → KANJI |
+| `Standard` | メモ帳, etc. | ImmCross → GJI/MS-IME direct |
+| `Imm32Unavailable` | Chrome, Edge | GJI/MS-IME direct |
+| `TsfNative` | WezTerm, Windows Terminal, UWP | GJI/MS-IME direct |
 
 > **TsfNative での GJI 利用:** `ImmGetDefaultIMEWnd` が NULL を返すため ImmCross は使えない。
 > GJI は VK_IME_ON (0x16) / VK_IME_OFF (0x1A) を Windows 標準の冪等キーとして処理するため、
@@ -240,28 +238,6 @@ Profile ではなく Policy で表現する:
 LINE = Standard（AppImeProfile）+ owns_physical_kanji=true（AppImePolicy）
 ```
 
-### KanjiToggleStrategy の confidence gate と 300ms ウィンドウ
-
-VK_KANJI はトグル操作であり**冪等ではない**。F21/F22（GJI）や IMM32 SetOpen と異なり、
-shadow が stale な状態で送ると意図と逆方向に反転する。
-
-`kanji_needs_context_override`（`executor.rs`）が送信可否を判断する。
-ON/OFF 両方向とも「shadow 一致 + Confirmed + 300ms 以内」の場合のみスキップ。
-300ms 超過後はスリープ復帰後の desync 修正のため再送を許可する。
-
-現在の実装では `effective_shadow`（shadow || candidate_visible || candidate_was_seen）を
-guard として使っているが、以下の条件が揃ったときのみ安全に使える:
-
-- shadow が信頼できる（observer が正常に動作している）
-- focus 直後でない（OS 側の状態が安定している）
-- pending transition がない
-- 直前の toggle から十分な時間が経過している
-
-`ImeControlView` にこれらの信頼度フィールドが追加された段階で、
-将来的に `UnsafeToToggle` を返す条件として実装する（§6 原則7 参照）。
-
----
-
 ## 4. 状態管理（ImeModel SSOT）
 
 ### 4-1. ImeModel の構造
@@ -278,7 +254,7 @@ ImeModel (state/ime_model.rs)
 ├─ app_policy: AppImePolicy    ← アプリ別ポリシー
 ├─ input_barrier              ← Ctrl+IME chord transaction
 ├─ force_guards: ForceGuardSet ← 強制 ON ガード
-├─ drift_monitor: DriftMonitor ← 観測失敗追跡
+├─ observe_miss_monitor: ObserveMissMonitor ← 観測失敗の連続回数の記録（閾値到達での force-on は撤去済み）
 ├─ pending: Option<ImeTransition> ← apply 進行中 transition
 ├─ applied_open: Option<bool>  ← 最後の apply 成功状態
 └─ applied_at_ms: u64         ← apply 成功時刻 (0=未確認)
@@ -321,7 +297,7 @@ fn effective_open(&self) -> bool {
 
 ```rust
 pub struct ForceGuard {
-    pub reason: ForceOnReason,     // BrokenAppBootstrap / PanicReset / DetectMissThreshold / ProfilePolicy
+    pub reason: ForceOnReason,     // PanicReset / ProfilePolicy（旧 BrokenAppBootstrap は削除済み。追加元は `621bf93c` で撤去）
     pub expires_at: Option<Instant>, // TTL（None = 永続）
     pub generation: u64,           // 発火時の状態 generation
 }
@@ -330,9 +306,8 @@ pub struct ForceGuard {
 guard が active な条件: `guards` が空でない（TTL 未失効）。
 
 **TTL 設計の方針:**
-- `BrokenAppBootstrap`: フォーカス変更で無効化すべき（`focus_generation` 追加が必要）
+- `BrokenAppBootstrap`: 撤去済み（`621bf93c`、2026-09-18。追加元の `try_force_on_bootstrap` を削除。variant 本体も後に削除した）
 - `PanicReset`: 確認済み観測で無効化すべき
-- `DetectMissThreshold`: Observer 成功で無効化（実装済み）
 
 ### 4-5. Observer ループ
 
@@ -361,7 +336,7 @@ refresh_ime_state()
 |------|------|------|
 | `Some(true/false)` | 観測成功 | observations に記録、キャッシュ更新 |
 | `None` | 観測失敗 (timeout 等) | 前回値を維持 |
-| miss_count ≥ 3 | 連続失敗 | `force_on_broken_app_bootstrap` = true |
+| miss_count ≥ 3 | 連続失敗 | 回数を記録するのみ（旧: `force_on_broken_app_bootstrap` = true。`621bf93c` で撤去） |
 
 ---
 
@@ -387,16 +362,16 @@ gji_observer.rs::observe_gji_after_focus()
 
 **既知の限界と将来方向:** focus 直後の 2500ms は判定が不確定。将来は以下の4状態に拡張予定:
 
-| 状態 | 意味 | KanjiToggle へのフォールバック |
-|------|------|-------------------------------|
-| `Unknown` | まだ判定できない（focus 後 2500ms 以内）| 禁止 |
-| `Present` | GJI I/O を確認済み | 不要（VK_IME_ON/OFF 使用） |
-| `Absent` | GJI なしと確認 | 条件付きで許可 |
-| `Broken` | GJI はあるが異常 | 禁止または保守的動作 |
+| 状態 | 意味 | direct 制御 |
+|------|------|-------------|
+| `Unknown` | まだ判定できない（focus 後 2500ms 以内）| MS-IME推定なら MsImeDirect |
+| `Present` | GJI I/O を確認済み | GjiDirect |
+| `Absent` | GJI なしと確認 | MsImeDirect |
+| `Broken` | GJI はあるが異常 | 保守的動作 |
 
 `Unknown` と `Absent` を区別することで、未確定状態での VK_KANJI 誤送信を防げる。
 
-**VK_KANJI を使わない理由:** GJI は VK_KANJI を「トグル」として解釈するが、
+**VK_KANJI を機構として使わない理由:** GJI/MS-IME は VK_KANJI を「トグル」として解釈するが、
 VK_IME_ON/OFF は冪等（ON なら ON、OFF なら OFF）のため desync が起きない。
 
 ### 5-3. ImmCross アプリ（LINE, Qt 等）
@@ -405,8 +380,7 @@ IMM32 経由では制御できるが、物理の IME キー（VK_KANJI）を見�
 spurious な連鎖反応が起きるアプリ群。
 
 **設計原則:** ImmCross アプリには物理 IME キーを一切通さない。
-VK_KANJI を送る場合は `IME_KANJI_MARKER` を付けて自己注入として識別し、
-フック側で素通りさせる。
+awase 側の制御は ImmCross または VK_IME_ON/OFF の冪等キーで行う。
 
 ### 5-4. TsfNative アプリ（WezTerm / Windows Terminal）
 
@@ -455,8 +429,8 @@ hook.rs: 親指キーを SavedRescueEvent から除外
 → IME 実態 OFF → VK_KANJI → ON（意図と逆）
 ```
 
-VK_IME_ON/OFF や IMM32 SetOpen は冪等だが、VK_KANJI は冪等でない。
-`KanjiToggleStrategy` を安全に使える条件は §3 参照。
+VK_IME_ON/OFF や IMM32 SetOpen は冪等だが、物理 VK_KANJI は冪等でない。
+機構としての VK_KANJI 送信は ADR-190 で撤去済み。
 
 ---
 
@@ -472,7 +446,7 @@ VK_IME_ON/OFF や IMM32 SetOpen は冪等だが、VK_KANJI は冪等でない。
 | SetOpen 後リフレッシュ | 20ms | 安全ネット |
 | GJI 検出窓 | 2500ms | フォーカス後の GJI I/O 確認 |
 | Ctrl+無変換 救済窓 | 50ms | TIMER_IME_OFF_RESCUE |
-| drift_monitor 閾値 | 3 | 連続観測失敗 → force_on 発動 |
+| observe_miss 閾値 | 3 | 連続観測失敗の記録のみ（旧: force_on 発動、`621bf93c` で撤去） |
 
 **タイミング定数の限界:** 複数のタイマーが重なる状況では数値調整だけでは対処しきれない。
 将来的には遷移フェーズ（`IntentRecorded → ApplyDispatched → AwaitingFirstObservation → Verified`）

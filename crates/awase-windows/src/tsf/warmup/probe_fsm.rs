@@ -33,11 +33,29 @@ use crate::tsf::literal_facts::{
     DetectEvidence, DetectPath, DetectRoute, DetectTarget, LiteralDetectFacts, LiteralVerdict,
 };
 
+/// `DeferredVk` の由来。ADR-123 変更B: focus 変更時等に `pending_deferred`
+/// を丸ごと破棄する経路（`discard_raw_recovery_if_focus_stale` 等）が、
+/// 「awase 自身が再送しようとしていたromaji」（`RecoveryResend`）と
+/// 「ユーザーが実際に打鍵したがまだ送信されていない入力」（`UserInput`）を
+/// 区別できるようにする。現時点ではログの内訳表示にのみ使う（挙動は変えない、
+/// 最小実装(b)）。`RecoveryResend` はADR-123変更A+C（`output/vk_send.rs`の
+/// `DeferGate::deferred_origin`、gate免除入口）が唯一の構築箇所 —
+/// `tests/architecture_guard.rs` の
+/// `deferred_origin_recovery_resend_construction_is_limited_to_gate_bypass`
+/// がこれを固定する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeferredOrigin {
+    UserInput,
+    RecoveryResend,
+}
+
 /// probe 進行中に蓄積する後続 VK。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DeferredVk {
     pub(crate) vk: VkCode,
     pub(crate) needs_shift: bool,
+    pub(crate) order_token: u64,
+    pub(crate) origin: DeferredOrigin,
 }
 use crate::tsf::probe::{LiteralDetector, TsfReadinessProbe};
 use crate::tsf::probe_bridge::OutputActiveGuard;
@@ -223,12 +241,6 @@ pub(crate) enum ProbeAction {
     /// dispatcher は `DispatchResult::LearnedTsf` を返し、呼び出し元 (`advance_tsf_probe`) が
     /// フォーカス中クラスを `InjectionModeStore` に学習し injection_mode を Tsf に昇格させる。
     UpgradeToTsf,
-    /// Unicode cold-start warmup 完了後にバッファ済み文字を送信する。
-    ///
-    /// [`crate::tsf::warmup::unicode_cold_warmup_fsm::UnicodeColdWarmupFsm`] が GJI write 確認
-    /// またはタイムアウト後に emit する。
-    /// dispatcher が各 `char` を `send_unicode_char_direct()` で送信する。
-    FlushDeferredUnicodeChars(Vec<char>),
     /// `DetectionResult::CompositionConfirmed`（非 partial）を確認した。
     ///
     /// dispatcher は必ず `consecutive_count`（`RawTsfLiteralRecovery` 連続発火数）を
@@ -396,13 +408,13 @@ async fn await_vk_detection(
             let _ = poll_input;
         };
         match verdict {
-            DetectionResult::CompositionConfirmed => log::debug!(
+            DetectionResult::CompositionConfirmed => tracing::debug!(
                 "[{log_tag}] cold={cold_seq} per-VK[{idx}/{last_idx}] \
                  candidate window already visible → skip literal-detect wait (vk=0x{:02X})",
                 vk.0,
                 cold_seq = cold_seq.value(),
             ),
-            DetectionResult::StaleConfirm => log::warn!(
+            DetectionResult::StaleConfirm => tracing::warn!(
                 "[{log_tag}] cold={cold_seq} per-VK[{idx}/{last_idx}] candidate window already \
                  visible だが直近の GJI I/O が猶予期間内に送信時刻へ追いつかず \
                  → stale confirm として扱う (vk=0x{:02X})",
@@ -484,7 +496,7 @@ pub(crate) async fn run_per_vk_confirm(
             // 落ちるため、正しく入力できていた文字まで毎回 backspace で消え、実質何も
             // 入力できなくなった。無リカバリの `return` に戻す
             // （docs/known-bugs.md BUG-27 参照）。
-            log::warn!(
+            tracing::warn!(
                 "[{log_tag}] cold={cold_seq} per-VK[{idx}/{last_idx}] vk_sent 未設定 → 中断",
                 cold_seq = cold_seq.value(),
             );
@@ -522,7 +534,7 @@ pub(crate) async fn run_per_vk_confirm(
 
         match detection {
             DetectionResult::CompositionConfirmed => {
-                log::debug!(
+                tracing::debug!(
                     "[{log_tag}] cold={cold_seq} per-VK[{idx}/{last_idx}] confirmed (vk=0x{:02X})",
                     vk.0,
                     cold_seq = cold_seq.value(),
@@ -538,7 +550,7 @@ pub(crate) async fn run_per_vk_confirm(
             DetectionResult::SuspectedLiteral => {
                 let (backs, escape_composition) =
                     crate::tsf::warmup::literal_detect_fsm::per_vk_recovery_params(false, idx);
-                log::debug!(
+                tracing::debug!(
                     "[{log_tag}] cold={cold_seq} per-VK[{idx}/{last_idx}] suspected literal \
                      (vk=0x{:02X} backs={backs} escape={escape_composition})",
                     vk.0,
@@ -580,7 +592,7 @@ pub(crate) async fn run_per_vk_confirm(
                 // いた。
                 let (backs, escape_composition) =
                     crate::tsf::warmup::literal_detect_fsm::per_vk_recovery_params(true, idx);
-                log::warn!(
+                tracing::warn!(
                     "[{log_tag}] cold={cold_seq} per-VK[{idx}/{last_idx}] stale confirm 検出 \
                      → backspace は送らず romaji 再送のみ行う (vk=0x{:02X} backs={backs} \
                      escape={escape_composition})",
@@ -601,7 +613,7 @@ pub(crate) async fn run_per_vk_confirm(
         }
     }
 
-    log::debug!(
+    tracing::debug!(
         "[{log_tag}] cold={cold_seq} per-VK: 全 {} VK 確認済み → セッション確認",
         vk_chars.len(),
         cold_seq = cold_seq.value(),
@@ -651,7 +663,7 @@ async fn tsf_probe_coro_body(
         let Some(outcome) = probe.check_outcome(total_max_ms) else {
             continue;
         };
-        log::debug!(
+        tracing::debug!(
             "[tsf-probe] cold={cold_seq} ChromeProbe 完了 ({}ms)",
             outcome.elapsed_ms,
             cold_seq = cold_seq.value(),
@@ -748,7 +760,7 @@ async fn tsf_probe_coro_body(
                 ]
             }
             DetectionResult::CompositionConfirmed => {
-                log::debug!(
+                tracing::debug!(
                     "[raw-tsf-literal] cold={cold_seq} composition confirmed",
                     cold_seq = cold_seq.value(),
                 );
@@ -768,7 +780,7 @@ async fn tsf_probe_coro_body(
                 // 限り送らない（`per_vk_recovery_params` のドキュメント参照）。
                 // StaleConfirm は confirm 根拠が古いことの検出であって literal の
                 // 証拠ではないため backs=0 とする。
-                log::warn!(
+                tracing::warn!(
                     "[raw-tsf-literal] cold={cold_seq} stale confirm 検出 → \
                      backspace は送らず romaji 再送のみ行う",
                     cold_seq = cold_seq.value(),
@@ -1272,7 +1284,8 @@ mod tests {
         // 猶予期間（EPOCH_FENCE_GRACE_MS）が過ぎても gji_last_write_ms は追いつかない
         // （前世代の残存 GJI I/O のまま）ため、次 tick で StaleConfirm に確定する。
         std::thread::sleep(std::time::Duration::from_millis(
-            LiteralDetector::EPOCH_FENCE_GRACE_MS + 10,
+            // BUG-130 と同型: GetTickCount64 の量子化(~15.6ms)を吸収するため +50ms(+10ms では windows-build CI で稀に flake した)。
+            LiteralDetector::EPOCH_FENCE_GRACE_MS + 50,
         ));
         let actions_after_stale = machine.tick(TsfEnvSnapshot {
             gji_active: true,

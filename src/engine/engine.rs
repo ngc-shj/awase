@@ -13,17 +13,17 @@
 
 use crate::config::ParsedKeyCombo;
 use crate::types::{
-    ContextChange, KeyClassification, KeyEventType, RawKeyEvent, ShadowImeAction, VkCode,
+    ContextChange, KeyAction, KeyClassification, KeyEventType, RawKeyEvent, ShadowImeAction, VkCode,
 };
 
 use super::decision::{
     ActivationState, Decision, Effect, EffectVec, EngineCommand, ImeEffect, InactiveReason,
-    InputContext, InputEffect, SetOpenOrigin, SpecialKeyCombos, UiEffect,
+    InputContext, InputEffect, SpecialKeyCombos, UiEffect,
 };
 use super::fsm_adapter::FsmAdapter;
-use super::fsm_types::{ComposingHint, ModeKeyConfig, ModifierState, TextKeyConfig};
+use super::fsm_types::{ModeKeyConfig, ModifierState, TextKeyConfig, ThumbRawVkEmission};
 use super::input_tracker::PhysicalKeyState;
-use super::key_lifecycle::{KeyLifecycle, KeyUpDisposition};
+use super::key_lifecycle::{KeyLifecycle, UpDuty};
 use super::nicola_fsm::NicolaFsm;
 
 /// 特殊キーコンボのマッチ結果
@@ -52,10 +52,11 @@ pub(super) enum SpecialKeyMatch {
 pub struct Engine {
     adapter: FsmAdapter,
     special_keys: SpecialKeyCombos,
-    /// 自動検出された IME トグルキー（ADR-092 決定D Step4a/Step4c、MS-IME
-    /// レジストリの `KeyAssignmentCtrlSpace`/`KeyAssignmentShiftSpace`、または
-    /// GJI config1.db の `GjiImeKeys.toggle` 由来。両ソースは排他——呼び出し元
-    /// が IME 種別確定イベントごとにどちらか一方だけを呼ぶ）。
+    /// 自動検出された IME トグルキー（ADR-092 決定D Step4a、MS-IME
+    /// レジストリの `KeyAssignmentCtrlSpace`/`KeyAssignmentShiftSpace` 由来。
+    /// GJI側のconfig1.db由来検出〈旧Step4c〉はADR-179で撤去し、無変換/
+    /// 変換は親指キー配置に関わらず`shadow_action` override経由の
+    /// follow-only経路へ一本化した）。
     /// `special_keys.ime_toggle`（ユーザーが `config.toml` に明示設定した分）
     /// とは別に保持し、`config.toml` へは一切書き込まない（決定C: Manual は
     /// 永続化、AutoDetected はライブ計算のみ）。`special_keys.ime_toggle` の
@@ -64,14 +65,6 @@ pub struct Engine {
     /// 「手動が非空なら自動を一切見ない」仕様のままでは自動検出が既定設定の
     /// ユーザーには永久に効かなかった）。
     ime_toggle_auto: Vec<ParsedKeyCombo>,
-    /// 自動検出された IME ON キー（ADR-092 決定D Step4c、GJI config1.db の
-    /// `GjiImeKeys.on` 由来）。`ime_toggle_auto` と同じ規約
-    /// （`config.toml` 非書き込み、`special_keys.ime_on` の内容に関わらず
-    /// 常に併用）。
-    ime_on_auto: Vec<ParsedKeyCombo>,
-    /// 自動検出された IME OFF キー（ADR-092 決定D Step4c、GJI config1.db の
-    /// `GjiImeKeys.off` 由来）。`ime_on_auto` と対称。
-    ime_off_auto: Vec<ParsedKeyCombo>,
     /// キーの Down/Up ペア追跡
     lifecycle: KeyLifecycle,
     /// 直前の実効状態（遷移検知用）
@@ -79,6 +72,13 @@ pub struct Engine {
     /// 直近の `on_timeout` でソロ連打緊急 OFF が発動したかの 1 ショットフラグ。
     /// Platform 層がトレイ通知を出すかどうかの判定に使う（`take_solo_off_notification`）。
     solo_off_notify: bool,
+    /// ADR-206: Phase 1（特殊キー照合）で KeyDown を Consume した**親指キー**の VK。
+    /// 最初の Down で開閉を書くとエンジンが活性化するため、自動リピートの Down は Phase 1 に来ず
+    /// FSM に新しい PendingThumb として入り、離した時に `forced_open_action` がもう一度発火してしまう
+    /// （押して開き離して閉じる二重トグル）。この印がある間の同じ VK の `was_down` Down は Phase 1 の前で
+    /// `Decision::consumed()` を返して FSM に渡さない。同じ VK の KeyUp・非リピート Down（置き直し）・
+    /// `release_pending_and_reinject`（flush・フォーカス変更）で更新/消去する。印が残っても失われるのは押下1回で、永続しない。
+    phase1_held: Option<VkCode>,
 }
 
 impl Engine {
@@ -88,11 +88,10 @@ impl Engine {
             adapter: FsmAdapter::new(fsm),
             special_keys,
             ime_toggle_auto: Vec::new(),
-            ime_on_auto: Vec::new(),
-            ime_off_auto: Vec::new(),
             lifecycle: KeyLifecycle::new(),
             prev_activation: ActivationState::Inactive(InactiveReason::UserDisabled),
             solo_off_notify: false,
+            phase1_held: None,
         }
     }
 
@@ -102,17 +101,6 @@ impl Engine {
     /// 呼ばれるたびに丸ごと置き換わる（決定C R2、計算は毎回やり直す）。
     pub fn set_ime_toggle_auto_keys(&mut self, keys: Vec<ParsedKeyCombo>) {
         self.ime_toggle_auto = keys;
-    }
-
-    /// GJI config1.db（`GjiImeKeys.on`）由来の自動検出 IME ON キーを設定する
-    /// （ADR-092 決定D Step4c）。`set_ime_toggle_auto_keys` と同じ規約。
-    pub fn set_ime_on_auto_keys(&mut self, keys: Vec<ParsedKeyCombo>) {
-        self.ime_on_auto = keys;
-    }
-
-    /// `set_ime_on_auto_keys` と対称（`GjiImeKeys.off` 由来）。
-    pub fn set_ime_off_auto_keys(&mut self, keys: Vec<ParsedKeyCombo>) {
-        self.ime_off_auto = keys;
     }
 
     /// ソロ N 連打でエンジン OFF を発動するキーを設定する。
@@ -133,6 +121,20 @@ impl Engine {
         config: TextKeyConfig,
     ) {
         self.adapter.set_space_thumb_config(space_thumb_vk, config);
+    }
+
+    /// ADR-120 決定0a 項目7(a)専用: 物理 BACKSPACE の VK コードを設定する
+    /// （Platform 層が判定して渡す。未呼び出しなら項目7(a)の集計は行わない）。
+    pub const fn set_backspace_vk(&mut self, vk: Option<VkCode>) {
+        self.adapter.set_backspace_vk(vk);
+    }
+
+    /// ADR-120 決定0a: 3キー仲裁の判定過程・訂正発生を観測する累積カウンタを返す。
+    /// 起動からの累積値であり、実際の変換結果には一切影響しない
+    /// （`crates/awase-windows/src/bug_report.rs` からの読み取り用途）。
+    #[must_use]
+    pub const fn retro_eval_stats(&self) -> &crate::engine::retro_eval_stats::RetroEvalStats {
+        self.adapter.retro_eval_stats()
     }
 
     /// 無変換/変換キー単独タップの composing 中ガードの扱いを設定する。
@@ -163,17 +165,59 @@ impl Engine {
         self.adapter.set_muhenkan_solo_tap_dedicated_fn_key(vk);
     }
 
-    /// 無変換キー単独タップの IME open 軸への肩代わり（ADR-092 決定D Step4b、
-    /// MS-IME レジストリ/GJI config1.db の宣言由来）を設定する。
-    /// `set_thumb_key_solo_tap_config`/`set_muhenkan_solo_tap_dedicated_fn_key`
-    /// とは独立して呼び出せる。
-    pub const fn set_muhenkan_delegate_to_open_axis(&mut self, action: Option<ShadowImeAction>) {
-        self.adapter.set_muhenkan_delegate_to_open_axis(action);
+    /// ADR-192 決定3b: Platform 層で bare `keys.ime_*` と分類した
+    /// 無変換/変換の強制 open 軸操作を設定する。
+    pub const fn set_thumb_forced_open_actions(
+        &mut self,
+        muhenkan: Option<ShadowImeAction>,
+        henkan: Option<ShadowImeAction>,
+    ) {
+        self.adapter.set_thumb_forced_open_actions(muhenkan, henkan);
     }
 
-    /// `set_muhenkan_delegate_to_open_axis` と対称（変換キー用）。
-    pub const fn set_henkan_delegate_to_open_axis(&mut self, action: Option<ShadowImeAction>) {
-        self.adapter.set_henkan_delegate_to_open_axis(action);
+    /// ADR-206: IME 設定由来の役割（`ModeKeyConfig` が Passthrough のときだけ発火）を設定する。
+    pub const fn set_thumb_role_open_actions(
+        &mut self,
+        muhenkan: Option<ShadowImeAction>,
+        henkan: Option<ShadowImeAction>,
+    ) {
+        self.adapter.set_thumb_role_open_actions(muhenkan, henkan);
+    }
+
+    /// 現在設定されている役割由来の open 軸操作 `(無変換, 変換)`（押した側だけを更新するため）。
+    #[must_use]
+    pub const fn thumb_role_open_actions(
+        &self,
+    ) -> (Option<ShadowImeAction>, Option<ShadowImeAction>) {
+        self.adapter.thumb_role_open_actions()
+    }
+
+    /// 現在設定されている無変換/変換の強制 open 軸操作 `(無変換, 変換)`（bare `keys.ime_*` 由来）。
+    #[must_use]
+    pub const fn thumb_forced_open_actions(
+        &self,
+    ) -> (Option<ShadowImeAction>, Option<ShadowImeAction>) {
+        self.adapter.thumb_forced_open_actions()
+    }
+
+    /// 修飾なしの `vk` が、明示された IME 制御コンボ（`ime_on`/`ime_off`/`ime_toggle`、自動検出トグル）に
+    /// 含まれるか（ADR-199 決定8）。含まれるキーには役割由来の `shadow_action` を付けない:
+    /// 付けると1回の押下で Engine の照合と役割の両方が開閉を書き、打ち消し合う。
+    #[must_use]
+    pub fn has_bare_ime_combo(&self, vk: VkCode) -> bool {
+        let bare = |k: &ParsedKeyCombo| k.vk == vk && !k.ctrl && !k.shift && !k.alt;
+        self.special_keys.ime_on.iter().any(bare)
+            || self.special_keys.ime_off.iter().any(bare)
+            || self.special_keys.ime_toggle.iter().any(bare)
+            || self.ime_toggle_auto.iter().any(bare)
+    }
+
+    /// 修飾なしの `vk` に対する、明示 config（`ime_on`/`ime_off`/`ime_toggle`）由来の open 軸操作
+    /// （[`SpecialKeyCombos::bare_ime_action`]）。ADR-199 決定16 で無変換/変換の役割由来の操作と合成するときの、
+    /// config 側の値（config が優先する）。
+    #[must_use]
+    pub fn bare_ime_action(&self, vk: VkCode) -> Option<ShadowImeAction> {
+        self.special_keys.bare_ime_action(vk)
     }
 
     /// Enter 親指キーのフォールバック挙動を設定する。
@@ -199,6 +243,28 @@ impl Engine {
     /// （`NicolaFsm::thumb_keys_are_ime_switch` の doc 参照）。
     pub const fn set_thumb_keys_are_ime_switch(&mut self, yes: bool) {
         self.adapter.set_thumb_keys_are_ime_switch(yes);
+    }
+
+    /// 3キー仲裁・重なり判定のタイミングマージンを設定する
+    /// （`GeneralConfig::timing_margin_percent`/`min_overlap_margin_percent`）。
+    /// 起動時（`bootstrap.rs`）から呼ぶ。reload 時は `UpdateFsmParams` 経由。
+    pub fn set_timing_margins(
+        &mut self,
+        timing_margin_percent: u32,
+        min_overlap_margin_percent: u32,
+    ) {
+        self.adapter
+            .set_timing_margins(timing_margin_percent, min_overlap_margin_percent);
+    }
+
+    /// `GeneralConfig` の調整可能フィールドを一括反映する
+    /// （`NicolaFsm::apply_general_config` 参照、/code-review指摘、
+    /// PR #127、7回目）。起動時（`bootstrap.rs`）から呼ぶ。
+    pub fn apply_general_config(&mut self, config: &crate::config::GeneralConfig) {
+        self.set_timing_margins(
+            config.timing_margin_percent,
+            config.min_overlap_margin_percent,
+        );
     }
 
     /// InputContext から実効状態を `ActivationState` で返す。
@@ -228,6 +294,53 @@ impl Engine {
         self.compute_state(ctx).is_active()
     }
 
+    /// `output_history` の `pending_releases` を解放し、`KeyLifecycle` に残る
+    /// Consume 義務も同期して解放して `effects` に追記する（ADR-112コードレビュー
+    /// 指摘）。コンテキストを丸ごと喪失する場面（`check_active_transition` の
+    /// active→inactive分岐・`handle_focus_changed`）で共通して必要になる処理を
+    /// 一本化した（/code-review 指摘: 元は両呼び出し元に同一ロジックが
+    /// コピペされており、将来の修正が片方だけに適用され再発するリスクが
+    /// あった）。
+    ///
+    /// 呼び出し順序が重要: `release_all_pending_output`（`output_history` 側）を
+    /// 先に呼び、それが発行した `KeyUp(vk)` の VK 集合を、`flush_pending_key_ups`
+    /// （`KeyLifecycle` 側）の再注入から除外する。これをしないと、`output_history`
+    /// に記録済みの同じ物理キーに対して独立した KeyUp が二重に注入される
+    /// （/code-review 指摘）。
+    fn release_pending_and_reinject(&mut self, effects: &mut EffectVec) {
+        let released_output_effects = self.adapter.release_all_pending_output();
+        // release_all_pending_output は高々1件の SendKeys effect しか積まない
+        // ため、この集合は実質「今押されている物理キー」の数のオーダー
+        // （通常0〜数件）に収まる。HashSet ではなく Vec + 線形探索で十分
+        // （/code-review 指摘）。
+        let released_vks: Vec<VkCode> = released_output_effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Input(InputEffect::SendKeys(actions)) => Some(actions.iter()),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|a| match a {
+                KeyAction::KeyUp(vk) => Some(*vk),
+                _ => None,
+            })
+            .collect();
+        // Phase 1（特殊キー等）でのみ consume され output_history にエントリを
+        // 残さないキーは release_all_pending_output ではカバーされないため、
+        // flush_pending_key_ups の戻り値を明示的に ReinjectKey として再注入する。
+        // これを捨てていると、そのキーの実物理 KeyUp が後で来たとき
+        // take_key_up_duty は既に空になった active_keys から UpDuty::None を
+        // 返し、Engine が非活性であれば生の KeyUp がそのまま OS へ通ってしまう。
+        let pending_key_ups = self.lifecycle.flush_pending_key_ups();
+        self.phase1_held = None;
+        for evt in pending_key_ups {
+            if !released_vks.contains(&evt.vk_code) {
+                effects.push(Effect::Input(InputEffect::ReinjectKey(evt)));
+            }
+        }
+        effects.extend(released_output_effects);
+    }
+
     /// 実効状態の遷移を検知し、必要な Effect（flush, UI 通知）を返す。
     fn check_active_transition(&mut self, ctx: &InputContext) -> EffectVec {
         let new_state = self.compute_state(ctx);
@@ -240,9 +353,9 @@ impl Engine {
         // 既存の `Engine {activated,deactivated}` ログは active/inactive が
         // "遷移した" 場合にしか出ないため、ime_on=true のまま何らかの理由で
         // 非活性が継続している（＝遷移が起きない）ケースを毎キー入力ごとに
-        // 可視化する。遷移の有無を問わず出すため log::debug! で十分な頻度に留める。
+        // 可視化する。遷移の有無を問わず出すため tracing::debug! で十分な頻度に留める。
         if ctx.ime_on && !now_active {
-            log::debug!(
+            tracing::debug!(
                 "[diag-engine-active] ime_on=true なのに非活性: reason={:?} \
                  romaji_capable={} japanese={} user_enabled={} was_active={} input_mode={:?}",
                 new_state,
@@ -259,18 +372,17 @@ impl Engine {
                 // active → inactive: 保留キーをフラッシュ。
                 // ctx.composing はこの呼び出し時点の最新値であり、保留キーが入力された
                 // 時点と同一ウィンドウ/コンテキストである保証がない（フォーカス変更に
-                // 伴う non-active 化等）ため Unknown を渡し、Space フォールバック例外も
-                // 含め無条件 suppress する（ComposingHint の doc 参照）。
+                // 伴う non-active 化等）ため Denied を渡し、保留中の親指キーによる
+                // 生の機能VK送出（Space フォールバック等）を無条件禁止する
+                // （`ThumbRawVkEmission` の doc 参照。かな出力には無関係）。
                 let reason = new_state.to_context_change();
                 let flush = self
                     .adapter
-                    .flush_to_effects(reason, ComposingHint::Unknown);
+                    .flush_to_effects(reason, ThumbRawVkEmission::Denied);
                 effects.extend(flush);
-                // lifecycle をクリア: Engine が consumed した KeyDown の対応 KeyUp が
-                // Engine inactive 時に到着しても consumed されないようにする。
-                let _ = self.lifecycle.flush_pending_key_ups();
+                self.release_pending_and_reinject(&mut effects);
             }
-            log::info!(
+            tracing::info!(
                 "Engine {} (ime={}, romaji={}, japanese={}, user={}, reason={:?})",
                 if now_active {
                     "activated"
@@ -285,14 +397,9 @@ impl Engine {
             );
         }
 
-        // ここで発行される SetOpen は `check_active_transition`（Phase 2、通常の毎キー
-        // 入力経路）由来であり、ユーザーが今このキーで IME ON/OFF を明示的に選んだ
-        // わけではない（`ctx.ime_on` が観測駆動で変化しただけでも Active/Inactive は
-        // 遷移しうる）。`SetOpenOrigin::ActivationSync` を渡し、Platform 層が
-        // `last_intent`（ユーザー明示意図）を汚染しないようにする（`SetOpenOrigin` の
-        // doc 参照）。
-        let transition_effects =
-            self.transition_activation(new_state, SetOpenOrigin::ActivationSync);
+        // ADR-213 決定3(P2b): 観測・RefreshState 由来の遷移は SetOpen を出さない（ユーザーの
+        // キーに応答する書き込みは shadow toggle の明示 actuation が担う）。UI 更新は従来どおり。
+        let transition_effects = self.transition_activation(new_state, false);
         effects.extend(transition_effects);
         effects
     }
@@ -306,13 +413,12 @@ impl Engine {
     ///   追加送信すると全角英数→半角英数のような意図しない conv 変化が起きる。
     /// 同じ状態: 空の EffectVec
     ///
-    /// `origin`: 発行する `ImeEffect::SetOpen` に付与する `SetOpenOrigin`。呼び出し元が
-    /// 「これは本物のユーザー操作（IME/エンジン ON/OFF コンボ、トレイ操作等）が引き金か、
-    /// それとも通常のキー入力経路での自動遷移か」を判断して渡すこと。
+    /// `emit_set_open`: false なら `SetOpen` を出さない（`EngineStateChanged` は出す。ADR-213 P2b）。
+    ///
     fn transition_activation(
         &mut self,
         new_state: ActivationState,
-        origin: SetOpenOrigin,
+        emit_set_open: bool,
     ) -> EffectVec {
         let was_active = self.prev_activation.is_active();
         let now_active = new_state.is_active();
@@ -323,18 +429,16 @@ impl Engine {
                 new_state,
                 ActivationState::Inactive(InactiveReason::NotRomajiInput)
             );
-            if !suppress_set_open {
+            if !suppress_set_open && emit_set_open {
                 effects.push(Effect::Ime(ImeEffect::SetOpen {
                     open: now_active,
-                    origin,
+                    press: None,
                 }));
             }
-            // NotRomajiInput の場合は SetOpen も engine-state キーも不要。
+            // NotRomajiInput の場合は SetOpen が不要。
             // ユーザーが選択した kana/katakana モードをそのまま維持する。
-            let suppress_ime_key = suppress_set_open; // 同じ条件
             effects.push(Effect::Ui(UiEffect::EngineStateChanged {
                 enabled: now_active,
-                send_ime_key: !suppress_ime_key,
             }));
             self.prev_activation = new_state;
         }
@@ -344,24 +448,59 @@ impl Engine {
     /// キーイベントの統合エントリポイント。
     ///
     /// 処理フロー:
-    /// 1. KeyUp 自動追跡
+    /// 1. KeyUp の Consume 義務を予約（`UpDuty`、まだ Decision は確定しない）
     /// 2. 特殊キー（エンジン ON/OFF + IME 制御）
     /// 3. 実効状態チェック + 遷移検知
     /// 4. NicolaFsm 処理
+    /// 5. 唯一の出口で、義務があれば `force_consume` により Consume へ格上げ
+    ///
+    /// ADR-112 決定2: 旧実装は Phase 1（KeyUp 自動追跡）が「Consume 済み
+    /// KeyDown に対応する KeyUp」を早期 return で即 `Decision::consumed()` に
+    /// し、`NicolaFsm::on_key_up` 配下の KeyUp 処理（`handle_key_up_pending_
+    /// char_thumb` の重なり判定含む）が実運用で一切呼ばれないという構造的
+    /// リグレッション（BUG-101）を生んでいた。本実装は「OS へ漏らさない」
+    /// という義務の予約と、「イベントを FSM に渡すかどうか」を分離し、
+    /// イベントは義務の有無によらず常に FSM まで届ける。義務があれば、
+    /// この関数の唯一の出口で機械的に Consume へ格上げする（Effects は
+    /// 落とさない）。
     pub fn on_input(&mut self, event: RawKeyEvent, ctx: &InputContext) -> Decision {
-        // Phase 0: KeyUp 自動追跡
         let is_key_down = matches!(event.event_type, KeyEventType::KeyDown);
-        if !is_key_down {
-            match self.lifecycle.on_key_up(event.vk_code) {
-                KeyUpDisposition::Consume => return Decision::consumed(),
-                // 非活性中に素通しした KeyDown の相方。活性化後に届いても
-                // FSM に解釈させない（`passed_while_inactive` の doc 参照）
-                KeyUpDisposition::PassThrough => return Decision::pass_through(),
-                KeyUpDisposition::Unknown => {}
+        let up_duty = if is_key_down {
+            UpDuty::None
+        } else {
+            if self.phase1_held == Some(event.vk_code) {
+                self.phase1_held = None;
             }
+            self.lifecycle.take_key_up_duty(event.vk_code)
+        };
+        // 非活性中に素通しした KeyDown の相方。活性化後に届いても
+        // FSM に解釈させない（`KeyLifecycle::passed_while_inactive` の doc 参照）
+        if up_duty == UpDuty::PassThrough {
+            return Decision::pass_through();
         }
 
-        // Phase 0.5: 同じ物理押下の途中で扱いを変えない。非活性中に素通しした
+        let mut decision = self.on_input_body(event, ctx, is_key_down, up_duty);
+        if up_duty == UpDuty::Consume {
+            decision.force_consume();
+        }
+        decision
+    }
+
+    /// `on_input` の本体（Phase 1〜4）。`up_duty` は Phase 2 の非活性早期 return
+    /// でのみ参照する——非活性中に Consume 義務のある KeyUp が来た場合、
+    /// chord 判定（`state`）を一切再開せず、`release_only` で `output_history`
+    /// の解放索引の掃除と対応する `KeyUp` の発行だけを行う
+    /// （`flush(ContextChange::ImeOff)` と同じ「コンテキストを失ったら
+    /// 同時打鍵判定を再開しない」方針）。それ以外の経路は旧実装の
+    /// Phase 1〜3 と同一。
+    fn on_input_body(
+        &mut self,
+        event: RawKeyEvent,
+        ctx: &InputContext,
+        is_key_down: bool,
+        up_duty: UpDuty,
+    ) -> Decision {
+        // 同じ物理押下の途中で扱いを変えない。非活性中に素通しした
         // KeyDown の auto-repeat が活性化後に FSM へ入ると、「最初は生キー、
         // リピートは変換」という混在が起き、OS へ渡した KeyDown に対応する
         // KeyUp も渡らなくなる（`passed_while_inactive` の doc 参照）
@@ -376,11 +515,19 @@ impl Engine {
             return Decision::pass_through_with(effects);
         }
 
+        // ADR-206: Phase 1 で Consume した親指の自動リピートは Phase 1 に閉じる（FSM に新しい PendingThumb として入れない）。
+        if is_key_down && event.was_down && self.phase1_held == Some(event.vk_code) {
+            return Decision::consumed();
+        }
+
         // Phase 1: Special keys (engine toggle + IME control)
         if is_key_down {
             if let Some(decision) = self.check_special_keys(ctx, &event) {
                 if decision.is_consumed() {
                     self.lifecycle.on_key_down_consumed(&event);
+                    if !event.was_down && Self::is_bare_thumb(&event, ctx.modifiers) {
+                        self.phase1_held = Some(event.vk_code);
+                    }
                 }
                 return decision;
             }
@@ -389,6 +536,11 @@ impl Engine {
         // Phase 2: Active state check + transition detection
         let transition_effects = self.check_active_transition(ctx);
         if !self.compute_active(ctx) {
+            if up_duty == UpDuty::Consume {
+                let mut decision = self.adapter.release_only(&event);
+                decision.prepend_effects(transition_effects);
+                return decision;
+            }
             if is_key_down {
                 self.lifecycle
                     .on_key_down_passed_while_inactive(event.vk_code);
@@ -413,7 +565,7 @@ impl Engine {
         // `on_timeout` は永久に呼ばれず、drain をそちらだけに頼ると 5 連打しても
         // 何も起きない（2026-08-26 コードレビュー指摘、report1）。
         if self.adapter.take_engine_off_requested() {
-            log::info!("Engine OFF triggered by consecutive solo key presses");
+            tracing::info!("Engine OFF triggered by consecutive solo key presses");
             self.solo_off_notify = true;
             return self.apply_special_key_match(&SpecialKeyMatch::EngineOff, ctx);
         }
@@ -429,18 +581,18 @@ impl Engine {
 
         // Engine が非活性なら on_timeout せず flush（コンテキスト喪失）。
         // 非活性化の理由（IME OFF・フォーカス変更等）を問わず、保留キーが入力された
-        // 時点と同一コンテキストである保証がないため Unknown を渡す。
+        // 時点と同一コンテキストである保証がないため Denied を渡す。
         if !self.compute_active(ctx) {
             return self
                 .adapter
-                .flush(ContextChange::ImeOff, ComposingHint::Unknown);
+                .flush(ContextChange::ImeOff, ThumbRawVkEmission::Denied);
         }
 
         let mut decision = self.adapter.on_timeout(timer_id, &phys, ctx.composing);
 
         // ソロ連打によるエンジン OFF トリガー
         if self.adapter.take_engine_off_requested() {
-            log::info!("Engine OFF triggered by consecutive solo key presses");
+            tracing::info!("Engine OFF triggered by consecutive solo key presses");
             self.solo_off_notify = true;
             return self.apply_special_key_match(&SpecialKeyMatch::EngineOff, ctx);
         }
@@ -452,26 +604,33 @@ impl Engine {
     /// `NicolaFsm::take_ime_open_requested`（ADR-092 決定D Step4b、無変換/変換
     /// 単独タップの IME open 軸への肩代わり）を確認し、あれば `decision` の
     /// 既存の効果（キー抑止・タイマー等）を保ったまま `Effect::Ime(SetOpen)`
-    /// を追加する。`origin: ExplicitUserAction` は `Effect::Ime(SetOpen)` の
+    /// を追加する。`Effect::Ime(SetOpen)` の
     /// 既存の消費経路（`awase-windows::key_pipeline::kp_stage_post_decision`）
     /// で `UserIntentSource::Command`（「awase エンジン内部の判断」）として
     /// 記録される——新しい witness 種別は不要（Opus コードレビュー指摘、
     /// 当初案の `SyncKey` witness は無変換/変換の毎打鍵で誤発火する致命的な
     /// 欠陥があった）。
     fn apply_ime_open_request(&mut self, decision: &mut Decision, ctx: &InputContext) {
-        let Some(action) = self.adapter.take_ime_open_requested() else {
+        let Some(request) = self.adapter.take_ime_open_requested() else {
             return;
         };
-        let new_open = match action {
-            ShadowImeAction::TurnOn => true,
-            ShadowImeAction::TurnOff => false,
-            ShadowImeAction::Toggle => !ctx.ime_on,
-        };
-        log::info!("IME open axis delegated (solo tap, key semantics absorption) → {new_open}");
+        let new_open = request.action.resolve(ctx.ime_on);
+        tracing::info!(
+            "IME open axis delegated (solo tap, key semantics absorption) → {new_open} press={:?}",
+            request.press
+        );
         // ime_on/ime_off コンボキーと同じ `ime_set_open_effects` を経由する
         // （`prev_activation` を進めて次打鍵での重複 SetOpen を防ぐため必須、
         // 直接 push_effect してはならない。上のdoc参照）。
-        for effect in self.ime_set_open_effects(ctx, new_open) {
+        // ADR-208 決定2 D1: 単独タップの確定点（KeyUp/タイムアウト/次のキー）は保留開始 KeyDown と別のイベントなので、
+        // 保留開始の押下 ID（`PendingThumbData::press_id`）を `SetOpen.press` へ運ぶ。
+        let mut effects = self.ime_set_open_effects(ctx, new_open);
+        for effect in &mut effects {
+            if let Effect::Ime(ImeEffect::SetOpen { press, .. }) = effect {
+                *press = request.press;
+            }
+        }
+        for effect in effects {
             decision.push_effect(effect);
         }
     }
@@ -507,7 +666,7 @@ impl Engine {
                 let old_active = self.compute_active(ctx);
                 let (user_enabled, mut decision) = self.adapter.toggle_enabled();
                 let new_active = self.compute_active(ctx);
-                log::info!(
+                tracing::info!(
                     "Engine user_enabled toggled: {} (active: {})",
                     if user_enabled { "ON" } else { "OFF" },
                     if new_active { "ON" } else { "OFF" },
@@ -532,9 +691,9 @@ impl Engine {
                 decision
             }
             // InvalidateContext は外部コンテキスト喪失（IME OFF・言語切替等）の汎用通知
-            // であり、composing が保留キーと同一コンテキストか保証できないため Unknown。
+            // であり、composing が保留キーと同一コンテキストか保証できないため Denied。
             EngineCommand::InvalidateContext(reason) => {
-                self.adapter.flush(reason, ComposingHint::Unknown)
+                self.adapter.flush(reason, ThumbRawVkEmission::Denied)
             }
             EngineCommand::SwapLayout(layout) => {
                 let decision = self.adapter.swap_layout(layout);
@@ -550,10 +709,14 @@ impl Engine {
                 threshold_ms,
                 confirm_mode,
                 speculative_delay_ms,
+                timing_margin_percent,
+                min_overlap_margin_percent,
             } => {
                 self.adapter.set_threshold_ms(threshold_ms);
                 self.adapter
                     .set_confirm_mode(confirm_mode, speculative_delay_ms);
+                self.adapter
+                    .set_timing_margins(timing_margin_percent, min_overlap_margin_percent);
                 Decision::pass_through()
             }
             EngineCommand::SetNgramModel(model) => {
@@ -586,19 +749,21 @@ impl Engine {
         // アプリ切替: 前のウィンドウで入力途中だったキーを別のウィンドウに持ち越さない。
         // ctx.composing はこの時点で既に新ウィンドウの状態を指しうる
         // （フォーカス切替が先に完了してから build_ctx() が呼ばれるため）ので、
-        // Unknown を渡して Space フォールバック例外も含め無条件 suppress する。
-        // 生 VK_SPACE 等が別ウィンドウへ誤注入されるのを防ぐ安全側の選択。
+        // Denied を渡して保留中の親指キーによる生の機能VK送出（Space フォールバック等）
+        // を無条件禁止する。VK_SPACE 等が別ウィンドウへ誤注入されるのを防ぐ安全側の選択。
         let flush_effects = self
             .adapter
-            .flush_to_effects(ContextChange::FocusChanged, ComposingHint::Unknown);
+            .flush_to_effects(ContextChange::FocusChanged, ThumbRawVkEmission::Denied);
         effects.extend(flush_effects);
 
-        // Consume 済みで KeyUp が来ていないキーの KeyUp を再注入して
-        // OS 側のキーボード状態と整合させる。
-        let pending_key_ups = self.lifecycle.flush_pending_key_ups();
-        for evt in pending_key_ups {
-            effects.push(Effect::Input(InputEffect::ReinjectKey(evt)));
-        }
+        // output_history の pending_releases を同期して掃除する（ADR-112
+        // コードレビュー指摘）。フォーカス変更は実効状態（active/inactive）の
+        // 遷移を伴わないことがあり（例: 両方とも日本語IMEのウィンドウ間の
+        // 切替）、その場合 check_active_transition 内の同種の掃除は発火しない。
+        // release_pending_and_reinject は実効状態を問わず無条件に発火するため、
+        // ここでも同期して呼ぶ必要がある（下の check_active_transition が
+        // 追加で掃除を試みても、この時点で空になっているため無害）。
+        self.release_pending_and_reinject(&mut effects);
 
         // 実効状態の遷移を検知
         let transition_effects = self.check_active_transition(ctx);
@@ -639,8 +804,8 @@ impl Engine {
     /// user_enabled 変更後の active 遷移を Decision に反映する。
     ///
     /// 呼び出し元（`EngineCommand::ToggleEngine` / `EngineOn`・`EngineOff` コンボ）は
-    /// いずれもユーザーの明示操作が引き金のため、`SetOpenOrigin::ExplicitUserAction` を
-    /// 使う（`check_active_transition` 由来の `ActivationSync` とは区別する）。
+    /// いずれもユーザーの明示操作が引き金のため、明示操作として SetOpen を出す
+    /// （`check_active_transition` 由来の遷移は SetOpen を出さない。ADR-213 P2b）。
     fn apply_active_transition(
         &mut self,
         old_active: bool,
@@ -660,7 +825,7 @@ impl Engine {
             } else {
                 ActivationState::Inactive(InactiveReason::UserDisabled)
             };
-            let effects = self.transition_activation(new_state, SetOpenOrigin::ExplicitUserAction);
+            let effects = self.transition_activation(new_state, true);
             for e in effects {
                 decision.push_effect(e);
             }
@@ -678,18 +843,17 @@ impl Engine {
     /// `SetOpen{true}` のみ追加する（意図を Platform 層に伝えるため）。
     ///
     /// EngineOn コンボ・`ForceEngineOn` コマンドいずれもユーザーの明示操作が引き金のため
-    /// `SetOpenOrigin::ExplicitUserAction` を使う。
     fn apply_engine_on_with_ime_recovery(&mut self, ctx: &InputContext, decision: &mut Decision) {
         let pseudo_ctx = InputContext {
             ime_on: true,
             ..*ctx
         };
         let target_state = self.compute_state(&pseudo_ctx);
-        let effects = self.transition_activation(target_state, SetOpenOrigin::ExplicitUserAction);
+        let effects = self.transition_activation(target_state, true);
         if effects.is_empty() {
             decision.push_effect(Effect::Ime(ImeEffect::SetOpen {
                 open: true,
-                origin: SetOpenOrigin::ExplicitUserAction,
+                press: None,
             }));
         } else {
             for e in effects {
@@ -700,7 +864,7 @@ impl Engine {
 
     /// `open` を反映した擬似 `InputContext` で新 `ActivationState` を求め、
     /// `transition_activation` で `SetOpen + EngineStateChanged` を発行する
-    /// （ユーザー明示操作起点、`origin: ExplicitUserAction` 固定）。状態が遷移
+    /// （ユーザー明示操作起点）。状態が遷移
     /// しない場合（例: `user_enabled=false` で既に Inactive）は `SetOpen` のみを
     /// 明示的に追加する（IME 制御の意図を Platform 層に伝えるため）。
     ///
@@ -723,14 +887,11 @@ impl Engine {
         let was_active = self.prev_activation.is_active();
         let now_active = new_state.is_active();
 
-        let mut effects = self.transition_activation(new_state, SetOpenOrigin::ExplicitUserAction);
+        let mut effects = self.transition_activation(new_state, true);
         if was_active == now_active {
             // 状態遷移なし → transition_activation は空 effects を返す。
             // IME 制御の意図 (SetOpen) は明示的に追加する。
-            effects.push(Effect::Ime(ImeEffect::SetOpen {
-                open,
-                origin: SetOpenOrigin::ExplicitUserAction,
-            }));
+            effects.push(Effect::Ime(ImeEffect::SetOpen { open, press: None }));
         }
         effects
     }
@@ -751,6 +912,24 @@ impl Engine {
             self.match_special_keys(ctx, event),
             Some(SpecialKeyMatch::ImeOff)
         )
+    }
+
+    /// この打鍵に対して Engine が `SetOpen(ExplicitUserAction)` を出す（`keys.ime_on/off/toggle`・自動検出トグル・
+    /// 非活性時の役割由来の単独押下）なら、その向きを副作用なしで返す（ADR-208 決定2 D1、PR #419 Opus M-4）。
+    ///
+    /// Platform 層が shadow toggle の判断の**前**に呼び、Engine が同じ打鍵の開閉を担うキーでは shadow の書き込みを
+    /// 抑止する（衝突を書く前に静的に解く。同じ打鍵で shadow と Engine の 2 経路が逆向きに書くと、ImmCross が先頭の窓では
+    /// 両方 async で勝ち負けが保証されない）。`ctx` は shadow の判断**前**の値で組む（トグル型は `!ctx.ime_on` が向きに効く）。
+    /// `keys.ime_detect`（`sync_direction`）と重なるキーは `match_special_keys` が元から一致させない（二重処理の防止）。
+    /// エンジン ON/OFF コンボ（`EngineOn`/`EngineOff`）は IME の開閉キーではないので `None`。
+    #[must_use]
+    pub fn matches_ime_set_open(&self, ctx: &InputContext, event: &RawKeyEvent) -> Option<bool> {
+        match self.match_special_keys(ctx, event)? {
+            SpecialKeyMatch::ImeOn => Some(true),
+            SpecialKeyMatch::ImeOff => Some(false),
+            SpecialKeyMatch::ImeToggle => Some(!ctx.ime_on),
+            SpecialKeyMatch::EngineOn | SpecialKeyMatch::EngineOff => None,
+        }
     }
 
     /// 変換/無変換系の特殊キーのコンボマッチのみを行う純粋判定メソッド（副作用なし）。
@@ -775,21 +954,56 @@ impl Engine {
             )
             .or_else(|| {
                 (!suppress_ime_combos)
-                    .then(|| self.match_ime_on_off_auto(ctx, event))
-                    .flatten()
-            })
-            .or_else(|| {
-                (!suppress_ime_combos)
                     .then(|| self.match_ime_toggle_auto(ctx, event))
                     .flatten()
             })
+            .or_else(|| {
+                // ADR-206: 自動リピートの Down は指令を作らない（`check_special_keys` が Consume だけ返す）。
+                (!event.was_down)
+                    .then(|| self.thumb_open_role_action(ctx, event))
+                    .flatten()
+                    .map(Self::special_match_of_open_action)
+            })
+    }
+
+    /// ADR-206: エンジン非活性（IME OFF、または開いていても英数等の `NotRomajiInput`）のとき、
+    /// 開閉の役割（IME 設定由来のトグル、または bare `keys.ime_*`）を持つ親指キーの単独押下が要求する open 軸操作。
+    /// 生キーを IME に通さず、awase が belief に従う絶対指定の `SetOpen` を1回書くための入口
+    /// （エンジン活性側は FSM の KeyUp 解決＝`forced_open_action`）。
+    ///
+    /// ユーザーがエンジンを無効化している間・日本語 IME でない間・`keys.ime_detect` と重なるキー
+    /// （`sync_direction`、`match_event` と同じ二重処理の防止）・専用 Fn キー設定済みの無変換は対象外（受動）。
+    /// bare `keys.ime_*` は `match_event` が先に一致するので、ここに来るのは実質、役割由来だけ。
+    fn thumb_open_role_action(
+        &self,
+        ctx: &InputContext,
+        event: &RawKeyEvent,
+    ) -> Option<ShadowImeAction> {
+        if self.compute_active(ctx)
+            || !ctx.is_japanese_ime
+            || !self.adapter.is_enabled()
+            || !Self::is_bare_thumb(event, ctx.modifiers)
+            || event.ime_relevance.sync_direction.is_some()
+        {
+            return None;
+        }
+        self.adapter
+            .thumb_open_role_action(event.vk_code, ctx.composing)
+    }
+
+    const fn special_match_of_open_action(action: ShadowImeAction) -> SpecialKeyMatch {
+        match action {
+            ShadowImeAction::TurnOn => SpecialKeyMatch::ImeOn,
+            ShadowImeAction::TurnOff => SpecialKeyMatch::ImeOff,
+            ShadowImeAction::Toggle => SpecialKeyMatch::ImeToggle,
+        }
     }
 
     /// 修飾キーを伴わない親指キーの**物理**単独押下か。Phase 1/Phase 1.5 の
     /// 判定が食い違わないよう、親指キーの bare 判定はここに集約する。
     ///
     /// `event.injected` は false 扱いにする（BUG-14 と同じ原則、
-    /// `match_ime_on_off_auto` の doc 参照）。手動設定の `ime_on`/`ime_off`/
+    /// `match_ime_toggle_auto` の doc 参照）。手動設定の `ime_on`/`ime_off`/
     /// `ime_toggle` はユーザーがマクロツール等から意図的に注入する運用を
     /// 妨げてはならないため、注入イベントをこのガードで抑制対象にしない。
     ///
@@ -797,7 +1011,7 @@ impl Engine {
     /// `general.left_thumb_key`/`right_thumb_key` に設定した**任意の** VK に
     /// 対して `LeftThumb`/`RightThumb` を返す（`hook.rs::classify_key`）。
     /// 一方 `resolve_pending_thumb_as_single`（`nicola_fsm.rs`）が
-    /// `delegate_to_open_axis`/`dedicated_fn_key` 等の特別扱いをするのは
+    /// `dedicated_fn_key`/開閉の役割（`forced_open_action`）等の特別扱いをするのは
     /// `muhenkan_vk`/`henkan_vk` が `Some` のとき、すなわち
     /// `bootstrap.rs`/`runtime/mod.rs` が `VK_NONCONVERT`/`VK_CONVERT`
     /// **限定**でフィルタして設定した場合のみ。無変換/変換以外を
@@ -821,64 +1035,17 @@ impl Engine {
             && !m.shift
     }
 
-    /// 自動検出由来の IME ON/OFF キー（`ime_on_auto`/`ime_off_auto`、ADR-092
-    /// 決定D Step4c、GJI config1.db の `GjiImeKeys.on`/`off` 由来）との
-    /// マッチ判定。手動設定（`keys.ime_on`/`ime_off`）の**追加**として働く
-    /// （2026-08-16 ユーザー判断で「明示 > 自動」の排他から「明示 ∪ 自動」の
-    /// 併用へ変更）——`ime_on`/`ime_off` は既定で非空（`Ctrl+変換`/
-    /// `Ctrl+無変換`）なため、旧来の「手動が非空なら自動を一切見ない」規則
-    /// （決定C R1、`match_special_keys` 経由で常に手動リストへ先に照合済み
-    /// だった前提）のままだと、既定設定のユーザーには自動検出（GJI の
-    /// config1.db 宣言キー等）が事実上永久に発火しない死んだ機能になって
-    /// いた。手動リストは `match_event` 内で既にこのメソッドより先に照合
-    /// 済みのため、ここでの追加判定は「手動キーでは一致しなかった押下を
-    /// 自動検出キーでも試す」という素直な union になる。
-    ///
-    /// `event.injected` な合成イベントにはマッチしない（BUG-14: MS-IME/CTF
-    /// 由来の注入イベントを信用してはならない、という既存原則。手動設定の
-    /// `ime_on`/`ime_off`/`engine_on`/`engine_off` は挙動を変えない
-    /// （ユーザーがマクロツール等から意図的に注入する運用を妨げないため）
-    /// が、自動検出リストはユーザーが存在を意識せず追加されるため、
-    /// 注入イベントへの露出を正当化する根拠が無い。Opus コードレビュー
-    /// 指摘）。
-    fn match_ime_on_off_auto(
-        &self,
-        ctx: &InputContext,
-        event: &RawKeyEvent,
-    ) -> Option<SpecialKeyMatch> {
-        // `SpecialKeyCombos::match_event` と同じ理由・同じガード
-        // （2026-08-16、`ime_detect` 側との二重処理防止、doc参照）。
-        if event.injected || event.ime_relevance.sync_direction.is_some() {
-            return None;
-        }
-        if self
-            .ime_on_auto
-            .iter()
-            .any(|k| matches_key_combo(*k, event, ctx.modifiers))
-        {
-            return Some(SpecialKeyMatch::ImeOn);
-        }
-        if self
-            .ime_off_auto
-            .iter()
-            .any(|k| matches_key_combo(*k, event, ctx.modifiers))
-        {
-            return Some(SpecialKeyMatch::ImeOff);
-        }
-        None
-    }
-
-    /// 自動検出由来の IME トグルキー（`ime_toggle_auto`）とのマッチ判定
-    /// （ADR-092 決定D Step4a/Step4c）。`match_ime_on_off_auto`と同じ理由
-    /// （2026-08-16 ユーザー判断）で、手動設定（`keys.ime_toggle`）の
-    /// **追加**として働く（排他ではない）。`event.injected`な合成イベントも
-    /// 対象外（`match_ime_on_off_auto`と同じ理由、doc参照）。
+    /// 自動検出由来の IME トグルキー（`ime_toggle_auto`、MS-IMEレジストリの
+    /// `KeyAssignmentCtrlSpace`/`KeyAssignmentShiftSpace`由来、ADR-092
+    /// 決定D Step4a）とのマッチ判定。2026-08-16 ユーザー判断で、手動設定
+    /// （`keys.ime_toggle`）の**追加**として働く（排他ではない）。
+    /// `event.injected`な合成イベントは対象外（BUG-14と同じ原則、
+    /// `is_bare_thumb`のdoc参照）。
     fn match_ime_toggle_auto(
         &self,
         ctx: &InputContext,
         event: &RawKeyEvent,
     ) -> Option<SpecialKeyMatch> {
-        // `match_ime_on_off_auto`と同じ理由・同じガード（doc参照）。
         if event.injected || event.ime_relevance.sync_direction.is_some() {
             return None;
         }
@@ -905,6 +1072,12 @@ impl Engine {
         self.match_special_keys(ctx, event)
     }
 
+    /// テスト用: 重なり不足判定のマージンを上書きする（ADR-112決定1参照）。
+    #[cfg(test)]
+    pub(super) fn set_min_overlap_margin_percent_for_test(&mut self, pct: u64) {
+        self.adapter.set_min_overlap_margin_percent_for_test(pct);
+    }
+
     /// `user_enabled` を無条件で true にし、IME recovery を伴う activate 処理を行う。
     ///
     /// `SpecialKeyMatch::EngineOn`（`Ctrl+Shift+変換` キーコンボ経由）と
@@ -914,7 +1087,7 @@ impl Engine {
         let old_active = self.compute_active(ctx);
         let (_, mut decision) = self.adapter.set_enabled(true);
         let new_active = self.compute_active(ctx);
-        log::info!("Engine user_enabled ON ({trigger}, active={new_active})");
+        tracing::info!("Engine user_enabled ON ({trigger}, active={new_active})");
         if new_active {
             self.apply_active_transition(old_active, new_active, &mut decision);
         } else {
@@ -932,16 +1105,16 @@ impl Engine {
                 let old_active = self.compute_active(ctx);
                 let (_, mut decision) = self.adapter.set_enabled(false);
                 let new_active = self.compute_active(ctx);
-                log::info!("Engine user_enabled OFF (key combo, active={new_active})");
+                tracing::info!("Engine user_enabled OFF (key combo, active={new_active})");
                 self.apply_active_transition(old_active, new_active, &mut decision);
                 decision
             }
             SpecialKeyMatch::ImeOn => {
-                log::info!("IME ON (key combo)");
+                tracing::info!("IME ON (key combo)");
                 self.build_ime_set_open_decision(ctx, true)
             }
             SpecialKeyMatch::ImeOff => {
-                log::info!("IME OFF (key combo)");
+                tracing::info!("IME OFF (key combo)");
                 self.build_ime_set_open_decision(ctx, false)
             }
             SpecialKeyMatch::ImeToggle => {
@@ -949,7 +1122,7 @@ impl Engine {
                 // トグル方向が反転しうる——既存の `ImeDetectConfig.toggle` 経由の
                 // VK_KANJI トグルと同じ弱点で、新規リスクではない。
                 let new_open = !ctx.ime_on;
-                log::info!("IME Toggle (key combo) → {new_open}");
+                tracing::info!("IME Toggle (key combo) → {new_open}");
                 self.build_ime_set_open_decision(ctx, new_open)
             }
         }
@@ -957,8 +1130,18 @@ impl Engine {
 
     /// 変換/無変換系の特殊キーを一括チェックし、一致した場合は状態変更して結果を返す。
     fn check_special_keys(&mut self, ctx: &InputContext, event: &RawKeyEvent) -> Option<Decision> {
+        // ADR-206 不変条件: 自動リピートの Down は開閉の指令を作らない。`phase1_held` が flush 等で消えた後でも、
+        // 役割由来の入口ではリピートを Consume するだけにする（生キーを IME に通さず、二重に書かない）。
+        if event.was_down && self.thumb_open_role_action(ctx, event).is_some() {
+            return Some(Decision::consumed());
+        }
         let m = self.match_special_keys(ctx, event)?;
-        Some(self.apply_special_key_match(&m, ctx))
+        let mut decision = self.apply_special_key_match(&m, ctx);
+        // ADR-208 決定2 D1: コンボ（Ctrl+変換等）・`keys.ime_*` の `SetOpen` に、その打鍵の押下 ID を載せる。
+        // 自動リピートの Down は `event.press_id` が `None` なので載らない（特殊キー照合はリピートでも一致するが、
+        // 従来どおり `applied` の already-matched 省略に任せる）。
+        decision.stamp_set_open_press(event.press_id);
+        Some(decision)
     }
 }
 
@@ -971,6 +1154,49 @@ fn matches_key_combo(combo: ParsedKeyCombo, event: &RawKeyEvent, modifiers: Modi
 }
 
 impl SpecialKeyCombos {
+    /// ADR-206 決定4: 旧 `*_solo_tap_ime_action` の移行用。`vk` に**無修飾の bare が既にあれば何もしない**
+    /// （ユーザーが明示した `keys.ime_*` を優先。旧設定が残ったまま新しい bare を足した場合に黙って上書きしない）。
+    /// 無ければ `action` の一覧へ bare を加える。修飾付きのコンボには触れない。config.toml は書き換えず、メモリ上の照合表だけを変える。
+    /// 戻り値は移行したか。
+    pub fn set_bare_ime_action_if_absent(&mut self, vk: VkCode, action: ShadowImeAction) -> bool {
+        if self.bare_ime_action(vk).is_some() {
+            return false;
+        }
+        let combo = ParsedKeyCombo {
+            ctrl: false,
+            shift: false,
+            alt: false,
+            vk,
+        };
+        match action {
+            ShadowImeAction::TurnOn => self.ime_on.push(combo),
+            ShadowImeAction::TurnOff => self.ime_off.push(combo),
+            ShadowImeAction::Toggle => self.ime_toggle.push(combo),
+        }
+        true
+    }
+
+    /// 修飾なしの `vk` に対する open 軸操作。通常の特殊キー照合と同じく方向固定を toggle より優先し、
+    /// on を off より先に評価する（ADR-192 決定3b。Platform 層の `thumb_forced_open_actions` と
+    /// ADR-199 決定16 の役割合成が共有する）。
+    #[must_use]
+    pub fn bare_ime_action(&self, vk: VkCode) -> Option<ShadowImeAction> {
+        let contains_bare = |combos: &[ParsedKeyCombo]| {
+            combos
+                .iter()
+                .any(|combo| combo.vk == vk && !combo.ctrl && !combo.shift && !combo.alt)
+        };
+        if contains_bare(&self.ime_on) {
+            Some(ShadowImeAction::TurnOn)
+        } else if contains_bare(&self.ime_off) {
+            Some(ShadowImeAction::TurnOff)
+        } else if contains_bare(&self.ime_toggle) {
+            Some(ShadowImeAction::Toggle)
+        } else {
+            None
+        }
+    }
+
     /// エンジン有効状態を考慮したうえでコンボマッチを行い、最初に一致した種別を返す。
     ///
     /// 副作用なし。`engine_enabled` は `adapter.is_enabled()` の値を、`engine_active` は
@@ -1039,7 +1265,7 @@ impl SpecialKeyCombos {
                 .iter()
                 .any(|k| matches_key_combo(*k, event, modifiers))
             {
-                log::debug!(
+                tracing::debug!(
                     "[special-key] IME ON match: vk={} ctrl={} shift={} alt={} extra_info={:#x}",
                     crate::diagnostics::MaskedVk(event.vk_code.0),
                     modifiers.ctrl,
@@ -1054,7 +1280,7 @@ impl SpecialKeyCombos {
                 .iter()
                 .any(|k| matches_key_combo(*k, event, modifiers))
             {
-                log::debug!(
+                tracing::debug!(
                     "[special-key] IME OFF match: vk={} ctrl={} shift={} alt={} extra_info={:#x}",
                     crate::diagnostics::MaskedVk(event.vk_code.0),
                     modifiers.ctrl,
@@ -1071,7 +1297,7 @@ impl SpecialKeyCombos {
                 .iter()
                 .any(|k| matches_key_combo(*k, event, modifiers))
             {
-                log::debug!(
+                tracing::debug!(
                     "[special-key] IME Toggle match: vk={} ctrl={} shift={} alt={} extra_info={:#x}",
                     crate::diagnostics::MaskedVk(event.vk_code.0),
                     modifiers.ctrl,

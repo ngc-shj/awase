@@ -8,14 +8,22 @@ use awase::kana_table::KanaTable;
 use awase::scanmap::PhysicalPos;
 use awase::types::{SpecialKey, VkCode};
 use awase::yab::{FullwidthStrExt as _, YabFace, YabLayout, YabValue};
+use awase_windows::scancode_map::{ScancodeMapPreset, ScancodeMapSelection};
 use awase_windows::vk::VkCodeExt as _;
 
 mod bug_report;
+#[cfg(test)]
+mod key_acceptance_tests;
+mod keymap_learn_launcher;
+mod keymap_learn_status;
+mod scancode_map_admin;
 mod startup_failure;
+mod update_check;
 
-/// 設定リロード用カスタムメッセージ ID（awase 本体側の `WM_APP + 10` と一致させる）
+/// 設定リロード用カスタムメッセージ。`awase_windows::WM_RELOAD_CONFIG`と
+/// 同じ値を使う。
 #[cfg(target_os = "windows")]
-const WM_RELOAD_CONFIG: u32 = 0x8000 + 10; // WM_APP = 0x8000
+use awase_windows::WM_RELOAD_CONFIG;
 
 /// awase のホームページ URL（`crates/awase-windows/src/tray.rs` の
 /// `HOMEPAGE_URL` と同じ値。crate を跨ぐため定数を共有できず文字列直書き）。
@@ -27,13 +35,7 @@ enum Tab {
     Keys,
     Keymap,
     DisableApps,
-    // サイドパネルから外しているため未構築（今後の課題として実装は保持）。
-    // disable_apps 部分のみ `DisableApps` タブへ切り出し済み（2026-08-26、
-    // BUG-90）。残る force_text/force_bypass/force_vk/force_tsf は
-    // プロセス名+クラス名の両方が必要な、より高度な上書き設定のため
-    // 引き続き非表示（config.toml の直接編集に委ねる）。
-    #[allow(dead_code)]
-    AppRules,
+    Calibration,
     Layout,
     Advanced,
 }
@@ -78,6 +80,13 @@ enum ValueKind {
     None,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayoutDiscardAction {
+    OpenPending,
+    OpenTextBox,
+    Reload,
+}
+
 /// 打鍵欄の入力を検証する。JIS キーボード上のキーとして表現できない文字が
 /// あれば、その文字を返す。
 fn find_invalid_keystroke_char(input: &str) -> Option<char> {
@@ -116,8 +125,12 @@ const CLIPBOARD_HISTORY_LEN: usize = 4;
 enum CaptureTarget {
     /// 既存ルールの from 全体（修飾+主キー）
     ExistingFrom(usize),
-    /// 既存ルールの to 主キー
-    ExistingTo(usize),
+    /// 既存ルールの to の1ステップ（ルール index, ステップ index）。
+    /// キャプチャした結果はこのステップを**置換**する（新規ルール側と対称、
+    /// コードレビュー指摘 M4）。新しいステップを増やすのは「＋」ボタン
+    /// （`rule.to.push(String::new())`）であり、キャプチャの役割ではない
+    /// （M3）。
+    ExistingTo(usize, usize),
     /// 新規ルールの from 全体
     NewFrom,
     /// 新規ルールの to 主キー
@@ -133,9 +146,18 @@ enum CaptureTarget {
 ///
 /// これが無いと GUI サブシステムでは panic してもコンソールに何も残らず
 /// 「無言のまま強制終了」になる（2026-07-11 プレビュータブ egui::Grid panic の
-/// 調査で発覚。当時 env_logger 自体が初期化されておらず log::warn! も no-op
+/// 調査で発覚。当時 env_logger 自体が初期化されておらず tracing::warn! も no-op
 /// だった）。
+///
+/// ADR-139 決定2（BufWriter・ローテーション・flush方針）は awase.exe の
+/// `awase.log` のみを対象としており、`awase-settings.log` はスコープ外
+/// （747MB 肥大化の実測は awase.exe 側のものであり、設定画面はログ量が
+/// 桁違いに少ない）。ここでは `log`→`tracing` の移行（決定1）のみ行い、
+/// ファイルへは `BufWriter` を挟まず直接書き込む（＝1行ごとに実質 flush 済み）。
 fn init_logging(debug_console: bool) {
+    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+
     let log_path = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("awase-settings.log")))
@@ -143,12 +165,13 @@ fn init_logging(debug_console: bool) {
 
     if debug_console {
         attach_parent_console();
-        let mut builder =
-            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"));
-        builder.format_timestamp_millis();
-        builder.target(env_logger::Target::Stderr);
-        builder.init();
-        log::info!("--debug: ログをコンソール(stderr)に出力, レベル=debug");
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .finish()
+            .init();
+        tracing::info!("--debug: ログをコンソール(stderr)に出力, レベル=debug");
         return;
     }
 
@@ -157,25 +180,66 @@ fn init_logging(debug_console: bool) {
         .append(true)
         .open(&log_path);
 
-    let mut builder =
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
-    builder.format_timestamp_millis();
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     if let Ok(file) = log_file {
-        builder.target(env_logger::Target::Pipe(Box::new(file)));
+        let handle = std::sync::Arc::new(std::sync::Mutex::new(file));
+        let _ = SETTINGS_LOG_FILE.set(std::sync::Arc::clone(&handle));
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(move || SettingsLogWriter(std::sync::Arc::clone(&handle)))
+            // ファイル出力にANSIエスケープシーケンスを混入させない
+            // （env_loggerのWriteStyle::Autoは非端末出力で自動的に無効化していたが、
+            // tracing-subscriberは既定でansi featureが有効なため明示指定が必要。
+            // 不具合報告に添付されるawase-settings.logが読めなくなるのを防ぐ）。
+            .with_ansi(false)
+            .finish()
+            .init();
+    } else {
+        // ファイルが開けない場合は stderr フォールバック
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .finish()
+            .init();
     }
-    // ファイルが開けない場合は stderr フォールバック
-    builder.init();
-    log::info!("awase-settings starting... (log → {})", log_path.display());
+    tracing::info!("awase-settings starting... (log → {})", log_path.display());
+}
+
+/// `init_logging` がファイルを開けた場合にのみ設置される書き込みハンドル。
+/// `log_checkpoint` からの明示 flush（後述）専用。
+static SETTINGS_LOG_FILE: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<std::fs::File>>> =
+    std::sync::OnceLock::new();
+
+struct SettingsLogWriter(std::sync::Arc<std::sync::Mutex<std::fs::File>>);
+
+impl std::io::Write for SettingsLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .map_or(Ok(buf.len()), |mut f| std::io::Write::write(&mut *f, buf))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0
+            .lock()
+            .map_or(Ok(()), |mut f| std::io::Write::flush(&mut *f))
+    }
 }
 
 /// ログを記録した直後に即 `flush` するチェックポイント。
 ///
-/// 通常の `log::info!` はバッファされる場合があり、直後にハング/クラッシュ
-/// すると出力が失われることがある（実機で「配列編集タブ関連のログが一切
-/// 出ない」と報告された際、原因切り分けのために導入）。
+/// `std::fs::File` への書き込みは（`BufWriter` を挟んでいないため）実質的に
+/// 毎行 syscall されているが、明示 flush の意図（実機で「配列編集タブ関連の
+/// ログが一切出ない」と報告された際の切り分け用）を保つためそのまま残す。
+/// 呼び出し内では他の `tracing::*!` マクロを呼ばない（`SETTINGS_LOG_FILE` の
+/// `Mutex` 再入を避けるため、ADR-139 決定2 の flush 実装規約に合わせる）。
 fn log_checkpoint(msg: &str) {
-    log::info!("[layout-tab] checkpoint: {msg}");
-    log::logger().flush();
+    tracing::info!("[layout-tab] checkpoint: {msg}");
+    if let Some(handle) = SETTINGS_LOG_FILE.get()
+        && let Ok(mut f) = handle.lock()
+    {
+        let _ = std::io::Write::flush(&mut *f);
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -190,6 +254,62 @@ fn attach_parent_console() {
 
 #[cfg(not(target_os = "windows"))]
 fn attach_parent_console() {}
+
+/// `awase_windows::autostart` は `#[cfg(windows)]` 専用モジュール（HKCU Run
+/// キー操作は Windows でしか意味を持たない）。このブリッジで参照を1箇所に
+/// 集約し、非Windowsホストでのビルド確認（`cargo check -p awase-settings`、
+/// 開発者のLinux環境やCI）を通す。
+///
+/// Blocker（Opus敵対的レビュー指摘、2026-09-07）: 以前は `main.rs` の複数箇所
+/// から `awase_windows::autostart::*` を無条件に呼んでおり、非Windowsホスト
+/// ビルドが `E0433 cannot find autostart in awase_windows` で失敗していた。
+/// CIにはこの経路（windowsターゲット指定無しでの `-p awase-settings` ビルド）
+/// が無く検出できなかったため、`.github/workflows/ci.yml` にも
+/// `cargo check -p awase-settings`（ホストターゲット）を追加している。
+#[cfg(target_os = "windows")]
+mod autostart_bridge {
+    pub fn is_registered() -> bool {
+        awase_windows::autostart::is_registered()
+    }
+
+    pub fn register_path(exe: &std::path::Path) -> bool {
+        awase_windows::autostart::register_path(exe)
+    }
+
+    pub fn unregister() -> bool {
+        awase_windows::autostart::unregister()
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+mod autostart_bridge {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Windows の Run キーを模倣する、プロセス内だけの状態。実際のレジストリ
+    /// は存在しないため永続化はしない。
+    ///
+    /// このPR以前は、設定画面のチェックボックスは Win32 API を一切呼ばず
+    /// `config.toml` の値を直接書き換えるだけだったため、非Windowsホスト
+    /// （Linuxでの設定GUI開発）でもチェックボックスが「動いているように」
+    /// 見えた。常に `false`/失敗を返す素朴なスタブにすると、この開発体験を
+    /// 壊してチェックボックスが恒久的に操作不能になる（/code-review指摘、
+    /// 2026-09-07）。実体を持たない無害なフラグで模倣し、その体験を保つ。
+    static SIMULATED_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+    pub fn is_registered() -> bool {
+        SIMULATED_REGISTERED.load(Ordering::Relaxed)
+    }
+
+    pub fn register_path(_exe: &std::path::Path) -> bool {
+        SIMULATED_REGISTERED.store(true, Ordering::Relaxed);
+        true
+    }
+
+    pub fn unregister() -> bool {
+        SIMULATED_REGISTERED.store(false, Ordering::Relaxed);
+        true
+    }
+}
 
 /// panic 時にファイル:行番号とメッセージをログに記録する。
 ///
@@ -208,7 +328,7 @@ fn install_panic_logging_hook() {
             .copied()
             .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
             .unwrap_or("(non-string payload)");
-        log::error!("[PANIC] {msg} @ {location}");
+        tracing::error!("[PANIC] {msg} @ {location}");
         prev_hook(info);
     }));
 }
@@ -223,17 +343,44 @@ fn main() -> eframe::Result<()> {
         return bug_report::run(&parse_bug_report_args(&args));
     }
 
+    if args.iter().any(|a| a == "--check-update") {
+        update_check::run();
+        std::process::exit(0);
+    }
+
+    let adr192_warning_context = has_adr192_warning_context(&args);
+
+    // ADR-111決定4: 自己昇格フローの昇格側エントリポイント。GUIは起動せず
+    // レジストリ操作のみ行い、終了コードで結果を返す（`--bug-report`と
+    // 同型のヘッドレス分岐パターン）。
+    if args.iter().any(|a| a == "--scancode-map") {
+        let Some(mode) = arg_value(&args, "--scancode-map") else {
+            tracing::error!("[scancode-map] --scancode-map に値がありません");
+            std::process::exit(1);
+        };
+        let Some(selection) = ScancodeMapSelection::from_cli_arg(mode) else {
+            tracing::error!("[scancode-map] 不正な --scancode-map 値: {mode}");
+            std::process::exit(1);
+        };
+        std::process::exit(scancode_map_admin::run_elevated_worker(selection));
+    }
+
     let viewport = egui::ViewportBuilder::default()
-        // 幅 580: サイドパネル(100) + プレビューのキーボード図(13キー×34px+段差
-        // インデント ≈ 464) + 余白。最も幅を要するタブがデフォルトで横スクロール
-        // なしに収まる値（従来の 500 ではプレビュー右端が切れていた）。
-        .with_inner_size([580.0, 650.0])
+        // 幅 760: サイドパネル(100) + 配列編集タブの最も幅を要する行（JIS 最上段
+        // 13キー、ボタン min_size 40px + item_spacing 8px ≈ 616px）+ 余白/
+        // スクロールバー分。580 だと draw_layout_keyboard_grid()
+        // (crates/awase-settings/src/main.rs) のボタン幅が「⌫BS」等4文字
+        // ラベルの視認性のため 34px→40px に広がった後もここが追随しておらず、
+        // デフォルトサイズで開くと配列編集タブのキーボード図が右へはみ出す
+        // ユーザー報告があった（2026-09-03。ウィンドウを広げれば表示は正常に
+        // 戻る＝致命的ではないが既定値の追随漏れ）。
+        .with_inner_size([760.0, 650.0])
         // ウィンドウを小さくしても全項目にスクロール + 下部固定ボタンで届くため、
         // 低解像度・高 DPI ディスプレイでも操作不能にならない下限だけ設ける。
         .with_min_inner_size([420.0, 320.0])
         .with_title("awase 設定");
-    startup_failure::run_with_fallback("awase-settings", viewport, |cc| {
-        Box::new(SettingsApp::new(cc)) as Box<dyn eframe::App>
+    startup_failure::run_with_fallback("awase-settings", viewport, move |cc| {
+        Box::new(SettingsApp::new(cc, adr192_warning_context)) as Box<dyn eframe::App>
     })
 }
 
@@ -258,6 +405,20 @@ fn arg_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
         .map(|pair| pair[1].as_str())
 }
 
+fn has_adr192_warning_context(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "--adr192-mode-key-warning")
+}
+
+/// 現在の実行ファイル（`awase-settings.exe`）と同じフォルダにある `name`
+/// を探す。`app::launch_settings_with_args`（awase.exe から awase-settings.exe
+/// を探す逆方向の実装）と同じ「実行ファイルの隣を探す」パターン。
+fn resolve_sibling_exe(name: &str) -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let path = dir.join(name);
+    path.exists().then_some(path)
+}
+
 /// 各 bool は無関係な由来（keymap キャプチャの修飾キー3つ、配列編集タブの
 /// dirty フラグ1つ、ADR-099 決定4の確認モーダル開閉フラグ1つ）を持つ独立
 /// したフラグであり、bitflags 化や enum への統合は可読性を下げるだけ
@@ -265,6 +426,12 @@ fn arg_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 #[expect(clippy::struct_excessive_bools)]
 struct SettingsApp {
     config: awase::config::AppConfig,
+    /// ADR-201 決定3 の `base`: GUI が読み込んだときの生の `AppConfig`（`validate()` で
+    /// 正規化する前）。保存は `to_save`（`self.config`）が `base` と違う項目だけを、
+    /// 保存直前のディスクの文書へ書く（三者比較）。更新は読み込み・キャンセルでの読み直しと、
+    /// 保存の成功（`poll_pending_save` が `Saved` を受けたとき、保存した値の複製）だけ。
+    /// 保存失敗では更新しない（次の保存で差分が書かれなくなるため）。
+    base: awase::config::AppConfig,
     config_path: std::path::PathBuf,
     /// 直近の `AppConfig::load` 結果の分類（ADR-099 決定4）。`Dangerous` の
     /// 間は `apply()` が無条件保存せず、確認・バックアップを必須にする。
@@ -285,22 +452,14 @@ struct SettingsApp {
     new_keymap_app: String,
     new_keymap_from_ctrl: bool,
     new_keymap_from_shift: bool,
-    new_keymap_from_alt: bool,
+    // Alt は GUI から選べない（ADR-114 決定5 — バックエンドが 'from' の Alt
+    // 修飾を禁止・skip するため）。
     new_keymap_from_main: String,
     new_keymap_to_main: String,
-    // key_remap rule add-buffers（ADR-110）
-    new_key_remap_from: String,
-    new_key_remap_to: String,
     // Keymap capture mode (None = not capturing)
     capturing: Option<CaptureTarget>,
-    // アプリ別タブ add-buffers: (process, class) × force_text/force_bypass/force_vk/force_tsf
-    new_override_bufs: [(String, String); 4],
     // disable_apps add-buffer（プロセス名のみ、class 不要）
     new_disable_app: String,
-    // post_bypass add-buffers
-    new_pb_key: String,
-    new_pb_process: String,
-    new_pb_class: String,
     // ── 配列編集タブの状態（旧 awase-yab-editor バイナリを統合） ──
     layout: YabLayout,
     layout_file_path: Option<PathBuf>,
@@ -315,16 +474,29 @@ struct SettingsApp {
     layout_edit_kind: ValueKind,
     layout_edit_value: String,
     layout_edit_special_idx: usize,
+    layout_edit_origin: Option<(String, ValueKind)>,
+    layout_edit_origin_is_sequence: bool,
+    layout_edit_last_seen: Option<(String, ValueKind)>,
+    ime_composing: bool,
+    ime_event_this_frame: bool,
     kana_table: KanaTable,
     layout_modified: bool,
     layout_status: String,
     /// 「配列編集」タブを一度でも開いたか（開いたときに一度だけ .yab を
     /// 読み込む。起動時の同期読み込みを避けるため）。
     layout_loaded: bool,
+    /// 現在の `layout_file_path` から `layout` を正常に読み込めているか。
+    layout_loaded_ok: bool,
+    /// `layout` を最後に正常読み込みした時点のキーボード配列。
+    layout_loaded_model: Option<awase::scanmap::KeyboardModel>,
     /// rfd の非同期ファイルダイアログから戻ってきたパス（開く）
     layout_pending_open: Option<PathBuf>,
     /// rfd の非同期ファイルダイアログから戻ってきたパス（名前を付けて保存）
     layout_pending_save_as: Option<PathBuf>,
+    pending_layout_discard: Option<LayoutDiscardAction>,
+    show_cancel_layout_confirm: bool,
+    pending_status_notes: Vec<String>,
+    config_loaded_model: awase::scanmap::KeyboardModel,
     /// コードレビュー指摘: `AppConfig::save()`（ADR-099 決定3、fsync+
     /// rename・失敗時50ms×最大4回リトライ）を `update()` から同期呼び出し
     /// すると、rename が失敗するケース（AV/OneDrive 等のロック）で最大
@@ -332,6 +504,159 @@ struct SettingsApp {
     /// バックグラウンドスレッドで実行し、この `Receiver` を毎フレーム
     /// ノンブロッキングでポーリングする。
     pending_save: Option<std::sync::mpsc::Receiver<PendingSaveResult>>,
+    /// Caps(英数)⇔Ctrl 入れ替えプリセット（ADR-111）の現在の Scancode Map
+    /// 状態キャッシュ。`None` はまだ一度も読んでいないことを示す（タブを
+    /// 開いた時と操作直後にのみ読み直す、毎フレーム `RegGetValueW` しない）。
+    scancode_map_status: Option<scancode_map_admin::ScancodeMapStatus>,
+    /// 直近の有効化/無効化操作の結果メッセージ（GUI表示用）。
+    scancode_map_last_message: Option<String>,
+    /// 起動時設定診断（ADR-116）: `config.validate()` 警告 + `layouts_dir`
+    /// 内の全 `.yab` の読込失敗/`yab::lint()` 警告。`recompute_diagnostics()`
+    /// で計算し、`config_path_panel` に表示する。空なら表示しない。
+    startup_diagnostics: Vec<String>,
+    /// 自動起動チェックボックスの表示に使う、レジストリ実体
+    /// （`autostart_bridge::is_registered()`）のキャッシュ。`tab_basic` の
+    /// 再描画ごとに `RegGetValueW` を呼ぶのを避けるため、`new()` と
+    /// `recompute_diagnostics()`（`apply_autostart_toggle` 末尾からも呼ばれる）
+    /// でのみ更新する（Opus敵対的レビュー指摘、2026-09-07）。
+    auto_start_registered: bool,
+    /// awaseの状態依存キー警告から起動されたことを示すargv由来のコンテキスト。
+    adr192_warning_context: bool,
+    adr192_replacement_undo: Option<Adr192ReplacementSnapshot>,
+    adr192_replacement_preview: Option<String>,
+    /// ADR-195段階6: 学習プロセス(`awase-keymap-learn-win`)を子プロセスとして
+    /// 起動中のとき、その標準出力から`drain_learning_output`が送ってくる
+    /// 行を毎フレームノンブロッキングで受け取るチャネル。
+    keymap_learn_rx:
+        Option<std::sync::mpsc::Receiver<Result<keymap_learn_launcher::LearnLine, String>>>,
+    /// 直近に受信した進捗（UI表示用、進捗行が来るたびに更新）。
+    keymap_learn_progress: Option<keymap_learn_launcher::LearnProgress>,
+    /// 学習が成功で終わった(進捗を100%・残り0秒で表示する)。進捗の割合は完了前は99%で
+    /// 止めるため、結果行を受けてから切り替える。
+    keymap_learn_finished: bool,
+    /// 学習プロセスの最終結果、または起動失敗のエラーメッセージ
+    /// （どちらもここに文字列化して保持、`keymap_learn_rx`が`None`になった後も残す）。
+    keymap_learn_status: Option<String>,
+    /// 起動中の学習子プロセスのハンドル（`kill()`/`wait()`用）。
+    /// 標準出力を読む別スレッドと共有するため`Arc<Mutex<_>>`で持つ
+    /// （読み取りループ自体は`ChildStdout`を直接読むのでロックを取らず進む、
+    /// `kill()`/`wait()`のときだけ短時間ロックする）。UIの「キャンセル」ボタンと
+    /// `on_exit`（ウィンドウを閉じたとき）の両方から`kill()`できるようにするための保持。
+    keymap_learn_child: Option<std::sync::Arc<std::sync::Mutex<std::process::Child>>>,
+    /// 学習プロセスの標準エラーを読み切るスレッドのハンドル。`result
+    /// status=failure`受信時、書き込み失敗理由(`print_result_line`のErr分岐が
+    /// 標準エラーへ書く1行)をUIに出すために`join()`する
+    /// (code-review指摘: 従来は標準エラーを`Stdio::null()`で捨てていたため、
+    /// 失敗理由がユーザーにもバグ報告にも一切残らなかった)。
+    keymap_learn_stderr_handle: Option<std::thread::JoinHandle<Option<String>>>,
+    /// 実行中(または直近)の子プロセスの起動モード(結果行の解釈に使う)。
+    keymap_learn_mode: keymap_learn_launcher::LearnMode,
+    /// ADR196-T4: 「使用中の予測表」状態表示用の現在の表状態(パネル表示時に再計算)。
+    keymap_table_state: Option<keymap_learn_status::TableState>,
+    /// 現在のIME本体版(フィンガープリント)。UIスレッドを塞がないよう別スレッドで取得する。
+    keymap_env_probe: keymap_learn_status::EnvProbe,
+}
+
+/// `keymap-learn-table.json`(config.tomlの隣。config.tomlの解決は`awase.exe`と同じ
+/// [`find_config_path`]、コマンドライン引数を優先)を読み、状態表示用の
+/// [`keymap_learn_status::TableState`]を作る。ファイルが無い・壊れている・4MB超過の場合は
+/// 表なし(内蔵表)として扱う(読み手`key_effect_runtime::read_persisted_table`と同じ棄却)。
+fn load_keymap_table_state(
+    current_env: awase_keymap_learn::revalidation::EnvVersionProbe,
+    custom_keymap_without_prediction: bool,
+    use_learned_keymap_table: bool,
+    current_fingerprint: Option<awase_keymap_learn::staleness::FingerprintProbe>,
+) -> keymap_learn_status::TableState {
+    let config_path = find_config_path();
+    let path = config_path
+        .parent()
+        .map(|dir| dir.join("keymap-learn-table.json"));
+    let (table, file_date) = path
+        .and_then(|path| {
+            let table =
+                awase_windows::state::key_effect_runtime::read_persisted_table(&path).ok()?;
+            let date = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| {
+                    keymap_learn_status::format_ymd(
+                        d.as_secs(),
+                        keymap_learn_status::local_utc_offset_secs(),
+                    )
+                });
+            Some((table, date))
+        })
+        .unzip();
+    let runtime_rejection = table
+        .as_ref()
+        .and_then(|t| keymap_learn_status::runtime_rejection_of(t, current_fingerprint));
+    keymap_learn_status::TableState::from_inputs(&keymap_learn_status::StatusInputs {
+        table: table.as_ref(),
+        current_env,
+        file_date: file_date.flatten(),
+        custom_keymap_without_prediction,
+        use_learned_keymap_table,
+        runtime_rejection,
+    })
+}
+
+#[derive(Clone)]
+struct Adr192ReplacementSnapshot {
+    ime_on: Vec<String>,
+    ime_off: Vec<String>,
+    muhenkan_legacy_action: Option<awase::config::ShadowImeActionConfig>,
+    henkan_legacy_action: Option<awase::config::ShadowImeActionConfig>,
+}
+
+fn apply_adr192_recommended_replacement(
+    config: &mut awase::config::AppConfig,
+) -> Adr192ReplacementSnapshot {
+    let snapshot = Adr192ReplacementSnapshot {
+        ime_on: config.keys.ime_on.clone(),
+        ime_off: config.keys.ime_off.clone(),
+        muhenkan_legacy_action: config.general.muhenkan_solo_tap_ime_action,
+        henkan_legacy_action: config.general.henkan_solo_tap_ime_action,
+    };
+    // 非推奨の `*_solo_tap_ime_action` は消す: 残すと、読込時に同じキーの旧設定が新しい bare と食い違う
+    // （bare が優先されるが、警告が出続け、消し忘れの原因になる。ADR-206 決定4）。置き換えの undo で元へ戻す。
+    config.general.muhenkan_solo_tap_ime_action = None;
+    config.general.henkan_solo_tap_ime_action = None;
+    // ADR-206: 単独タップの開閉は「開閉の役割（bare `keys.ime_*`）があれば生キーを抑止して awase が絶対指定で書く」に
+    // 一本化した。親指キーでも `*_solo_tap_ime_action`/`always_suppress` は書かず、bare のコンボを書く。
+    // 親指キーのときは既存のリスト（既定の `Ctrl+無変換` 等）を消さないよう追記する。親指でない無変換/変換は
+    // 従来どおり置き換える（同時打鍵に使わないので `Ctrl` 付き等の他の割り当てより単独が確実、ADR-192）。
+    let henkan_is_thumb = is_henkan_thumb_key(&config.general.left_thumb_key)
+        || is_henkan_thumb_key(&config.general.right_thumb_key);
+    let muhenkan_is_thumb = is_muhenkan_thumb_key(&config.general.left_thumb_key)
+        || is_muhenkan_thumb_key(&config.general.right_thumb_key);
+    if henkan_is_thumb {
+        push_unique(&mut config.keys.ime_on, "変換");
+    } else {
+        config.keys.ime_on = vec!["変換".to_owned()];
+    }
+    if muhenkan_is_thumb {
+        push_unique(&mut config.keys.ime_off, "無変換");
+    } else {
+        config.keys.ime_off = vec!["無変換".to_owned()];
+    }
+    snapshot
+}
+
+fn push_unique(list: &mut Vec<String>, key: &str) {
+    if !list.iter().any(|k| k == key) {
+        list.push(key.to_owned());
+    }
+}
+
+fn undo_adr192_recommended_replacement(
+    config: &mut awase::config::AppConfig,
+    snapshot: Adr192ReplacementSnapshot,
+) {
+    config.keys.ime_on = snapshot.ime_on;
+    config.keys.ime_off = snapshot.ime_off;
+    config.general.muhenkan_solo_tap_ime_action = snapshot.muhenkan_legacy_action;
+    config.general.henkan_solo_tap_ime_action = snapshot.henkan_legacy_action;
 }
 
 /// バックグラウンドスレッドで実行する保存処理の結果。
@@ -342,25 +667,51 @@ enum PendingSaveResult {
     /// `AppConfig::save()` が失敗した。
     SaveFailed(String),
     /// 保存に成功した。`warnings` は `validate()` が返した警告文。
-    Saved { warnings: Vec<String> },
+    /// `keyboard_model` は保存時点のスナップショット——保存は非同期で
+    /// 完了までの間にユーザーが`self.config`をさらに編集しうるため、
+    /// `poll_pending_save`側で「今の`self.config`」を読むと実際に保存された
+    /// 値とずれる（`config_loaded_model`の更新元として誤る、code-review指摘）。
+    Saved {
+        warnings: Vec<String>,
+        keyboard_model: awase::scanmap::KeyboardModel,
+        /// 保存した `to_save` の複製。成功後の `base` にする（ADR-201 決定3）。
+        saved: Box<awase::config::AppConfig>,
+    },
 }
 
 impl SettingsApp {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, adr192_warning_context: bool) -> Self {
         setup_fonts(&cc.egui_ctx);
+        // CLI引数でconfigパスが明示されている場合は自己修復しない（ADR-178 決定2）。
+        if cli_arg_config_path().is_none() {
+            ensure_default_config_exists();
+        }
         let config_path = find_config_path();
         let (config, config_load_state) = match awase::config::AppConfig::load(&config_path) {
             Ok(cfg) => (cfg, awase::config::ConfigLoadState::Loaded),
             Err(e) => {
                 let state = awase::config::classify_load_error(&e);
-                log::warn!("Config load failed: {e} (classified as {state:?}), using defaults");
+                tracing::warn!("Config load failed: {e} (classified as {state:?}), using defaults");
                 (default_config(), state)
             }
         };
+        // config_load_state == Loadedのときのみ発火する（round v14 B2対応）:
+        // 読み込みに失敗しdefault_config()にフォールバックした場合、
+        // GeneralConfig::default()のlayouts_dirは"config"（出荷値"layout"とは
+        // 別物、src/config.rs参照）であり、これを書き込み先に使うと
+        // %LOCALAPPDATA%\awase\config\に同梱6ファイルを誤生成してしまう。
+        if cli_arg_config_path().is_none()
+            && config_load_state == awase::config::ConfigLoadState::Loaded
+        {
+            ensure_default_layouts_exist(&config.general.layouts_dir);
+        }
         let available_layouts = scan_layout_names(&config.general.layouts_dir);
+        let config_loaded_model = config.general.keyboard_model;
+        let base = config.clone();
 
-        Self {
+        let mut app = Self {
             config,
+            base,
             config_path,
             config_load_state,
             show_dangerous_save_confirm: false,
@@ -375,17 +726,10 @@ impl SettingsApp {
             new_keymap_app: String::new(),
             new_keymap_from_ctrl: false,
             new_keymap_from_shift: false,
-            new_keymap_from_alt: false,
             new_keymap_from_main: String::new(),
             new_keymap_to_main: String::new(),
-            new_key_remap_from: String::new(),
-            new_key_remap_to: String::new(),
             capturing: None,
-            new_override_bufs: Default::default(),
             new_disable_app: String::new(),
-            new_pb_key: String::new(),
-            new_pb_process: String::new(),
-            new_pb_class: String::new(),
             // 配列編集タブの状態は「配列編集」タブを開くまで読み込まない
             // （ensure_layout_loaded 参照）。起動時に毎回 .yab を同期的に
             // 読み込むと、ウィンドウ生成〜最初の描画までの間が延び、実機で
@@ -399,14 +743,44 @@ impl SettingsApp {
             layout_edit_kind: ValueKind::None,
             layout_edit_value: String::new(),
             layout_edit_special_idx: 0,
+            layout_edit_origin: None,
+            layout_edit_origin_is_sequence: false,
+            layout_edit_last_seen: None,
+            ime_composing: false,
+            ime_event_this_frame: false,
             kana_table: KanaTable::build(),
             layout_modified: false,
             layout_status: String::new(),
             layout_loaded: false,
+            layout_loaded_ok: false,
+            layout_loaded_model: None,
             layout_pending_open: None,
             layout_pending_save_as: None,
+            pending_layout_discard: None,
+            show_cancel_layout_confirm: false,
+            pending_status_notes: Vec::new(),
+            config_loaded_model,
             pending_save: None,
-        }
+            scancode_map_status: None,
+            scancode_map_last_message: None,
+            startup_diagnostics: Vec::new(),
+            // recompute_diagnostics() が直後に実体で上書きする。
+            auto_start_registered: false,
+            adr192_warning_context,
+            adr192_replacement_undo: None,
+            adr192_replacement_preview: None,
+            keymap_learn_rx: None,
+            keymap_learn_progress: None,
+            keymap_learn_finished: false,
+            keymap_learn_status: None,
+            keymap_learn_child: None,
+            keymap_learn_stderr_handle: None,
+            keymap_learn_mode: keymap_learn_launcher::LearnMode::Learn,
+            keymap_table_state: None,
+            keymap_env_probe: keymap_learn_status::EnvProbe::new(std::time::SystemTime::now()),
+        };
+        app.recompute_diagnostics();
+        app
     }
 
     /// `apply()` の実処理。`config_load_state` が `Dangerous`（読み込み失敗で
@@ -425,6 +799,11 @@ impl SettingsApp {
     /// （こちらはエンジンスレッド上で動くため ADR-099 round2 SF-1 で
     /// 別途トレードオフとして許容済み）とは異なり、こちらは最も高頻度に
     /// 呼ばれる呼び出し元（「適用」ボタン）であり、非同期化の効果が大きい。
+    ///
+    /// ADR-126でガード(A)/(B)を分離した結果、意図的に閾値を超えている
+    /// （2つの独立した目的のガードを1つの条件式へ混ぜたことがround4/5の
+    /// バグの原因だったため、無理に関数分割で短縮しない）。
+    #[expect(clippy::too_many_lines)]
     fn apply_confirmed(&mut self) {
         if self.pending_save.is_some() {
             // 前回の保存がまだ完了していなければ多重に起動しない。
@@ -435,11 +814,120 @@ impl SettingsApp {
             return;
         }
 
-        let (_validated, warnings) = self.config.clone().validate();
+        // code-review指摘: 前回呼び出しがガード等で早期returnした場合に
+        // 積んだままの警告が次回に紛れ込まないよう、関数冒頭で必ずクリアする
+        // （以前はガード(A)より後にあり、ガード(A)がreturnする経路では
+        // クリアされないままになっていた）。
+        self.pending_status_notes.clear();
+
+        // 2026-09-05 の stale read-modify-write（GUIに編集ウィジェットが無い
+        // `keys.ime_detect` 等を、古い読み込み時の値で上書きして外部エディタでの編集が
+        // 消える）への対策は、以前はここでディスクから画面に無い項目を読み直していた。
+        // ADR-201 決定3 の三者比較（`self.base` から変えた項目だけを保存直前のディスクへ
+        // 書く）で構造的に不要になったので削除した（回帰テストは `awase::config_save`）。
+
+        // /code-review指摘（PR #127、2回目）: self.configはこの直後に
+        // AppConfig::from(validated)で上書きされるため、事前の
+        // `self.config.clone()`はvalidate()に渡した瞬間に捨てられる
+        // 無駄なdeep clone（keymaps/app_overridesのVecまで含む）だった。
+        // mem::takeで元の値をmoveし、cloneを避ける。
+        // ADR-207: 撤去済みキーの通知は、この保存（`save_edit`/`save`）でファイルから消えるので、
+        // 保存直後の警告には出さない（出すと「削除してください」が、消したのと同じ保存で表示される）。
+        let removed_notices = self.config.removed_notices().to_vec();
+        let (validated, mut warnings) = std::mem::take(&mut self.config).validate();
+        warnings.retain(|w| !removed_notices.contains(w));
         if !warnings.is_empty() {
             self.status = format!("警告: {}", warnings.join("; "));
         }
+        // /code-review指摘: 以前はvalidate()の戻り値（confirm_mode="speculative"
+        // → two_phase正規化等を含む）を警告文の生成にしか使わず、保存対象は
+        // 未検証のself.configのcloneだった。設定画面がconfirm_modeを一切
+        // 表示しなくなった今、この正規化はユーザーが手で直す手段が無いため、
+        // 保存されずに警告だけが「適用」を押すたび永遠に再表示され続けていた。
+        // validated側をself.configにも反映し、保存対象にする。
+        self.config = awase::config::AppConfig::from(validated);
+
+        if self.layout_modified
+            && let Some(loaded_model) = self.layout_loaded_model
+            && loaded_model != self.config.general.keyboard_model
+        {
+            self.status = "配列編集に未保存の変更がありますが、読み込み時と異なるキーボード配列に変更されているため保存できません。キーボード配列を元に戻して適用するか、配列編集タブで変更を破棄してキーボード配列に合った配列を開き直してください。（この変更は下部のバナーが示す未保存の配列編集と同じものです）".to_string();
+            // /code-review指摘: この時点で`self.config`は既に検証済みの新しい
+            // 値に上書き済み（540行目）——中止するのはディスクへの書き込みで
+            // あって`self.config`のロールバックではない。診断リストを
+            // 再計算しないと、変更後の`self.config`と食い違う古い診断が
+            // 画面上部に残り続ける。
+            self.recompute_diagnostics();
+            return;
+        }
+
+        let default_layout_path = resolve_layouts_dir(&self.config.general.layouts_dir)
+            .join(&self.config.general.default_layout);
+        if default_layout_path.exists()
+            && let Err(e) =
+                load_yab_layout(&default_layout_path, self.config.general.keyboard_model)
+        {
+            if self.config_loaded_model != self.config.general.keyboard_model {
+                self.status = format!(
+                    "現在の既定の配列ファイル（{}）が、これから適用するキーボード配列で読み込めないため保存できません。default_layoutをそのキーボード配列に合ったファイルに変更するか、キーボード配列を元に戻してください（{e}）。",
+                    self.config.general.default_layout
+                );
+                // /code-review指摘: 上のガード(A)と同様、`self.config`は
+                // 既に新しい値なので中止前に診断を再計算する。
+                self.recompute_diagnostics();
+                return;
+            }
+            self.pending_status_notes.push(format!(
+                "既定の配列ファイル{}を読み込めません（{e}）。awaseエンジンはこの配列を読み込めない状態です",
+                self.config.general.default_layout
+            ));
+        }
+
+        // 配列編集タブの未保存編集を`.yab`へ書き込めない場合でも、それだけを
+        // 理由に他タブの設定変更まで保存不能にしない（premortem R5-1と同じ
+        // 原則——配列編集タブに閉じた問題が、無関係な設定の保存を巻き込んでは
+        // ならない）。`.yab`書き込みだけをスキップし、警告を添えて
+        // config.toml側の保存は続行する。実際のディスクI/Oエラー
+        // （`layout_write_to_path`の`Err`）はこれとは別に、部分適用を避ける
+        // ため引き続き適用全体を中止する。
+        let mut saved_layout_name = None;
+        if self.layout_modified {
+            if !self.layout_loaded_ok {
+                self.pending_status_notes.push(
+                    "配列ファイルを読み込めていないため配列の変更は保存されていません".to_string(),
+                );
+            } else if let Some(path) = self.layout_file_path.clone() {
+                if path != default_layout_path {
+                    self.pending_status_notes.push(
+                        "この配列ファイルは現在の配列フォルダ／既定の配列と異なるため、awaseエンジンには反映されません"
+                            .to_string(),
+                    );
+                }
+                if let Err(e) = self.layout_write_to_path(&path, true, false) {
+                    self.status = e;
+                    // /code-review指摘: 上の2ガードと同様、中止前に
+                    // `self.config`変更後の診断を再計算する。
+                    self.recompute_diagnostics();
+                    return;
+                }
+                saved_layout_name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string());
+            } else {
+                self.pending_status_notes.push(
+                    "配列ファイルの保存先が未設定のため配列の変更は保存されていません".to_string(),
+                );
+            }
+        }
+        // /code-review指摘（PR #133）: self.config はここで既に正規化済みの
+        // 新しい値に置き換わっている。診断リストの再計算をバックグラウンド
+        // 保存の結果（Saved分岐）だけに任せると、保存が BackupFailed/
+        // SaveFailed で失敗した場合に self.config は変わっているのに
+        // 診断リストだけ古いままになる。保存の成否によらず、config が
+        // 変わった時点で再計算する。
+        self.recompute_diagnostics();
         let clone = self.config.clone();
+        let base = self.base.clone();
 
         let config_path = self.config_path.clone();
         let is_dangerous = matches!(
@@ -455,7 +943,7 @@ impl SettingsApp {
             // 上書きしてしまう）。
             //
             // コードレビュー指摘 C2: バックアップに失敗しても以前は
-            // `log::warn!` するだけで保存を続行しており、Dangerous を招いた
+            // `tracing::warn!` するだけで保存を続行しており、Dangerous を招いた
             // 原因（PermissionDenied・共有違反など）はバックアップの
             // 読み取り＝コピーも失敗させやすいため、最もバックアップが必要な
             // 場面でこそ原本が無防備に上書きされ得た。バックアップ対象の
@@ -472,19 +960,34 @@ impl SettingsApp {
                         )));
                         return;
                     }
-                    log::info!("Backed up unreadable config to {}", bak_path.display());
+                    tracing::info!("Backed up unreadable config to {}", bak_path.display());
                 }
             }
 
-            match clone.save(&config_path) {
+            // Dangerous（読み込みに失敗して既定値を表示中）は `base` が意味を持たないので、
+            // 今と同じ全体の書き出し（上でバックアップ済み）。それ以外は差分だけ書く。
+            let result = if is_dangerous {
+                clone.save(&config_path)
+            } else {
+                awase::config_save::save_edit(&clone, &base, &config_path)
+            };
+            match result {
                 Ok(()) => {
-                    let _ = tx.send(PendingSaveResult::Saved { warnings });
+                    let _ = tx.send(PendingSaveResult::Saved {
+                        warnings,
+                        keyboard_model: clone.general.keyboard_model,
+                        saved: Box::new(clone),
+                    });
                 }
                 Err(e) => {
                     let _ = tx.send(PendingSaveResult::SaveFailed(e.to_string()));
                 }
             }
         });
+        if let Some(name) = saved_layout_name {
+            self.pending_status_notes
+                .insert(0, format!("配列 {name} を含む"));
+        }
         self.pending_save = Some(rx);
     }
 
@@ -496,20 +999,46 @@ impl SettingsApp {
             return;
         };
         match rx.try_recv() {
-            Ok(PendingSaveResult::Saved { warnings }) => {
-                if warnings.is_empty() {
-                    self.status = "設定を保存しました".to_string();
+            Ok(PendingSaveResult::Saved {
+                warnings,
+                keyboard_model,
+                saved,
+            }) => {
+                // ADR-201 決定3: 成功で `base` を保存した値にする（保存後にディスクを読み直さない）。
+                self.base = *saved;
+                let mut parts = vec!["設定を保存しました".to_string()];
+                parts.append(&mut self.pending_status_notes);
+                if !warnings.is_empty() {
+                    parts.push(format!("警告: {}", warnings.join("; ")));
                 }
+                self.status = if parts.len() == 1 {
+                    parts.remove(0)
+                } else {
+                    let head = parts.remove(0);
+                    format!("{head}（{}）", parts.join(" / "))
+                };
                 self.config_load_state = awase::config::ConfigLoadState::Loaded;
+                // code-review指摘: `self.config.general.keyboard_model`は
+                // 非同期保存の完了を待つ間にユーザーがさらに編集していると
+                // 「実際に保存された値」とずれる。送信元でスナップショットした
+                // `keyboard_model`を使う。
+                self.config_loaded_model = keyboard_model;
+                // apply_confirmed() は保存開始前にも recompute_diagnostics()
+                // を呼ぶが、その時点で config_load_state がまだ Dangerous
+                // だった場合はガードに掛かり何もしない。Dangerous から
+                // 復帰する保存が成功したこの分岐でも改めて呼び直す必要がある。
+                self.recompute_diagnostics();
                 send_reload_config_message();
                 self.pending_save = None;
             }
             Ok(PendingSaveResult::BackupFailed(msg)) => {
                 self.status = format!("保存失敗: {msg}");
+                self.pending_status_notes.clear();
                 self.pending_save = None;
             }
             Ok(PendingSaveResult::SaveFailed(e)) => {
                 self.status = format!("保存失敗: {e}");
+                self.pending_status_notes.clear();
                 self.pending_save = None;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -522,11 +1051,311 @@ impl SettingsApp {
         }
     }
 
+    /// ADR-195段階6: 学習プロセス(`awase-keymap-learn-win.exe`)を子プロセスとして
+    /// 起動する。対象プロセスの一時停止・keepalive等は不要
+    /// (`is_keymap_learn_process_name`によるawase.exe側の恒久バイパス、ADR195-T1)。
+    fn start_keymap_learning(&mut self) {
+        self.start_keymap_process(keymap_learn_launcher::LearnMode::Learn);
+    }
+
+    /// ADR196-T4: `mode`で`awase-keymap-learn-win`を起動する(学習・採用・軽量再検証で共通)。
+    fn start_keymap_process(&mut self, mode: keymap_learn_launcher::LearnMode) {
+        // code-review指摘: 呼び出し元(「学習を開始」ボタン)はkeymap_learn_rx.is_some()の
+        // 間ボタンを無効化しているが、それだけに頼ると、万一二重に呼ばれた場合に前の
+        // Arc<Mutex<Child>>と読み取りスレッドを黙って上書きし、古い子プロセスをkillする
+        // 手段(keymap_learn_child)を失ったまま野良稼働させてしまう(実キー注入を行う
+        // プロセスが2つ同時に動く事故になりうる)。関数自身でも二重起動を防ぐ。
+        if self.keymap_learn_rx.is_some() {
+            return;
+        }
+        let exe_path = awase::paths::resolve_relative_to_exe("awase-keymap-learn-win.exe");
+        // 見つからないときにOSのエラー文だけを出すと原因が分かりにくい（PATH検索へのフォールバックも
+        // 避けるため、起動の前に存在を確かめる）。
+        if !exe_path.exists() {
+            self.keymap_learn_status = Some(format!(
+                "学習プロセス（awase-keymap-learn-win.exe）が見つかりません（{}）。\
+                 awase.exe と同じフォルダに置かれているか確認してください",
+                exe_path.display()
+            ));
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut child = match keymap_learn_launcher::spawn_learning_process(&exe_path, mode) {
+            Ok(child) => child,
+            Err(e) => {
+                self.keymap_learn_status = Some(format!(
+                    "{} を起動できませんでした（{e}）",
+                    exe_path.display()
+                ));
+                return;
+            }
+        };
+        let stdout = match keymap_learn_launcher::take_learning_stdout(&mut child) {
+            Ok(stdout) => stdout,
+            Err(e) => {
+                // code-review指摘: ここで単にreturnすると、既に起動済み(実キー注入を
+                // 行いうる)のchildがどこにも保持されないままDropされる。std::process::
+                // ChildのDropはプロセスをkillしない(ハンドルを閉じるだけ)ため、標準出力
+                // 取得に失敗しただけの子プロセスが野良のまま動き続けてしまう。
+                let _ = child.kill();
+                self.keymap_learn_status = Some(format!(
+                    "学習プロセスの標準出力を取得できませんでした（{e}）"
+                ));
+                return;
+            }
+        };
+        // code-review指摘: 標準エラーの取得失敗は致命的ではない(失敗理由の表示が
+        // 簡素になるだけ)ので、学習プロセス自体の起動は止めない。
+        self.keymap_learn_stderr_handle = keymap_learn_launcher::take_learning_stderr(&mut child)
+            .ok()
+            .map(|stderr| {
+                std::thread::spawn(move || {
+                    keymap_learn_launcher::drain_learning_stderr_lines_logged(
+                        stderr,
+                        keymap_learn_launcher::learning_log_path(mode).as_deref(),
+                    )
+                })
+            });
+        // Arc<Mutex<Child>>で共有し、UIの「キャンセル」ボタン・on_exit・読み取りスレッドの
+        // いずれからも同じChildをkill()/wait()できるようにする(標準出力は上で取り出し済みなので
+        // 読み取りループ自体はこのロックを取らない)。
+        let child = std::sync::Arc::new(std::sync::Mutex::new(child));
+        self.keymap_learn_child = Some(std::sync::Arc::clone(&child));
+        std::thread::spawn(move || {
+            let result = keymap_learn_launcher::drain_learning_output(stdout, |line| {
+                let _ = tx.send(Ok(line));
+            });
+            if let Err(e) = result {
+                let _ = tx.send(Err(format!("学習プロセスの出力読み取りに失敗（{e}）")));
+            }
+            // code-review指摘: lock()が毒(他スレッドがロック保持中にpanic)を返すと
+            // 単に諦めてはいけない。ここは資源の後始末(reap)専用で、内部不変条件の
+            // 破損を気にする場面ではないため、毒付きでもガードを回収して続行する。
+            // ロックを握ったままwait()すると、子が生きている間UIのkill_keymap_learn_child()が
+            // lock()で固まる。短いtry_wait()ポーリングでロックを都度手放す。
+            loop {
+                let exited = {
+                    let mut guard = match child.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    !matches!(guard.try_wait(), Ok(None))
+                };
+                if exited {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+        self.keymap_learn_rx = Some(rx);
+        self.keymap_learn_mode = mode;
+        self.keymap_learn_progress = None;
+        self.keymap_learn_finished = false;
+        self.keymap_learn_status = Some("起動中…".to_string());
+    }
+
+    /// 表ファイルが変わりうる終了(結果行・異常終了・エラー)後の共通処理。状態表示を
+    /// 破棄し、IME本体版も取り直させる(学習中にIMEが更新された場合に備える)。
+    fn invalidate_keymap_table_state(&mut self) {
+        self.keymap_table_state = None;
+        self.keymap_env_probe.request_reprobe();
+    }
+
+    /// 子プロセスが結果行を返して終わったときの後始末。
+    fn finish_keymap_process(&mut self) {
+        self.keymap_learn_rx = None;
+        self.keymap_learn_child = None;
+        self.invalidate_keymap_table_state();
+    }
+
+    /// 較正パネル表示時に呼ぶ。現在のIME本体版の取得(ブロックしうるWin32呼び出し)を
+    /// 別スレッドで走らせ、結果が届くまでは(古い版で誤った状態を出さないよう)状態表示を
+    /// 更新しない。
+    fn refresh_keymap_table_state(&mut self, ctx: &egui::Context) {
+        if self.keymap_env_probe.needs_start() {
+            #[cfg(windows)]
+            {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let ctx = ctx.clone();
+                let start = self.keymap_env_probe.process_start;
+                std::thread::spawn(move || {
+                    let _ = tx.send(keymap_learn_status::EnvSnapshot {
+                        version: awase_keymap_learn_win::probe_gji_env_version(start),
+                        custom_keymap_without_prediction:
+                            awase_keymap_learn_win::probe_custom_keymap_without_prediction(),
+                        fingerprint: awase_keymap_learn_win::probe_current_fingerprint(),
+                    });
+                    ctx.request_repaint();
+                });
+                self.keymap_env_probe.attach(rx);
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = ctx;
+                let (tx, rx) = std::sync::mpsc::channel();
+                let _ = tx.send(keymap_learn_status::EnvSnapshot::UNKNOWN);
+                self.keymap_env_probe.attach(rx);
+            }
+        }
+        if self.keymap_env_probe.poll() {
+            self.keymap_table_state = None;
+        }
+        if self.keymap_table_state.is_none() && !self.keymap_env_probe.is_pending() {
+            self.keymap_table_state = Some(load_keymap_table_state(
+                self.keymap_env_probe.current(),
+                self.keymap_env_probe.custom_keymap_without_prediction(),
+                self.config.general.use_learned_keymap_table,
+                self.keymap_env_probe.fingerprint(),
+            ));
+        }
+    }
+
+    /// 実行中の学習プロセスを強制終了する（UIの「キャンセル」ボタン、および
+    /// `on_exit`〈ウィンドウを閉じたとき〉から呼ぶ）。実キー注入を行う子プロセスを
+    /// 止める手段がUIに無いと、ウィンドウを閉じても・ハングしても
+    /// タスクマネージャ頼みになってしまうため。
+    fn cancel_keymap_learning(&mut self) {
+        self.kill_keymap_learn_child();
+        self.keymap_learn_rx = None;
+        self.invalidate_keymap_table_state();
+        self.keymap_learn_status = Some("キャンセルしました。".to_string());
+    }
+
+    /// `keymap_learn_child`が保持している子プロセスを(生きていれば)強制終了して
+    /// 手放す。`cancel_keymap_learning`(ユーザー操作)だけでなく、`poll_keymap_learn`の
+    /// 異常系(標準出力読み取りエラー・resultを送らず切断)からも呼ぶ——標準出力の
+    /// 読み取りスレッドは`drain_learning_output`が`Err`を返しても直後に`child.wait()`
+    /// するだけでkillはしない。実キー注入を行いうる子プロセスがハングしている場合、
+    /// killせずに`keymap_learn_child`を手放すと、UIから二度とkillする手段が無い
+    /// まま野良で動き続ける(code-review指摘)。
+    fn kill_keymap_learn_child(&mut self) {
+        if let Some(child) = self.keymap_learn_child.take() {
+            // code-review指摘: lock()が毒を返しても`if let Ok(...)`で黙って諦めると、
+            // 実キー注入を行いうる子プロセスをkillせずに手放してしまい、UIには
+            // 「キャンセルしました」等の成功メッセージだけが残って二度とkillする
+            // 手段が無くなる。killは内部不変条件に依存しない操作なので、毒付きでも
+            // ガードを回収してkillを試みる。
+            let mut guard = match child.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let _ = guard.kill();
+        }
+    }
+
+    /// `start_keymap_learning()` が起動した学習プロセスの標準出力を毎フレーム
+    /// ノンブロッキングで確認する。`poll_pending_save`と同じパターン
+    /// (受信できるだけ受信してから、空なら`request_repaint`で再描画を予約)。
+    fn poll_keymap_learn(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.keymap_learn_rx else {
+            return;
+        };
+        loop {
+            match rx.try_recv() {
+                Ok(Ok(line)) if !self.keymap_learn_mode.accepts(&line) => {}
+                Ok(Ok(keymap_learn_launcher::LearnLine::Progress(p))) => {
+                    self.keymap_learn_progress = Some(p);
+                    self.keymap_learn_status = Some("測定中…".to_string());
+                }
+                Ok(Ok(keymap_learn_launcher::LearnLine::Result(outcome))) => {
+                    self.keymap_learn_finished = matches!(
+                        outcome,
+                        keymap_learn_launcher::LearnOutcome::Success
+                            | keymap_learn_launcher::LearnOutcome::SuccessWithWarnings
+                    );
+                    self.keymap_learn_status = Some(match outcome {
+                        keymap_learn_launcher::LearnOutcome::Success => {
+                            "完了しました。".to_string()
+                        }
+                        keymap_learn_launcher::LearnOutcome::SuccessWithWarnings => {
+                            "完了しましたが、一部観測に警告がありました。".to_string()
+                        }
+                        keymap_learn_launcher::LearnOutcome::Failure => {
+                            // code-review指摘: 標準出力の`result status=failure`行には
+                            // 理由が含まれない(`awase-keymap-learn-win`は理由文を標準
+                            // エラーへ書く)。`result`行送信の時点で子プロセスの終了・
+                            // 標準エラーのEOFは目前のはずなので、joinはここで短時間しか
+                            // ブロックしない。
+                            let reason = self
+                                .keymap_learn_stderr_handle
+                                .take()
+                                .and_then(|h| h.join().ok())
+                                .flatten();
+                            match reason {
+                                Some(reason) => format!("学習に失敗しました: {reason}"),
+                                None => "学習に失敗しました。".to_string(),
+                            }
+                        }
+                    });
+                    self.finish_keymap_process();
+                    break;
+                }
+                Ok(Ok(keymap_learn_launcher::LearnLine::Adopt(ok))) => {
+                    self.keymap_learn_status = Some(if ok {
+                        "学習結果を使う設定にしました。".to_string()
+                    } else {
+                        "学習結果の採用に失敗しました。".to_string()
+                    });
+                    self.finish_keymap_process();
+                    break;
+                }
+                Ok(Ok(keymap_learn_launcher::LearnLine::Revalidate(outcome))) => {
+                    use keymap_learn_launcher::RevalidateOutcome as R;
+                    self.keymap_learn_status = Some(
+                        match outcome {
+                            R::Passed => "再検証に合格しました。学習表をそのまま使います。",
+                            R::Invalidated => {
+                                "再検証で精度が足りず、学習表を無効にしました。学習をやり直してください。"
+                            }
+                            R::Failure => "再検証を完了できませんでした。",
+                        }
+                        .to_string(),
+                    );
+                    self.finish_keymap_process();
+                    break;
+                }
+                Ok(Err(e)) => {
+                    self.keymap_learn_status = Some(e);
+                    self.keymap_learn_rx = None;
+                    self.kill_keymap_learn_child();
+                    self.invalidate_keymap_table_state();
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint();
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // 進捗を何行か報告した後でクラッシュした場合でも(「起動中…」からは
+                    // 既に進んでいても)、resultを送らずに終了したことを必ず伝える。
+                    // ここを「起動中…」のときだけに限定すると、進捗報告後にクラッシュした
+                    // ケースでステータスが「測定中…」のまま固まって見えてしまう。
+                    self.keymap_learn_status =
+                        Some("学習プロセスが結果を送らずに終了しました。".to_string());
+                    self.keymap_learn_rx = None;
+                    self.kill_keymap_learn_child();
+                    self.invalidate_keymap_table_state();
+                    break;
+                }
+            }
+        }
+    }
+
     /// 「適用」ボタンのハンドラ。`config_load_state` が `Dangerous`
     /// （読み込み失敗により現在初期値を表示中）なら、無条件保存の代わりに
     /// 確認モーダルを開く（`show_dangerous_save_confirm`、実処理は
     /// `apply_confirmed()`）。それ以外は通常通り即保存する。
     fn apply(&mut self) {
+        // /code-review指摘: グローバルCtrl+Sハンドラや「適用」ボタンの
+        // 有効/無効化には確認モーダル表示中の抑止を入れたが、`apply()`
+        // 自体には無かった。3択キャンセル確認・配列破棄確認が開いている間に
+        // 何らかの経路で`apply()`が呼ばれると、その確認が尋ねている変更を
+        // そのまま保存してしまう（確認モーダルを実質無視できる）。呼び出し元
+        // ごとに同じ条件を重複させるのではなく、ここで一元的に拒否する。
+        if self.show_cancel_layout_confirm || self.pending_layout_discard.is_some() {
+            self.status = "他の確認が表示されています。先にそちらへ答えてください。".to_string();
+            return;
+        }
         if matches!(
             self.config_load_state,
             awase::config::ConfigLoadState::Dangerous(_)
@@ -538,15 +1367,38 @@ impl SettingsApp {
     }
 
     fn cancel(&mut self) {
+        if self.pending_save.is_some() {
+            self.status = "保存中です。少々お待ちください…".to_string();
+            return;
+        }
+        // /code-review指摘: 配列破棄確認モーダル（`pending_layout_discard`、
+        // ツールバー「開く」「再読み込み」「パス欄Enter」経由）が既に表示中に
+        // ここへ到達すると、この直後の`layout_modified`分岐で
+        // `show_cancel_layout_confirm`まで立ってしまい、非ブロッキングな
+        // `egui::Window`が2つ同時に描画される（round2 R2-8と同型）。
+        if self.pending_layout_discard.is_some() {
+            self.status = "他の確認が表示されています。先にそちらへ答えてください。".to_string();
+            return;
+        }
         // コードレビュー指摘: 確認モーダル（`show_dangerous_save_confirm_modal`）は
         // `egui::Modal` のような背景ブロッキングを持たないため、モーダル表示中でも
         // 下部パネルの「キャンセル」ボタンが押せてしまう。ここで cancel() が
         // 呼ばれた場合はモーダルの前提（Dangerous 状態）が解消されるため、
         // 開いたままのモーダルが状態と矛盾しないよう必ず閉じる。
         self.show_dangerous_save_confirm = false;
+        if self.layout_modified {
+            self.show_cancel_layout_confirm = true;
+            return;
+        }
+        self.cancel_config_only();
+    }
+
+    fn cancel_config_only(&mut self) {
         match awase::config::AppConfig::load(&self.config_path) {
             Ok(cfg) => {
                 self.available_layouts = scan_layout_names(&cfg.general.layouts_dir);
+                self.config_loaded_model = cfg.general.keyboard_model;
+                self.base = cfg.clone();
                 self.config = cfg;
                 self.config_load_state = awase::config::ConfigLoadState::Loaded;
                 self.status = "変更を破棄しました".to_string();
@@ -556,6 +1408,124 @@ impl SettingsApp {
                 self.status = format!("読み込み失敗: {e}");
             }
         }
+        self.recompute_diagnostics();
+    }
+
+    fn cancel_config_and_layout(&mut self) {
+        self.cancel_config_only();
+        let Some(path) = self.layout_file_path.clone() else {
+            // /code-review指摘: `layout_file_path`が`None`のまま
+            // `layout_modified`が真になることは通常の操作では起きない
+            // （`layout_modified`を立てる経路はすべて`layout_selected_pos`を
+            // 前提とし、それには`ensure_layout_loaded`——F8によりパスを
+            // 必ず確定させる——を経由する必要があるため）。ただし万一
+            // 到達した場合、`cancel_config_only()`が直前に上書きした
+            // 「変更を破棄しました」は配列側が実際には破棄されていないのに
+            // 成功したと誤解させる。`layout_modified`は真のまま残すのが
+            // 正確なので、ここでは状態を変えず、誤解を招くメッセージだけ
+            // 訂正する。
+            self.status =
+                "設定は破棄しましたが、配列編集の保存先が未設定のため配列側は元に戻せませんでした"
+                    .to_string();
+            return;
+        };
+        match load_yab_layout(&path, self.config.general.keyboard_model) {
+            Ok((ly, lint_warnings)) => {
+                self.layout = ly;
+                self.layout_modified = false;
+                self.layout_loaded_ok = true;
+                self.layout_loaded_model = Some(self.config.general.keyboard_model);
+                self.clear_layout_edit_selection();
+                self.status = append_lint_warnings(
+                    "設定と配列編集を破棄しました".to_string(),
+                    &lint_warnings,
+                );
+            }
+            Err(e) => {
+                self.layout_loaded_ok = false;
+                self.layout_loaded_model = None;
+                self.clear_layout_edit_selection();
+                self.status = format!("読み込み失敗: {e}");
+            }
+        }
+    }
+
+    /// 起動時設定診断（ADR-116）を再計算する。`config.validate()` の警告と、
+    /// `layouts_dir` 内の全 `.yab` の読込失敗/`yab::lint()` 警告を集める。
+    ///
+    /// `config_load_state` が `Dangerous`（`config.toml` の読込自体に失敗し
+    /// `default_config()` を表示中）のときは何もしない——その既定設定を
+    /// 診断しても無意味な結果が、本当に重要な「読込失敗」という赤字警告
+    /// （`config_path_panel`）の隣に並ぶだけになる。
+    ///
+    /// `config.validate()` は `self.config.clone()` に対して呼び、
+    /// `self.config` 自体は変更しない（`apply_confirmed` の `mem::take` +
+    /// 書き戻しパターンはここでは使わない）。書き戻すと `validate_layouts`
+    /// の正規化（`..` を含むパスを `"layout"` に書き換える）が確定して
+    /// しまい、ユーザーがまだ「適用」を押していないのに画面表示上の
+    /// `layouts_dir` が黙って変わる（`recompute_diagnostics` は保存や
+    /// キャンセルとは無関係な複数箇所から呼ばれるため、この副作用は
+    /// 許容できない）。
+    fn recompute_diagnostics(&mut self) {
+        if matches!(
+            self.config_load_state,
+            awase::config::ConfigLoadState::Dangerous(_)
+        ) {
+            self.startup_diagnostics.clear();
+            return;
+        }
+
+        let layouts_dir = resolve_layouts_dir(&self.config.general.layouts_dir);
+        let mut diagnostics = scan_yab_files_for_diagnostics(&layouts_dir);
+
+        // ここは apply_confirmed の mem::take + 書き戻しパターンを**あえて
+        // 使わない**（Opus敵対的レビュー指摘、r3→r4）。書き戻すと
+        // `validate_layouts` の正規化（".." 含みパスを "layout" へ書き換え）
+        // が `self.config` に確定してしまい、ユーザーがまだ「適用」を押して
+        // いないのに画面表示上の `layouts_dir` が黙って変わる（例:
+        // 設定画面を開いただけで "../foo" が "layout" に見える）。
+        // `apply_confirmed` は正規化を保存対象にする必要があるため書き戻しが
+        // 正しいが、ここは警告文を覗くだけなので clone で十分——
+        // `AppConfig` は小さく、この関数はユーザー操作のたび（毎フレームでは
+        // ない）にしか呼ばれない。
+        let (_, warnings) = self.config.clone().validate();
+        diagnostics.extend(warnings);
+
+        // Defender の Behavior:Win32/Persistence.A!.ml 誤検知対策
+        // （2026-09-07）で awase.exe 側のバックグラウンド自己修復を廃止した
+        // ため、config.toml とレジストリ実体がズレていても awase.exe は
+        // ログにしか記録しない。ユーザーへの可視化はここ（設定画面を開いた
+        // ときの診断）で行う方針。
+        //
+        // 「自動起動」チェックボックス自体は config.toml ではなく
+        // `autostart_bridge::is_registered()`（レジストリ実体）を真実源として
+        // 表示する（Opus敵対的レビュー指摘 Major 6、2026-09-07: 以前は
+        // config.toml を真実源にしていたため、レジストリ側の操作が失敗した
+        // 場合にチェックボックス表示が実状態と食い違ったまま固まる経路が
+        // あった）。ここでの診断はそれとは別に、config.toml に記録された
+        // 「最後にユーザーが選んだ意図」と実体がズレていること自体を知らせる
+        // （MSIの再インストールでRunキーが復活する等、外部要因でズレうる）。
+        let auto_start_configured = self.config.general.auto_start == "enabled";
+        self.auto_start_registered = autostart_bridge::is_registered();
+        let auto_start_registered = self.auto_start_registered;
+        if auto_start_configured && !auto_start_registered {
+            diagnostics.push(
+                "config.toml では自動起動が有効になっていますが、Windowsの自動起動登録が\
+                 見つかりません。上の「自動起動」チェックボックスをクリックして登録してください。"
+                    .to_string(),
+            );
+        } else if !auto_start_configured && auto_start_registered {
+            diagnostics.push(
+                "config.toml では自動起動が無効になっていますが、Windowsには自動起動登録が\
+                 残っています（再インストール等が原因の可能性があります）。解除したい場合は\
+                 上の「自動起動」チェックボックスをクリックして解除してください。このまま\
+                 有効な状態として維持したい場合は、一度オフにしてから再度オンにすると\
+                 config.tomlの記録もWindowsの実体と一致します。"
+                    .to_string(),
+            );
+        }
+
+        self.startup_diagnostics = diagnostics;
     }
 
     /// 現在編集している config.toml の実パスを常時表示する上部パネル。
@@ -619,6 +1589,30 @@ impl SettingsApp {
                     ),
                 );
             }
+            if !self.startup_diagnostics.is_empty() {
+                ui.add_space(4.0);
+                // Defender誤検知対策で「設定画面を開いたときの警告だけで
+                // 十分」という方針にした以上、折りたたまれたまま気づかれ
+                // ないのでは意味が無い（Opus敵対的レビュー指摘 Minor 9、
+                // 2026-09-07）。診断が1件でもあれば既定で開く。
+                egui::CollapsingHeader::new(format!(
+                    "⚠ 設定の診断結果（{}件）",
+                    self.startup_diagnostics.len()
+                ))
+                .default_open(true)
+                .show(ui, |ui| {
+                    // /code-review指摘: 警告件数が多いと TopBottomPanel が
+                    // 際限なく伸びて中央の設定UIを押し出しかねないため、
+                    // 高さを固定してスクロール可能にする。
+                    egui::ScrollArea::vertical()
+                        .max_height(150.0)
+                        .show(ui, |ui| {
+                            for msg in &self.startup_diagnostics {
+                                ui.label(msg);
+                            }
+                        });
+                });
+            }
             ui.add_space(4.0);
         });
     }
@@ -665,6 +1659,87 @@ impl SettingsApp {
         }
     }
 
+    fn show_cancel_layout_confirm_modal(&mut self, ctx: &egui::Context) {
+        if !self.show_cancel_layout_confirm {
+            return;
+        }
+        let mut open = true;
+        let mut config_only = false;
+        let mut both = false;
+        let mut cancel = false;
+        egui::Window::new("確認")
+            .id(egui::Id::new("cancel_layout_confirm"))
+            .order(egui::Order::Foreground)
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("配列編集に未保存の変更があります。キャンセルする範囲を選んでください。");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("設定だけ元に戻す").clicked() {
+                        config_only = true;
+                    }
+                    if ui.button("両方元に戻す").clicked() {
+                        both = true;
+                    }
+                    if ui.button("やめる").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if config_only {
+            self.show_cancel_layout_confirm = false;
+            self.cancel_config_only();
+        } else if both {
+            self.show_cancel_layout_confirm = false;
+            self.cancel_config_and_layout();
+        } else if cancel || !open {
+            self.show_cancel_layout_confirm = false;
+        }
+    }
+
+    fn show_layout_discard_confirm_modal(&mut self, ctx: &egui::Context) {
+        if self.pending_layout_discard.is_none() {
+            return;
+        }
+        let mut open = true;
+        let mut discard = false;
+        let mut cancel = false;
+        egui::Window::new("確認")
+            .id(egui::Id::new("layout_discard_confirm"))
+            .order(egui::Order::Foreground)
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("未保存の配列編集を破棄して続行しますか？");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("破棄して続行").clicked() {
+                        discard = true;
+                    }
+                    if ui.button("やめる").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if discard {
+            // `layout_modified`をここで無条件にfalseへ落とさない。`OpenPending`は
+            // 非同期のファイル選択ダイアログを開くだけで、実際の読み込みは
+            // `drain_layout_pending_async`経由で後から行われる——ダイアログを
+            // キャンセルすると何も置き換わらないまま`layout_modified`だけが
+            // 偽になり、未保存の編集が「保存済み」であるかのように扱われてしまう
+            // （下部の未保存インジケータが消え、「適用」が`.yab`を書かなくなる）。
+            // `layout_modified = false`は各読み込み関数
+            // （`layout_load_from_path`/`layout_reload_unchecked`）の成功時にのみ
+            // 行われるため、ここでは何もせず実処理へ委ねる。
+            self.run_pending_layout_discard_action();
+        } else if cancel || !open {
+            self.pending_layout_discard = None;
+        }
+    }
+
     // ── 配列編集タブ（旧 awase-yab-editor）──
 
     const fn layout_face_mut(&mut self, face: Face) -> &mut YabFace {
@@ -689,12 +1764,30 @@ impl SettingsApp {
         }
     }
 
+    fn clear_layout_edit_selection(&mut self) {
+        self.layout_selected_pos = None;
+        self.layout_edit_value.clear();
+        self.layout_edit_origin = None;
+        self.layout_edit_origin_is_sequence = false;
+        self.layout_edit_last_seen = None;
+        self.ime_composing = false;
+    }
+
     fn select_layout_cell(&mut self, pos: PhysicalPos) {
         self.layout_selected_pos = Some(pos);
+        self.layout_status.clear();
         let value = self
             .layout_face(self.layout_current_face)
             .get(&pos)
             .cloned();
+        let origin_is_sequence = matches!(
+            value,
+            Some(
+                YabValue::CtrlChord { .. }
+                    | YabValue::InlineSequence { .. }
+                    | YabValue::MacroRef(_)
+            )
+        );
         match value {
             Some(YabValue::Romaji { romaji, .. }) => {
                 self.layout_edit_kind = ValueKind::Keystroke;
@@ -718,10 +1811,156 @@ impl SettingsApp {
                 self.layout_edit_kind = ValueKind::Vk;
                 self.layout_edit_value = format!("{:X}", vk.0);
             }
-            Some(YabValue::None) | None => {
+            // ADR-115: 打鍵列(CtrlChord/InlineSequence/MacroRef)のGUI編集は
+            // 非対象。生テキストをLiteralとして表示するに留める——保存すると
+            // 打鍵列としての意味を失う既知の限界（決定9(a)）。Sequenceは
+            // resolve_keystroke_syntax後のプレビュー専用コピーにしか
+            // 現れないためNone扱いでよい。
+            Some(
+                v @ (YabValue::CtrlChord { .. }
+                | YabValue::InlineSequence { .. }
+                | YabValue::MacroRef(_)),
+            ) => {
+                self.layout_edit_kind = ValueKind::Literal;
+                self.layout_edit_value = v.serialize();
+            }
+            Some(YabValue::Sequence(_) | YabValue::None) | None => {
                 self.layout_edit_kind = ValueKind::None;
                 self.layout_edit_value.clear();
             }
+        }
+        self.layout_edit_origin = Some((self.layout_edit_value.clone(), self.layout_edit_kind));
+        self.layout_edit_origin_is_sequence = origin_is_sequence;
+        self.layout_edit_last_seen = None;
+        self.ime_composing = false;
+    }
+
+    fn update_ime_state(&mut self, ctx: &egui::Context) {
+        self.ime_event_this_frame = false;
+        ctx.input(|i| {
+            for event in &i.events {
+                match event {
+                    egui::Event::Ime(egui::ImeEvent::Enabled | egui::ImeEvent::Preedit(_)) => {
+                        self.ime_composing = true;
+                        self.ime_event_this_frame = true;
+                    }
+                    egui::Event::Ime(egui::ImeEvent::Commit(_) | egui::ImeEvent::Disabled) => {
+                        self.ime_composing = false;
+                        self.ime_event_this_frame = true;
+                    }
+                    _ => {}
+                }
+            }
+        });
+        if self.layout_selected_pos.is_none() {
+            self.ime_composing = false;
+        }
+    }
+
+    fn build_layout_edit_value(&self, allow_empty_as_none: bool) -> Result<YabValue, String> {
+        match self.layout_edit_kind {
+            ValueKind::Keystroke => {
+                let input = normalize_keystroke_input(&self.layout_edit_value);
+                if input.is_empty() {
+                    if allow_empty_as_none {
+                        Ok(YabValue::None)
+                    } else {
+                        Err("空にすると値が消えます。「なし」を選んでください".to_string())
+                    }
+                } else if let Some(bad) = find_invalid_keystroke_char(&input) {
+                    Err(format!(
+                        "「{bad}」は JIS キーボード上のキーとして入力できません"
+                    ))
+                } else if input.chars().all(|c| c.is_ascii_alphabetic()) {
+                    let kana = self.kana_table.kana_for_romaji(&input);
+                    Ok(YabValue::Romaji {
+                        romaji: input,
+                        kana,
+                    })
+                } else {
+                    Ok(YabValue::KeySequence(input))
+                }
+            }
+            ValueKind::Literal => {
+                let s = self.layout_edit_value.clone();
+                if s.is_empty() {
+                    if allow_empty_as_none {
+                        Ok(YabValue::None)
+                    } else {
+                        Err("空にすると値が消えます。「なし」を選んでください".to_string())
+                    }
+                } else {
+                    Ok(YabValue::Literal(s))
+                }
+            }
+            ValueKind::Special => Ok(YabValue::Special(
+                SPECIAL_KEYS[self.layout_edit_special_idx].0,
+            )),
+            ValueKind::Vk => {
+                let hex = self.layout_edit_value.trim().trim_start_matches('V');
+                if hex.is_empty() {
+                    if allow_empty_as_none {
+                        Ok(YabValue::None)
+                    } else {
+                        Err("空にすると値が消えます。「なし」を選んでください".to_string())
+                    }
+                } else if let Ok(code) = u16::from_str_radix(hex, 16) {
+                    Ok(YabValue::Vk(VkCode(code)))
+                } else {
+                    Err(format!("「{hex}」は16進数として解釈できません"))
+                }
+            }
+            ValueKind::None => Ok(YabValue::None),
+        }
+    }
+
+    fn commit_pending_layout_edit(&mut self, ctx: &egui::Context) {
+        let Some(pos) = self.layout_selected_pos else {
+            return;
+        };
+        if self.layout_edit_origin_is_sequence {
+            return;
+        }
+        if matches!(self.layout_edit_kind, ValueKind::None | ValueKind::Special) {
+            return;
+        }
+        if self.ime_composing || self.ime_event_this_frame {
+            ctx.request_repaint();
+            return;
+        }
+
+        let raw = (self.layout_edit_value.clone(), self.layout_edit_kind);
+        if self.layout_edit_origin.as_ref() == Some(&raw) {
+            if self.layout_edit_last_seen.as_ref() != Some(&raw) {
+                self.layout_status.clear();
+                self.layout_edit_last_seen = Some(raw);
+            }
+            return;
+        }
+        if self.layout_edit_last_seen.as_ref() == Some(&raw) {
+            return;
+        }
+        self.layout_edit_last_seen = Some(raw.clone());
+
+        match self.build_layout_edit_value(false) {
+            Ok(value) => {
+                if self.layout_face(self.layout_current_face).get(&pos) != Some(&value) {
+                    self.layout_face_mut(self.layout_current_face)
+                        .insert(pos, value);
+                    self.layout_modified = true;
+                }
+                self.layout_edit_origin = Some(raw);
+                self.layout_status.clear();
+            }
+            Err(msg) => {
+                self.layout_status = msg;
+            }
+        }
+    }
+
+    fn clear_ime_on_tab_change(&mut self, new_tab: Tab) {
+        if self.active_tab != new_tab {
+            self.ime_composing = false;
         }
     }
 
@@ -751,92 +1990,106 @@ impl SettingsApp {
         let Some(pos) = self.layout_selected_pos else {
             return;
         };
-        self.layout_status = format!("貼り付けました: {}", cell_tooltip(Some(&value), pos));
+        let message = format!("貼り付けました: {}", cell_tooltip(Some(&value), pos));
         self.layout_face_mut(self.layout_current_face)
             .insert(pos, value);
         self.layout_modified = true;
         // 編集パネルの表示も貼り付け後の値に合わせて更新する。
+        // code-review指摘: `select_layout_cell`は冒頭で`layout_status`を
+        // クリアする（round2 A4）ため、ステータス設定はこの呼び出しの
+        // **後**に行う——先に設定すると即座に消えて表示されない。
+        self.select_layout_cell(pos);
+        self.layout_status = message;
+    }
+
+    /// 「特殊キー」ComboBoxの選択が実際に変わっていれば直接コミットする
+    /// （`commit_pending_layout_edit()`を経由しない独立経路、round3 R3-2）。
+    /// UI描画から切り出してあるのは、egui ComboBoxのポインタ操作を
+    /// シミュレートしなくても`previous_idx`との比較・コミット・
+    /// `select_layout_cell`によるバッファ再同期（round4 R4-3）を
+    /// ユニットテストできるようにするため。
+    fn commit_special_key_if_changed(&mut self, pos: PhysicalPos, previous_idx: usize) {
+        if self.layout_edit_special_idx == previous_idx {
+            return;
+        }
+        let special_key = SPECIAL_KEYS[self.layout_edit_special_idx].0;
+        self.layout_face_mut(self.layout_current_face)
+            .insert(pos, YabValue::Special(special_key));
+        self.layout_modified = true;
         self.select_layout_cell(pos);
     }
 
+    // code-review指摘: ADR-126のD1で旧「適用」ボタンを撤去して以降、本番の
+    // コミット経路は`commit_pending_layout_edit()`のみで、この関数は
+    // 既存テスト（`build_layout_edit_value`の共有パース・バリデーション
+    // ロジックの検証）専用として残している。`#[allow(dead_code)]`のまま
+    // 本番`impl`に残すと、将来「適用ボタンを復活させよう」と誤って再配線
+    // した場合に`layout_edit_origin_is_sequence`/`ime_composing`のガードを
+    // 一切通らずコミットしてしまう——`#[cfg(test)]`で物理的にビルドから
+    // 除外し、その事故を構造的に防ぐ。
+    #[cfg(test)]
     fn apply_layout_edit(&mut self) {
         let Some(pos) = self.layout_selected_pos else {
             return;
         };
-        let value = match self.layout_edit_kind {
-            ValueKind::Keystroke => {
-                let input = normalize_keystroke_input(&self.layout_edit_value);
-                if input.is_empty() {
-                    YabValue::None
-                } else if let Some(bad) = find_invalid_keystroke_char(&input) {
-                    self.layout_status =
-                        format!("「{bad}」は JIS キーボード上のキーとして入力できません");
-                    return;
-                } else if input.chars().all(|c| c.is_ascii_alphabetic()) {
-                    let kana = self.kana_table.kana_for_romaji(&input);
-                    YabValue::Romaji {
-                        romaji: input,
-                        kana,
-                    }
-                } else {
-                    YabValue::KeySequence(input)
-                }
+        let value = match self.build_layout_edit_value(true) {
+            Ok(value) => value,
+            Err(msg) => {
+                self.layout_status = msg;
+                return;
             }
-            ValueKind::Literal => {
-                let s = self.layout_edit_value.clone();
-                if s.is_empty() {
-                    YabValue::None
-                } else {
-                    YabValue::Literal(s)
-                }
-            }
-            ValueKind::Special => YabValue::Special(SPECIAL_KEYS[self.layout_edit_special_idx].0),
-            ValueKind::Vk => {
-                let hex = self.layout_edit_value.trim().trim_start_matches('V');
-                if hex.is_empty() {
-                    YabValue::None
-                } else if let Ok(code) = u16::from_str_radix(hex, 16) {
-                    YabValue::Vk(VkCode(code))
-                } else {
-                    self.layout_status = format!("「{hex}」は16進数として解釈できません");
-                    return;
-                }
-            }
-            ValueKind::None => YabValue::None,
         };
         self.layout_face_mut(self.layout_current_face)
             .insert(pos, value);
         self.layout_modified = true;
         self.layout_status = "変更あり".to_string();
+        self.select_layout_cell(pos);
     }
 
-    fn layout_do_save(&mut self) {
-        let path = self.layout_file_path.clone();
-        match path {
-            Some(p) => self.layout_write_to_path(&p),
-            None => self.layout_do_save_as_dialog(),
-        }
-    }
-
-    fn layout_write_to_path(&mut self, path: &Path) {
+    fn layout_write_to_path(
+        &mut self,
+        path: &Path,
+        update_current_path: bool,
+        recompute_diagnostics: bool,
+    ) -> Result<(), String> {
         let text = self.layout.serialize(self.config.general.keyboard_model);
         match std::fs::write(path, &text) {
             Ok(()) => {
-                self.layout_file_path = Some(path.to_path_buf());
-                self.layout_file_path_buf = path.display().to_string();
-                self.layout_modified = false;
+                if update_current_path {
+                    self.layout_file_path = Some(path.to_path_buf());
+                    self.layout_file_path_buf = path.display().to_string();
+                    self.layout_modified = false;
+                }
                 // 書き込み成功後にのみ lint する（失敗時に計算を無駄にしない）。
                 let lint_warnings = awase::yab::lint(&text);
                 self.layout_status = append_lint_warnings(
                     format!("{} に保存しました", path.display()),
                     &lint_warnings,
                 );
+                // ADR-116: 配列編集タブでの保存直後に上部パネルの診断リストが
+                // 古いまま（クォート崩れを直したのに警告が残る等）にならない
+                // よう再計算する。
+                if recompute_diagnostics {
+                    self.recompute_diagnostics();
+                }
+                Ok(())
             }
-            Err(e) => self.layout_status = format!("保存失敗: {e}"),
+            Err(e) => {
+                let msg = format!("保存失敗: {e}");
+                self.layout_status.clone_from(&msg);
+                Err(msg)
+            }
         }
     }
 
     fn layout_do_open_dialog(&mut self) {
+        if !self.confirm_layout_discard_or_defer(LayoutDiscardAction::OpenPending) {
+            return;
+        }
+        self.layout_open_dialog_unchecked();
+    }
+
+    fn layout_open_dialog_unchecked(&mut self) {
         let task = rfd::AsyncFileDialog::new()
             .set_title("配列ファイルを開く")
             .add_filter("YAB 配列ファイル", &["yab"])
@@ -853,7 +2106,7 @@ impl SettingsApp {
 
     fn layout_do_save_as_dialog(&mut self) {
         let task = rfd::AsyncFileDialog::new()
-            .set_title("名前を付けて保存")
+            .set_title("別ファイルへ書き出す")
             .add_filter("YAB 配列ファイル", &["yab"])
             .add_filter("すべてのファイル", &["*"])
             .save_file();
@@ -869,26 +2122,66 @@ impl SettingsApp {
     fn layout_load_from_path(&mut self, path: &Path) {
         match load_yab_layout(path, self.config.general.keyboard_model) {
             Ok((ly, lint_warnings)) => {
-                self.layout = ly;
                 self.layout_file_path_buf = path.display().to_string();
                 self.layout_file_path = Some(path.to_path_buf());
+                self.layout = ly;
                 self.layout_modified = false;
-                self.layout_selected_pos = None;
+                self.layout_loaded_ok = true;
+                self.layout_loaded_model = Some(self.config.general.keyboard_model);
+                self.clear_layout_edit_selection();
                 self.layout_status = append_lint_warnings(
                     format!("{} を読み込みました", path.display()),
                     &lint_warnings,
                 );
             }
-            Err(e) => self.layout_status = format!("読み込み失敗: {e}"),
+            Err(e) => {
+                // round5 code-review指摘: 失敗時も無条件に`layout_file_path`を
+                // 新パスへ差し替えると、直前まで有効だった配列ファイルへの
+                // 参照が失われる（以後`F5`再読み込みも壊れたパスを見続け、
+                // キャンセルの「両方元に戻す」の復元先も無くなる）。
+                // `layout_file_path`が未設定（起動直後の初回読み込み等）の
+                // 場合のみ、round1 F8の判断どおり試行したパスを既定値として
+                // 割り当てる——「保存先が未設定」という状態そのものは
+                // 失敗時にも作らないが、既に有効なパスを壊れたパスで
+                // 上書きすることはしない。
+                if let Some(existing) = &self.layout_file_path {
+                    // code-review指摘: パス欄が失敗した新パスの表示のまま
+                    // 残ると、実際に有効なファイル（`layout_file_path`）と
+                    // テキスト欄の表示が食い違い、次のF5/Enterがどちらを
+                    // 指しているか分からなくなる。有効な既存パスへ戻す。
+                    self.layout_file_path_buf = existing.display().to_string();
+                } else {
+                    self.layout_file_path_buf = path.display().to_string();
+                    self.layout_file_path = Some(path.to_path_buf());
+                }
+                self.layout_loaded_ok = false;
+                self.layout_loaded_model = None;
+                self.clear_layout_edit_selection();
+                self.layout_status = format!("読み込み失敗: {e}");
+            }
         }
     }
 
     fn layout_do_open_from_text_box(&mut self) {
+        if !self.confirm_layout_discard_or_defer(LayoutDiscardAction::OpenTextBox) {
+            return;
+        }
+        self.layout_open_from_text_box_unchecked();
+    }
+
+    fn layout_do_reload(&mut self) {
+        if !self.confirm_layout_discard_or_defer(LayoutDiscardAction::Reload) {
+            return;
+        }
+        self.layout_reload_unchecked();
+    }
+
+    fn layout_open_from_text_box_unchecked(&mut self) {
         let path = PathBuf::from(&self.layout_file_path_buf);
         self.layout_load_from_path(&path);
     }
 
-    fn layout_do_reload(&mut self) {
+    fn layout_reload_unchecked(&mut self) {
         let Some(path) = self.layout_file_path.clone() else {
             self.layout_status = "ファイルパスが未設定です".to_string();
             return;
@@ -897,13 +2190,55 @@ impl SettingsApp {
             Ok((ly, lint_warnings)) => {
                 self.layout = ly;
                 self.layout_modified = false;
-                self.layout_selected_pos = None;
+                self.layout_loaded_ok = true;
+                self.layout_loaded_model = Some(self.config.general.keyboard_model);
+                self.clear_layout_edit_selection();
                 self.layout_status = append_lint_warnings(
                     format!("{} を再読み込みしました", path.display()),
                     &lint_warnings,
                 );
             }
-            Err(e) => self.layout_status = format!("再読み込み失敗: {e}"),
+            Err(e) => {
+                self.layout_loaded_ok = false;
+                self.layout_loaded_model = None;
+                self.clear_layout_edit_selection();
+                self.layout_status = format!("再読み込み失敗: {e}");
+            }
+        }
+    }
+
+    fn confirm_layout_discard_or_defer(&mut self, action: LayoutDiscardAction) -> bool {
+        if self.show_cancel_layout_confirm {
+            // /code-review指摘: この関数は「開く」「再読み込み」「パス欄Enter」
+            // （ツールバー）とCtrl+O/F5（`handle_layout_shortcuts`、こちらは
+            // 呼び出し前に別途ガード済み）の両方から呼ばれる。下部「キャンセル」
+            // が開いた3択確認モーダル(`show_cancel_layout_confirm`)が表示中に
+            // ここへ到達すると、ここで`pending_layout_discard`まで立ってしまい
+            // 非ブロッキングな`egui::Window`が2つ同時に描画される
+            // （round2 R2-8と同型）。個々の呼び出し元にガードを重複させるのではなく、
+            // ここで一元的に拒否する。
+            self.layout_status =
+                "他の確認が表示されています。先にそちらへ答えてください。".to_string();
+            return false;
+        }
+        if self.layout_modified {
+            self.pending_layout_discard = Some(action);
+            self.layout_status =
+                "未保存の配列編集があります。破棄するか確認してください。".to_string();
+            false
+        } else {
+            true
+        }
+    }
+
+    fn run_pending_layout_discard_action(&mut self) {
+        let Some(action) = self.pending_layout_discard.take() else {
+            return;
+        };
+        match action {
+            LayoutDiscardAction::OpenPending => self.layout_open_dialog_unchecked(),
+            LayoutDiscardAction::OpenTextBox => self.layout_open_from_text_box_unchecked(),
+            LayoutDiscardAction::Reload => self.layout_reload_unchecked(),
         }
     }
 
@@ -936,7 +2271,7 @@ impl SettingsApp {
             self.layout_load_from_path(&path);
         }
         if let Some(path) = self.layout_pending_save_as.take() {
-            self.layout_write_to_path(&path);
+            let _ = self.layout_write_to_path(&path, false, true);
         }
     }
 
@@ -946,8 +2281,16 @@ impl SettingsApp {
         if self.active_tab != Tab::Layout {
             return;
         }
-        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::S)) {
-            self.layout_do_save();
+        // code-review指摘（round2 R2-8と同型の退行）: グローバルCtrl+Sには
+        // 確認モーダル表示中の抑止を追加したが、ここ（Ctrl+O/F5）が
+        // 無条件のままだと、3択キャンセルモーダル等を開いた状態でF5を押すと
+        // `confirm_layout_discard_or_defer`経由で破棄確認モーダルが追加で
+        // 開き、非ブロッキングな`egui::Window`同士が同一フレームに共存する。
+        if self.show_dangerous_save_confirm
+            || self.show_cancel_layout_confirm
+            || self.pending_layout_discard.is_some()
+        {
+            return;
         }
         if ctx.input(|i| i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::O)) {
             self.layout_do_open_dialog();
@@ -1000,25 +2343,58 @@ impl SettingsApp {
                 shift,
                 alt,
             } => {
+                // Alt はキャプチャで押されていても [[keymap]] の from には反映しない
+                // （ADR-114 決定5 — バックエンドが 'from' の Alt 修飾を禁止・skip する
+                // ため、GUI 側でも作れないようにして対称性を保つ）。
+                let _ = alt;
+                let (left_thumb_vk, right_thumb_vk) = keymap_thumb_vks(&self.config.general);
+                // 禁止キーをキャプチャした場合は self.status に理由を出す
+                // （以前は無言で捨てられ、ユーザーは拒否されたのか取りこぼした
+                // のか区別できなかった、コードレビュー指摘 m7）。
+                let reject = |internal: &str, is_to_side: bool, status: &mut String| -> bool {
+                    if let Some(reason) =
+                        keymap_forbidden_reason(internal, left_thumb_vk, right_thumb_vk, is_to_side)
+                    {
+                        let side = if is_to_side { "to" } else { "from" };
+                        *status = format!(
+                            "「{}」は {side} に指定できません: {reason}",
+                            key_display_name(internal)
+                        );
+                        true
+                    } else {
+                        false
+                    }
+                };
                 match target {
                     CaptureTarget::ExistingFrom(i) => {
-                        if let Some(rule) = self.config.keymaps.get_mut(i) {
-                            rule.from = format_combo(ctrl, shift, alt, &internal);
+                        if !reject(&internal, false, &mut self.status)
+                            && let Some(rule) = self.config.keymaps.get_mut(i)
+                        {
+                            rule.from = format_combo(ctrl, shift, false, &internal);
                         }
                     }
-                    CaptureTarget::ExistingTo(i) => {
-                        if let Some(rule) = self.config.keymaps.get_mut(i) {
-                            rule.to = Some(internal);
+                    CaptureTarget::ExistingTo(i, step_i) => {
+                        // step_i が既に削除されていた場合（キャプチャ待機中に
+                        // 「x」でステップを消された等）は get_mut が None を返し
+                        // 何もしない。
+                        if !reject(&internal, true, &mut self.status)
+                            && let Some(rule) = self.config.keymaps.get_mut(i)
+                            && let Some(step) = rule.to.get_mut(step_i)
+                        {
+                            *step = internal;
                         }
                     }
                     CaptureTarget::NewFrom => {
-                        self.new_keymap_from_ctrl = ctrl;
-                        self.new_keymap_from_shift = shift;
-                        self.new_keymap_from_alt = alt;
-                        self.new_keymap_from_main = internal;
+                        if !reject(&internal, false, &mut self.status) {
+                            self.new_keymap_from_ctrl = ctrl;
+                            self.new_keymap_from_shift = shift;
+                            self.new_keymap_from_main = internal;
+                        }
                     }
                     CaptureTarget::NewTo => {
-                        self.new_keymap_to_main = internal;
+                        if !reject(&internal, true, &mut self.status) {
+                            self.new_keymap_to_main = internal;
+                        }
                     }
                 }
                 self.capturing = None;
@@ -1041,6 +2417,90 @@ enum CapturedKey {
 // ── Tab methods ──
 
 impl SettingsApp {
+    fn adr192_replacement_controls_visible(&self) -> bool {
+        self.adr192_warning_context || self.adr192_replacement_undo.is_some()
+    }
+
+    /// 自動起動チェックボックスがクリックされた直後（＝ボタン起点）に、
+    /// HKCU Run キーへの実際の登録/解除を即座に行い、成功した場合のみ
+    /// `config.toml` の `auto_start` を更新する。
+    ///
+    /// Windows Defender の Behavior:Win32/Persistence.A!.ml 誤検知対策
+    /// （2026-09-07、ユーザーとの相談で方針決定）: Run キーへの書き込みは
+    /// ユーザーのクリックに対する直接の同期的な応答としてのみ発生させ、
+    /// バックグラウンドでの無操作な自己修復（awase.exe起動時の再書き込み）
+    /// は行わない（`app::bootstrap::handle_auto_start` 参照）。設定画面側の
+    /// このチェックボックスも同じ方針に合わせ、トグル時にその場で
+    /// register/unregister を呼ぶ（config.toml の値だけを変えて次回
+    /// awase.exe 起動時に反映されるのを待つ、という間接的な経路にしない）。
+    ///
+    /// `awase-settings.exe` は `awase.exe` とは別プロセスのため
+    /// `std::env::current_exe()` は自分自身のパスしか返さない。登録対象は
+    /// 同じフォルダにある `awase.exe`（`app::launch_settings_with_args` が
+    /// 逆方向で使っているのと同じ「実行ファイルの隣を探す」パターン）を
+    /// 明示的に解決して渡す。
+    fn apply_autostart_toggle(&mut self, enable: bool) {
+        if enable {
+            let Some(awase_exe) = resolve_sibling_exe("awase.exe") else {
+                self.status =
+                    "自動起動を有効にできませんでした: 同じフォルダに awase.exe が見つかりません。"
+                        .to_string();
+                return;
+            };
+            if !autostart_bridge::register_path(&awase_exe) {
+                self.status =
+                    "自動起動を有効にできませんでした（レジストリへの書き込みに失敗しました）。"
+                        .to_string();
+                return;
+            }
+        } else if !autostart_bridge::unregister() {
+            self.status = "自動起動を無効にできませんでした。".to_string();
+            return;
+        }
+
+        let value = if enable { "enabled" } else { "disabled" };
+        match self.save_auto_start_config(value) {
+            Some(warnings) if warnings.is_empty() => {
+                self.config.general.auto_start = value.to_string();
+                self.base.general.auto_start = value.to_string();
+                self.status = if enable {
+                    "自動起動を有効にしました。".to_string()
+                } else {
+                    "自動起動を無効にしました。".to_string()
+                };
+            }
+            Some(warnings) => {
+                self.config.general.auto_start = value.to_string();
+                self.base.general.auto_start = value.to_string();
+                self.status = format!(
+                    "自動起動の設定は反映しましたが、config.toml の他の項目に警告があります: {}",
+                    warnings.join("; ")
+                );
+            }
+            None => {
+                // レジストリ側は既に更新済みだが config.toml への反映に失敗した。
+                // チェックボックス表示自体は config.toml ではなくレジストリ実体
+                // （`is_registered()`）を真実源にしているため in-memory の値を
+                // 更新してもズレの可視化には影響しない。むしろここで更新して
+                // おかないと、後で無関係な項目を編集して「適用」（全体保存）を
+                // 押した際に古い値が書き戻され、この保存失敗が固定化してしまう
+                // （/code-review指摘、2026-09-07）。`base` は更新しない（ディスクに書けて
+                // いないので、次の保存で `auto_start` が差分として書かれる）。
+                self.config.general.auto_start = value.to_string();
+                self.status =
+                    "自動起動レジストリは更新しましたが、config.toml への保存に失敗しました。"
+                        .to_string();
+            }
+        }
+        self.recompute_diagnostics();
+    }
+
+    /// 実処理は [`awase::config::AppConfig::save_auto_start`]（`tray.rs`
+    /// と共通化、Opus敵対的レビュー指摘 Minor 11、2026-09-07）。
+    fn save_auto_start_config(&self, value: &str) -> Option<Vec<String>> {
+        awase::config::AppConfig::save_auto_start(&self.config_path, value)
+    }
+
     #[expect(clippy::too_many_lines)]
     fn tab_basic(&mut self, ui: &mut egui::Ui) {
         ui.heading("全般設定");
@@ -1055,59 +2515,36 @@ impl SettingsApp {
             )
             .on_hover_text(threshold_hover);
         });
-        let confirm_mode_hover =
-            "文字の確定方法を選びます。\nモードごとに速度と正確さのバランスが異なります。";
-        ui.horizontal(|ui| {
-            ui.label("確定モード:").on_hover_text(confirm_mode_hover);
-            egui::ComboBox::from_id_salt("confirm_mode")
-                .selected_text(confirm_mode_label(self.config.general.confirm_mode))
-                .show_ui(ui, |ui| {
-                    use awase::config::ConfirmMode;
-                    ui.selectable_value(&mut self.config.general.confirm_mode, ConfirmMode::Wait, "待機 (wait)")
-                        .on_hover_text("選ぶと: タイムアウトまで出力を保留します。\n最も正確ですが、入力に少し遅延を感じます。");
-                    ui.selectable_value(&mut self.config.general.confirm_mode, ConfirmMode::Speculative, "先行確定 (speculative)")
-                        .on_hover_text("選ぶと: 即座に出力し、親指シフトと判定されたら差し替えます。\n高速ですが、まれに画面がちらつきます。");
-                    ui.selectable_value(&mut self.config.general.confirm_mode, ConfirmMode::TwoPhase, "二段タイマー (two_phase)")
-                        .on_hover_text("選ぶと: 短い待機の後に投機出力します。\nwait と speculative の中間的な動作です。");
-                    ui.selectable_value(&mut self.config.general.confirm_mode, ConfirmMode::AdaptiveTiming, "適応タイミング (adaptive_timing)")
-                        .on_hover_text("選ぶと: 連続入力中は待機、途切れたら投機出力します。\nタイピング速度に自動適応します。");
-                    ui.selectable_value(&mut self.config.general.confirm_mode, ConfirmMode::NgramPredictive, "n-gram 予測 (ngram_predictive)")
-                        .on_hover_text("選ぶと: 統計データで次の文字を予測し、判定を最適化します。\nn-gram ファイル未指定時は二段タイマーとして動作します。");
-                })
-                .response
-                .on_hover_text(confirm_mode_hover);
-        });
-        ui.label(confirm_mode_tooltip(self.config.general.confirm_mode));
-        let spec_enabled = matches!(
-            self.config.general.confirm_mode,
-            awase::config::ConfirmMode::TwoPhase
-                | awase::config::ConfirmMode::AdaptiveTiming
-                | awase::config::ConfirmMode::NgramPredictive
-        );
-        ui.add_enabled_ui(spec_enabled, |ui| {
-            let spec_delay_hover = "投機出力までの待機時間です。この値が短いほど応答が速くなりますが、\n誤判定が増えます。TwoPhase/AdaptiveTiming と、NgramPredictive の\nフォールバック動作で使用されます。";
-            ui.horizontal(|ui| {
-                ui.label("投機出力待機:").on_hover_text(spec_delay_hover);
-                ui.add(
-                    egui::Slider::new(&mut self.config.general.speculative_delay_ms, 0..=100)
-                        .suffix(" ms"),
-                )
-                .on_hover_text(spec_delay_hover);
-            });
-        });
         ui.label("出力方式: アプリごとに最適な注入方式を自動選択します（設定不要）")
             .on_hover_text(
                 "フォアグラウンドのアプリ種別を判別し、VK送信・TSF送信等の\n最適な文字注入方式を自動的に切り替えます。手動設定は不要です。",
             );
-        let mut auto_start_checked = self.config.general.auto_start == "enabled";
-        if ui.checkbox(&mut auto_start_checked, "自動起動").on_hover_text("ONにすると: Windows ログオン時に自動的に awase を起動します。\nタスクスケジューラに登録されます。").changed() {
-            self.config.general.auto_start = if auto_start_checked {
-                "enabled"
-            } else {
-                "disabled"
-            }
-            .to_string();
+        // config.toml ではなくレジストリ実体を真実源として表示する
+        // （Opus敵対的レビュー指摘 Major 6、`recompute_diagnostics` の
+        // コメント参照）。再描画のたびに `RegGetValueW` を呼ばないよう
+        // `self.auto_start_registered`（`recompute_diagnostics`/
+        // `apply_autostart_toggle` が更新）をキャッシュとして使う
+        // （Opus敵対的レビュー指摘、2026-09-07）。
+        let mut auto_start_checked = self.auto_start_registered;
+        if ui
+            .checkbox(&mut auto_start_checked, "自動起動")
+            .on_hover_text(
+                "ONにすると: Windows ログオン時に自動的に awase を起動します。\n\
+                 チェックした時点ですぐにレジストリへ登録/解除します\n\
+                 （バックグラウンドでの自動修復は行いません — 反映されない場合は\n\
+                 このチェックボックスを再度クリックしてください）。",
+            )
+            .changed()
+        {
+            self.apply_autostart_toggle(auto_start_checked);
         }
+        ui.checkbox(&mut self.config.general.update_check, "更新を確認")
+            .on_hover_text(
+                "ONにすると: トレイを右クリックした際に awase.cc のサーバーへ最新バージョンを\n\
+                 問い合わせ、新しい版があればメニューに表示します。バージョン・OS・端末固有の情報は\n\
+                 送信しません（接続元IPアドレスはCloudflareの標準アクセスログに記録されます）。\n\
+                 OFFにすると一切通信しません。"
+            );
         let keyboard_model_hover = "物理キーボードの配列です。\n\
                  JIS: 無変換/変換キーが物理的に存在する日本語キーボード。\n\
                  US: ANSI 104キー配列。無変換/変換キーが無いため、\n\
@@ -1158,7 +2595,8 @@ impl SettingsApp {
                 self.config.keys.engine_off = vec!["Ctrl+Shift+無変換".to_string()];
                 self.config.keys.ime_on = vec!["Ctrl+変換".to_string()];
                 self.config.keys.ime_off = vec!["Ctrl+無変換".to_string()];
-                self.config.keys.ime_toggle = vec!["VK_KANJI".to_string()];
+                // 既定は空（ADR-199 決定15）。ime_on/ime_off の既定は従来どおり。
+                self.config.keys.ime_toggle = awase::config::KeysConfig::default().ime_toggle;
                 self.config.keys.engine_off_solo_repeat = Some("VK_INSERT".to_string());
             }
             // JIS → US への切替時、エンジンON/OFF・IME ON/OFF の既定値
@@ -1192,12 +2630,12 @@ impl SettingsApp {
                  使用不可・同時打鍵検出自体が機能しません。プログラマブルキーボードで\n\
                  F13-F20 等へ物理リマップするか、Space を検討してください。\n\
                  キー設定タブの候補にある「Left Alt」「Right Alt」を選ぶと、\n\
-                 親指シフト ON 時のみ Alt キーを親指キーとして使えます）。\n\
+                 親指シフト入力中のみ Alt キーを親指キーとして使えます）。\n\
                  \n\
-                 親指シフト ON/OFF・IME ON/OFF のホットキーも未設定になっています\n\
-                 （無変換/変換前提の既定値は US では動かないため）。\n\
-                 「キー設定」タブで、動作する物理キーの組み合わせを設定してください。\n\
-                 単独5連打OFF（既定 Insert キー）は無変換/変換に依存しないため\n\
+                 親指シフト入力／ローマ字入力（上級者向け設定タブ）・IME ON/OFF（キー設定タブ）の\n\
+                 ホットキーも未設定になっています（無変換/変換前提の既定値は US では\n\
+                 動かないため）。動作する物理キーの組み合わせを設定してください。\n\
+                 単独5連打で無効化（既定 Insert キー）は無変換/変換に依存しないため\n\
                  US でもそのまま動作します。",
             );
         }
@@ -1229,6 +2667,7 @@ impl SettingsApp {
                 .clicked()
             {
                 self.available_layouts = scan_layout_names(&self.config.general.layouts_dir);
+                self.recompute_diagnostics();
             }
         });
     }
@@ -1241,8 +2680,8 @@ impl SettingsApp {
         // Thumb keys
         ui.label("親指キー");
         let left_thumb_hover = "左の親指シフトキーに使うキーです。通常は「無変換」キーを使います。\n\
-                 「Left Alt」を選ぶと、物理 Left Alt キーを親指シフト ON 時に限り\n\
-                 左親指キーとして使います（OFF 時は通常の Alt として機能し、\n\
+                 「Left Alt」を選ぶと、物理 Left Alt キーを親指シフト入力中に限り\n\
+                 左親指キーとして使います（ローマ字入力中は通常の Alt として機能し、\n\
                  Alt+Tab 等を損ないません。PowerToys 等の OS レベルキーリマップと\n\
                  同様の効果を awase 単体で実現する機能です）。";
         ui.horizontal(|ui| {
@@ -1255,7 +2694,7 @@ impl SettingsApp {
             );
         });
         let right_thumb_hover = "右の親指シフトキーに使うキーです。通常は「変換」キーを使います。\n\
-                 「Right Alt」を選ぶと、物理 Right Alt キーを親指シフト ON 時に限り\n\
+                 「Right Alt」を選ぶと、物理 Right Alt キーを親指シフト入力中に限り\n\
                  右親指キーとして使います（詳細は左親指のヒントを参照）。";
         ui.horizontal(|ui| {
             ui.label("  右親指:").on_hover_text(right_thumb_hover);
@@ -1266,9 +2705,11 @@ impl SettingsApp {
                 right_thumb_hover,
             );
         });
-        if self.config.general.left_thumb_key == "VK_SPACE"
-            || self.config.general.right_thumb_key == "VK_SPACE"
-        {
+        if awase_windows::state::alt_impersonation::is_thumb_key_vk(
+            &self.config.general.left_thumb_key,
+            &self.config.general.right_thumb_key,
+            awase_windows::vk::VK_SPACE,
+        ) {
             ui.indent("space_thumb_options", |ui| {
                 ui.checkbox(
                     &mut self.config.general.space_thumb_ignore_composing_guard,
@@ -1289,9 +2730,11 @@ impl SettingsApp {
                 );
             });
         }
-        if self.config.general.left_thumb_key == "VK_RETURN"
-            || self.config.general.right_thumb_key == "VK_RETURN"
-        {
+        if awase_windows::state::alt_impersonation::is_thumb_key_vk(
+            &self.config.general.left_thumb_key,
+            &self.config.general.right_thumb_key,
+            awase_windows::vk::VK_RETURN,
+        ) {
             ui.indent("enter_thumb_options", |ui| {
                 ui.checkbox(
                     &mut self.config.general.enter_thumb_ignore_composing_guard,
@@ -1312,13 +2755,21 @@ impl SettingsApp {
                 );
             });
         }
-        if is_muhenkan_thumb_key(&self.config.general.left_thumb_key)
-            || is_muhenkan_thumb_key(&self.config.general.right_thumb_key)
-        {
+        let muhenkan_is_thumb = is_muhenkan_thumb_key(&self.config.general.left_thumb_key)
+            || is_muhenkan_thumb_key(&self.config.general.right_thumb_key);
+        let henkan_is_thumb = is_henkan_thumb_key(&self.config.general.left_thumb_key)
+            || is_henkan_thumb_key(&self.config.general.right_thumb_key);
+        let muhenkan_role = self.config.keys.has_bare_role_key("NONCONVERT");
+        let henkan_role = self.config.keys.has_bare_role_key("CONVERT");
+        let any_passthrough = (muhenkan_is_thumb
+            && !self.config.general.muhenkan_solo_tap_always_suppress)
+            || (henkan_is_thumb && !self.config.general.henkan_solo_tap_always_suppress);
+        if muhenkan_is_thumb {
             ui.indent("muhenkan_thumb_options", |ui| {
                 solo_tap_suppress_combo(
                     ui,
                     "無変換",
+                    muhenkan_role,
                     "MS-IME は無変換キー単独打鍵に既定で「かな切替」（IME オン相当）を\n\
                      割り当てているため、送出すると awase の管理外で IME モードが\n\
                      切り替わることがあります（2026-08-07 実機で確認）。",
@@ -1329,20 +2780,23 @@ impl SettingsApp {
         }
         // 2026-08-17 ユーザー判断: GJI 専用Fnキー変換（ADR-091 §D3.2）の
         // 手動設定 UI（専用Fnキードロップダウン・config1.dbへの書き込み
-        // ボタン）は一旦、設定画面から撤去した（実装自体は撤去していない、
-        // `muhenkan_solo_tap_dedicated_fn_key` は config.toml で引き続き
-        // 設定可能）。GJI検出時のconfig1.db自動判定・awase.exe起動時の
-        // ポップアップ同意フロー（`gji_charset_autodetect.rs`/
-        // `gji_charset_popup.rs`）が主経路として機能し続けるため、通常の
-        // 利用に支障はない。無変換キー単独タップのすぐ下に変換キー単独
-        // タップが並ぶよう、この節を撤去した分だけ表示順も詰まる。
-        if is_henkan_thumb_key(&self.config.general.left_thumb_key)
-            || is_henkan_thumb_key(&self.config.general.right_thumb_key)
-        {
+        // ボタン）は設定画面から撤去した。2026-09-02、実験的機能のまま
+        // 撤去し忘れて出荷されていたGJI検出時のconfig1.db自動判定・
+        // 起動時ポップアップ同意フロー（`gji_charset_autodetect.rs`の
+        // 専用Fnキー部分・`gji_charset_popup.rs`/`gji_charset_write.rs`）も
+        // 全撤去した（実機でGJIのキー設定が実際にはカスタムなのに
+        // 「カスタム以外」と誤診断されるなど、ユーザーの混乱を招いていた）。
+        // `muhenkan_solo_tap_dedicated_fn_key`（config.toml による手動設定）
+        // の内部配線は残っており、上級者は引き続き手動で有効化できるが、
+        // 現状これを設定画面から有効化する経路は無い。無変換キー単独タップ
+        // のすぐ下に変換キー単独タップが並ぶよう、この節を撤去した分だけ
+        // 表示順も詰まる。
+        if henkan_is_thumb {
             ui.indent("henkan_thumb_options", |ui| {
                 solo_tap_suppress_combo(
                     ui,
                     "変換",
+                    henkan_role,
                     "MS-IME は変換キー単独打鍵に既定で「再変換」を割り当てており、\n\
                      設定次第では IME オン相当の割当ても可能なため、送出すると\n\
                      awase の管理外で IME モードが切り替わることがあります。",
@@ -1351,29 +2805,74 @@ impl SettingsApp {
                 );
             });
         }
+        if any_passthrough {
+            ime_key_settings_hint(ui);
+        }
         ui.add_space(8.0);
 
         // 2026-08-15 ユーザー判断: 「awase → IME ON/OFFキー」は単に
         // 「IME ON/OFFキー」へ改称。「IME → awase ON/OFFキー」（旧
         // `tab_ime_detect`）は既に GUI から撤去済みで対比する相手が無くなった
-        // ため「awase → 」を残す意味が無い。多くのユーザーが実際に設定したい
-        // 項目のため、親指シフト ON/OFF より上に表示する。
+        // ため「awase → 」を残す意味が無い。「親指シフト入力／ローマ字入力」
+        // （旧称「親指シフト ON/OFF」→「awase 有効/無効」）は2026-09-02に
+        // 「上級者向け設定」タブへ移動済みのため、このタブでは本項目のみを扱う。
         ui.label("IME ON/OFFキー");
+        ui.group(|ui| {
+            ui.label("状態依存のIMEモードキー（ADR-192）");
+            ui.checkbox(
+                &mut self.config.general.warn_state_dependent_mode_keys,
+                "状態依存のキーを検出したときに警告する",
+            );
+            if self.adr192_replacement_controls_visible() {
+                ui.label(
+                    "警告された変換/無変換キーを、変換=IME ON・無変換=IME OFFの冪等な設定へ置き換えられます。親指キーの場合は、単独で押したときに生キーを送らず、awaseが直接IMEを開閉します。",
+                );
+                if ui.button("変更内容をプレビュー").clicked() {
+                    self.adr192_replacement_preview = Some(
+                        "[keys] ime_on に「変換」、ime_off に「無変換」を追加します（親指キーは既存の設定を残して追記、それ以外は置き換え）。"
+                            .to_owned(),
+                    );
+                }
+                if let Some(preview) = &self.adr192_replacement_preview {
+                    ui.monospace(preview);
+                    if ui.button("この置き換えを適用").clicked() {
+                        self.adr192_replacement_undo = Some(apply_adr192_recommended_replacement(
+                            &mut self.config,
+                        ));
+                        "冪等なIME ON/OFF設定へ置き換えました。「適用」でconfig.tomlへ保存してください。"
+                            .clone_into(&mut self.status);
+                    }
+                }
+                if self.adr192_replacement_undo.is_some()
+                    && ui.button("置き換えを元に戻す").clicked()
+                    && let Some(snapshot) = self.adr192_replacement_undo.take()
+                {
+                    undo_adr192_recommended_replacement(&mut self.config, snapshot);
+                    "ADR-192の置き換えを元に戻しました。".clone_into(&mut self.status);
+                }
+            } else {
+                ui.label(
+                    "現在のIME設定を判定していません。awaseが状態依存キーを検出した際の警告から開くと、診断結果に基づいてここから操作できます。",
+                );
+            }
+        });
         combo_key_list_ui(
             ui,
-            "IME ON",
+            "IME を強制的に ON にそろえるキー（モードずれ補正用）",
             "ime_on",
             &mut self.config.keys.ime_on,
             &mut self.new_ime_on,
-            "IME を ON にするキーの組み合わせです。\nIME がオフの状態からオンに切り替えます。",
+            "IME を ON にそろえるキーの組み合わせです（モードずれの補正用）。\n押すたびに IME を ON の状態にそろえます。通常の IME 切替は IME 側のキー設定で行ってください。",
+            &mut self.status,
         );
         combo_key_list_ui(
             ui,
-            "IME OFF",
+            "IME を強制的に OFF にそろえるキー（モードずれ補正用）",
             "ime_off",
             &mut self.config.keys.ime_off,
             &mut self.new_ime_off,
-            "IME を OFF にするキーの組み合わせです。\nIME がオンの状態からオフに切り替えます。",
+            "IME を OFF にそろえるキーの組み合わせです（モードずれの補正用）。\n押すたびに IME を OFF の状態にそろえます。通常の IME 切替は IME 側のキー設定で行ってください。",
+            &mut self.status,
         );
         combo_key_list_ui(
             ui,
@@ -1381,66 +2880,14 @@ impl SettingsApp {
             "ime_toggle",
             &mut self.config.keys.ime_toggle,
             &mut self.new_ime_toggle,
-            "IME の ON/OFF をトグルするキーの組み合わせです。\n現在の状態に応じて ON⇔OFF が切り替わります。",
+            "IME の ON/OFF をトグルするキーの組み合わせです。\n現在の状態に応じて ON⇔OFF が切り替わります。\n既定は空（IME 側の設定に従います）。",
+            &mut self.status,
         );
-        ui.add_space(8.0);
-
-        // Engine on/off
-        ui.label("親指シフト ON/OFF");
-        combo_key_list_ui(
-            ui,
-            "親指シフト ON",
-            "eng_on",
-            &mut self.config.keys.engine_on,
-            &mut self.new_engine_on,
-            "親指シフトを ON にするキーの組み合わせです。\n複数登録できます。",
-        );
-        combo_key_list_ui(
-            ui,
-            "親指シフト OFF",
-            "eng_off",
-            &mut self.config.keys.engine_off,
-            &mut self.new_engine_off,
-            "親指シフトを OFF にするキーの組み合わせです。\n複数登録できます。",
-        );
-        let solo_repeat_hover = "指定キーを単独で素早く5回連続押下すると親指シフトを OFF にします。\nCtrl スタック等で通常のキー操作が効かなくなった際の緊急脱出用です。";
-        ui.horizontal(|ui| {
-            ui.label("  単独5連打で OFF:")
-                .on_hover_text(solo_repeat_hover);
-            solo_repeat_combo(
-                ui,
-                &mut self.config.keys.engine_off_solo_repeat,
-                solo_repeat_hover,
-            );
-        });
-        ui.add_space(8.0);
-
-        // Toggle hotkey
-        ui.label("親指シフト ON/OFF トグル");
-        let engine_toggle_hover =
-            "親指シフトの ON/OFF をトグルするホットキーです。\nシステム全体で有効です。";
-        ui.horizontal(|ui| {
-            ui.label("  親指シフト切替:")
-                .on_hover_text(engine_toggle_hover);
-            hotkey_combo_ui(
-                ui,
-                "engine_toggle_hotkey",
-                &mut self.config.general.engine_toggle_hotkey,
-                engine_toggle_hover,
-            );
-        });
     }
 
     #[expect(clippy::too_many_lines)]
     fn tab_keymap(&mut self, ui: &mut egui::Ui) {
         ui.heading("ショートカット再割当");
-        // ADR-110 決定7/10（R7対応）: [[keymap]] は実際のキー処理から一度も
-        // 呼ばれておらず動作しない（docs/known-bugs.md BUG-99）。
-        // docs/known-bugs.md はユーザーには届かないため、GUI 上にも明示する。
-        ui.colored_label(
-            egui::Color32::from_rgb(200, 120, 0),
-            "⚠ 現在この機能は動作しません（キー処理から呼ばれていません、BUG-99）",
-        );
         ui.label(
             "アプリ別にキー入力を別キーへ置き換えます。\n\
              例: Ctrl+I を F7 に再割当（vim 系で Tab と区別したい場合等）。\n\
@@ -1453,6 +2900,7 @@ impl SettingsApp {
 
         // local copy of capturing to avoid borrow-conflict with self.config.keymaps below
         let mut capturing = self.capturing;
+        let (left_thumb_vk, right_thumb_vk) = keymap_thumb_vks(&self.config.general);
 
         // Existing rules table
         ui.label("登録済みルール");
@@ -1483,16 +2931,21 @@ impl SettingsApp {
                     }
 
                     // from: modifiers + main key + capture button
-                    let (mut ctrl, mut shift, mut alt, mut main) = parse_combo_str(&rule.from);
+                    // Alt 修飾は GUI から選べない（ADR-114 決定5 — バックエンドが
+                    // 'from' の Alt 修飾を禁止・skip するため、対称性を保つ）。
+                    // 既存 config.toml に Alt 付きルールが手書きされていた場合、
+                    // その alt 値はここでは変更されず素通しされる（バックエンドが
+                    // 別途警告して skip する）。
+                    let (mut ctrl, mut shift, alt, mut main) = parse_combo_str(&rule.from);
                     let mut changed = false;
                     changed |= ui.checkbox(&mut ctrl, "Ctrl").changed();
                     changed |= ui.checkbox(&mut shift, "Shift").changed();
-                    changed |= ui.checkbox(&mut alt, "Alt").changed();
                     if main_key_combo(
                         ui,
                         &format!("from_main_{i}"),
                         &mut main,
                         "変換元のキーです。左の Ctrl/Shift/Alt と組み合わせて判定します。",
+                        keymap_from_key_options(left_thumb_vk, right_thumb_vk),
                     ) {
                         changed = true;
                     }
@@ -1504,22 +2957,63 @@ impl SettingsApp {
 
                     ui.label("→");
 
-                    // to: main key only + capture button
-                    let mut to_main = rule.to.clone().unwrap_or_default();
-                    if main_key_combo_optional(
-                        ui,
-                        &format!("to_main_{i}"),
-                        &mut to_main,
-                        "再注入するキー。「（消費のみ）」を選ぶとキーを消費するだけになります。",
-                    ) {
-                        rule.to = if to_main.is_empty() {
-                            None
-                        } else {
-                            Some(to_main)
-                        };
+                    // to: 各ステップに main key ドロップダウン + ⌨（このステップを
+                    // 置換）+ x（このステップを削除）を並べる。「＋」でステップを
+                    // 末尾に追加する——新規ルール側と対称な「＋＝追加／x＝削除／
+                    // ⌨＝置換」という直交した操作にする（コードレビュー指摘 M3/M4）。
+                    let mut rm_to = None;
+                    if rule.to.is_empty() {
+                        ui.label("（消費のみ）");
                     }
-                    let to_target = CaptureTarget::ExistingTo(i);
-                    capture_button(ui, &mut capturing, to_target);
+                    for (step_i, to_main) in rule.to.iter_mut().enumerate() {
+                        main_key_combo_to(
+                            ui,
+                            &format!("to_main_{i}_{step_i}"),
+                            to_main,
+                            "再注入するキー列の1ステップです。各ステップは修飾子なしの Down+Up として送信されます。",
+                            left_thumb_vk,
+                            right_thumb_vk,
+                        );
+                        if to_main.is_empty() {
+                            // 「＋」で追加した直後、まだ何も選んでいないステップ。
+                            // 未選択のまま気付かず保存すると、バックエンドの
+                            // KeymapTable::new がこのルール全体を無言で
+                            // skip する（'to' パース失敗 → continue 'rules）
+                            // ため、GUI 側でも見える形で警告する
+                            // （code-review指摘）。
+                            ui.colored_label(
+                                egui::Color32::from_rgb(200, 120, 0),
+                                "⚠未選択",
+                            )
+                            .on_hover_text(
+                                "このステップが未選択のまま保存すると、\
+                                 ルール全体が無効になります（バックエンドが\
+                                 警告ログを出して丸ごとスキップします）。",
+                            );
+                        }
+                        capture_button(ui, &mut capturing, CaptureTarget::ExistingTo(i, step_i));
+                        if ui
+                            .small_button("x")
+                            .on_hover_text("押すと: この送信ステップを削除します。")
+                            .clicked()
+                        {
+                            rm_to = Some(step_i);
+                        }
+                    }
+                    if let Some(step_i) = rm_to {
+                        rule.to.remove(step_i);
+                        capturing = adjust_capturing_after_to_step_removed(capturing, i, step_i);
+                    }
+                    if ui
+                        .small_button("+")
+                        .on_hover_text(
+                            "押すと: 送信ステップを末尾に1つ追加します（追加後、\
+                             ドロップダウンまたは⌨で内容を選びます）。",
+                        )
+                        .clicked()
+                    {
+                        rule.to.push(String::new());
+                    }
 
                     if ui
                         .small_button("x")
@@ -1532,6 +3026,7 @@ impl SettingsApp {
             }
             if let Some(i) = rm {
                 self.config.keymaps.remove(i);
+                capturing = adjust_capturing_after_rule_removed(capturing, i);
             }
         }
         ui.add_space(12.0);
@@ -1551,17 +3046,18 @@ impl SettingsApp {
                 .on_hover_text("対象プロセス名（例: vim.exe）。空欄で全アプリ対象。");
                 ui.end_row();
 
-                let from_hover = "変換元のキーです。左の Ctrl/Shift/Alt と組み合わせて判定します。";
+                let from_hover =
+                    "変換元のキーです。左の Ctrl/Shift と組み合わせて判定します（Alt 修飾は使用できません）。";
                 ui.label("  from:").on_hover_text(from_hover);
                 ui.horizontal_wrapped(|ui| {
                     ui.checkbox(&mut self.new_keymap_from_ctrl, "Ctrl");
                     ui.checkbox(&mut self.new_keymap_from_shift, "Shift");
-                    ui.checkbox(&mut self.new_keymap_from_alt, "Alt");
                     main_key_combo(
                         ui,
                         "new_from_main",
                         &mut self.new_keymap_from_main,
                         from_hover,
+                        keymap_from_key_options(left_thumb_vk, right_thumb_vk),
                     );
                     capture_button(ui, &mut capturing, CaptureTarget::NewFrom);
                 })
@@ -1573,11 +3069,13 @@ impl SettingsApp {
                     "再注入するキー。「（消費のみ）」を選ぶとキーを消費するだけになります。";
                 ui.label("  to:").on_hover_text(to_hover);
                 ui.horizontal_wrapped(|ui| {
-                    main_key_combo_optional(
+                    main_key_combo_to_optional(
                         ui,
                         "new_to_main",
                         &mut self.new_keymap_to_main,
                         to_hover,
+                        left_thumb_vk,
+                        right_thumb_vk,
                     );
                     capture_button(ui, &mut capturing, CaptureTarget::NewTo);
                 })
@@ -1590,139 +3088,190 @@ impl SettingsApp {
             .button("+追加")
             .on_hover_text("押すと: 上で組み立てたルールを一覧に追加します。")
             .clicked()
-            && !self.new_keymap_from_main.is_empty()
         {
-            let from = format_combo(
-                self.new_keymap_from_ctrl,
-                self.new_keymap_from_shift,
-                self.new_keymap_from_alt,
-                &self.new_keymap_from_main,
-            );
-            self.config.keymaps.push(awase::config::KeymapRule {
-                app: if self.new_keymap_app.is_empty() {
-                    None
-                } else {
-                    Some(self.new_keymap_app.clone())
-                },
-                from,
-                to: if self.new_keymap_to_main.is_empty() {
-                    None
-                } else {
-                    Some(self.new_keymap_to_main.clone())
-                },
-            });
-            self.new_keymap_app.clear();
-            self.new_keymap_from_ctrl = false;
-            self.new_keymap_from_shift = false;
-            self.new_keymap_from_alt = false;
-            self.new_keymap_from_main.clear();
-            self.new_keymap_to_main.clear();
+            if self.new_keymap_from_main.is_empty() {
+                // 以前は無言で何も起きなかった（ベストプラクティスレビュー
+                // 指摘）。「＋追加」を押したのに何も起きないと、ボタンが
+                // 壊れていると誤解される。
+                self.status = "from のキーが未選択のため追加できません。".to_string();
+            } else {
+                let from = format_combo(
+                    self.new_keymap_from_ctrl,
+                    self.new_keymap_from_shift,
+                    false, // Alt は使用できない（ADR-114 決定5）
+                    &self.new_keymap_from_main,
+                );
+                self.config.keymaps.push(awase::config::KeymapRule {
+                    app: if self.new_keymap_app.is_empty() {
+                        None
+                    } else {
+                        Some(self.new_keymap_app.clone())
+                    },
+                    from,
+                    to: if self.new_keymap_to_main.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![self.new_keymap_to_main.clone()]
+                    },
+                });
+                self.new_keymap_app.clear();
+                self.new_keymap_from_ctrl = false;
+                self.new_keymap_from_shift = false;
+                self.new_keymap_from_main.clear();
+                self.new_keymap_to_main.clear();
+            }
         }
 
         ui.add_space(16.0);
-        egui::CollapsingHeader::new("物理キー単純リマップ（key_remap）")
-            .default_open(true)
-            .show(ui, |ui| self.tab_key_remap(ui));
+        self.scancode_map_section(ui);
     }
 
-    /// `key_remap`（ADR-110）の設定セクション。`tab_keymap` の
-    /// `CollapsingHeader` から呼ばれる（決定7: 新規タブは作らず、視覚的に
-    /// 分離した既存タブ内セクションとして提供する）。
-    fn tab_key_remap(&mut self, ui: &mut egui::Ui) {
+    /// Caps(英数)⇔Ctrl 入れ替え / Caps(英数)→Ctrl 片方向複製プリセット
+    /// （ADR-111 / ADR-126）。Scancode Map（レジストリ、要昇格・要再起動）
+    /// 方式のみを提供する——ADR-110の
+    /// フックベース`key_remap`機構はJIS英数キー位置で日本語IMEと衝突する
+    /// 構造的リスクが判明したため撤回済み（`docs/adr/111-...md`参照）。
+    fn scancode_map_section(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.heading("Caps(英数) / Ctrl プリセット");
         ui.label(
-            "物理キー1つを別の物理キーとして常時扱います（例: CapsLock を Ctrl として \
-             使う）。エンジンの有効/無効に関わらず常時適用されます。\n\
-             ※ Alt/Win 系キーは from/to に指定できません（内部の held 判定と整合しないため）。",
+            "CapsLock（JISキーボードでは英数キー）と左Ctrlの役割を変更します。\n\
+             Windows のレジストリ（Scancode Map）を書き換えるため、管理者権限の\n\
+             確認が1回表示されます。変更の反映には再起動が必要です（サインアウトでは\n\
+             反映されないことがあります）。\n\
+             この設定はこのPCの全ユーザーに影響します。リモートデスクトップ接続の\n\
+             セッション内では動作しません。",
         );
-        ui.add_space(8.0);
+        ui.add_space(4.0);
 
-        ui.label("登録済みルール");
-        if self.config.key_remap.is_empty() {
-            ui.label("  （ルールはまだ登録されていません）");
-        } else {
-            let mut rm = None;
-            let warnings: Vec<Option<String>> = (0..self.config.key_remap.len())
-                .map(|i| key_remap_row_warning(&self.config.key_remap, i))
-                .collect();
-            for (i, rule) in self.config.key_remap.iter_mut().enumerate() {
-                ui.horizontal_wrapped(|ui| {
-                    key_remap_key_combo(
-                        ui,
-                        &format!("key_remap_from_{i}"),
-                        &mut rule.from,
-                        "リマップ元の物理キーです。",
-                    );
-                    ui.label("→");
-                    key_remap_key_combo(
-                        ui,
-                        &format!("key_remap_to_{i}"),
-                        &mut rule.to,
-                        "リマップ先のキーです。",
-                    );
-                    if let Some(reason) = &warnings[i] {
-                        ui.colored_label(egui::Color32::from_rgb(200, 120, 0), "⚠")
-                            .on_hover_text(reason);
-                    }
-                    if ui
-                        .small_button("x")
-                        .on_hover_text("押すと: このルールを削除します。")
-                        .clicked()
-                    {
-                        rm = Some(i);
-                    }
-                });
-            }
-            if let Some(i) = rm {
-                self.config.key_remap.remove(i);
-            }
+        if self.scancode_map_status.is_none() {
+            self.scancode_map_status = Some(scancode_map_admin::read_status());
         }
-        ui.add_space(12.0);
 
-        ui.label("新規追加");
-        ui.horizontal_wrapped(|ui| {
-            key_remap_key_combo(
-                ui,
-                "new_key_remap_from",
-                &mut self.new_key_remap_from,
-                "リマップ元の物理キーです。",
-            );
-            ui.label("→");
-            key_remap_key_combo(
-                ui,
-                "new_key_remap_to",
-                &mut self.new_key_remap_to,
-                "リマップ先のキーです。",
-            );
-            if ui
-                .button("+追加")
-                .on_hover_text("押すと: 上で選んだルールを一覧に追加します。")
-                .clicked()
-                && !self.new_key_remap_from.is_empty()
-                && !self.new_key_remap_to.is_empty()
-            {
-                self.config.key_remap.push(awase::config::KeyRemapRule {
-                    from: self.new_key_remap_from.clone(),
-                    to: self.new_key_remap_to.clone(),
-                });
-                self.new_key_remap_from.clear();
-                self.new_key_remap_to.clear();
+        match &self.scancode_map_status {
+            Some(scancode_map_admin::ScancodeMapStatus::Active {
+                preset,
+                extra_entries,
+            }) => {
+                let preset_name = match preset {
+                    ScancodeMapPreset::Swap => "Caps(英数) ⇔ Ctrl 入れ替え",
+                    ScancodeMapPreset::CapsAsExtraCtrl => "Caps(英数) を Ctrl として追加",
+                };
+                if *extra_entries == 0 {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0, 140, 0),
+                        format!("✓ 有効: {preset_name}"),
+                    );
+                } else {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0, 140, 0),
+                        format!(
+                            "✓ 有効: {preset_name}（他に awase と無関係な設定が {extra_entries} 件あります）"
+                        ),
+                    );
+                }
             }
+            Some(scancode_map_admin::ScancodeMapStatus::Inactive { extra_entries }) => {
+                if *extra_entries == 0 {
+                    ui.label("未設定");
+                } else {
+                    ui.label(format!(
+                        "未設定（awase と無関係な Scancode Map 設定が {extra_entries} 件あります）"
+                    ));
+                }
+            }
+            Some(scancode_map_admin::ScancodeMapStatus::ReadError(e)) => {
+                ui.colored_label(egui::Color32::RED, format!("読み取りエラー: {e}"));
+            }
+            None => unreachable!("直前に read_status() で埋めている"),
+        }
+
+        // ラジオの選択値と有効/無効を1回の match で導出する（表示用の match
+        // とは別に保つが、この2つは1つにまとめておく——/code-review指摘:
+        // 同じ scancode_map_status を独立に3回 match/matches! すると、
+        // 将来 ScancodeMapStatus に variant が増えたときに一部の match
+        // だけ更新漏れが起きやすい）。
+        let (derived, is_read_error) = match &self.scancode_map_status {
+            Some(scancode_map_admin::ScancodeMapStatus::Active { preset, .. }) => (
+                match preset {
+                    ScancodeMapPreset::Swap => ScancodeMapSelection::Swap,
+                    ScancodeMapPreset::CapsAsExtraCtrl => ScancodeMapSelection::CapsAsExtraCtrl,
+                },
+                false,
+            ),
+            Some(scancode_map_admin::ScancodeMapStatus::ReadError(_)) => {
+                (ScancodeMapSelection::Off, true)
+            }
+            _ => (ScancodeMapSelection::Off, false),
+        };
+        let mut selection = derived;
+        ui.add_enabled_ui(!is_read_error, |ui| {
+            ui.radio_value(&mut selection, ScancodeMapSelection::Off, "無効");
+            ui.radio_value(
+                &mut selection,
+                ScancodeMapSelection::Swap,
+                "Caps(英数) ⇔ Ctrl を入れ替える",
+            );
+            ui.radio_value(
+                &mut selection,
+                ScancodeMapSelection::CapsAsExtraCtrl,
+                "Caps(英数) を Ctrl として追加する\n\
+                 （Ctrl が2つになります。元の Ctrl キーはそのまま。\n\
+                 英数キー自体は使えなくなります）",
+            );
         });
+        if selection != derived {
+            self.apply_scancode_map_change(selection);
+        }
+
+        if let Some(msg) = &self.scancode_map_last_message {
+            ui.label(msg);
+        }
+    }
+
+    /// プリセット変更時の処理。自己昇格フロー
+    /// （`scancode_map_admin::request_elevated_change`）を起動して完了を
+    /// 待ち、結果に応じてメッセージを表示し、状態キャッシュを読み直す
+    /// （ADR-111決定4・決定7、ADR-126決定4・決定5）。
+    fn apply_scancode_map_change(&mut self, selection: ScancodeMapSelection) {
+        use scancode_map_admin::ElevationOutcome;
+        let outcome = scancode_map_admin::request_elevated_change(selection);
+        self.scancode_map_last_message = Some(match outcome {
+            ElevationOutcome::Success => match selection {
+                ScancodeMapSelection::Off => {
+                    "無効にしました。反映するには再起動してください。".to_string()
+                }
+                ScancodeMapSelection::Swap => {
+                    "入れ替えを有効にしました。反映するには再起動してください。".to_string()
+                }
+                ScancodeMapSelection::CapsAsExtraCtrl => {
+                    "Ctrl として追加する設定にしました。反映するには再起動してください。"
+                        .to_string()
+                }
+            },
+            ElevationOutcome::Failed => "処理に失敗しました。".to_string(),
+            ElevationOutcome::Cancelled => {
+                "キャンセルされました（管理者権限が必要です）。".to_string()
+            }
+            ElevationOutcome::LaunchError(e) => format!("起動できませんでした: {e}"),
+        });
+        // 決定7: 操作直後にのみ再読み込みする（毎フレーム読まない）。
+        self.scancode_map_status = Some(scancode_map_admin::read_status());
     }
 
     /// 「アプリ無効化」タブ（`disable_apps`）。プロセス名のみで完結する単純な
-    /// 設定のため、`tab_app_rules`（force_text/force_bypass/force_vk/force_tsf、
-    /// プロセス名+クラス名の両方が必要でGUI化を見送っている）とは切り離して
-    /// 常時表示する（2026-08-26、BUG-90: PowerToys Mouse Without Borders 使用中
-    /// に物理「英数」キーが効かない不具合の回避策としてユーザーが自分で
+    /// 設定のため常時表示する（2026-08-26、BUG-90: PowerToys Mouse Without Borders
+    /// 使用中に物理「英数」キーが効かない不具合の回避策としてユーザーが自分で
     /// `disable_apps` に中継ウィンドウのプロセス名を追加できるようにする）。
+    /// アプリ別上書き（force_text/force_bypass/force_vk/force_tsf、`post_bypass`）の
+    /// 設定画面は ADR-217 で撤去した（config.toml の直接編集では引き続き有効）。
     fn tab_disable_apps(&mut self, ui: &mut egui::Ui) {
         ui.heading("アプリを無効化");
         ui.label(
             "指定したアプリにフォーカスがある間、awase を丸ごと無効化します（force_bypass より強く、\n\
              フックレベルで生キーがそのままアプリへ届きます。DirectInput 等を使うゲームにも通用します）。\n\
              プロセス名のみで指定し、クラス名は不要です。大文字小文字・.exe の有無は区別しません。\n\
-             無効化中は IME 制御（ON/OFF 自動切替・warmup 等）も完全に停止します。",
+             無効化中は IME 制御（自動的な ON/OFF 切り替えなど）も完全に停止します。",
         );
         ui.add_space(4.0);
         process_list_ui(
@@ -1732,120 +3281,93 @@ impl SettingsApp {
             "フォーカス中このプロセスでは、awase のキー変換・IME 制御を一切行いません。\n既定でリモートデスクトップ接続（mstsc.exe）が登録されています\n（接続元での Ctrl キー押しっぱなし不具合対策）。",
             &mut self.config.app_overrides.disable_apps,
             &mut self.new_disable_app,
+            &mut self.status,
         );
     }
 
-    #[expect(clippy::too_many_lines)]
-    fn tab_app_rules(&mut self, ui: &mut egui::Ui) {
-        ui.heading("アプリ別オーバーライド");
-        ui.label(
-            "特定アプリでの awase の挙動を上書きします。\n\
-             プロセス名・クラス名は両方必須で、完全一致（大文字小文字は区別しない）です。\n\
-             クラス名はログの [focus-sync] 行などで確認できます。",
-        );
-        ui.add_space(8.0);
+    /// 「IMEキー学習」タブ。ADR-176の手動較正（1キーずつの測定、結果はIME判定に
+    /// 適用されないため）は撤去し、ADR-195の学習ウィザードだけをタブの最上段に置く。
+    fn tab_calibration(&mut self, ui: &mut egui::Ui) {
+        ui.heading("IMEキー学習");
+        self.keymap_learn_wizard_ui(ui);
+    }
 
-        let [buf_text, buf_bypass, buf_vk, buf_tsf] = &mut self.new_override_bufs;
-        override_list_ui(
-            ui,
-            "ov_text",
-            "テキスト入力扱いを強制 (force_text)",
-            "フォーカス分類を強制的に TextInput にします。\nNICOLA 変換が効かないアプリで有効にします。",
-            &mut self.config.app_overrides.force_text,
-            buf_text,
-        );
-        override_list_ui(
-            ui,
-            "ov_bypass",
-            "素通しを強制 (force_bypass)",
-            "フォーカス分類を強制的に NonText にし、全キーを変換せず OS に通します。\nゲーム等、awase を効かせたくないアプリで有効にします。",
-            &mut self.config.app_overrides.force_bypass,
-            buf_bypass,
-        );
-        override_list_ui(
-            ui,
-            "ov_vk",
-            "VK 注入を強制 (force_vk)",
-            "文字出力を VK Batched 方式（IME に composition させる）に強制します。",
-            &mut self.config.app_overrides.force_vk,
-            buf_vk,
-        );
-        override_list_ui(
-            ui,
-            "ov_tsf",
-            "TSF 注入を強制 (force_tsf)",
-            "文字出力を TSF Sequential 方式に強制します。\nWezTerm 等の TSF ネイティブアプリで使用します。",
-            &mut self.config.app_overrides.force_tsf,
-            buf_tsf,
-        );
+    /// ADR-195段階6: `awase-keymap-learn-win`(独立学習プロセス、ADR195-T1)を子プロセスとして
+    /// 起動し、全キー×全状態を自動巡回測定するウィザード導線。
+    fn keymap_learn_wizard_ui(&mut self, ui: &mut egui::Ui) {
+        self.refresh_keymap_table_state(&ui.ctx().clone());
+        {
+            ui.label(
+                "全ての対応キー×状態を自動で巡回測定します。\n\
+                 測定中は学習ウィンドウを前面に保ち、キーボードに触れないでください\n\
+                 （他の窓へ切り替えたり物理キーを押すと、測定は失敗として中止されます）。",
+            );
+            ui.add_space(4.0);
+            ui.label(keymap_learn_status::LEARNING_RECOMMENDATION);
+            ui.add_space(8.0);
 
-        ui.separator();
-        ui.heading("プレフィックスキー素通し (post_bypass)");
-        ui.label(
-            "Ctrl+キー（tmux prefix 等）が素通しされた直後の次の1キーを\n\
-             NICOLA 変換せずそのまま通します。\n\
-             プロセス名・クラス名は部分一致で、空欄はすべてにマッチします。",
-        );
-        ui.add_space(4.0);
-        let mut rm = None;
-        for (i, rule) in self.config.post_bypass.iter().enumerate() {
+            let running = self.keymap_learn_rx.is_some();
+            let table_state = self.keymap_table_state.clone();
+            if let Some(state) = &table_state {
+                ui.label(state.status_line(None));
+                ui.horizontal(|ui| {
+                    if state.can_adopt()
+                        && ui
+                            .add_enabled(!running, egui::Button::new("学習結果を使う"))
+                            .clicked()
+                    {
+                        self.start_keymap_process(
+                            keymap_learn_launcher::LearnMode::AdoptPendingJudgement,
+                        );
+                    }
+                    if state.can_revalidate()
+                        && ui
+                            .add_enabled(!running, egui::Button::new("軽量再検証を実行"))
+                            .clicked()
+                    {
+                        self.start_keymap_process(keymap_learn_launcher::LearnMode::Revalidate);
+                    }
+                });
+                ui.add_space(4.0);
+            }
             ui.horizontal(|ui| {
-                ui.label(format!(
-                    "    {} / process={} / class={}",
-                    rule.key,
-                    if rule.process.is_empty() {
-                        "(すべて)"
-                    } else {
-                        &rule.process
-                    },
-                    if rule.class.is_empty() {
-                        "(すべて)"
-                    } else {
-                        &rule.class
-                    },
-                ));
                 if ui
-                    .small_button("x")
-                    .on_hover_text("押すと: この行を削除します。")
+                    .add_enabled(!running, egui::Button::new("学習を開始"))
                     .clicked()
                 {
-                    rm = Some(i);
+                    self.start_keymap_learning();
+                }
+                // 実キー注入を行う子プロセスなので、閉じる/ハングしたときにタスクマネージャ
+                // 頼みにならないよう、UIから止める手段を必ず用意する。
+                if ui
+                    .add_enabled(running, egui::Button::new("キャンセル"))
+                    .clicked()
+                {
+                    self.cancel_keymap_learning();
                 }
             });
-        }
-        if let Some(i) = rm {
-            self.config.post_bypass.remove(i);
-        }
-        let pb_key_hover = "Ctrl+このキーが素通しされた直後の次の1キーを NICOLA 変換せず\nそのまま通します（tmux の Ctrl+B 等の prefix キー用）。";
-        ui.horizontal(|ui| {
-            ui.label("Ctrl+").on_hover_text(pb_key_hover);
-            main_key_combo(ui, "new_pb_key", &mut self.new_pb_key, pb_key_hover);
-            ui.add(
-                egui::TextEdit::singleline(&mut self.new_pb_process)
-                    .desired_width(120.0)
-                    .hint_text("プロセス名 (部分一致)"),
-            )
-            .on_hover_text("対象プロセス名（部分一致）。空欄はすべてのプロセスにマッチします。");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.new_pb_class)
-                    .desired_width(120.0)
-                    .hint_text("クラス名 (部分一致)"),
-            )
-            .on_hover_text("対象ウィンドウのクラス名（部分一致）。空欄はすべてにマッチします。");
-            if ui
-                .button("+追加")
-                .on_hover_text("押すと: 上で組み立てたルールを一覧に追加します。")
-                .clicked()
-                && !self.new_pb_key.is_empty()
-            {
-                // ランタイムの parse は "Ctrl+<キー>" 形式（Ctrl 必須）を要求する
-                self.config.post_bypass.push(awase::config::PostBypassRule {
-                    key: format_combo(true, false, false, &std::mem::take(&mut self.new_pb_key)),
-                    process: std::mem::take(&mut self.new_pb_process),
-                    class: std::mem::take(&mut self.new_pb_class),
-                });
+
+            if let Some(p) = self.keymap_learn_progress {
+                ui.add_space(4.0);
+                let finished = self.keymap_learn_finished;
+                let fraction = if finished { 1.0 } else { p.fraction() };
+                ui.add(egui::ProgressBar::new(fraction).text(format!("{:.0}%", fraction * 100.0)));
+                if finished {
+                    ui.label("残り約0秒");
+                } else if let Some(eta_ms) = p.eta_ms {
+                    // 切り捨てて表示する(1秒未満は「0秒」。四捨五入だと、終わる直前に「1秒」が残って見える)。
+                    ui.label(format!("残り約{:.0}秒", (eta_ms / 1000.0).floor().max(0.0)));
+                } else {
+                    // 巡回の間は、状態が次々に見つかり終わりが分からないため、残り時間を出さない。
+                    ui.label("残り時間を見積もり中…");
+                }
             }
-        });
+
+            if let Some(status) = &self.keymap_learn_status {
+                ui.add_space(4.0);
+                ui.label(status);
+            }
+        }
     }
 
     #[expect(clippy::too_many_lines)]
@@ -1881,15 +3403,8 @@ impl SettingsApp {
                 self.layout_do_open_dialog();
             }
             if ui
-                .button("保存")
-                .on_hover_text("押すと: 現在編集中の内容を今開いているファイルへ上書き保存します。")
-                .clicked()
-            {
-                self.layout_do_save();
-            }
-            if ui
-                .button("名前を付けて保存")
-                .on_hover_text("押すと: 保存先を選ぶダイアログを開き、別名/別の場所へ保存します。")
+                .button("別名で書き出す")
+                .on_hover_text("押すと: 現在編集中の内容を別ファイルへ書き出します。開いているファイルは変わりません。")
                 .clicked()
             {
                 self.layout_do_save_as_dialog();
@@ -1971,7 +3486,7 @@ impl SettingsApp {
                     .clicked()
                 {
                     self.layout_current_face = *face;
-                    self.layout_selected_pos = None;
+                    self.clear_layout_edit_selection();
                 }
             }
         });
@@ -1995,7 +3510,26 @@ impl SettingsApp {
         if first_open {
             log_checkpoint("ツールバー/タブ/凡例 描画完了、グリッド描画開始");
         }
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        // ScrollArea::vertical()（縦のみ）ではなく ::both() を使う。理由:
+        // 縦専用スクロール領域は横方向を単に available 幅へ clip するだけで
+        // 自前の横スクロールバーを持たず、しかも egui 0.31.1 の ScrollArea は
+        // 常に content_max_size を自身の可視サイズに収める（scroll_area.rs の
+        // `if true {}` 分岐、`content_max_size[d] = f32::INFINITY` はデッド
+        // コード）ため、外側の egui::ScrollArea::both()（tab_layout の呼び出し元、
+        // Main content の横スクロール = 最終フォールバック、7207413c 参照）も
+        // キーボード図の実際の幅を検知できず、横スクロールバーが出ないまま
+        // 右端が切れていた（ウィンドウを既定幅より手動で縮めると発生。#156
+        // code review 1周目の指摘）。
+        //
+        // かといって ScrollArea を丸ごと外すと、ツールバー/保存・開くボタン/
+        // 面タブ/凡例（このスコープの外、上で描画済み）まで grid+編集パネルと
+        // 一緒に縦スクロールしてしまい、編集パネルが伸びた状態で下へスクロール
+        // すると保存ボタンや面タブが画面外に流れて操作しづらくなる（#156
+        // code review 2周目の指摘）。そこでこの内側スコープだけ独立した
+        // スクロール領域として残しつつ、::both() にして自前の横スクロール
+        // バーを持たせることで、上のツールバー類は固定したまま
+        // grid+編集パネル側の横オーバーフローにも到達できるようにする。
+        egui::ScrollArea::both().show(ui, |ui| {
             self.draw_layout_keyboard_grid(ui);
             if first_open {
                 log_checkpoint("グリッド描画完了、編集パネル描画開始");
@@ -2114,11 +3648,12 @@ impl SettingsApp {
         ui.add_space(4.0);
 
         // Type selector (radio buttons)
-        ui.horizontal(|ui| {
-            ui.label("種別:");
-            ui.radio_value(&mut self.layout_edit_kind, ValueKind::Keystroke, "打鍵")
-                .on_hover_text(
-                    "ローマ字（複数文字、例: 「si」「tsu」）またはキーボード上の\n\
+        ui.add_enabled_ui(!self.layout_edit_origin_is_sequence, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("種別:");
+                ui.radio_value(&mut self.layout_edit_kind, ValueKind::Keystroke, "打鍵")
+                    .on_hover_text(
+                        "ローマ字（複数文字、例: 「si」「tsu」）またはキーボード上の\n\
                      記号・数字（例: 「!」「1」）を、実際のキー押下として送信し、\n\
                      IME に処理させます。\n\
                      \n\
@@ -2129,29 +3664,45 @@ impl SettingsApp {
                      JIS キーボード上に存在する文字（半角の英数字・記号）のみ\n\
                      入力できます。全角で入力しても自動で半角に変換されるので、\n\
                      半角/全角を意識する必要はありません。",
-                );
-            ui.radio_value(&mut self.layout_edit_kind, ValueKind::Literal, "リテラル")
-                .on_hover_text(
-                    "指定した文字列を Unicode 文字としてそのまま直接送信します\n\
+                    );
+                ui.radio_value(&mut self.layout_edit_kind, ValueKind::Literal, "リテラル")
+                    .on_hover_text(
+                        "指定した文字列を Unicode 文字としてそのまま直接送信します\n\
                      （IME を一切経由しません）。IME や変換モードに関係なく必ず\n\
                      その文字が出ます。「ー」「…」のような固定記号に向いています。",
-                );
-            ui.radio_value(&mut self.layout_edit_kind, ValueKind::Special, "特殊キー")
-                .on_hover_text(
-                    "Backspace / Escape / Enter / Space / Delete / Insert / \n\
+                    );
+                ui.radio_value(&mut self.layout_edit_kind, ValueKind::Special, "特殊キー")
+                    .on_hover_text(
+                        "Backspace / Escape / Enter / Space / Delete / Insert / \n\
                      矢印 / Home / End / PageUp / PageDown を送信します。",
-                );
-            ui.radio_value(&mut self.layout_edit_kind, ValueKind::Vk, "VKコード")
-                .on_hover_text(
-                    "仮想キーコードを16進数で直接指定します（やまぶきR互換の\n\
+                    );
+                ui.radio_value(&mut self.layout_edit_kind, ValueKind::Vk, "VKコード")
+                    .on_hover_text(
+                        "仮想キーコードを16進数で直接指定します（やまぶきR互換の\n\
                      「V」+16進数指定）。特殊キーに無いキーを送りたい場合に使います。",
-                );
-            ui.radio_value(&mut self.layout_edit_kind, ValueKind::None, "なし")
-                .on_hover_text("このキーへの割り当てを解除します（パススルー）。");
+                    );
+                ui.radio_value(&mut self.layout_edit_kind, ValueKind::None, "なし")
+                    .on_hover_text("このキーへの割り当てを解除します（パススルー）。");
+            });
         });
+        if self.layout_edit_origin_is_sequence {
+            ui.label(
+                egui::RichText::new(
+                    "このセルは打鍵列構文を含むため、GUIでは編集できません。.yabを直接編集してください。",
+                )
+                .small()
+                .color(egui::Color32::GRAY),
+            );
+        }
         ui.add_space(4.0);
 
         // Value input
+        // round4 architect W3/premortem R4-2: ADR-115打鍵列セルは種別ラジオ
+        // （上記）だけでなく値ウィジェットもここで無効化する。
+        // `layout_edit_origin_is_sequence`ガード（commit_pending_layout_edit
+        // ステップ2）が既にコミットを構造的に阻止しているため、これはUI上の
+        // 二重の防御（「操作しても何も起きない」編集可能に見えるUIを残さない）。
+        ui.add_enabled_ui(!self.layout_edit_origin_is_sequence, |ui| {
         match self.layout_edit_kind {
             ValueKind::Keystroke => {
                 ui.horizontal(|ui| {
@@ -2167,7 +3718,7 @@ impl SettingsApp {
                         .on_hover_text(
                             "ローマ字（例: ka, si, tsu）または半角記号/数字（例: !, 1）を入力します。",
                         );
-                    if resp.changed() {
+                    if resp.changed() && !self.ime_composing && !self.ime_event_this_frame {
                         self.layout_edit_value = normalize_keystroke_input(&self.layout_edit_value);
                     }
                 });
@@ -2218,18 +3769,28 @@ impl SettingsApp {
             }
             ValueKind::Special => {
                 let special_hover = "このキーを押したときに送信する特殊キーを選びます。";
+                let previous_idx = self.layout_edit_special_idx;
                 ui.horizontal(|ui| {
                     ui.label("特殊キー:").on_hover_text(special_hover);
-                    egui::ComboBox::from_id_salt("special_key")
+                    let response = egui::ComboBox::from_id_salt("special_key")
                         .selected_text(SPECIAL_KEYS[self.layout_edit_special_idx].1)
                         .show_ui(ui, |ui| {
                             for (i, (_, name)) in SPECIAL_KEYS.iter().enumerate() {
                                 ui.selectable_value(&mut self.layout_edit_special_idx, i, *name);
                             }
                         })
-                        .response
-                        .on_hover_text(special_hover);
+                        .response;
+                    response.on_hover_text(special_hover);
                 });
+                // `ComboBox::show_ui`（`show_index`とは異なる素の版）は内側の
+                // `selectable_value`のクリックを`Response::changed()`へ伝播しない
+                // （egui-0.31.1のcombo_box_dyn実装を確認済み）。ここで`changed()`
+                // を条件にすると特殊キーが恒久的にコミットされないため、選択前後の
+                // インデックス比較で明示的に変更を検知する（判定・コミット自体は
+                // `commit_special_key_if_changed`に切り出し、egui/ComboBoxの
+                // ポインタ操作をシミュレートしなくてもユニットテストできるように
+                // している）。
+                self.commit_special_key_if_changed(pos, previous_idx);
             }
             ValueKind::Vk => {
                 ui.horizontal(|ui| {
@@ -2257,34 +3818,124 @@ impl SettingsApp {
                     egui::RichText::new("このキーへの割り当てを解除します")
                         .color(egui::Color32::GRAY),
                 );
+                if self.layout_face(self.layout_current_face).get(&pos) != Some(&YabValue::None)
+                    && ui.button("このキーの割り当てを解除").clicked()
+                {
+                    self.layout_face_mut(self.layout_current_face)
+                        .insert(pos, YabValue::None);
+                    self.layout_modified = true;
+                    self.select_layout_cell(pos);
+                }
             }
         }
-
-        let can_apply = (self.layout_edit_kind != ValueKind::Keystroke
-            || find_invalid_keystroke_char(self.layout_edit_value.trim()).is_none())
-            && (self.layout_edit_kind != ValueKind::Vk
-                || self.layout_edit_value.trim().is_empty()
-                || u16::from_str_radix(self.layout_edit_value.trim().trim_start_matches('V'), 16)
-                    .is_ok());
-
-        ui.add_space(6.0);
-        if ui
-            .add_enabled(
-                can_apply,
-                egui::Button::new(egui::RichText::new("適用").strong()),
-            )
-            .on_hover_text(
-                "押すと: 上で入力した内容を選択中のセルへ反映します（ファイルへの\n保存は別途「保存」ボタンで行います）。",
-            )
-            .clicked()
-        {
-            self.apply_layout_edit();
-        }
+        });
     }
 
+    #[expect(clippy::too_many_lines)]
     fn tab_advanced(&mut self, ui: &mut egui::Ui) {
         ui.heading("上級者向け設定");
         ui.add_space(4.0);
+
+        // Engine on/off
+        // 2026-09-02 ユーザー判断: 旧称「エンジン ON/OFF」→「親指シフト
+        // ON/OFF」は、隣接する「IME ON/OFF」（Windows側のIME状態）と紛らわしい
+        // という指摘を受け「awase 有効/無効」へ改称。かつ日常的に触る設定
+        // ではないため「キー設定」タブから本タブへ移動した。
+        // 2026-09-03 ユーザー判断: 「awase 有効/無効」もエンジンという実装用語が
+        // 残り分かりにくいという指摘を受け、状態そのものを名付ける「親指シフト
+        // 入力／ローマ字入力」へ改称。ON/OFF表記をやめたことで「IME ON/OFF」との
+        // 混同も避けられる。
+        let awase_enable_hover = "ローマ字入力にすると、キー入力の変換（親指シフト同時打鍵判定・\n\
+             ローマ字→かな変換）を一切行わず、すべてのキーをそのまま素通しします。\n\
+             Windows 側の IME の ON/OFF 状態には影響しません（別項目の「IME ON/OFF」参照）。";
+        ui.label("親指シフト入力／ローマ字入力")
+            .on_hover_text(awase_enable_hover);
+        combo_key_list_ui(
+            ui,
+            "親指シフト入力にする",
+            "eng_on",
+            &mut self.config.keys.engine_on,
+            &mut self.new_engine_on,
+            "親指シフト入力に切り替えるキーの組み合わせです。\n複数登録できます。",
+            &mut self.status,
+        );
+        combo_key_list_ui(
+            ui,
+            "ローマ字入力にする",
+            "eng_off",
+            &mut self.config.keys.engine_off,
+            &mut self.new_engine_off,
+            "ローマ字入力に切り替えるキーの組み合わせです。\n複数登録できます。",
+            &mut self.status,
+        );
+        let solo_repeat_hover = "指定キーを単独で素早く5回連続押下するとローマ字入力に切り替えます。\nCtrl スタック等で通常のキー操作が効かなくなった際の緊急脱出用です。";
+        ui.horizontal(|ui| {
+            ui.label("  単独5連打でローマ字入力にする:")
+                .on_hover_text(solo_repeat_hover);
+            solo_repeat_combo(
+                ui,
+                &mut self.config.keys.engine_off_solo_repeat,
+                solo_repeat_hover,
+            );
+        });
+        ui.add_space(8.0);
+
+        // Toggle hotkey
+        ui.label("親指シフト入力／ローマ字入力 切替")
+            .on_hover_text(awase_enable_hover);
+        let engine_toggle_hover =
+            "親指シフト入力とローマ字入力をトグルするホットキーです。\nシステム全体で有効です。";
+        ui.horizontal(|ui| {
+            ui.label("  切替:").on_hover_text(engine_toggle_hover);
+            hotkey_combo_ui(
+                ui,
+                "engine_toggle_hotkey",
+                &mut self.config.general.engine_toggle_hotkey,
+                engine_toggle_hover,
+            );
+        });
+        ui.add_space(8.0);
+
+        // confirm_mode / speculative_delay_ms は設定画面から完全に非表示にした
+        // （2026-08-30、ユーザー判断: 「wait 単一表示というか設定UIから見えなく
+        // したらいい」）。`config.toml` に `confirm_mode = "ngram_predictive"` と
+        // 手書きすれば使える純粋な toml 裏設定（v2 で選択肢は wait / ngram_predictive
+        // の2択。旧値 speculative / two_phase / adaptive_timing は wait として読む）。
+
+        let slider_with_tip = |ui: &mut egui::Ui,
+                               label: &str,
+                               tip: &str,
+                               suffix: &str,
+                               val: &mut u32,
+                               range: std::ops::RangeInclusive<u32>| {
+            ui.horizontal(|ui| {
+                ui.label(label).on_hover_text(tip);
+                ui.add(egui::Slider::new(val, range).suffix(suffix))
+                    .on_hover_text(tip);
+            });
+        };
+        slider_with_tip(
+            ui,
+            "3キー分岐マージン:",
+            "char1→親指→char2 と3キーが来た場合の仲裁マージンです。\n\
+             2つの間隔の差がこの割合を超えるとタイミングだけで決定し、\n\
+             それ以外は n-gram で判定します（下の n-gram 設定を参照）。",
+            " %",
+            &mut self.config.general.timing_margin_percent,
+            0..=100,
+        );
+        slider_with_tip(
+            ui,
+            "重なり不足マージン:",
+            "文字キー+親指キーの物理的な重なり時間がこの割合未満だと\n\
+             「重なり不足」とみなし、n-gram でタイブレークします\n\
+             （n-gram が無効なら単独打鍵扱いになります）。",
+            " %",
+            &mut self.config.general.min_overlap_margin_percent,
+            0..=100,
+        );
+        ui.add_space(8.0);
+
         ui.checkbox(
             &mut self.config.general.swallow_alt_kana_input_method_switch,
             "Alt+かな による IME 入力方式切替（ローマ字⇔JIS かな）を無効化する",
@@ -2296,68 +3947,62 @@ impl SettingsApp {
              JIS かな直接入力に切り替わると、awase が送出するローマ字綴りの\n\
              キー列が誤読され、一度切り替わると awase 側からは元に戻せません\n\
              （Windows にこの入力方式を外部から切り替える公式 API が無いため）。\n\
-             JIS かな直接入力を意図的に使いたい場合（= awase の Engine を OFF に\n\
+             JIS かな直接入力を意図的に使いたい場合（= awase をローマ字入力に\n\
              して使う場合など）のみ OFF にしてください。",
         );
         ui.add_space(4.0);
         half_width_alnum_toggle_checkbox(ui, &mut self.config.general.half_width_alnum_toggle);
+        ui.add_space(4.0);
+        keystroke_sequence_checkbox(ui, &mut self.config.general.keystroke_sequence);
         ui.add_space(8.0);
-        let slider_with_tip = |ui: &mut egui::Ui,
-                               label: &str,
-                               tip: &str,
-                               val: &mut u32,
-                               range: std::ops::RangeInclusive<u32>| {
-            ui.horizontal(|ui| {
-                ui.label(label).on_hover_text(tip);
-                ui.add(egui::Slider::new(val, range).suffix(" ms"))
-                    .on_hover_text(tip);
-            });
-        };
-        let ngram_enabled = matches!(
-            self.config.general.confirm_mode,
-            awase::config::ConfirmMode::NgramPredictive
-        );
-        if !ngram_enabled {
-            ui.label(
-                "n-gram 設定は確定モードが「n-gram 予測」のときのみ使用されます（全般設定タブ）",
-            );
-        }
-        ui.add_enabled_ui(ngram_enabled, |ui| {
-        let ngram_file_hover = "n-gram 統計データファイルのパスです。\n.csv.gz または .toml 形式に対応しています。\nngram_predictive モードで使用されます。";
+        // n-gram はタイブレーク（3キー分岐・重なり不足判定・2キーしきい値の
+        // 動的調整）に confirm_mode を問わず常に使われる（ngram_file が
+        // ロードできていれば）。かつては「confirm_mode が n-gram 予測の
+        // ときだけ使う」という誤った前提でグレーアウトしていたが、
+        // 実際にはタイブレーク経路は wait を含む全モードで有効なため
+        // 2026-08-30 に外した。
+        let ngram_file_hover = "n-gram 統計データファイルのパスです。\n.csv.gz または .toml 形式に対応しています。\n同時打鍵のタイブレーク（3キー分岐・重なり不足判定）に\nconfirm_mode を問わず常に使われます。";
         ui.horizontal(|ui| {
             ui.label("n-gram ファイル:").on_hover_text(ngram_file_hover);
             let mut buf = self.config.general.ngram_file.clone().unwrap_or_default();
-            if ui.text_edit_singleline(&mut buf).on_hover_text(ngram_file_hover).changed() {
+            if ui
+                .text_edit_singleline(&mut buf)
+                .on_hover_text(ngram_file_hover)
+                .changed()
+            {
                 self.config.general.ngram_file = if buf.is_empty() { None } else { Some(buf) };
             }
         });
         slider_with_tip(
             ui,
             "n-gram 調整幅:",
-            "n-gram 予測による閾値調整の幅です。\n大きいほど予測の影響が強くなります。",
+            "n-gram による同時打鍵しきい値調整の幅です。\n大きいほど予測の影響が強くなります。",
+            " ms",
             &mut self.config.general.ngram_adjustment_range_ms,
             0..=100,
         );
         slider_with_tip(
             ui,
             "n-gram 最小閾値:",
-            "n-gram 予測で調整される閾値の下限です。\nこれより短い閾値にはなりません。",
+            "n-gram で調整される同時打鍵しきい値の下限です。\nこれより短い閾値にはなりません。",
+            " ms",
             &mut self.config.general.ngram_min_threshold_ms,
             10..=200,
         );
         slider_with_tip(
             ui,
             "n-gram 最大閾値:",
-            "n-gram 予測で調整される閾値の上限です。\nこれより長い閾値にはなりません。",
+            "n-gram で調整される同時打鍵しきい値の上限です。\nこれより長い閾値にはなりません。",
+            " ms",
             &mut self.config.general.ngram_max_threshold_ms,
             50..=500,
         );
-        });
         ui.add_space(8.0);
         slider_with_tip(
             ui,
             "フォーカスデバウンス:",
             "フォーカス切り替え時のデバウンス時間です。\nAlt+Tab などでフォーカスが連続変更される際の誤検知を防ぎます。",
+            " ms",
             &mut self.config.general.focus_debounce_ms,
             0..=200,
         );
@@ -2365,6 +4010,7 @@ impl SettingsApp {
             ui,
             "IME ポーリング間隔:",
             "IME 状態のポーリング間隔です。\nマウスで言語バーを操作した場合などの検出用です。\n小さいほどレスポンスが良くなりますが、CPU 負荷が増えます。",
+            " ms",
             &mut self.config.general.ime_poll_interval_ms,
             100..=5000,
         );
@@ -2381,8 +4027,34 @@ impl SettingsApp {
 // ── eframe::App ──
 
 impl eframe::App for SettingsApp {
+    // ADR-126で確認モーダルの排他制御を追加した分だけ意図的に閾値を超えている
+    // （フレーム冒頭の処理順序が本ADRの核心のため、無理に関数分割しない）。
+    #[expect(clippy::too_many_lines)]
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // ADR-126 D6: ウィンドウを閉じる操作には config/layout どちらの
+        // 未保存確認も入れない。キャンセルボタンの復元操作だけを確認対象にする。
+        self.update_ime_state(ctx);
         self.poll_pending_save(ctx);
+        self.poll_keymap_learn(ctx);
+        // 別ウィンドウでIMEのキーマップ設定を変えて戻ってきたとき、学習表の状態表示
+        // （版・指紋に依存する）が古いままにならないよう取り直させる。
+        let window_focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        if self.keymap_env_probe.observe_window_focus(window_focused) {
+            self.keymap_table_state = None;
+        }
+        self.commit_pending_layout_edit(ctx);
+        // code-review指摘: キー捕捉モードだけでなく、確認モーダル表示中
+        // （Dangerous確認・キャンセル3択・配列破棄確認）にもグローバル
+        // Ctrl+Sを発火させない。モーダルの背後で予期せず`apply()`が
+        // 走ってしまうことを防ぐ。
+        if self.capturing.is_none()
+            && !self.show_dangerous_save_confirm
+            && !self.show_cancel_layout_confirm
+            && self.pending_layout_discard.is_none()
+            && ctx.input(|i| i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::S))
+        {
+            self.apply();
+        }
         self.handle_layout_shortcuts(ctx);
 
         // 複数ディスプレイ対応: DPI スケールの異なるモニタへ移動すると、
@@ -2412,6 +4084,8 @@ impl eframe::App for SettingsApp {
 
         self.config_path_panel(ctx);
         self.show_dangerous_save_confirm_modal(ctx);
+        self.show_cancel_layout_confirm_modal(ctx);
+        self.show_layout_discard_confirm_modal(ctx);
 
         // Side panel for tab selection
         egui::SidePanel::left("tab_panel")
@@ -2419,12 +4093,10 @@ impl eframe::App for SettingsApp {
             .default_width(100.0)
             .show(ctx, |ui| {
                 ui.add_space(8.0);
-                // 「アプリ別」(AppRules) は高度な機能（force_text/force_bypass/
-                // force_vk/force_tsf、プロセス名+クラス名の両方が必要）のため
-                // GUI 化を見送り、config.toml の直接編集に委ねている。
-                // tab_app_rules の実装自体は残してある。disable_apps 部分だけは
-                // プロセス名のみで完結する単純な設定のため、2026-08-26（BUG-90）
-                // に「アプリ無効化」タブとして切り出して表示するようにした。
+                // アプリ別上書き（force_text/force_bypass/force_vk/force_tsf、
+                // `post_bypass`）の画面は ADR-217 で撤去した（config.toml の直接編集に
+                // 委ねる）。disable_apps だけはプロセス名のみで完結する単純な設定のため、
+                // 2026-08-26（BUG-90）に「アプリ無効化」タブとして切り出して表示している。
                 //
                 // 「配列編集」(Layout) は 2026-07-06 に「配列プレビューの実装が
                 // まだ固まっていない」として一旦非表示にしていたが、layouts_dir の
@@ -2441,8 +4113,10 @@ impl eframe::App for SettingsApp {
                     (Tab::Advanced, "上級者向け設定"),
                     (Tab::DisableApps, "アプリ無効化"),
                     (Tab::Keymap, "ショートカット"),
+                    (Tab::Calibration, "IMEキー学習"),
                 ] {
                     if ui.selectable_label(self.active_tab == tab, label).clicked() {
+                        self.clear_ime_on_tab_change(tab);
                         self.active_tab = tab;
                     }
                 }
@@ -2454,11 +4128,38 @@ impl eframe::App for SettingsApp {
         // （複数ディスプレイの DPI 遷移で実発生）。
         egui::TopBottomPanel::bottom("action_panel").show(ctx, |ui| {
             ui.add_space(6.0);
+            if self.layout_modified {
+                ui.label(
+                    egui::RichText::new("配列編集に未保存の変更があります")
+                        .color(egui::Color32::from_rgb(200, 80, 0)),
+                );
+                ui.add_space(4.0);
+            }
             ui.horizontal(|ui| {
-                if ui.button("適用").clicked() {
+                let save_in_progress = self.pending_save.is_some();
+                // /code-review指摘: グローバルCtrl+S（`update()`冒頭）には
+                // 確認モーダル表示中の抑止を入れたが、この「適用」ボタン自体は
+                // `save_in_progress`しか見ていなかった。3択キャンセル確認や
+                // 配列破棄確認が開いている間にクリックすると、その確認が
+                // 尋ねている変更をそのまま`apply_confirmed()`で保存してしまう
+                // （確認モーダルを実質無視できてしまう）。同じ条件で無効化する。
+                let confirm_modal_open = self.show_dangerous_save_confirm
+                    || self.show_cancel_layout_confirm
+                    || self.pending_layout_discard.is_some();
+                if ui
+                    .add_enabled(
+                        !save_in_progress && !confirm_modal_open,
+                        egui::Button::new("適用"),
+                    )
+                    .on_hover_text("押すと: 変更を保存して awase に再読み込みを通知します（配列編集の変更も保存されます）。")
+                    .clicked()
+                {
                     self.apply();
                 }
-                if ui.button("キャンセル").clicked() {
+                if ui
+                    .add_enabled(!save_in_progress, egui::Button::new("キャンセル"))
+                    .clicked()
+                {
                     self.cancel();
                 }
             });
@@ -2485,82 +4186,28 @@ impl eframe::App for SettingsApp {
                     Tab::Keys => self.tab_keys(ui),
                     Tab::Keymap => self.tab_keymap(ui),
                     Tab::DisableApps => self.tab_disable_apps(ui),
-                    Tab::AppRules => self.tab_app_rules(ui),
+                    Tab::Calibration => self.tab_calibration(ui),
                     Tab::Layout => self.tab_layout(ui),
                     Tab::Advanced => self.tab_advanced(ui),
                 });
         });
     }
+
+    /// ウィンドウを閉じるとき、学習ウィザード(ADR-195段階6)の子プロセスが実行中なら
+    /// 強制終了する。実キー注入を行う子プロセスがウィンドウを閉じた後もタスク
+    /// マネージャ頼みで動き続けることを防ぐ。
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if self.keymap_learn_child.is_some() {
+            self.cancel_keymap_learning();
+        }
+    }
 }
 
 // ── Reusable UI helpers ──
 
-/// アプリ別オーバーライド1カテゴリ分のリスト UI（完全一致・両フィールド必須）。
-fn override_list_ui(
-    ui: &mut egui::Ui,
-    id: &str,
-    label: &str,
-    tooltip: &str,
-    entries: &mut Vec<awase::config::AppOverrideEntry>,
-    buf: &mut (String, String),
-) {
-    ui.label(label).on_hover_text(tooltip);
-    let mut rm = None;
-    for (i, e) in entries.iter().enumerate() {
-        ui.horizontal(|ui| {
-            ui.label(format!("    {} / {}", e.process, e.class));
-            if ui
-                .small_button("x")
-                .on_hover_text("押すと: この行を削除します。")
-                .clicked()
-            {
-                rm = Some(i);
-            }
-        })
-        .response
-        .on_hover_text(tooltip);
-    }
-    if let Some(i) = rm {
-        entries.remove(i);
-    }
-    ui.horizontal(|ui| {
-        ui.add(
-            egui::TextEdit::singleline(&mut buf.0)
-                .desired_width(150.0)
-                .hint_text("プロセス名 (例: msedge.exe)")
-                .id(egui::Id::new(format!("{id}_proc"))),
-        )
-        .on_hover_text("対象プロセスの実行ファイル名です。完全一致で判定します。");
-        ui.add(
-            egui::TextEdit::singleline(&mut buf.1)
-                .desired_width(200.0)
-                .hint_text("クラス名 (完全一致)")
-                .id(egui::Id::new(format!("{id}_class"))),
-        )
-        .on_hover_text(
-            "対象ウィンドウのクラス名です。完全一致で判定します。\nログの [focus-sync] 行などで確認できます。",
-        );
-        if ui
-            .button("+追加")
-            .on_hover_text("押すと: 入力したプロセス名・クラス名の組み合わせを一覧に追加します。")
-            .clicked()
-            && !buf.0.is_empty()
-            && !buf.1.is_empty()
-        {
-            entries.push(awase::config::AppOverrideEntry {
-                process: std::mem::take(&mut buf.0),
-                class: std::mem::take(&mut buf.1),
-            });
-        }
-    });
-    ui.add_space(8.0);
-}
-
 /// `disable_apps`（プロセス名のみでアプリ全体を無効化するリスト）編集 UI。
 ///
-/// `override_list_ui` はプロセス名+クラス名の2フィールド固定で密結合なため、
-/// プロセス名のみの入力欄を別関数として新設した（トレイト/クロージャ導入は
-/// 40行の関数には過剰）。
+/// プロセス名のみの入力欄（クラス名は不要）。
 fn process_list_ui(
     ui: &mut egui::Ui,
     id: &str,
@@ -2568,6 +4215,7 @@ fn process_list_ui(
     tooltip: &str,
     entries: &mut Vec<String>,
     buf: &mut String,
+    status: &mut String,
 ) {
     ui.label(label).on_hover_text(tooltip);
     let mut rm = None;
@@ -2602,9 +4250,12 @@ fn process_list_ui(
             .button("+追加")
             .on_hover_text("押すと: 入力したプロセス名を一覧に追加します。")
             .clicked()
-            && !buf.is_empty()
         {
-            entries.push(std::mem::take(buf));
+            if buf.is_empty() {
+                *status = "プロセス名を入力してください。".to_string();
+            } else {
+                entries.push(std::mem::take(buf));
+            }
         }
     });
     ui.add_space(8.0);
@@ -2650,8 +4301,8 @@ fn solo_repeat_combo(ui: &mut egui::Ui, current: &mut Option<String>, tooltip: &
 }
 
 /// 無変換/変換キー単独タップの抑制方針。実体は `*_solo_tap_always_suppress`/
-/// `*_solo_tap_ignore_composing_guard` の2boolだが、GUI上は「常に無視する」/
-/// 「常に送出する」の2択コンボボックスとして見せる。当初は変換候補ウィンドウ
+/// `*_solo_tap_ignore_composing_guard` の2boolだが、GUI上は「無効にする」/
+/// 「IME に任せる」の2択コンボボックスとして見せる。当初は変換候補ウィンドウ
 /// 表示中かどうかで挙動を変える中間状態も設けていたが、その判定（composing、
 /// UIA/MSAAのフォーカス監視に依存）自体がこのリポジトリでは何度も裏切ってきた
 /// 実績があり（例: BUG-11 の UIA キャッシュ汚染）、信頼できない判定を条件にした
@@ -2660,6 +4311,10 @@ fn solo_repeat_combo(ui: &mut egui::Ui, current: &mut Option<String>, tooltip: &
 /// 従来通り2bool独立のまま変更しない——「常に送出する」選択時は
 /// `ignore_composing_guard`を`true`に固定することで、常にcomposing判定を
 /// 無視した一貫した挙動にする。
+///
+/// 文言は2026-10-04に「IME 側のキー設定で割り当てた機能を使うかどうか」が伝わる形へ改めた
+/// （旧ラベルは「常に無視する」/「常に送出する」で、何のために選ぶのかが読み取れず、
+/// `keys.ime_on` に無変換を入れたうえでパススルーにする誤用を招いていた）。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SoloTapSuppressMode {
     AlwaysSuppress,
@@ -2689,25 +4344,26 @@ impl SoloTapSuppressMode {
 
     fn label(self) -> &'static str {
         match self {
-            Self::AlwaysSuppress => "常に無視する（既定）",
-            Self::PassThrough => "常に送出する（パススルー）",
+            Self::AlwaysSuppress => "無効にする（既定）",
+            Self::PassThrough => "IME に任せる（パススルー）",
         }
     }
 
     fn hover_text(self, key_label: &str, default_hijack_risk: &str) -> String {
         match self {
             Self::AlwaysSuppress => format!(
-                "{key_label}キーの単独タップを常に完全に無視します\n\
-                 （OS へ一切送出しません）。\n\
+                "NICOLA 入力中（IME ON）は、{key_label}キーを単独で押しても何も起きません。\n\
+                 awase が単独タップを飲み込み、IME にも送りません。\n\
                  {default_hijack_risk}\n\
-                 {key_label}キー本来の機能を Windows 全般で使いたい場合のみ\n\
-                 「常に送出する」にしてください。"
+                 親指キーとして他のキーと同時に押したときの動作は、この設定の影響を受けません。\n\
+                 IME のキー設定で{key_label}キーに割り当てた機能を使いたい場合は\n\
+                 「IME に任せる」にしてください。"
             ),
             Self::PassThrough => format!(
-                "{key_label}キーの単独タップを常に{key_label}キー本来の機能として\n\
-                 OS へ送出します。変換候補ウィンドウの表示有無では挙動を\n\
-                 変えません（この判定自体がフォーカス監視に依存し必ずしも\n\
-                 信頼できないため、中間の挙動は設けていません）。\n\
+                "NICOLA 入力中も、{key_label}キーの単独タップを IME へ送ります。\n\
+                 IME のキー設定で{key_label}キーに割り当てた機能\n\
+                 （IME のオン/オフ、再変換など）を使えます。\n\
+                 変換候補ウィンドウの表示有無では挙動を変えません。\n\
                  {default_hijack_risk}"
             ),
         }
@@ -2717,31 +4373,77 @@ impl SoloTapSuppressMode {
 /// 「左Shift単独タップで半角英数トグルを有効にする」チェックボックス。
 /// `Off`/`All`の二択として操作する（`MsImeOnly`はGUIからは選べない中間値、
 /// チェックボックスに触れなければ既存の`MsImeOnly`設定は変更されない）。
+/// 「二値enumをチェックボックス1個で切り替える」という、この画面に複数ある
+/// 定型パターンの共通実装。`on_value`/`off_value` のどちらでもない中間値
+/// （例: `HalfWidthAlnumTogglePolicy::MsImeOnly`）を持つ enum でも、チェック
+/// 済み判定は `*policy == on_value` のみで行うため、中間値は「未チェック」
+/// 側に表示されるだけで壊れない（ユーザーがチェックボックスを操作しない限り
+/// 値は変わらない）。
+fn enum_toggle_checkbox<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    policy: &mut T,
+    on_value: T,
+    off_value: T,
+    label: &str,
+    hover_text: &str,
+) {
+    let mut enabled = *policy == on_value;
+    if ui
+        .checkbox(&mut enabled, label)
+        .on_hover_text(hover_text)
+        .changed()
+    {
+        *policy = if enabled { on_value } else { off_value };
+    }
+}
+
 fn half_width_alnum_toggle_checkbox(
     ui: &mut egui::Ui,
     policy: &mut awase::config::HalfWidthAlnumTogglePolicy,
 ) {
-    let mut enabled = *policy == awase::config::HalfWidthAlnumTogglePolicy::All;
-    if ui
-        .checkbox(
-            &mut enabled,
-            "左Shift単独タップで半角英数トグルを有効にする",
-        )
-        .on_hover_text(
-            "ONにすると: 左Shiftキーを他のキーを介さずに単独でタップすると、\n\
-             IMEをONにしたまま半角英数入力に切り替わります（もう一度タップ、\n\
-             または右Shiftタップで解除）。MS-IME・Google 日本語入力の\n\
-             両方で有効になります（実機ソーク中の機能、BUG-25 参照）。\n\
-             OFFにすると: この機能全体を無効化します。",
-        )
-        .changed()
-    {
-        *policy = if enabled {
-            awase::config::HalfWidthAlnumTogglePolicy::All
-        } else {
-            awase::config::HalfWidthAlnumTogglePolicy::Off
-        };
-    }
+    enum_toggle_checkbox(
+        ui,
+        policy,
+        awase::config::HalfWidthAlnumTogglePolicy::All,
+        awase::config::HalfWidthAlnumTogglePolicy::Off,
+        "左Shift単独タップで半角英数トグルを有効にする",
+        "ONにすると: 左Shiftキーを他のキーを介さずに単独でタップすると、\n\
+         IMEをONにしたまま半角英数入力に切り替わります（もう一度タップ、\n\
+         または右Shiftタップで解除）。MS-IME・Google 日本語入力の\n\
+         両方で有効になります（実機ソーク中の機能、BUG-25 参照）。\n\
+         OFFにすると: この機能全体を無効化します。",
+    );
+}
+
+/// 打鍵列機能（`.yab` の `CtrlChord`/`InlineSequence`/`MacroRef`、ADR-115）の
+/// 有効化チェックボックス。既定 On（2026-09-13〜、ADR-115 決定8追補）。
+/// `CV`+16進数2桁・セル内 `+` 区切り・`@`+マクロ名はいずれも偶然一致するには
+/// 十分特殊な文字列であり、`layout/nicola_kakutei.yab`（句読点で確定）を含め
+/// 素の目的で使われるのが通常のため常時有効にした。OFFはあくまで、この解釈
+/// 自体を望まないユーザー向けの明示的オプトアウト。
+fn keystroke_sequence_checkbox(
+    ui: &mut egui::Ui,
+    policy: &mut awase::config::KeystrokeSequencePolicy,
+) {
+    enum_toggle_checkbox(
+        ui,
+        policy,
+        awase::config::KeystrokeSequencePolicy::On,
+        awase::config::KeystrokeSequencePolicy::Off,
+        "打鍵列機能を有効にする",
+        "ON(既定)の場合: .yab の1セルに複数のキー操作を割り当てる打鍵列構文\n\
+         （Ctrl+キー送信・セル内 `+` 区切りの複数アクション・`@`マクロ参照）\n\
+         が有効です。例: 「レイアウト」で `nicola_kakutei.yab` を選ぶと、\n\
+         句読点「。」「、」を入力した直後に Ctrl+M（IME の全確定ショート\n\
+         カット）を送ります（やまぶき／DvorakJ の「句読点で確定」相当）。\n\
+         確定に使う Ctrl+M は使用する IME（Google 日本語入力/MS-IME）側で\n\
+         「全確定」に割り当てられている必要があります。他のアプリで\n\
+         Ctrl+M が別機能に割り当てられている場合は競合します。\n\
+         OFFにすると: この構文（`CV`+16進数2桁・セル内 `+`・`@`マクロ）を\n\
+         解釈せず、セルの生テキストをそのままリテラル文字列として扱う\n\
+         （打鍵列機能導入前の挙動）に戻します。この構文の解釈自体を\n\
+         望まない場合のみ OFF にしてください。",
+    );
 }
 
 /// 無変換/変換キー単独タップの抑制方針コンボボックス。`key_label`は
@@ -2752,6 +4454,7 @@ fn half_width_alnum_toggle_checkbox(
 fn solo_tap_suppress_combo(
     ui: &mut egui::Ui,
     key_label: &str,
+    role_overrides: bool,
     default_hijack_risk: &str,
     always_suppress: &mut bool,
     ignore_composing_guard: &mut bool,
@@ -2776,7 +4479,90 @@ fn solo_tap_suppress_combo(
             .response
             .on_hover_text(mode.hover_text(key_label, default_hijack_risk));
     });
+    if role_overrides && mode == SoloTapSuppressMode::PassThrough {
+        ui.colored_label(
+            egui::Color32::from_rgb(200, 120, 0),
+            format!(
+                "{key_label}は keys.ime_on/ime_off/ime_toggle にも設定されています。この場合、単独タップは\n\
+                 「IME の状態をそろえる」動作になり、上の設定（IME に任せる）は効きません。\n\
+                 IME 側で割り当てた機能を使うには、{key_label}を keys.ime_* から外してください。"
+            ),
+        );
+    }
     mode.apply(always_suppress, ignore_composing_guard);
+}
+
+/// 「IME に任せる」を選んだ人向けに、IME 側のキー設定の場所を案内する。
+///
+/// IME ごとに設定の呼び方と場所が違う（Microsoft IME は「キーとタッチのカスタマイズ」、
+/// Google 日本語入力は「プロパティ」の「キー設定」）。設定画面を開く操作は OS・IME のバージョンに
+/// 依存しやすいので、Microsoft IME は設定ページ（`ms-settings:regionlanguage-jpnime`）を、
+/// Google 日本語入力は `GoogleIMEJaTool.exe --mode=config_dialog`（プロパティ）を開くだけに
+/// とどめ、画面内の遷移は自動化しない。開けない場合の逃げ道として、タスクトレイの IME アイコンから
+/// 開く手順を常に案内文として出す（ボタンが見つからない・起動に失敗しても手順が残る）。
+fn ime_key_settings_hint(ui: &mut egui::Ui) {
+    ui.indent("ime_key_settings_hint", |ui| {
+        ui.label(
+            "「IME に任せる」では、IME のキー設定で無変換/変換に割り当てた機能\n\
+             （IME のオン/オフ、再変換など）が使えます。割り当ては IME 側で行います。\n\
+             ・Microsoft IME: 「キーとタッチのカスタマイズ」\n\
+             ・Google 日本語入力: プロパティの「キー設定」（「コマンド」に機能を割り当てます）",
+        );
+        #[cfg(windows)]
+        {
+            ui.horizontal(|ui| {
+                if ui.button("Microsoft IME の設定を開く").clicked() {
+                    open_msime_settings();
+                }
+                if let Some(tool) = find_gji_tool()
+                    && ui.button("Google 日本語入力のプロパティを開く").clicked()
+                {
+                    open_gji_properties(&tool);
+                }
+            });
+        }
+        ui.label(
+            "ボタンで開けない場合: タスクトレイの IME アイコン（「あ」/「A」）を右クリックして\n\
+             「プロパティ」（Google 日本語入力）を選ぶか、設定アプリの「時刻と言語」→「言語と地域」→\n\
+             「日本語」→「言語のオプション」（Microsoft IME）から開いてください。",
+        );
+    });
+}
+
+/// Microsoft IME の設定ページを開く。`explorer.exe` に `ms-settings:` を渡す（コンソール窓が出ず、
+/// `unsafe` も要らない）。失敗しても何も起きないだけなので結果は見ない（案内文が逃げ道になる）。
+#[cfg(windows)]
+fn open_msime_settings() {
+    let _ = std::process::Command::new("explorer.exe")
+        .arg("ms-settings:regionlanguage-jpnime")
+        .spawn();
+}
+
+/// Google 日本語入力の設定ツール（`GoogleIMEJaTool.exe`）の場所。標準のインストール先
+/// （32bit 版の Program Files。実機 3.34.6260.0 で確認）と、念のため 64bit 側を探す。見つからなければ
+/// `None`（ボタンを出さず、案内文だけにする）。
+#[cfg(windows)]
+fn find_gji_tool() -> Option<std::path::PathBuf> {
+    ["ProgramFiles(x86)", "ProgramFiles"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(|base| {
+            std::path::PathBuf::from(base)
+                .join("Google")
+                .join("Google Japanese Input")
+                .join("GoogleIMEJaTool.exe")
+        })
+        .find(|path| path.is_file())
+}
+
+/// Google 日本語入力のプロパティ画面を開く（`--mode=config_dialog`、実機で「Google 日本語入力 プロパティ」
+/// ウィンドウが開くことを確認済み）。キー設定タブを直接開く引数は見つかっていないので、タブの選択は利用者が行う。
+/// 失敗しても何も起きないだけなので結果は見ない（案内文が逃げ道になる）。
+#[cfg(windows)]
+fn open_gji_properties(tool: &std::path::Path) {
+    let _ = std::process::Command::new(tool)
+        .arg("--mode=config_dialog")
+        .spawn();
 }
 
 /// `combo_key_list_ui` の「新規追加」行が保持する一時入力状態。
@@ -2802,6 +4588,7 @@ fn combo_key_list_ui(
     keys: &mut Vec<String>,
     new_entry: &mut NewComboBuf,
     tooltip: &str,
+    status: &mut String,
 ) {
     ui.label(format!("  {label}:")).on_hover_text(tooltip);
     let mut rm = None;
@@ -2841,15 +4628,18 @@ fn combo_key_list_ui(
             .button("+追加")
             .on_hover_text("押すと: 上で組み立てたキーの組み合わせを一覧に追加します。")
             .clicked()
-            && !new_entry.main.is_empty()
         {
-            keys.push(format_combo(
-                new_entry.ctrl,
-                new_entry.shift,
-                new_entry.alt,
-                &new_entry.main,
-            ));
-            *new_entry = NewComboBuf::default();
+            if new_entry.main.is_empty() {
+                *status = "キーが未選択のため追加できません。".to_string();
+            } else {
+                keys.push(format_combo(
+                    new_entry.ctrl,
+                    new_entry.shift,
+                    new_entry.alt,
+                    &new_entry.main,
+                ));
+                *new_entry = NewComboBuf::default();
+            }
         }
     });
 }
@@ -2975,8 +4765,8 @@ const SOLO_REPEAT_EXTRA_OPTIONS: &[(&str, &str)] = &[("Insert", "VK_INSERT")];
 /// 解決可能で `config.toml` に手書きすれば従来から機能していたが、
 /// `THUMB_KEY_OPTIONS` に候補が無く GUI 上選べなかった
 /// （2026-08-03 ユーザー報告「エンジンOFFの条件で英数キーが選択出来ない」）。
-/// `VK_KANJI`（漢字）は「IME ON/OFF トグル」（`keys.ime_toggle`）の既定値
-/// （2026-08-16 ユーザー要望）として選べるようにするため追加。
+/// `VK_KANJI`（漢字）は「IME ON/OFF トグル」（`keys.ime_toggle`）で選べるようにするため
+/// 追加（2026-08-16 ユーザー要望。既定値は 2026-09-29 に空へ変更済みで、候補としては残す）。
 ///
 /// `THUMB_KEY_OPTIONS` には**混ぜない**: `thumb_key_combo`/`solo_repeat_combo`
 /// （親指キー・単独連打候補）は同時打鍵の相手や単独タップ判定に使われるため、
@@ -2985,113 +4775,6 @@ const SOLO_REPEAT_EXTRA_OPTIONS: &[(&str, &str)] = &[("Insert", "VK_INSERT")];
 /// 「用途ごとに候補リストを分離する」既存パターンに倣う。
 const IME_MODE_KEY_OPTIONS: &[(&str, &str)] =
     &[("英数", "VK_DBE_ALPHANUMERIC"), ("漢字", "VK_KANJI")];
-
-/// `key_remap`（ADR-110、物理キー単純リマップ）専用の候補リスト。
-///
-/// `KEYMAP_MAIN_KEYS`（`[[keymap]]` の main key ドロップダウン用）には
-/// 修飾キー・CapsLock が1つも含まれていない（コンボ UI 側で Ctrl/Shift/Alt を
-/// チェックボックスとして別扱いするため）。`key_remap` の主対象はまさに
-/// これらの修飾キー・CapsLock なので、専用リストとして分離する（決定7）。
-///
-/// `THUMB_KEY_OPTIONS` はそのまま含める——このリスト自体には `"Left Alt"`/
-/// `"Right Alt"` センチネル文字列は含まれない（それらは別の
-/// `ALT_IMPERSONATION_OPTIONS` にのみ存在し、`thumb_key_combo` が `.chain()`
-/// で明示的に混ぜている）。Alt/Win 系 VK は決定4で `from`/`to` 双方禁止のため、
-/// このリストにも一切含めない。
-const KEY_REMAP_KEYS: &[(&str, &str)] = &[
-    ("CapsLock", "VK_CAPITAL"),
-    ("Left Ctrl", "VK_LCONTROL"),
-    ("Right Ctrl", "VK_RCONTROL"),
-    ("Left Shift", "VK_LSHIFT"),
-    ("Right Shift", "VK_RSHIFT"),
-    ("Space", "VK_SPACE"),
-    ("Enter", "VK_RETURN"),
-    ("変換", "VK_CONVERT"),
-    ("無変換", "VK_NONCONVERT"),
-    ("かな", "VK_KANA"),
-    ("カタカナ", "VK_DBE_KATAKANA"),
-    ("ひらがな", "VK_DBE_HIRAGANA"),
-    ("英数", "VK_DBE_ALPHANUMERIC"),
-    ("漢字", "VK_KANJI"),
-    ("F13", "VK_F13"),
-    ("F14", "VK_F14"),
-    ("F15", "VK_F15"),
-    ("F16", "VK_F16"),
-    ("F17", "VK_F17"),
-    ("F18", "VK_F18"),
-    ("F19", "VK_F19"),
-    ("F20", "VK_F20"),
-];
-
-/// `rules[index]` の GUI 表示用の警告理由（無ければ `None`）。
-///
-/// `awase_windows::state::key_remap::compile_key_remaps` の主要な skip 条件
-/// （名前解決失敗・`from == to`・重複・Alt/Win 系禁止）を GUI 表示用に軽量に
-/// 再実装したもの。`compile_key_remaps` 自身は `log::warn!` するだけで
-/// per-rule の理由文字列を返す設計になっていない（起動時ログ用途のため）ため、
-/// GUI ではこの別実装で表示する（多少の重複を許容する、決定7）。親指キー/
-/// ホットキー衝突警告（決定9）は config 全体の文脈が必要なため GUI 側では
-/// 省略し、起動時ログのみで通知する。
-const KEY_REMAP_FORBIDDEN_VKS: [&str; 5] =
-    ["VK_MENU", "VK_LMENU", "VK_RMENU", "VK_LWIN", "VK_RWIN"];
-
-fn key_remap_row_warning(rules: &[awase::config::KeyRemapRule], index: usize) -> Option<String> {
-    let rule = &rules[index];
-    let Some(from_vk) = VkCode::from_name(&rule.from) else {
-        return Some(format!("'{}' を解決できません", rule.from));
-    };
-    let Some(to_vk) = VkCode::from_name(&rule.to) else {
-        return Some(format!("'{}' を解決できません", rule.to));
-    };
-    if from_vk == to_vk {
-        return Some("from と to が同じです（無意味）".to_string());
-    }
-    if KEY_REMAP_FORBIDDEN_VKS.contains(&rule.from.as_str())
-        || KEY_REMAP_FORBIDDEN_VKS.contains(&rule.to.as_str())
-    {
-        return Some("Alt/Win 系キーは使用できません".to_string());
-    }
-    // 解決済み VkCode で比較する（`compile_key_remaps` と同じ基準）。生文字列
-    // 比較だと "無変換" と "VK_NONCONVERT" のような別名表記違いの重複を
-    // 見逃す（同じ VkCode に解決されるにも関わらず異なる文字列のため）。
-    if rules[..index]
-        .iter()
-        .any(|r| VkCode::from_name(&r.from) == Some(from_vk))
-    {
-        return Some(format!("'{}' は重複しています（先頭が優先）", rule.from));
-    }
-    None
-}
-
-/// `key_remap` の `from`/`to` 選択ドロップダウン。`thumb_key_combo` と同型
-/// （キャプチャボタンなし、`KEY_REMAP_KEYS` からの選択のみ）。変更時は true を返す。
-fn key_remap_key_combo(ui: &mut egui::Ui, id: &str, current: &mut String, tooltip: &str) -> bool {
-    let mut changed = false;
-    egui::ComboBox::from_id_salt(id)
-        .selected_text(if current.is_empty() {
-            "（未選択）"
-        } else {
-            KEY_REMAP_KEYS
-                .iter()
-                .find(|(_, v)| *v == current.as_str())
-                .map_or(current.as_str(), |(d, _)| *d)
-        })
-        .width(110.0)
-        .show_ui(ui, |ui| {
-            for (label, internal) in KEY_REMAP_KEYS {
-                if ui
-                    .selectable_label(current.as_str() == *internal, *label)
-                    .clicked()
-                {
-                    *current = (*internal).to_string();
-                    changed = true;
-                }
-            }
-        })
-        .response
-        .on_hover_text(tooltip);
-    changed
-}
 
 #[cfg(test)]
 mod ime_mode_key_options_tests {
@@ -3109,7 +4792,7 @@ mod ime_mode_key_options_tests {
     }
 
     /// 「漢字」が IME ON/OFF トグル欄のドロップダウン候補に出るようにする
-    /// （`keys.ime_toggle` の既定値 `VK_KANJI` が選択可能である必要がある）。
+    /// （既存 config.toml の明示値 `VK_KANJI` が選択可能である必要がある）。
     #[test]
     fn ime_mode_key_options_contains_kanji() {
         assert!(
@@ -3132,64 +4815,180 @@ mod ime_mode_key_options_tests {
     }
 }
 
+/// 物理キーが存在しない IME 仮想キーが「from」（物理キー押下のキャプチャ対象）
+/// 候補に紛れていないことを保証する回帰テスト（2026-09-03 ユーザー指摘）。
 #[cfg(test)]
-mod key_remap_tests {
-    use super::{KEY_REMAP_KEYS, key_remap_row_warning};
-    use awase::config::KeyRemapRule;
+mod keymap_from_key_options_tests {
+    use super::{keymap_from_key_options, keymap_to_key_options};
+    use awase_windows::vk::{VK_CONVERT, VK_NONCONVERT, VK_SPACE};
 
-    fn rule(from: &str, to: &str) -> KeyRemapRule {
-        KeyRemapRule {
-            from: from.to_string(),
-            to: to.to_string(),
-        }
-    }
-
-    /// ADR-110 決定7 の設定例（`VK_CAPITAL`/`VK_LCONTROL`）が GUI から選べる
-    /// （`KEYMAP_MAIN_KEYS` には無いことが r1 のバグだったため、専用リストで
-    /// カバーされていることを固定する）。
+    /// `forbidden_target_vk_reason(..., is_to_side=false)` が禁止するキーは
+    /// keymap from 候補から除外されていること。
     #[test]
-    fn key_remap_keys_contains_caps_lock_and_left_ctrl() {
-        assert!(KEY_REMAP_KEYS.iter().any(|(_, v)| *v == "VK_CAPITAL"));
-        assert!(KEY_REMAP_KEYS.iter().any(|(_, v)| *v == "VK_LCONTROL"));
-    }
-
-    /// Alt/Win 系 VK は決定4で禁止のため候補に出さない（R5対応）。
-    #[test]
-    fn key_remap_keys_excludes_alt_and_win_variants() {
-        for forbidden in ["VK_MENU", "VK_LMENU", "VK_RMENU", "VK_LWIN", "VK_RWIN"] {
+    fn forbidden_keys_are_excluded_from_from_options() {
+        let from_internals: Vec<&str> = keymap_from_key_options(VK_NONCONVERT, VK_CONVERT)
+            .map(|(_, i)| *i)
+            .collect();
+        for forbidden in ["変換", "無変換", "かな", "漢字", "VK_IME_ON", "VK_IME_OFF"] {
             assert!(
-                !KEY_REMAP_KEYS.iter().any(|(_, v)| *v == forbidden),
-                "{forbidden} が KEY_REMAP_KEYS に含まれている"
+                !from_internals.contains(&forbidden),
+                "{forbidden} が keymap_from_key_options（from 候補）に漏れている"
             );
         }
     }
 
+    /// ADR-130 の OR 判定は to 側限定。親指キーを Space 等へ変えたユーザーでは、
+    /// `変換` は from 候補として使えるが to 候補からは除外される。
     #[test]
-    fn valid_rule_has_no_warning() {
-        let rules = [rule("VK_CAPITAL", "VK_LCONTROL")];
-        assert!(key_remap_row_warning(&rules, 0).is_none());
+    fn conv_mutating_keys_are_to_side_only_exclusions() {
+        let from_internals: Vec<&str> = keymap_from_key_options(VK_NONCONVERT, VK_SPACE)
+            .map(|(_, i)| *i)
+            .collect();
+        let to_internals: Vec<&str> = keymap_to_key_options(VK_NONCONVERT, VK_SPACE)
+            .map(|(_, i)| *i)
+            .collect();
+
+        assert!(from_internals.contains(&"変換"));
+        assert!(!to_internals.contains(&"変換"));
+    }
+}
+
+/// `keymap_forbidden_reason`（キャプチャ拒否時に `self.status` へ表示する
+/// 理由文字列の算出、コードレビュー指摘 m7）の回帰テスト。
+#[cfg(test)]
+mod keymap_forbidden_reason_tests {
+    use super::keymap_forbidden_reason;
+    use awase_windows::vk::{VK_CONVERT, VK_NONCONVERT, VK_SPACE};
+
+    #[test]
+    fn returns_reason_for_forbidden_to_side_vk() {
+        assert!(
+            keymap_forbidden_reason("VK_KANJI", VK_NONCONVERT, VK_CONVERT, true).is_some(),
+            "IME 制御系 VK は to 側で禁止理由を返すべき"
+        );
     }
 
     #[test]
-    fn from_equal_to_warns() {
-        let rules = [rule("VK_CAPITAL", "VK_CAPITAL")];
-        assert!(key_remap_row_warning(&rules, 0).is_some());
+    fn returns_none_for_allowed_vk() {
+        assert_eq!(
+            keymap_forbidden_reason("VK_F7", VK_NONCONVERT, VK_CONVERT, true),
+            None,
+            "通常キーは禁止理由が無いはず"
+        );
     }
 
     #[test]
-    fn alt_variant_warns() {
-        let rules = [rule("VK_LMENU", "VK_CAPITAL")];
-        assert!(key_remap_row_warning(&rules, 0).is_some());
+    fn or_judgment_is_to_side_only() {
+        // 親指キーを Space に変えているので VK_CONVERT は親指キー由来では
+        // 禁止されない。to 側だけ ADR-130 の OR 判定で禁止される。
+        assert_eq!(
+            keymap_forbidden_reason("VK_CONVERT", VK_NONCONVERT, VK_SPACE, false),
+            None
+        );
+        assert!(keymap_forbidden_reason("VK_CONVERT", VK_NONCONVERT, VK_SPACE, true).is_some());
     }
 
     #[test]
-    fn duplicate_from_warns_second_entry_only() {
-        let rules = [
-            rule("VK_CAPITAL", "VK_LCONTROL"),
-            rule("VK_CAPITAL", "VK_RCONTROL"),
-        ];
-        assert!(key_remap_row_warning(&rules, 0).is_none());
-        assert!(key_remap_row_warning(&rules, 1).is_some());
+    fn unresolvable_name_is_not_treated_as_forbidden() {
+        // `keymap_internal_allowed` と同じ意味論: 名前解決できない文字列は
+        // 「禁止」ではなく「対象外」として扱う（バックエンドの
+        // 'to' パース失敗パスが別途処理する）。
+        assert_eq!(
+            keymap_forbidden_reason("not-a-real-vk-name", VK_NONCONVERT, VK_CONVERT, true),
+            None
+        );
+    }
+}
+
+/// `adjust_capturing_after_to_step_removed`/`adjust_capturing_after_rule_removed`
+/// の回帰テスト（ベストプラクティスレビュー指摘: キャプチャ待機中に別の
+/// ステップ／ルールを削除すると、位置ベースの `CaptureTarget` がズレて
+/// 意図しない対象を上書きしうる問題）。
+#[cfg(test)]
+mod capturing_index_adjustment_tests {
+    use super::{
+        CaptureTarget, adjust_capturing_after_rule_removed, adjust_capturing_after_to_step_removed,
+    };
+
+    #[test]
+    fn to_step_removal_cancels_capture_on_the_removed_step_itself() {
+        // rule 0 の step 1 をキャプチャ待機中に、まさにその step 1 が削除された。
+        let capturing = Some(CaptureTarget::ExistingTo(0, 1));
+        assert_eq!(
+            adjust_capturing_after_to_step_removed(capturing, 0, 1),
+            None,
+            "削除対象そのものを待っていたキャプチャは取消すべき"
+        );
+    }
+
+    #[test]
+    fn to_step_removal_shifts_capture_on_a_later_step() {
+        // to = [A, B, C]。step 1(B)をキャプチャ待機中に step 0(A)が削除される
+        // と to = [B, C] になり、B は新しい index 0 に移る。
+        let capturing = Some(CaptureTarget::ExistingTo(0, 1));
+        assert_eq!(
+            adjust_capturing_after_to_step_removed(capturing, 0, 0),
+            Some(CaptureTarget::ExistingTo(0, 0)),
+            "後続ステップを待っていたキャプチャはインデックスを1つ詰めるべき \
+             （そうしないと次に押したキーが別のステップを上書きする）"
+        );
+    }
+
+    #[test]
+    fn to_step_removal_leaves_capture_on_an_earlier_step_untouched() {
+        let capturing = Some(CaptureTarget::ExistingTo(0, 0));
+        assert_eq!(
+            adjust_capturing_after_to_step_removed(capturing, 0, 2),
+            capturing,
+            "削除されたステップより前を待っているキャプチャは変更しない"
+        );
+    }
+
+    #[test]
+    fn to_step_removal_in_a_different_rule_is_untouched() {
+        let capturing = Some(CaptureTarget::ExistingTo(1, 0));
+        assert_eq!(
+            adjust_capturing_after_to_step_removed(capturing, 0, 0),
+            capturing,
+            "別のルールのステップ削除は無関係なキャプチャに影響しない"
+        );
+    }
+
+    #[test]
+    fn rule_removal_cancels_capture_on_the_removed_rule() {
+        assert_eq!(
+            adjust_capturing_after_rule_removed(Some(CaptureTarget::ExistingFrom(2)), 2),
+            None
+        );
+        assert_eq!(
+            adjust_capturing_after_rule_removed(Some(CaptureTarget::ExistingTo(2, 3)), 2),
+            None
+        );
+    }
+
+    #[test]
+    fn rule_removal_shifts_capture_on_a_later_rule() {
+        assert_eq!(
+            adjust_capturing_after_rule_removed(Some(CaptureTarget::ExistingFrom(3)), 1),
+            Some(CaptureTarget::ExistingFrom(2))
+        );
+        assert_eq!(
+            adjust_capturing_after_rule_removed(Some(CaptureTarget::ExistingTo(3, 5)), 1),
+            Some(CaptureTarget::ExistingTo(2, 5)),
+            "ルール index だけ詰め、ステップ index はそのまま保つべき"
+        );
+    }
+
+    #[test]
+    fn rule_removal_leaves_capture_on_an_earlier_rule_untouched() {
+        let capturing = Some(CaptureTarget::ExistingFrom(0));
+        assert_eq!(adjust_capturing_after_rule_removed(capturing, 2), capturing);
+    }
+
+    #[test]
+    fn removal_with_no_pending_capture_is_a_no_op() {
+        assert_eq!(adjust_capturing_after_to_step_removed(None, 0, 0), None);
+        assert_eq!(adjust_capturing_after_rule_removed(None, 0), None);
     }
 }
 
@@ -3312,6 +5111,10 @@ const KEYMAP_MAIN_KEYS: &[(&str, &str)] = &[
     ("Backspace", "VK_BACK"),
     ("Delete", "VK_DELETE"),
     ("Insert", "VK_INSERT"),
+    ("←", "VK_LEFT"),
+    ("↑", "VK_UP"),
+    ("→", "VK_RIGHT"),
+    ("↓", "VK_DOWN"),
     ("Home", "VK_HOME"),
     ("End", "VK_END"),
     ("PgUp", "VK_PRIOR"),
@@ -3331,37 +5134,157 @@ const KEYMAP_MAIN_KEYS: &[(&str, &str)] = &[
     ("全角", "VK_DBE_DBCSCHAR"),
 ];
 
+/// `KEYMAP_MAIN_KEYS` から、対応する物理キーが存在しない IME 仮想キー
+/// （`ImeKeyKind::ImeOn`/`ImeOff`/`DbeAlphanumeric`/`DbeKatakana`/`DbeHiragana`/
+/// `DbeSbcsChar`/`DbeDbcsChar`）だけを除いた候補一覧。
+///
+/// `かな`(`ImeKeyKind::Kana`)・`漢字`(`ImeKeyKind::Kanji`) は実在する
+/// 物理キーなので除外しない——`ImeKeyKind::from_vk(vk).is_some()` 全体を
+/// 除外条件にすると、この2つも誤って弾いてしまう（コードレビュー指摘）。
+///
+/// `[[keymap]]` の `from`/`to` 専用の `keymap_from_key_options`/
+/// `keymap_to_key_options` とは別物: あちらは親指キー重複・IME
+/// conv-mutating（ADR-130）といった `[[keymap]]` 固有の禁止理由まで含む
+/// SSOT（`forbidden_target_vk_reason`）を通すが、post_bypass prefix キーや
+/// `engine_toggle_hotkey` は `[[keymap]]` ルールではないため、それらの
+/// keymap 固有の禁止理由は適用対象外（ADR-130 決定6 の SSOT 化は
+/// 「keymap の from/to 候補」のみが対象、コードレビュー指摘 M2）。
+fn physical_key_options() -> impl Iterator<Item = &'static (&'static str, &'static str)> {
+    KEYMAP_MAIN_KEYS.iter().filter(|(_, internal)| {
+        VkCode::from_name(internal).is_some_and(|vk| {
+            !matches!(
+                awase_windows::vk::ImeKeyKind::from_vk(vk),
+                Some(
+                    awase_windows::vk::ImeKeyKind::ImeOn
+                        | awase_windows::vk::ImeKeyKind::ImeOff
+                        | awase_windows::vk::ImeKeyKind::DbeAlphanumeric
+                        | awase_windows::vk::ImeKeyKind::DbeKatakana
+                        | awase_windows::vk::ImeKeyKind::DbeHiragana
+                        | awase_windows::vk::ImeKeyKind::DbeSbcsChar
+                        | awase_windows::vk::ImeKeyKind::DbeDbcsChar
+                )
+            )
+        })
+    })
+}
+
+/// `KEYMAP_MAIN_KEYS` から、keymap の from 側で禁止される VK を除いた候補一覧。
+fn keymap_from_key_options(
+    left_thumb_vk: VkCode,
+    right_thumb_vk: VkCode,
+) -> impl Iterator<Item = &'static (&'static str, &'static str)> {
+    keymap_key_options(left_thumb_vk, right_thumb_vk, false)
+}
+
+/// `KEYMAP_MAIN_KEYS` から、keymap の to 側で禁止される VK を除いた候補一覧。
+fn keymap_to_key_options(
+    left_thumb_vk: VkCode,
+    right_thumb_vk: VkCode,
+) -> impl Iterator<Item = &'static (&'static str, &'static str)> {
+    keymap_key_options(left_thumb_vk, right_thumb_vk, true)
+}
+
+fn keymap_key_options(
+    left_thumb_vk: VkCode,
+    right_thumb_vk: VkCode,
+    is_to_side: bool,
+) -> impl Iterator<Item = &'static (&'static str, &'static str)> {
+    KEYMAP_MAIN_KEYS.iter().filter(move |(_, internal)| {
+        keymap_internal_allowed(internal, left_thumb_vk, right_thumb_vk, is_to_side)
+    })
+}
+
+fn keymap_internal_allowed(
+    internal: &str,
+    left_thumb_vk: VkCode,
+    right_thumb_vk: VkCode,
+    is_to_side: bool,
+) -> bool {
+    keymap_forbidden_reason(internal, left_thumb_vk, right_thumb_vk, is_to_side).is_none()
+}
+
+/// `internal` が禁止されているなら理由文字列を返す（`keymap_internal_allowed`
+/// の理由付き版）。キャプチャ拒否時に `self.status` へ表示するために使う
+/// （コードレビュー指摘 m7）。`VkCode::from_name` が解決できない文字列は
+/// 禁止扱いにしない（`forbidden_target_vk_reason` の対象外＝許可、という
+/// 既存の `keymap_internal_allowed` の意味論を保つ）。
+fn keymap_forbidden_reason(
+    internal: &str,
+    left_thumb_vk: VkCode,
+    right_thumb_vk: VkCode,
+    is_to_side: bool,
+) -> Option<&'static str> {
+    VkCode::from_name(internal).and_then(|vk| {
+        awase_windows::keymap::forbidden_target_vk_reason(
+            vk,
+            left_thumb_vk,
+            right_thumb_vk,
+            is_to_side,
+        )
+    })
+}
+
+/// `rule.to` からステップ `removed_step_i` を削除した後、待機中の `⌨`
+/// キャプチャの対象インデックスを追随させる。
+///
+/// キャプチャは `CaptureTarget::ExistingTo(rule_i, step_i)` という**位置**
+/// でステップを指すため、キャプチャ待機中に別のステップが削除されると
+/// `step_i` がズレて意図しないステップを上書きしうる（ベストプラクティス
+/// レビュー指摘）。削除されたステップ自身を待っていたキャプチャは取消し、
+/// それより後ろのステップを待っていたキャプチャはインデックスを1つ詰める。
+/// 別のルール・より前のステップを対象にしたキャプチャは変更しない。
+#[must_use]
+fn adjust_capturing_after_to_step_removed(
+    capturing: Option<CaptureTarget>,
+    rule_i: usize,
+    removed_step_i: usize,
+) -> Option<CaptureTarget> {
+    match capturing {
+        Some(CaptureTarget::ExistingTo(ci, cstep)) if ci == rule_i => {
+            match cstep.cmp(&removed_step_i) {
+                std::cmp::Ordering::Equal => None,
+                std::cmp::Ordering::Greater => Some(CaptureTarget::ExistingTo(ci, cstep - 1)),
+                std::cmp::Ordering::Less => capturing,
+            }
+        }
+        other => other,
+    }
+}
+
+/// `self.config.keymaps` からルール `removed_i` を削除した後、待機中の `⌨`
+/// キャプチャの対象インデックスを追随させる
+/// （`adjust_capturing_after_to_step_removed` のルール単位版）。
+#[must_use]
+fn adjust_capturing_after_rule_removed(
+    capturing: Option<CaptureTarget>,
+    removed_i: usize,
+) -> Option<CaptureTarget> {
+    match capturing {
+        Some(CaptureTarget::ExistingFrom(ci)) if ci == removed_i => None,
+        Some(CaptureTarget::ExistingFrom(ci)) if ci > removed_i => {
+            Some(CaptureTarget::ExistingFrom(ci - 1))
+        }
+        Some(CaptureTarget::ExistingTo(ci, _)) if ci == removed_i => None,
+        Some(CaptureTarget::ExistingTo(ci, cstep)) if ci > removed_i => {
+            Some(CaptureTarget::ExistingTo(ci - 1, cstep))
+        }
+        other => other,
+    }
+}
+
+fn keymap_thumb_vks(config: &awase::config::GeneralConfig) -> (VkCode, VkCode) {
+    let left = awase_windows::state::alt_impersonation::resolve_thumb_key(&config.left_thumb_key)
+        .map_or(awase_windows::vk::VK_NONCONVERT, |(vk, _)| vk);
+    let right = awase_windows::state::alt_impersonation::resolve_thumb_key(&config.right_thumb_key)
+        .map_or(awase_windows::vk::VK_CONVERT, |(vk, _)| vk);
+    (left, right)
+}
+
 const fn keyboard_model_label(model: awase::scanmap::KeyboardModel) -> &'static str {
     use awase::scanmap::KeyboardModel;
     match model {
         KeyboardModel::Jis => "JIS (日本語109キー)",
         KeyboardModel::Us => "US (ANSI 104キー)",
-    }
-}
-
-const fn confirm_mode_label(mode: awase::config::ConfirmMode) -> &'static str {
-    use awase::config::ConfirmMode;
-    match mode {
-        ConfirmMode::Wait => "待機 (wait)",
-        ConfirmMode::Speculative => "先行確定 (speculative)",
-        ConfirmMode::TwoPhase => "二段タイマー (two_phase)",
-        ConfirmMode::AdaptiveTiming => "適応タイミング (adaptive_timing)",
-        ConfirmMode::NgramPredictive => "n-gram 予測 (ngram_predictive)",
-    }
-}
-
-const fn confirm_mode_tooltip(mode: awase::config::ConfirmMode) -> &'static str {
-    use awase::config::ConfirmMode;
-    match mode {
-        ConfirmMode::Wait => "  タイムアウトまで出力を保留。最も正確だが遅延あり。",
-        ConfirmMode::Speculative => "  即座に出力し、同時打鍵時に差し替え。高速だが一瞬ちらつく。",
-        ConfirmMode::TwoPhase => "  短い待機後に投機出力。wait と speculative の中間。",
-        ConfirmMode::AdaptiveTiming => {
-            "  連続打鍵中は wait、途切れたら投機。タイピング速度に適応。"
-        }
-        ConfirmMode::NgramPredictive => {
-            "  n-gram 統計で投機/待機を動的判断。モデル未指定時は二段タイマー動作。"
-        }
     }
 }
 
@@ -3376,22 +5299,10 @@ fn key_display_name(internal: &str) -> &str {
 /// keymap rule の `from` 文字列を (Ctrl, Shift, Alt, main_internal) に分解する。
 /// パース失敗時は (false, false, false, "") を返す。
 fn parse_combo_str(s: &str) -> (bool, bool, bool, String) {
-    let parts: Vec<&str> = s.split('+').map(str::trim).collect();
-    if parts.is_empty() {
-        return (false, false, false, String::new());
-    }
-    let (mut ctrl, mut shift, mut alt) = (false, false, false);
-    let mod_count = parts.len().saturating_sub(1);
-    for &part in &parts[..mod_count] {
-        match part {
-            "Ctrl" | "Control" => ctrl = true,
-            "Shift" => shift = true,
-            "Alt" => alt = true,
-            _ => {}
-        }
-    }
-    let main = (*parts.last().unwrap_or(&"")).to_string();
-    (ctrl, shift, alt, main)
+    // 修飾キーの解釈は読み手（`parse_key_combo`/`parse_hotkey`）と同じ関数を使う
+    // （ADR-201 決定1）。未知の修飾キーは今までどおり黙って捨てて主キーだけ残す。
+    let c = awase_windows::vk::interpret_combo(s);
+    (c.ctrl, c.shift, c.alt, c.main.to_string())
 }
 
 /// 修飾キーと main key から keymap rule 用文字列を組み立てる。
@@ -3442,8 +5353,22 @@ fn thumb_key_combo(ui: &mut egui::Ui, id: &str, current: &mut String, tooltip: &
     changed
 }
 
-/// main key ドロップダウン（必須選択版）。変更時は true を返す。
-fn main_key_combo(ui: &mut egui::Ui, id: &str, current: &mut String, tooltip: &str) -> bool {
+/// main key ドロップダウン（必須選択版）。
+///
+/// 呼び出し元はいずれも物理キー押下のキャプチャ対象（keymap の from・
+/// post_bypass prefix キー・グローバルトグルホットキー）だが、候補一覧は
+/// 呼び出し元ごとに異なる（コードレビュー指摘 M2）: keymap の from は
+/// `keymap_from_key_options`（`[[keymap]]` 固有の禁止理由まで含む SSOT）、
+/// それ以外（post_bypass・トグルホットキー）は `physical_key_options`
+/// （物理キーが存在しない IME 仮想キーのみを除外）を渡す。変更時は true を
+/// 返す。
+fn main_key_combo(
+    ui: &mut egui::Ui,
+    id: &str,
+    current: &mut String,
+    tooltip: &str,
+    options: impl Iterator<Item = &'static (&'static str, &'static str)>,
+) -> bool {
     let display = key_display_name(current).to_string();
     let mut changed = false;
     egui::ComboBox::from_id_salt(id)
@@ -3454,7 +5379,7 @@ fn main_key_combo(ui: &mut egui::Ui, id: &str, current: &mut String, tooltip: &s
         })
         .width(110.0)
         .show_ui(ui, |ui| {
-            for (label, internal) in KEYMAP_MAIN_KEYS {
+            for (label, internal) in options {
                 if ui.selectable_label(current == internal, *label).clicked() {
                     *current = (*internal).to_string();
                     changed = true;
@@ -3481,7 +5406,7 @@ fn hotkey_combo_ui(ui: &mut egui::Ui, id: &str, current: &mut Option<String>, to
     changed |= ui.checkbox(&mut ctrl, "Ctrl").changed();
     changed |= ui.checkbox(&mut shift, "Shift").changed();
     changed |= ui.checkbox(&mut alt, "Alt").changed();
-    if main_key_combo(ui, id, &mut main, tooltip) {
+    if main_key_combo(ui, id, &mut main, tooltip, physical_key_options()) {
         changed = true;
     }
     if ui
@@ -3583,6 +5508,10 @@ fn egui_key_to_internal(key: egui::Key) -> Option<&'static str> {
         Key::Backspace => "VK_BACK",
         Key::Delete => "VK_DELETE",
         Key::Insert => "VK_INSERT",
+        Key::ArrowLeft => "VK_LEFT",
+        Key::ArrowUp => "VK_UP",
+        Key::ArrowRight => "VK_RIGHT",
+        Key::ArrowDown => "VK_DOWN",
         Key::Home => "VK_HOME",
         Key::End => "VK_END",
         Key::PageUp => "VK_PRIOR",
@@ -3600,12 +5529,51 @@ fn egui_key_to_internal(key: egui::Key) -> Option<&'static str> {
     })
 }
 
-/// main key ドロップダウン（オプショナル版＝「消費のみ」選択肢付き）。変更時は true を返す。
-fn main_key_combo_optional(
+/// main key ドロップダウン（keymap の to＝再注入先専用、必須選択版）。
+///
+/// 物理キー押下のキャプチャ対象ではないが、ADR-130 の OR 判定
+/// （`ImeKeyKind::from_vk(vk).is_some() || vk_may_mutate_conv(vk)`）により
+/// `keymap_to_key_options`（`is_to_side=true`）で絞り込む——IME 制御系 VK は
+/// この経路でも禁止対象（`forbidden_target_vk_reason` 参照）。「消費のみ」
+/// 選択肢はここには無い（それは `main_key_combo_to_optional`）。変更時は
+/// true を返す。
+fn main_key_combo_to(
     ui: &mut egui::Ui,
     id: &str,
     current: &mut String,
     tooltip: &str,
+    left_thumb_vk: VkCode,
+    right_thumb_vk: VkCode,
+) -> bool {
+    let display = key_display_name(current).to_string();
+    let mut changed = false;
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(if current.is_empty() {
+            "（未選択）"
+        } else {
+            &display
+        })
+        .width(110.0)
+        .show_ui(ui, |ui| {
+            for (label, internal) in keymap_to_key_options(left_thumb_vk, right_thumb_vk) {
+                if ui.selectable_label(current == internal, *label).clicked() {
+                    *current = (*internal).to_string();
+                    changed = true;
+                }
+            }
+        })
+        .response
+        .on_hover_text(tooltip);
+    changed
+}
+
+fn main_key_combo_to_optional(
+    ui: &mut egui::Ui,
+    id: &str,
+    current: &mut String,
+    tooltip: &str,
+    left_thumb_vk: VkCode,
+    right_thumb_vk: VkCode,
 ) -> bool {
     let display = key_display_name(current).to_string();
     let mut changed = false;
@@ -3625,7 +5593,7 @@ fn main_key_combo_optional(
                 current.clear();
                 changed = true;
             }
-            for (label, internal) in KEYMAP_MAIN_KEYS {
+            for (label, internal) in keymap_to_key_options(left_thumb_vk, right_thumb_vk) {
                 if ui.selectable_label(current == internal, *label).clicked() {
                     *current = (*internal).to_string();
                     changed = true;
@@ -3679,7 +5647,13 @@ fn cell_display(value: Option<&YabValue>) -> String {
         Some(YabValue::Special(SpecialKey::PageUp)) => "PgUp".to_string(),
         Some(YabValue::Special(SpecialKey::PageDown)) => "PgDn".to_string(),
         Some(YabValue::Vk(vk)) => format!("V{:X}", vk.0),
-        Some(YabValue::None) | None => "\u{2014}".to_string(), // —
+        // ADR-115決定9(a): CtrlChordはVK、MacroRef/InlineSequenceはrawを
+        // そのまま表示する。Sequenceは(resolve_keystroke_syntax後の
+        // プレビュー専用コピーにしか現れないため)Noneと同じ表示にする。
+        Some(YabValue::CtrlChord { vk, .. }) => format!("Ctrl+{:X}", vk.0),
+        Some(YabValue::MacroRef(name)) => format!("@{name}"),
+        Some(YabValue::InlineSequence { raw, .. }) => raw.clone(),
+        Some(YabValue::Sequence(_) | YabValue::None) | None => "\u{2014}".to_string(), // —
     }
 }
 
@@ -3690,7 +5664,13 @@ const fn cell_color(value: Option<&YabValue>) -> egui::Color32 {
         Some(YabValue::Special(_)) => egui::Color32::from_rgb(210, 255, 220),
         Some(YabValue::KeySequence(_)) => egui::Color32::from_rgb(200, 235, 255),
         Some(YabValue::Vk(_)) => egui::Color32::from_rgb(255, 225, 200),
-        Some(YabValue::None) | None => egui::Color32::from_rgb(220, 220, 220),
+        // ADR-115: 打鍵列系は薄紫で統一し、既存カラーパレットと区別する。
+        Some(
+            YabValue::CtrlChord { .. } | YabValue::InlineSequence { .. } | YabValue::MacroRef(_),
+        ) => egui::Color32::from_rgb(230, 210, 255),
+        Some(YabValue::Sequence(_) | YabValue::None) | None => {
+            egui::Color32::from_rgb(220, 220, 220)
+        }
     }
 }
 
@@ -3712,7 +5692,10 @@ fn value_description(value: Option<&YabValue>) -> String {
         Some(YabValue::KeySequence(s)) => format!("キーシーケンス: {s}"),
         Some(YabValue::Special(sk)) => format!("特殊キー: {sk:?}"),
         Some(YabValue::Vk(vk)) => format!("仮想キーコード: 0x{:X}", vk.0),
-        Some(YabValue::None) | None => "割り当てなし".to_string(),
+        Some(YabValue::CtrlChord { vk, .. }) => format!("Ctrl+VK: 0x{:X}", vk.0),
+        Some(YabValue::InlineSequence { raw, .. }) => format!("打鍵列: {raw}"),
+        Some(YabValue::MacroRef(name)) => format!("打鍵列マクロ参照: @{name}"),
+        Some(YabValue::Sequence(_) | YabValue::None) | None => "割り当てなし".to_string(),
     }
 }
 
@@ -3730,6 +5713,18 @@ fn load_yab_layout(
     model: awase::scanmap::KeyboardModel,
 ) -> Result<(YabLayout, Vec<String>), String> {
     let content = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    // NOTE: ここは意図的に `resolve_keystroke_syntax` を通さない。この関数が返す
+    // `YabLayout` は GUI 編集の作業コピーであると同時に `layout_write_to_path` が
+    // そのまま `serialize()` して .yab へ書き戻す対象そのもの。一度 resolve すると
+    // `CtrlChord`/`InlineSequence`/`MacroRef` が `Literal`/`Sequence` に置き換わり、
+    // 元のセル生テキストが失われた状態で保存されてしまう（`Sequence` は
+    // `serialize()` が `無` を返す設計のため、キルスイッチ on で保存すると打鍵列
+    // セルが丸ごと消える。off でも `raw` の一部だけが残る形で壊れる）。実装直後の
+    // Opus実装後レビューでこの resolve 呼び出しを一度追加したところ、まさにこの
+    // 破壊的な保存回帰が3系統のレビュー観点から独立に指摘されたため差し戻した
+    // （経緯は `docs/known-bugs.md` FEATURE-115 参照）。GUI プレビューがキルスイッチ
+    // off 時の実際の送信内容と食い違う点（新構文セルがそのまま表示される）は
+    // 非破壊的な既知の制約として残す。
     let layout = YabLayout::parse(&content, model)
         .map(YabLayout::resolve_kana)
         .map_err(|e| format!("パース失敗: {e}"))?;
@@ -3770,15 +5765,56 @@ fn empty_yab_layout() -> YabLayout {
 /// しまい、「設定画面で保存しても awase.exe に反映されない」という実機バグの
 /// 原因になる（2026-07-19 に実際に発生し確認済み）。
 fn find_config_path() -> std::path::PathBuf {
+    cli_arg_config_path().unwrap_or_else(|| awase::paths::resolve_relative_to_exe("config.toml"))
+}
+
+/// CLI引数でconfigパスが明示されていればそれを返す（`--flag`/`--flag value`
+/// 形式はスキップ）。`ensure_default_config_exists`を呼んでよいかどうかの
+/// 判定（ADR-178 決定2、CLI指定時は自己修復しない）に`find_config_path`とは
+/// 独立して使う——`find_config_path`自体は`update_check.rs`やテストコード
+/// からも呼ばれるため、そちらに自己修復を仕込むと意図しない箇所で発火する。
+fn cli_arg_config_path() -> Option<std::path::PathBuf> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg.starts_with("--") {
             let _ = args.next(); // value をスキップ
             continue;
         }
-        return std::path::PathBuf::from(arg);
+        return Some(std::path::PathBuf::from(arg));
     }
-    awase::paths::resolve_relative_to_exe("config.toml")
+    None
+}
+
+/// 開発ビルドかどうかを判定する（ADR-178 決定2）。実体は
+/// `awase::paths::is_dev_build()`（`resolve_relative_to_exe`のワークスペース
+/// ルート解決と同じ判定基準を共有する、ADR-178 v14 opusレビューM6対応
+/// ——旧実装は`crates/awase-windows/src/app/mod.rs::is_dev_build`との2クレート
+/// 重複だった）。
+fn is_dev_build() -> bool {
+    awase::paths::is_dev_build()
+}
+
+/// `config.toml`が実行ファイルの隣に無ければ、埋め込み既定値から生成する
+/// （ADR-178 決定2）。
+/// `current_exe()`の親ディレクトリ。開発ビルドではないことを呼び出し元が
+/// 保証していること（`is_dev_build()`）。
+fn exe_dir() -> Option<std::path::PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(std::path::Path::to_path_buf))
+}
+
+fn ensure_default_config_exists() {
+    if is_dev_build() {
+        return;
+    }
+    let Some(exe_dir) = exe_dir() else {
+        return;
+    };
+    let config_path = exe_dir.join("config.toml");
+    if let Err(e) = awase::config::ensure_config_exists(&config_path) {
+        tracing::warn!("Failed to create default config.toml: {e}");
+    }
 }
 
 /// `layouts_dir` を解決する。実行ファイル隣・`cargo run` 時のワークスペース
@@ -3787,6 +5823,171 @@ fn find_config_path() -> std::path::PathBuf {
 /// ワークスペースルート直下の `layout/` を見つけられなかった）。
 fn resolve_layouts_dir(layouts_dir: &str) -> std::path::PathBuf {
     awase::paths::resolve_relative_to_exe(layouts_dir)
+}
+
+/// `layouts_dir_raw`（`config.general.layouts_dir`の生文字列）に有効な
+/// `.yab`が1本も無ければ、同梱6ファイルを埋め込み既定値から生成する
+/// （ADR-178 決定2）。生成先は`exe_dir.join(layouts_dir_raw)`に固定し、
+/// `resolve_layouts_dir()`（＝`resolve_relative_to_exe`）の結果を使わない
+/// ——exe隣に存在しない場合はCWD相対の裸パスへフォールバックするため、
+/// 生成前に呼ぶと生成先がCWD相対になってしまう（`crates/awase-windows/src/app/mod.rs::ensure_default_layouts_exist`
+/// で2026-09-17の実機検証により確認した実害と同型）。呼び出し元はこの
+/// 関数の**後**で`resolve_layouts_dir`を呼んで読み取り先を解決すること。
+fn ensure_default_layouts_exist(layouts_dir_raw: &str) {
+    if is_dev_build() {
+        return;
+    }
+    let Some(exe_dir) = exe_dir() else {
+        return;
+    };
+    let target_dir = exe_dir.join(layouts_dir_raw);
+    if let Err(e) = awase::config::ensure_layouts_exist(&target_dir) {
+        tracing::warn!("Failed to create default layout files: {e}");
+    }
+}
+
+/// `dir` 内の全 `.yab` を読込失敗（UTF-8デコード失敗含む）と
+/// `yab::lint()` 警告について診断する（ADR-116 決定3）。
+///
+/// `awase-windows` 側の `LayoutEntry::scan_all` と同じ「read + lint のみ、
+/// `YabLayout::parse` は呼ばない」原則を踏む。パースまで行うと、同梱の
+/// JIS用レイアウトが `keyboard_model = "us"` 環境で列数上限超過により
+/// 恒久的に警告される（US配列ユーザーには対処しようがない誤警告になる）。
+/// `scan_layout_names`（ファイル名一覧のみ返す既存関数）を拡張せず専用の
+/// 小さいループにしているのは、共有を狙って抽象化すると
+/// `LayoutEntry::scan_all` とほぼ同じロジックの再発明になるため
+/// （ADR-116 r1のレビューで指摘された過剰設計と同型）。
+fn scan_yab_files_for_diagnostics(dir: &std::path::Path) -> Vec<String> {
+    let mut diagnostics = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            // /code-review指摘: 以前は無言で空リストを返していた。
+            // `layouts_dir` の打ち間違いは最も起きやすい設定ミスの1つで、
+            // awase.exe 側（LayoutEntry::scan_all）は同じ状況で
+            // 「レイアウトディレクトリが見つかりません」と警告している
+            // （bootstrap.rs:710-716）のに、直しに行く設定画面だけが沈黙する
+            // のはADR-116の出発点だったBUG-104と同型の無言フォールバック。
+            diagnostics.push(format!(
+                "レイアウトディレクトリが見つかりません: {}: {e}",
+                dir.display()
+            ));
+            return diagnostics;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "yab") {
+            continue;
+        }
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                // 1セルごとに1件積むと、崩れたファイル1つで診断リストが
+                // 数十行に膨れ上がる（1ファイルにつき1件へ集約、
+                // scan_all 側の同種修正と対称）。
+                let lint_warnings = awase::yab::lint(&content);
+                if !lint_warnings.is_empty() {
+                    diagnostics.push(format!("{}: {}", path.display(), lint_warnings.join(" / ")));
+                }
+            }
+            Err(e) => {
+                diagnostics.push(format!("レイアウト読込失敗: {}: {e}", path.display()));
+            }
+        }
+    }
+    // /code-review指摘: read_dir の返す順はファイルシステム依存で
+    // 実行のたび変わりうる。scan_layout_names（同じ layouts_dir を走査する
+    // 既存関数）も名前でソートしているため、これに揃える。
+    diagnostics.sort();
+    diagnostics
+}
+
+#[cfg(test)]
+mod scan_yab_files_for_diagnostics_tests {
+    use super::scan_yab_files_for_diagnostics;
+
+    fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "awase_test_scan_yab_diag_{label}_{}_{id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn missing_directory_reports_a_warning_not_silence() {
+        // /code-review指摘: 以前は read_dir 失敗時に無言で空 Vec を返しており、
+        // layouts_dir の打ち間違いという最も起きやすい設定ミスに対して
+        // 設定画面だけが沈黙していた。
+        let dir = std::env::temp_dir().join("awase_test_scan_yab_diag_does_not_exist_ever");
+        let _ = std::fs::remove_dir_all(&dir);
+        let diagnostics = scan_yab_files_for_diagnostics(&dir);
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].contains("レイアウトディレクトリが見つかりません"));
+    }
+
+    #[test]
+    fn empty_directory_reports_nothing() {
+        let dir = unique_temp_dir("empty");
+        assert!(scan_yab_files_for_diagnostics(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unreadable_file_reports_one_warning() {
+        // 非UTF-8バイト列 = read_to_string が失敗するケース（BUG-104の
+        // トリガーそのもの）。
+        let dir = unique_temp_dir("unreadable");
+        std::fs::write(dir.join("broken.yab"), [0xFF, 0xFE, 0x00, 0x81]).unwrap();
+        let diagnostics = scan_yab_files_for_diagnostics(&dir);
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].contains("レイアウト読込失敗"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quote_corrupted_cells_collapse_into_one_entry_per_file() {
+        // BUG-95のクォート崩れ再現。複数セルが崩れていても診断リストの
+        // 1エントリに集約されること（/code-review指摘: 1セルごとに1件だと
+        // 崩れたファイル1つで診断リストが数十行に膨れ上がる）。
+        let dir = unique_temp_dir("lint");
+        std::fs::write(
+            dir.join("broken.yab"),
+            "[ローマ字シフト無し]\n'あ,'い,ｕ,ｅ,ｏ\n",
+        )
+        .unwrap();
+        let diagnostics = scan_yab_files_for_diagnostics(&dir);
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "expected one aggregated entry: {diagnostics:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clean_file_reports_nothing() {
+        let dir = unique_temp_dir("clean");
+        std::fs::write(
+            dir.join("ok.yab"),
+            "[ローマ字シフト無し]\nｋａ,ｔａ,ｋｏ,ｓａ,ｒａ\n",
+        )
+        .unwrap();
+        assert!(scan_yab_files_for_diagnostics(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_yab_files_are_ignored() {
+        let dir = unique_temp_dir("ignore");
+        std::fs::write(dir.join("readme.txt"), "not a layout").unwrap();
+        assert!(scan_yab_files_for_diagnostics(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 fn scan_layout_names(layouts_dir: &str) -> Vec<String> {
@@ -3861,7 +6062,7 @@ fn send_reload_config_message() {
                 let lparam = windows::Win32::Foundation::LPARAM(0);
                 let _ = PostMessageW(hwnd, WM_RELOAD_CONFIG, msg, lparam);
             } else {
-                log::warn!(
+                tracing::warn!(
                     "設定リロード通知の送信先ウィンドウ (awase_tray_window) が見つかりません。\
                      awase.exe が起動していないか、権限レベルが異なる可能性があります。"
                 );
@@ -3873,18 +6074,23 @@ fn send_reload_config_message() {
 #[cfg(test)]
 mod layout_tab_repro {
     use super::{
-        CLIPBOARD_HISTORY_LEN, Face, KanaTable, NewComboBuf, PhysicalPos, SPECIAL_KEYS,
-        SettingsApp, Tab, ValueKind, YabValue, empty_yab_layout, find_config_path, load_yab_layout,
-        resolve_layouts_dir,
+        CLIPBOARD_HISTORY_LEN, Face, KanaTable, LayoutDiscardAction, NewComboBuf, PhysicalPos,
+        SPECIAL_KEYS, SettingsApp, Tab, ValueKind, YabValue, apply_adr192_recommended_replacement,
+        empty_yab_layout, find_config_path, has_adr192_warning_context, load_yab_layout,
+        resolve_layouts_dir, undo_adr192_recommended_replacement,
     };
 
     fn test_settings_app(config: awase::config::AppConfig) -> SettingsApp {
         let layout_path =
             resolve_layouts_dir(&config.general.layouts_dir).join(&config.general.default_layout);
-        let layout = load_yab_layout(&layout_path, config.general.keyboard_model)
-            .map(|(ly, _lint_warnings)| ly)
-            .unwrap_or_else(|_| empty_yab_layout());
+        let (layout, layout_loaded_ok) =
+            load_yab_layout(&layout_path, config.general.keyboard_model).map_or_else(
+                |_| (empty_yab_layout(), false),
+                |(ly, _lint_warnings)| (ly, true),
+            );
+        let config_loaded_model = config.general.keyboard_model;
         SettingsApp {
+            base: config.clone(),
             config,
             config_path: std::path::PathBuf::from("config.toml"),
             config_load_state: awase::config::ConfigLoadState::Loaded,
@@ -3900,17 +6106,10 @@ mod layout_tab_repro {
             new_keymap_app: String::new(),
             new_keymap_from_ctrl: false,
             new_keymap_from_shift: false,
-            new_keymap_from_alt: false,
             new_keymap_from_main: String::new(),
             new_keymap_to_main: String::new(),
-            new_key_remap_from: String::new(),
-            new_key_remap_to: String::new(),
             capturing: None,
-            new_override_bufs: <[(String, String); 4]>::default(),
             new_disable_app: String::new(),
-            new_pb_key: String::new(),
-            new_pb_process: String::new(),
-            new_pb_class: String::new(),
             layout_file_path_buf: layout_path.display().to_string(),
             layout_file_path: Some(layout_path),
             layout,
@@ -3920,13 +6119,42 @@ mod layout_tab_repro {
             layout_edit_kind: ValueKind::None,
             layout_edit_value: String::new(),
             layout_edit_special_idx: 0,
+            layout_edit_origin: None,
+            layout_edit_origin_is_sequence: false,
+            layout_edit_last_seen: None,
+            ime_composing: false,
+            ime_event_this_frame: false,
             kana_table: KanaTable::build(),
             layout_modified: false,
             layout_status: String::new(),
             layout_loaded: true,
+            layout_loaded_ok,
+            layout_loaded_model: layout_loaded_ok.then_some(config_loaded_model),
             layout_pending_open: None,
             layout_pending_save_as: None,
+            pending_layout_discard: None,
+            show_cancel_layout_confirm: false,
+            pending_status_notes: Vec::new(),
+            config_loaded_model,
             pending_save: None,
+            scancode_map_status: None,
+            scancode_map_last_message: None,
+            startup_diagnostics: Vec::new(),
+            auto_start_registered: false,
+            adr192_warning_context: false,
+            adr192_replacement_undo: None,
+            adr192_replacement_preview: None,
+            keymap_learn_rx: None,
+            keymap_learn_progress: None,
+            keymap_learn_finished: false,
+            keymap_learn_status: None,
+            keymap_learn_child: None,
+            keymap_learn_stderr_handle: None,
+            keymap_learn_mode: crate::keymap_learn_launcher::LearnMode::Learn,
+            keymap_table_state: None,
+            keymap_env_probe: crate::keymap_learn_status::EnvProbe::new(
+                std::time::SystemTime::now(),
+            ),
         }
     }
 
@@ -4000,14 +6228,46 @@ mod layout_tab_repro {
         });
     }
 
-    /// `tab_basic`/`tab_keymap`/`tab_disable_apps`/`tab_app_rules`/
+    #[test]
+    fn adr192_warning_flag_and_undo_control_replacement_ui_visibility() {
+        let args = vec![
+            "awase-settings".to_owned(),
+            "--adr192-mode-key-warning".to_owned(),
+        ];
+        assert!(has_adr192_warning_context(&args));
+        assert!(!has_adr192_warning_context(&["awase-settings".to_owned()]));
+
+        let mut app = test_settings_app(awase::config::AppConfig::default());
+        assert!(!app.adr192_replacement_controls_visible());
+        app.adr192_warning_context = true;
+        assert!(app.adr192_replacement_controls_visible());
+        app.adr192_warning_context = false;
+        app.adr192_replacement_undo = Some(apply_adr192_recommended_replacement(&mut app.config));
+        assert!(app.adr192_replacement_controls_visible());
+    }
+
+    #[test]
+    fn adr192_replacement_ui_renders_with_and_without_warning_context() {
+        let mut app = test_settings_app(awase::config::AppConfig::default());
+        let ctx = eframe::egui::Context::default();
+        for warning_context in [false, true] {
+            app.adr192_warning_context = warning_context;
+            let _ = ctx.run(eframe::egui::RawInput::default(), |ctx| {
+                eframe::egui::CentralPanel::default().show(ctx, |ui| {
+                    app.tab_keys(ui);
+                });
+            });
+        }
+    }
+
+    /// `tab_basic`/`tab_keymap`/`tab_disable_apps`/
     /// `tab_advanced` がパニックしないことを固定する（2026-08-15、ホバー
     /// ヒント拡充で全タブに手を入れたため追加。`tab_disable_apps` は
-    /// 2026-08-26 BUG-90 で `tab_app_rules` から切り出した際に追加。
+    /// 2026-08-26 BUG-90 で追加。
     /// `full_tab_layout_render_with_real_config_does_not_panic` と同じ
     /// パターン）。`tab_keymap`は既存ルールが無いと空一覧の分岐しか通らない
     /// ため、ダミーの `KeymapRule` を1件足して非空分岐（`main_key_combo`/
-    /// `main_key_combo_optional` を含む行）も描画させる。
+    /// `main_key_combo_to` を含む行）も描画させる。
     #[test]
     fn remaining_tabs_render_does_not_panic() {
         let config_path = find_config_path();
@@ -4020,7 +6280,11 @@ mod layout_tab_repro {
         config.keymaps.push(awase::config::KeymapRule {
             app: Some("vim.exe".to_string()),
             from: "Ctrl+I".to_string(),
-            to: Some("VK_F7".to_string()),
+            // 2ステップにして、ADR-130 の複数ステップ to UI（各ステップの
+            // ドロップダウン・⌨・x、末尾の「＋」）が実際にレンダリングされる
+            // ことをこのスモークテストで確認する（ベストプラクティス
+            // レビュー指摘: 単一ステップだけでは "+" ボタンの経路が未検証）。
+            to: vec!["VK_F7".to_string(), "VK_F8".to_string()],
         });
         config.post_bypass.push(awase::config::PostBypassRule {
             key: "Ctrl+B".to_string(),
@@ -4044,11 +6308,6 @@ mod layout_tab_repro {
         let _ = ctx.run(eframe::egui::RawInput::default(), |ctx| {
             eframe::egui::CentralPanel::default().show(ctx, |ui| {
                 app.tab_disable_apps(ui);
-            });
-        });
-        let _ = ctx.run(eframe::egui::RawInput::default(), |ctx| {
-            eframe::egui::CentralPanel::default().show(ctx, |ui| {
-                app.tab_app_rules(ui);
             });
         });
         let _ = ctx.run(eframe::egui::RawInput::default(), |ctx| {
@@ -4157,7 +6416,7 @@ mod layout_tab_repro {
             "awase_settings_roundtrip_test_{}.yab",
             std::process::id()
         ));
-        app.layout_write_to_path(&path);
+        app.layout_write_to_path(&path, true, true).unwrap();
         assert!(!app.layout_modified, "保存後も変更ありのままになっている");
 
         let content = std::fs::read_to_string(&path).expect("保存したファイルを読み戻せない");
@@ -4379,6 +6638,402 @@ mod layout_tab_repro {
         );
     }
 
+    fn temp_layout_app() -> (SettingsApp, std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "awase_test_settings_layout_{}_{}",
+            std::process::id(),
+            unique_test_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let layout_path = dir.join("test.yab");
+        let layout_text = empty_yab_layout().serialize(awase::scanmap::KeyboardModel::Jis);
+        std::fs::write(&layout_path, layout_text).unwrap();
+
+        let mut config: awase::config::AppConfig = toml::from_str("[general]").unwrap();
+        config.general.layouts_dir = dir.display().to_string();
+        config.general.default_layout = "test.yab".to_string();
+        config.general.keyboard_model = awase::scanmap::KeyboardModel::Jis;
+
+        let mut app = test_settings_app(config);
+        let config_path = dir.join("config.toml");
+        app.config_path = config_path.clone();
+        app.layout_load_from_path(&layout_path);
+        (app, dir, config_path)
+    }
+
+    fn is_empty_cell(value: Option<&YabValue>) -> bool {
+        matches!(value, None | Some(YabValue::None))
+    }
+
+    #[test]
+    fn commit_pending_layout_edit_commits_text_and_kind_changes() {
+        let (mut app, dir, _config_path) = temp_layout_app();
+        let ctx = eframe::egui::Context::default();
+        let pos = PhysicalPos::new(0, 0);
+
+        app.select_layout_cell(pos);
+        app.layout_edit_kind = ValueKind::Keystroke;
+        app.layout_edit_value = "ka".to_string();
+        app.commit_pending_layout_edit(&ctx);
+        assert!(matches!(
+            app.layout_face(Face::Normal).get(&pos),
+            Some(YabValue::Romaji { romaji, .. }) if romaji == "ka"
+        ));
+
+        app.layout_edit_kind = ValueKind::Literal;
+        app.commit_pending_layout_edit(&ctx);
+        assert!(matches!(
+            app.layout_face(Face::Normal).get(&pos),
+            Some(YabValue::Literal(s)) if s == "ka"
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn commit_pending_layout_edit_skips_sequence_cells_even_if_kind_changes() {
+        let (mut app, dir, _config_path) = temp_layout_app();
+        let ctx = eframe::egui::Context::default();
+        let pos = PhysicalPos::new(0, 0);
+        let original = YabValue::MacroRef("macro1".to_string());
+        app.layout_face_mut(Face::Normal)
+            .insert(pos, original.clone());
+
+        app.select_layout_cell(pos);
+        app.layout_edit_kind = ValueKind::Keystroke;
+        app.commit_pending_layout_edit(&ctx);
+
+        assert_eq!(app.layout_face(Face::Normal).get(&pos), Some(&original));
+        assert!(!app.layout_modified);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn commit_pending_layout_edit_skips_none_special_and_ime_frames() {
+        let (mut app, dir, _config_path) = temp_layout_app();
+        let ctx = eframe::egui::Context::default();
+        let pos = PhysicalPos::new(0, 0);
+        app.select_layout_cell(pos);
+
+        app.layout_edit_kind = ValueKind::Special;
+        app.layout_edit_special_idx = 1;
+        app.commit_pending_layout_edit(&ctx);
+        assert!(is_empty_cell(app.layout_face(Face::Normal).get(&pos)));
+
+        app.layout_edit_kind = ValueKind::Keystroke;
+        app.layout_edit_value = "ka".to_string();
+        app.ime_composing = true;
+        app.commit_pending_layout_edit(&ctx);
+        assert!(is_empty_cell(app.layout_face(Face::Normal).get(&pos)));
+
+        app.ime_composing = false;
+        app.ime_event_this_frame = true;
+        app.commit_pending_layout_edit(&ctx);
+        assert!(is_empty_cell(app.layout_face(Face::Normal).get(&pos)));
+
+        app.ime_event_this_frame = false;
+        app.commit_pending_layout_edit(&ctx);
+        assert!(matches!(
+            app.layout_face(Face::Normal).get(&pos),
+            Some(YabValue::Romaji { romaji, .. }) if romaji == "ka"
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // 上のテストは「commit_pending_layout_editがSpecialをコミットしない」
+    // ことしか見ておらず、`ValueKind::Special`が実際にコミットされる唯一の
+    // 経路（ComboBoxの`response.changed()`——egui-0.31.1のcombo_box_dynは
+    // これを伝播しないため実質デッドコードだった）を一度も通していなかった。
+    // これがcode-reviewで見つかったBlocker（特殊キーがGUIから設定不能）を
+    // 素通りさせた直接の原因のため、独立コミット経路
+    // `commit_special_key_if_changed`を専用にテストする。
+    #[test]
+    fn selecting_a_different_special_key_commits_and_resyncs_buffer() {
+        let (mut app, dir, _config_path) = temp_layout_app();
+        let pos = PhysicalPos::new(0, 0);
+        app.select_layout_cell(pos);
+        app.layout_edit_kind = ValueKind::Special;
+        let previous_idx = app.layout_edit_special_idx;
+        let new_idx = (previous_idx + 1) % SPECIAL_KEYS.len();
+
+        app.layout_edit_special_idx = new_idx;
+        app.commit_special_key_if_changed(pos, previous_idx);
+
+        let expected = SPECIAL_KEYS[new_idx].0;
+        assert_eq!(
+            app.layout_face(Face::Normal).get(&pos),
+            Some(&YabValue::Special(expected))
+        );
+        assert!(app.layout_modified);
+        // round4 R4-3: 直接コミット後もバッファ（種別・インデックス）は
+        // `select_layout_cell`により新しいモデル値と再同期されている
+        // ——編集パネルの表示とモデルが恒久的に食い違わない。
+        assert_eq!(app.layout_edit_kind, ValueKind::Special);
+        assert_eq!(app.layout_edit_special_idx, new_idx);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn selecting_the_same_special_key_index_does_not_commit() {
+        let (mut app, dir, _config_path) = temp_layout_app();
+        let pos = PhysicalPos::new(0, 0);
+        app.select_layout_cell(pos);
+        app.layout_edit_kind = ValueKind::Special;
+        let previous_idx = app.layout_edit_special_idx;
+
+        // ラジオを「特殊キー」へ切り替えただけ（ComboBoxは未操作、
+        // インデックスは前回のセルから引き継いだ値のまま）では、
+        // round3 R3-2が防ごうとした「未操作のインデックスが無言で
+        // コミットされる」事故を起こしてはならない。
+        app.commit_special_key_if_changed(pos, previous_idx);
+
+        assert!(is_empty_cell(app.layout_face(Face::Normal).get(&pos)));
+        assert!(!app.layout_modified);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn commit_pending_layout_edit_does_not_repeat_same_error_every_frame() {
+        let (mut app, dir, _config_path) = temp_layout_app();
+        let ctx = eframe::egui::Context::default();
+        app.select_layout_cell(PhysicalPos::new(0, 0));
+        app.layout_edit_kind = ValueKind::Keystroke;
+        app.layout_edit_value = "あ".to_string();
+
+        app.commit_pending_layout_edit(&ctx);
+        assert!(app.layout_status.contains("JIS キーボード"));
+        app.layout_status = "別のステータス".to_string();
+        app.commit_pending_layout_edit(&ctx);
+        assert_eq!(app.layout_status, "別のステータス");
+
+        app.layout_edit_value = String::new();
+        app.layout_edit_origin = Some((String::new(), ValueKind::Keystroke));
+        app.commit_pending_layout_edit(&ctx);
+        assert!(app.layout_status.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn apply_confirmed_writes_modified_layout_and_skips_unmodified_layout() {
+        let (mut app, dir, config_path) = temp_layout_app();
+        let layout_path = app.layout_file_path.clone().unwrap();
+        let before = std::fs::read_to_string(&layout_path).unwrap();
+        app.apply_confirmed();
+        wait_for_pending_save(&mut app);
+        assert_eq!(std::fs::read_to_string(&layout_path).unwrap(), before);
+
+        app.select_layout_cell(PhysicalPos::new(0, 0));
+        app.layout_edit_kind = ValueKind::Literal;
+        app.layout_edit_value = "x".to_string();
+        app.commit_pending_layout_edit(&eframe::egui::Context::default());
+        app.apply_confirmed();
+        wait_for_pending_save(&mut app);
+
+        let after = std::fs::read_to_string(&layout_path).unwrap();
+        assert_ne!(after, before);
+        assert!(!app.layout_modified);
+        assert!(app.status.contains("配列 test.yab を含む"));
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // R5-1と同じ原則: 配列編集タブに閉じた問題（読み込み未了）は`.yab`書き込み
+    // だけをスキップし、無関係な設定変更(config.toml保存)まで巻き込んで
+    // 適用不能にしてはならない。
+    #[test]
+    fn apply_confirmed_skips_layout_write_but_still_saves_config_when_loaded_state_is_bad() {
+        let (mut app, dir, config_path) = temp_layout_app();
+        let layout_path = app.layout_file_path.clone().unwrap();
+        let before = std::fs::read_to_string(&layout_path).unwrap();
+        app.layout_modified = true;
+        app.layout_loaded_ok = false;
+
+        app.apply_confirmed();
+        wait_for_pending_save(&mut app);
+
+        assert_eq!(std::fs::read_to_string(&layout_path).unwrap(), before);
+        assert!(config_path.exists());
+        assert!(
+            app.status
+                .contains("読み込めていないため配列の変更は保存されていません")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn apply_confirmed_guard_a_blocks_modified_layout_model_mismatch() {
+        let (mut app, dir, config_path) = temp_layout_app();
+        app.layout_modified = true;
+        app.layout_loaded_ok = true;
+        app.layout_loaded_model = Some(awase::scanmap::KeyboardModel::Jis);
+        app.config.general.keyboard_model = awase::scanmap::KeyboardModel::Us;
+
+        app.apply_confirmed();
+
+        assert!(app.pending_save.is_none());
+        assert!(app.status.contains("読み込み時と異なるキーボード配列"));
+        assert!(!config_path.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn apply_confirmed_guard_b_allows_matching_default_layout_with_or_without_editor_state() {
+        let (mut app, dir, config_path) = temp_layout_app();
+        let us_path = dir.join("us.yab");
+        std::fs::write(
+            &us_path,
+            empty_yab_layout().serialize(awase::scanmap::KeyboardModel::Us),
+        )
+        .unwrap();
+        app.layout_loaded_model = Some(awase::scanmap::KeyboardModel::Jis);
+        app.layout_modified = false;
+        app.config.general.keyboard_model = awase::scanmap::KeyboardModel::Us;
+        app.config.general.default_layout = "us.yab".to_string();
+
+        app.apply_confirmed();
+        wait_for_pending_save(&mut app);
+
+        assert!(config_path.exists());
+        assert!(app.status.contains("設定を保存しました"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn apply_confirmed_guard_b_warns_but_saves_when_model_is_unchanged() {
+        let (mut app, dir, config_path) = temp_layout_app();
+        let broken_path = dir.join("broken.yab");
+        std::fs::write(
+            &broken_path,
+            "[ローマ字シフト無し]\n\
+             無,無,無,無,無,無,無,無,無,無,無,無,無,無\n\
+             無,無,無,無,無,無,無,無,無,無,無,無\n\
+             無,無,無,無,無,無,無,無,無,無,無,無\n\
+             無,無,無,無,無,無,無,無,無,無,無\n",
+        )
+        .unwrap();
+        app.config.general.default_layout = "broken.yab".to_string();
+        app.config_loaded_model = app.config.general.keyboard_model;
+
+        app.apply_confirmed();
+        wait_for_pending_save(&mut app);
+
+        assert!(config_path.exists());
+        assert!(app.status.contains("読み込めません"));
+        assert!(app.status.contains("設定を保存しました"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn apply_confirmed_guard_b_skips_missing_default_layout() {
+        let (mut app, dir, config_path) = temp_layout_app();
+        app.config.general.default_layout = "missing.yab".to_string();
+
+        app.apply_confirmed();
+        wait_for_pending_save(&mut app);
+
+        assert!(config_path.exists());
+        assert!(app.status.contains("設定を保存しました"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cancel_with_modified_layout_opens_three_way_confirm_and_both_reload_resyncs() {
+        let (mut app, dir, config_path) = temp_layout_app();
+        std::fs::write(&config_path, "[general]\n").unwrap();
+        app.select_layout_cell(PhysicalPos::new(0, 0));
+        app.layout_edit_kind = ValueKind::Literal;
+        app.layout_edit_value = "x".to_string();
+        app.commit_pending_layout_edit(&eframe::egui::Context::default());
+
+        app.cancel();
+        assert!(app.show_cancel_layout_confirm);
+        assert!(app.layout_modified);
+
+        app.cancel_config_and_layout();
+        assert!(!app.layout_modified);
+        assert!(app.layout_selected_pos.is_none());
+        assert!(app.layout_edit_origin.is_none());
+        assert!(is_empty_cell(
+            app.layout_face(Face::Normal).get(&PhysicalPos::new(0, 0))
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // /code-review指摘（round2 R2-8と同型）: 3択キャンセル確認モーダルが
+    // 開いている間に、配列破棄確認（「開く」「再読み込み」「パス欄Enter」
+    // 経由）を新たに開こうとすると、2つの非ブロッキング`egui::Window`が
+    // 同時に描画されてしまう。`confirm_layout_discard_or_defer`側で
+    // 一元的に拒否することを検証する。
+    #[test]
+    fn discard_confirm_is_refused_while_cancel_confirm_is_open() {
+        let (mut app, dir, _config_path) = temp_layout_app();
+        app.select_layout_cell(PhysicalPos::new(0, 0));
+        app.layout_edit_kind = ValueKind::Literal;
+        app.layout_edit_value = "x".to_string();
+        app.commit_pending_layout_edit(&eframe::egui::Context::default());
+
+        app.cancel();
+        assert!(app.show_cancel_layout_confirm);
+
+        let allowed = app.confirm_layout_discard_or_defer(LayoutDiscardAction::Reload);
+        assert!(!allowed);
+        assert!(
+            app.pending_layout_discard.is_none(),
+            "3択確認が開いている間は配列破棄確認を新たに開いてはならない"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // /code-review指摘: 3択キャンセル確認モーダルが開いている間に「適用」が
+    // 実行されると、確認が尋ねている変更（未保存の配列編集）をそのまま
+    // 保存してしまい、確認モーダル自体を無意味にする。`apply()`が
+    // それを拒否することを検証する。
+    #[test]
+    fn apply_is_refused_while_cancel_confirm_is_open() {
+        let (mut app, dir, config_path) = temp_layout_app();
+        app.select_layout_cell(PhysicalPos::new(0, 0));
+        app.layout_edit_kind = ValueKind::Literal;
+        app.layout_edit_value = "x".to_string();
+        app.commit_pending_layout_edit(&eframe::egui::Context::default());
+        let before = std::fs::read_to_string(app.layout_file_path.clone().unwrap()).unwrap();
+
+        app.cancel();
+        assert!(app.show_cancel_layout_confirm);
+
+        app.apply();
+
+        assert!(app.pending_save.is_none(), "確認表示中は保存を開始しない");
+        assert!(app.layout_modified, "未保存の編集はそのまま残る");
+        assert_eq!(
+            std::fs::read_to_string(app.layout_file_path.clone().unwrap()).unwrap(),
+            before
+        );
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // 逆方向: 配列破棄確認が開いている間に下部「キャンセル」を押しても、
+    // 3択確認モーダルを重ねて開いてはならない。
+    #[test]
+    fn cancel_is_refused_while_discard_confirm_is_open() {
+        let (mut app, dir, _config_path) = temp_layout_app();
+        app.select_layout_cell(PhysicalPos::new(0, 0));
+        app.layout_edit_kind = ValueKind::Literal;
+        app.layout_edit_value = "x".to_string();
+        app.commit_pending_layout_edit(&eframe::egui::Context::default());
+
+        let allowed = app.confirm_layout_discard_or_defer(LayoutDiscardAction::Reload);
+        assert!(!allowed);
+        assert!(app.pending_layout_discard.is_some());
+
+        app.cancel();
+        assert!(
+            !app.show_cancel_layout_confirm,
+            "配列破棄確認が開いている間は3択確認を新たに開いてはならない"
+        );
+        assert!(app.pending_layout_discard.is_some(), "既存の確認は残る");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     // ── ADR-099 決定4b/4c: config_load_state の遷移・保存前バックアップ ──
     // GUI 起動なしのロジック単体テスト。apply()/apply_confirmed() は
     // send_reload_config_message() を呼ぶが、#[cfg(target_os = "windows")]
@@ -4492,6 +7147,41 @@ mod layout_tab_repro {
         );
     }
 
+    /// 旧 confirm_mode（廃止済み）が config.toml に残っていても、読込時に
+    /// `wait` として扱われ、警告が出て、保存後のファイルに旧値が残らないこと。
+    #[test]
+    fn apply_confirmed_legacy_confirm_mode_loads_as_wait_with_warning() {
+        let config = awase::config::AppConfig::from_toml_str(
+            "[general]\nconfirm_mode = \"two_phase\"\nspeculative_delay_ms = 30\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.general.confirm_mode,
+            awase::config::ConfirmMode::Wait
+        );
+        let mut app = test_settings_app(config);
+        let config_path = std::env::temp_dir().join(format!(
+            "awase_test_legacy_confirm_{}_{}.toml",
+            std::process::id(),
+            unique_test_id()
+        ));
+        app.config_path = config_path.clone();
+        std::fs::write(
+            &config_path,
+            "[general]\nconfirm_mode = \"two_phase\"\nspeculative_delay_ms = 30\n",
+        )
+        .unwrap();
+
+        app.apply_confirmed();
+        wait_for_pending_save(&mut app);
+
+        let _ = std::fs::remove_file(&config_path);
+        assert_eq!(
+            app.config.general.confirm_mode,
+            awase::config::ConfirmMode::Wait
+        );
+    }
+
     /// コードレビュー指摘 C2 の回帰テスト: バックアップへのコピーが失敗した
     /// 場合、保存を中止し元ファイルを上書きしない（安全側に倒す）。
     /// `config_path` を読み取り不可（`chmod 0o000`）にすることで
@@ -4580,6 +7270,249 @@ mod layout_tab_repro {
         );
         assert!(!app.show_dangerous_save_confirm);
         let _ = std::fs::remove_file(&config_path);
+    }
+
+    /// BUG-115追記（2026-09-05ユーザー報告）の回帰テスト: `keys.ime_detect`
+    /// はGUIに編集ウィジェットが無いため、設定画面を開いたまま外部エディタ
+    /// で`config.toml`の`[keys.ime_detect]`を書き換えても、`self.config`
+    /// （起動時に読み込んだ古いスナップショット）が「適用」のたびに
+    /// ファイルへ上書き保存され、外部編集が消えて見えていた
+    /// （stale read-modify-write）。`apply_confirmed()`が保存直前に
+    /// ディスク上の最新`ime_detect`を拾い直すことを確認する。
+    #[test]
+    fn apply_confirmed_preserves_externally_edited_ime_detect() {
+        let config_path = std::env::temp_dir().join(format!(
+            "awase_test_ime_detect_preserve_{}_{}.toml",
+            std::process::id(),
+            unique_test_id()
+        ));
+        // GUI起動時点の状態を模す: ime_detect.on = ["VK_F16"]。
+        std::fs::write(
+            &config_path,
+            "[general]\n[keys.ime_detect]\non = [\"VK_F16\"]\n",
+        )
+        .unwrap();
+        let config = awase::config::AppConfig::load(&config_path).unwrap();
+        assert_eq!(config.keys.ime_detect.on, vec!["VK_F16".to_string()]);
+        let mut app = test_settings_app(config);
+        app.config_path = config_path.clone();
+        app.config_load_state = ConfigLoadState::Loaded;
+
+        // 設定画面を開いたまま、外部エディタでime_detectだけを書き換えた体。
+        std::fs::write(
+            &config_path,
+            "[general]\n[keys.ime_detect]\non = [\"VK_F17\"]\n",
+        )
+        .unwrap();
+
+        // GUIには他に変更が無い状態で「適用」を押す。
+        app.apply_confirmed();
+        wait_for_pending_save(&mut app);
+
+        let saved = awase::config::AppConfig::load(&config_path).unwrap();
+        let _ = std::fs::remove_file(&config_path);
+        let bak_path = config_path.with_extension("toml.bak");
+        let _ = std::fs::remove_file(&bak_path);
+
+        assert_eq!(
+            saved.keys.ime_detect.on,
+            vec!["VK_F17".to_string()],
+            "外部エディタでの編集(VK_F17)が、GUI起動時の古いスナップショット\
+             (VK_F16)で上書きされてはならない"
+        );
+    }
+
+    /// /code-review指摘（PR #168）の回帰テスト: `keys.ime_detect`と同じく
+    /// GUIに編集ウィジェットが無い他のフィールド（
+    /// `app_overrides.input_relay_apps`/`keystroke_macro`）も、外部エディタでの手動編集が「適用」で
+    /// 上書きされてはならない（上記`apply_confirmed_preserves_externally_edited_ime_detect`
+    /// と同型、対象フィールドを拡張した回帰）。
+    #[test]
+    fn apply_confirmed_preserves_externally_edited_gui_less_fields() {
+        let config_path = std::env::temp_dir().join(format!(
+            "awase_test_gui_less_fields_preserve_{}_{}.toml",
+            std::process::id(),
+            unique_test_id()
+        ));
+        std::fs::write(
+            &config_path,
+            "[general]\n\
+             [keys.ime_detect]\n\
+             [app_overrides]\n\
+             input_relay_apps = [\"old.exe\"]\n\
+             [[keystroke_macro]]\n\
+             name = \"old\"\n\
+             steps = []\n",
+        )
+        .unwrap();
+        let config = awase::config::AppConfig::load(&config_path).unwrap();
+        let mut app = test_settings_app(config);
+        app.config_path = config_path.clone();
+        app.config_load_state = ConfigLoadState::Loaded;
+
+        // 設定画面を開いたまま、外部エディタでGUIウィジェットの無い
+        // フィールドだけを書き換えた体。
+        std::fs::write(
+            &config_path,
+            "[general]\n\
+             [keys.ime_detect]\n\
+             [app_overrides]\n\
+             input_relay_apps = [\"new.exe\"]\n\
+             [[keystroke_macro]]\n\
+             name = \"new\"\n\
+             steps = []\n",
+        )
+        .unwrap();
+
+        app.apply_confirmed();
+        wait_for_pending_save(&mut app);
+
+        let saved = awase::config::AppConfig::load(&config_path).unwrap();
+        let _ = std::fs::remove_file(&config_path);
+        let bak_path = config_path.with_extension("toml.bak");
+        let _ = std::fs::remove_file(&bak_path);
+
+        assert_eq!(
+            saved.app_overrides.input_relay_apps,
+            vec!["new.exe".to_string()]
+        );
+        assert_eq!(saved.keystroke_macro.len(), 1);
+        assert_eq!(saved.keystroke_macro[0].name, "new");
+    }
+
+    /// ADR-207: 撤去した `keys.engine_on_ime_key` が config.toml に残っていても、GUI の保存で
+    /// 行が消え、保存直後の警告に「削除してください」が出ない。
+    #[test]
+    fn apply_confirmed_removes_retired_engine_ime_keys_without_warning() {
+        let config_path = std::env::temp_dir().join(format!(
+            "awase_test_retired_engine_ime_keys_{}_{}.toml",
+            std::process::id(),
+            unique_test_id()
+        ));
+        std::fs::write(
+            &config_path,
+            "[general]\n[keys]\nengine_on_ime_key = \"VK_DBE_DBCSCHAR\"\n",
+        )
+        .unwrap();
+        let config = awase::config::AppConfig::load(&config_path).unwrap();
+        assert_eq!(config.removed_notices().len(), 1);
+        let mut app = test_settings_app(config);
+        app.config_path = config_path.clone();
+        app.config_load_state = ConfigLoadState::Loaded;
+
+        app.apply_confirmed();
+        wait_for_pending_save(&mut app);
+
+        let text = std::fs::read_to_string(&config_path).unwrap();
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_file(config_path.with_extension("toml.bak"));
+        assert!(!text.contains("engine_on_ime_key"), "{text}");
+        assert!(!app.status.contains("撤去"), "{}", app.status);
+    }
+
+    fn loaded_app_with_file(text: &str) -> (SettingsApp, std::path::PathBuf) {
+        let config_path = std::env::temp_dir().join(format!(
+            "awase_test_base_{}_{}.toml",
+            std::process::id(),
+            unique_test_id()
+        ));
+        std::fs::write(&config_path, text).unwrap();
+        let config = awase::config::AppConfig::load(&config_path).unwrap();
+        let mut app = test_settings_app(config);
+        app.config_path = config_path.clone();
+        app.config_load_state = ConfigLoadState::Loaded;
+        (app, config_path)
+    }
+
+    /// ADR-201 決定3 (7): 保存の成功で `base` は保存した値（`to_save` の複製）になる。
+    #[test]
+    fn base_becomes_saved_value_on_success() {
+        let (mut app, path) = loaded_app_with_file("# keep\n[general]\n");
+        app.config.general.simultaneous_threshold_ms = 90;
+        app.apply_confirmed();
+        wait_for_pending_save(&mut app);
+        assert_eq!(app.base.general.simultaneous_threshold_ms, 90);
+        assert!(std::fs::read_to_string(&path).unwrap().contains("# keep"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ADR-201 決定3 (7): 保存の失敗では `base` を更新しない（次の保存で差分が残る）。
+    #[test]
+    fn base_is_not_updated_on_failed_save() {
+        let (mut app, path) = loaded_app_with_file("[general]\n");
+        let before = app.base.general.simultaneous_threshold_ms;
+        let dir = std::env::temp_dir().join(format!(
+            "awase_test_base_fail_{}_{}",
+            std::process::id(),
+            unique_test_id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        app.config_path = dir.clone();
+        app.config.general.simultaneous_threshold_ms = 90;
+        app.apply_confirmed();
+        wait_for_pending_save(&mut app);
+        assert!(app.status.contains("保存失敗"), "{}", app.status);
+        assert_eq!(app.base.general.simultaneous_threshold_ms, before);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ADR-201 決定3 (7): 保存中に GUI で行った編集が、成功後の `base` 更新で失われない
+    /// （`base` は保存した値であり `self.config` ではない。差分は次の保存で書かれる）。
+    #[test]
+    fn edit_made_during_save_survives_base_update() {
+        let (mut app, path) = loaded_app_with_file("[general]\n");
+        app.config.general.simultaneous_threshold_ms = 90;
+        app.apply_confirmed();
+        app.config.general.simultaneous_threshold_ms = 95; // 保存中の編集
+        wait_for_pending_save(&mut app);
+        assert_eq!(app.base.general.simultaneous_threshold_ms, 90);
+        assert_eq!(app.config.general.simultaneous_threshold_ms, 95);
+        app.apply_confirmed();
+        wait_for_pending_save(&mut app);
+        let saved = awase::config::AppConfig::load(&path).unwrap();
+        assert_eq!(saved.general.simultaneous_threshold_ms, 95);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ADR-201 決定3 (6): `Dangerous`（型が合わないが TOML としては正しいファイル）は、
+    /// `toml_edit` で読めても全体の書き出し（バックアップ後）になる。未知キーは残らない。
+    #[test]
+    fn dangerous_state_writes_whole_file_after_backup() {
+        let (mut app, path) = dangerous_app();
+        std::fs::write(
+            &path,
+            "[general]\nsimultaneous_threshold_ms = \"abc\"\nunknown_key = 1\n",
+        )
+        .unwrap();
+        app.apply_confirmed();
+        wait_for_pending_save(&mut app);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let bak = path.with_extension("toml.bak");
+        assert!(!text.contains("unknown_key"), "全体書き出しのはず: {text}");
+        assert!(bak.exists(), "バックアップを取る");
+        assert!(awase::config::AppConfig::load(&path).is_ok());
+        assert_eq!(app.config_load_state, ConfigLoadState::Loaded);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&bak);
+    }
+
+    /// ADR-201 決定3 (6): 保存直前に外部の書きかけ（TOML として壊れている）なら保存を中止し、
+    /// ファイルを上書きしない。`base` も更新しない。
+    #[test]
+    fn broken_file_at_save_time_aborts_without_overwrite() {
+        let (mut app, path) = loaded_app_with_file("[general]\n");
+        std::fs::write(&path, "[general\nhalf written").unwrap();
+        app.config.general.simultaneous_threshold_ms = 90;
+        app.apply_confirmed();
+        wait_for_pending_save(&mut app);
+        assert!(app.status.contains("保存失敗"), "{}", app.status);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[general\nhalf written"
+        );
+        assert_ne!(app.base.general.simultaneous_threshold_ms, 90);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// コードレビュー指摘の回帰テスト: `apply_confirmed()` は保存の完了を
@@ -4691,5 +7624,73 @@ mod layout_tab_repro {
             !app.show_dangerous_save_confirm,
             "cancel() はモーダルの前提(Dangerous)を解消するので、開いたままの確認モーダルも閉じるべき"
         );
+    }
+
+    #[test]
+    fn adr192_replacement_appends_bare_combos_when_key_is_a_thumb_key() {
+        // AppConfig::default()の親指キーは無変換/変換(標準NICOLA配置)。ADR-206以降は
+        // `*_solo_tap_ime_action`/`always_suppress`を書かず、bareの`keys.ime_on`/`ime_off`へ
+        // 既存の要素（既定のCtrl+無変換等）を消さずに追記する。
+        let mut config = awase::config::AppConfig::default();
+        let original_ime_on = config.keys.ime_on.clone();
+        let original_ime_off = config.keys.ime_off.clone();
+        let original_muhenkan_suppress = config.general.muhenkan_solo_tap_always_suppress;
+        let _snapshot = apply_adr192_recommended_replacement(&mut config);
+        for original in &original_ime_on {
+            assert!(config.keys.ime_on.contains(original), "既存の要素は残る");
+        }
+        for original in &original_ime_off {
+            assert!(config.keys.ime_off.contains(original), "既存の要素は残る");
+        }
+        assert!(config.keys.ime_on.iter().any(|k| k == "変換"));
+        assert!(config.keys.ime_off.iter().any(|k| k == "無変換"));
+        assert_eq!(config.general.muhenkan_solo_tap_ime_action, None);
+        assert_eq!(config.general.henkan_solo_tap_ime_action, None);
+        assert_eq!(
+            config.general.muhenkan_solo_tap_always_suppress, original_muhenkan_suppress,
+            "always_suppressは書き換えない"
+        );
+        // 旧設定が残っている場合の経路: 置き換えで旧設定は None に戻り、undo で元に戻る。
+        let mut legacy = awase::config::AppConfig::default();
+        legacy.general.muhenkan_solo_tap_ime_action =
+            Some(awase::config::ShadowImeActionConfig::Toggle);
+        legacy.general.henkan_solo_tap_ime_action = Some(awase::config::ShadowImeActionConfig::On);
+        let before = toml::to_string(&legacy).unwrap();
+        let snapshot = apply_adr192_recommended_replacement(&mut legacy);
+        assert_eq!(legacy.general.muhenkan_solo_tap_ime_action, None);
+        assert_eq!(legacy.general.henkan_solo_tap_ime_action, None);
+        undo_adr192_recommended_replacement(&mut legacy, snapshot);
+        assert_eq!(toml::to_string(&legacy).unwrap(), before);
+        // 2回適用しても重複しない。
+        let _ = apply_adr192_recommended_replacement(&mut config);
+        assert_eq!(
+            config.keys.ime_on.iter().filter(|k| *k == "変換").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn adr192_replacement_replaces_lists_when_key_is_not_a_thumb_key() {
+        // 無変換/変換を親指シフトに使っていない構成(USキーボード等)では従来どおりリストを置き換える。
+        let mut config = awase::config::AppConfig::default();
+        config.general.left_thumb_key = "Space".to_owned();
+        config.general.right_thumb_key = "Space".to_owned();
+        let _snapshot = apply_adr192_recommended_replacement(&mut config);
+        assert_eq!(config.keys.ime_on, ["変換"]);
+        assert_eq!(config.keys.ime_off, ["無変換"]);
+        assert_eq!(config.general.henkan_solo_tap_ime_action, None);
+        assert_eq!(config.general.muhenkan_solo_tap_ime_action, None);
+    }
+
+    #[test]
+    fn adr192_replacement_can_be_undone_exactly() {
+        let mut config = awase::config::AppConfig::default();
+        config.keys.ime_on = vec!["Ctrl+変換".into()];
+        config.keys.ime_off = vec!["Ctrl+無変換".into()];
+        config.general.muhenkan_solo_tap_always_suppress = false;
+        let before = toml::to_string(&config).unwrap();
+        let snapshot = apply_adr192_recommended_replacement(&mut config);
+        undo_adr192_recommended_replacement(&mut config, snapshot);
+        assert_eq!(toml::to_string(&config).unwrap(), before);
     }
 }

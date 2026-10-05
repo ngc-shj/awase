@@ -1,4 +1,19 @@
+---
+id: ADR-053
+title: |-
+  StepCoro — タイマー駆動コルーチンによる FSM チェーン置換
+status: |-
+  実装済み(一部撤去、2026-10-04 確認)。StepCoro は crates/timed-fsm に現存、GjiWarmupCoro・TsfProbeCoro 等は現存。SacrificialWarmupCoro は d4956490 で撤去。旧: 採用済み
+related_adr:
+  - "ADR-042"
+  - "ADR-047"
+  - "ADR-048"
+  - "ADR-051"
+---
+
 # ADR-053: StepCoro — タイマー駆動コルーチンによる FSM チェーン置換
+
+> 状態更新(2026-10-04): 実装済み(一部撤去、2026-10-04 確認)。StepCoro は crates/timed-fsm に現存、GjiWarmupCoro・TsfProbeCoro 等は現存。SacrificialWarmupCoro は d4956490 で撤去
 
 ## ステータス
 

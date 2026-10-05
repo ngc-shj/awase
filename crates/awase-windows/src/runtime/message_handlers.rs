@@ -24,8 +24,9 @@ use crate::tray;
 use crate::vk::VkCodeExt;
 use crate::win32::post_to_main_thread;
 use crate::{
-    with_app, with_app_ref, Runtime, TIMER_GJI_LONG_IDLE, TIMER_HOOK_WATCHDOG, TIMER_IME_REFRESH,
-    TIMER_OUTPUT_GUARD, TIMER_POWER_RESUME, TIMER_TSF_GATE, TIMER_TSF_PROBE, WM_EXECUTE_EFFECTS,
+    with_app, with_app_ref, Runtime, TIMER_GJI_LONG_IDLE, TIMER_HOOK_WATCHDOG,
+    TIMER_HOOK_WATCHDOG_CANARY_CHECK, TIMER_IME_REFRESH, TIMER_OUTPUT_GUARD, TIMER_POWER_RESUME,
+    TIMER_TSF_GATE, TIMER_TSF_PROBE, WM_EXECUTE_EFFECTS,
 };
 use awase::platform::ImeOpenOutcome;
 use awase::types::{ContextChange, VkCode};
@@ -38,7 +39,7 @@ fn recover_pending_drain_request() {
         return;
     }
     if DRAIN_RERUN_PENDING.swap(false, Ordering::AcqRel) {
-        log::debug!("[drain] recovering deferred drain request");
+        tracing::debug!("[drain] recovering deferred drain request");
         post_to_main_thread(crate::tsf::probe_bridge::WM_DRAIN_OUTPUT_QUEUE);
     }
 }
@@ -80,9 +81,28 @@ fn notify_if_solo_off_triggered(app: &mut Runtime) {
     if app.engine.take_solo_off_notification() {
         app.platform.tray.show_balloon(
             "awase",
-            "無変換キーの連打でエンジンを緊急停止しました。\n\
+            "無変換キーの連打でローマ字入力に緊急切替しました。\n\
              戻すには Ctrl+Shift+変換 を押してください。",
         );
+    }
+}
+
+/// OS かな入力ロック警告のトレイ表示を、投函時点の値ではなくディスパッチ時点の
+/// `KanaLockHysteresis::warned()` へ同期する。再入で複数回 repost されても
+/// 常に最新の値へ収束する（冪等）。
+pub(crate) fn handle_wm_kana_lock_warning_changed(app: &mut Runtime) {
+    app.platform
+        .tray
+        .set_kana_lock_warned(app.kana_lock_hysteresis.warned());
+}
+
+/// hook 側で採取した IME-mode 診断を journal へ吸い上げる。
+pub(crate) fn handle_wm_hook_ime_mode_diagnostic(app: &mut Runtime) {
+    for record in hook::drain_hook_ime_mode_diagnostics() {
+        app.platform_state
+            .ime
+            .journal
+            .record(crate::journal::JournalEntry::HookImeModeDiagnostic { record });
     }
 }
 
@@ -102,7 +122,7 @@ pub(crate) fn begin_key_batch(app: &mut Runtime) {
         let decision = app
             .engine
             .on_command(awase::engine::EngineCommand::FocusChanged, &ctx);
-        app.execute_decision_suppressed(decision);
+        app.execute_decision(decision);
     }
 }
 
@@ -133,6 +153,34 @@ pub(crate) fn deliver_key_event(
         app.platform_state.gate.last_hook_activity_ms = hook::current_tick_ms();
     }
 
+    let is_key_down = matches!(event.event_type, awase::types::KeyEventType::KeyDown);
+
+    // ── `[[keymap]]` latch チェック（ADR-114 決定2 ステップ1、最優先）──
+    // `Nested`/`NonText` の早期returnより前、`origin`/`focus_kind` を問わず
+    // 必ず実行する。片方だけを先に動かすと、latch が残った状態でこの vk の
+    // KeyDown/KeyUp のどちらか一方だけが先に素通りしてしまう Down/Up 非対称
+    // （OS 側で「押しっぱなし」に見えるイベント）が生じるため、KeyUp 回収と
+    // KeyDown の自動リピート抑制の両方をここに置く。
+    if app
+        .platform_state
+        .keymap
+        .keymap_latch
+        .is_latched(event.vk_code)
+    {
+        if is_key_down {
+            // 自動リピート抑制: find_match を呼ばず黙って consume する
+            // （target_vk は再送しない）。HOOK_KEYS overflow で latch が
+            // stale に残っていた場合でも、この分岐に例外を設けない
+            // （latch 漏れ対策、T5 参照）。
+            return KeyDelivery::Consumed;
+        }
+        app.platform_state
+            .keymap
+            .keymap_latch
+            .release(event.vk_code);
+        return KeyDelivery::Consumed;
+    }
+
     if matches!(origin, KeyOrigin::Hook(PumpContext::Nested)) {
         app.executor.enqueue_reinject(event);
         return KeyDelivery::Reinjected;
@@ -153,6 +201,24 @@ pub(crate) fn deliver_key_event(
         return KeyDelivery::Reinjected;
     }
 
+    // ── `[[keymap]]` KeyDown 新規照合（ADR-114 決定2 ステップ2）──
+    // NonText パススルーの後・`[[post_bypass]]` 消費の前。ステップ1 で
+    // latch 済みと判定された vk はここに到達しない（既に consume 済み）ため、
+    // ここで扱うのは「まだ latch されていない vk の新規 KeyDown」のみ。
+    // NICOLA エンジンには一切見せない（`Ctrl+I` の `I` が同時打鍵判定に
+    // 巻き込まれるのを防ぐ）ため `[[post_bypass]]` より先に評価する。
+    //
+    // 既知の限界（v1 スコープ）: `FocusKind::NonText` では一切効かない
+    // （このチェックが NonText 早期returnの後にあるため）。`[[keymap]]` の
+    // 送信（SendInput）が「NonText では awase は一切手を出さない」という
+    // 既存の不変条件を破ることになる副作用の監査コストを避けるための
+    // 意図的な v1 判断。
+    if is_key_down {
+        if let Some(delivery) = consume_keymap_match(app, event) {
+            return delivery;
+        }
+    }
+
     // ── Post-bypass passthrough（Ctrl+J 等 tmux prefix 直後のコマンドキー）──
     // Ctrl+key bypass の直後に non-Ctrl 非修飾キーが来た場合、NICOLA エンジンを
     // スキップして直接 passthrough する（1 キー分のみ）。
@@ -165,7 +231,6 @@ pub(crate) fn deliver_key_event(
     // 対象キー（無変換/変換系）と衝突する可能性は低い。NonText のように
     // 「フォーカス分類の誤判定で常時パススルーになる」広いガードとは性質が
     // 異なるため、ここは従来どおり適用する。
-    let is_key_down = matches!(event.event_type, awase::types::KeyEventType::KeyDown);
     if let Some(delivery) = consume_post_bypass(app, event, is_key_down) {
         return delivery;
     }
@@ -187,6 +252,72 @@ pub(crate) fn deliver_key_event(
     } else {
         KeyDelivery::Consumed
     }
+}
+
+/// `[[keymap]]` の KeyDown 新規照合（ADR-114 決定2 ステップ2）。マッチしなければ
+/// `None` を返し、呼び出し元は通常の早期return分岐（`[[post_bypass]]` 等）へ
+/// 進む。マッチすれば必ず `Some(KeyDelivery::Consumed)` を返す。
+///
+/// `deliver_key_event` 本体から分離することで cognitive complexity を抑える
+/// （振る舞いは変更なし、`cancel_composition_and_arm_post_bypass_on_ctrl` と
+/// 同じ理由）。
+fn consume_keymap_match(
+    app: &mut Runtime,
+    event: awase::types::RawKeyEvent,
+) -> Option<KeyDelivery> {
+    let matched = app
+        .platform_state
+        .keymap
+        .active_keymaps
+        .find_match(event.vk_code, event.modifier_snapshot)?;
+    app.platform_state.keymap.keymap_latch.latch(event.vk_code);
+    if !matched.is_empty() {
+        // IME composition（GJI/MS-IME 問わず）が表示中に target_vk を
+        // そのまま SendInput すると、IME が先にそれを自身のショートカットとして
+        // 横取りしてしまう（`cancel_composition_and_arm_post_bypass_on_ctrl` が
+        // Ctrl+key パススルー時に同じ問題へ対処しているのと同型の問題、ADR-114
+        // 実装レビューで発見）。送信前に composition をキャンセルする。
+        //
+        // `[[keymap]]` の `from` は修飾子必須ではない（decision5 は Ctrl/Shift を
+        // 主キーとしてのみ禁止し、修飾子として使うことは許可している）ため、
+        // composition 中に無修飾キー1つでも `[[keymap]]` にマッチしうる——
+        // このキャンセルは未確定文字列を破棄する（`cancel_ime_composition` が
+        // 送る `CPS_CANCEL` の効果）。決定3で明記済み（ADR-114 実装レビュー
+        // MA-2、意図的な仕様として受け入れる）。
+        //
+        // `is_composition_warm_in_tsf()`（GJI 専用の `gji_candidate_visible`）
+        // だけでは MS-IME の composition を検出できない（ADR-114 実装レビュー
+        // MA-1）ため、IME 非依存の `ime_composition_active_now()`
+        // （`build_input_context` 等が使う既存の唯一の一般シグナル）を主に使い、
+        // GJI 固有の検出タイミングの違いをカバーするため両方を OR で見る。
+        if crate::tsf::observer::ime_composition_active_now()
+            || app.platform.is_composition_warm_in_tsf()
+        {
+            cancel_composition(app, crate::output::ColdReason::KeymapTarget);
+        }
+        // SAFETY: メインスレッド（エンジンスレッド）から呼ばれる。
+        unsafe {
+            crate::output::held_modifiers::send_keymap_target(
+                event.modifier_snapshot.ctrl,
+                event.modifier_snapshot.shift,
+                &matched,
+            );
+        }
+    }
+    Some(KeyDelivery::Consumed)
+}
+
+/// IME composition をキャンセルする（`cancel_ime_composition` の呼び出し +
+/// 内部状態更新をセットで行う唯一の場所）。呼び出し元が「キャンセルすべきか」を
+/// 判定し、必要な場合にのみ呼ぶこと（`consume_keymap_match`/
+/// `cancel_composition_and_arm_post_bypass_on_ctrl` の両方から呼ぶ、ADR-114
+/// 実装レビュー指摘）。`reason` は journal・診断用（実装レビュー m-2、呼び出し元の
+/// 文脈を正しく記録する——`[[keymap]]` 起因のキャンセルを `CtrlKeyBypass` として
+/// 記録すると cold-start の連鎖を追う際に誤誘導する）。
+fn cancel_composition(app: &mut Runtime, reason: crate::output::ColdReason) {
+    // SAFETY: メインスレッド（エンジンスレッド）から呼ばれる。
+    unsafe { super::cancel_ime_composition() };
+    app.platform.on_composition_cancel(reason);
 }
 
 /// `CallbackResult::PassThrough` 確定時、Ctrl+非修飾キーによる bypass の直前に
@@ -216,16 +347,17 @@ fn cancel_composition_and_arm_post_bypass_on_ctrl(
     {
         return;
     }
+    // m-1（ADR-114 実装レビュー）: `is_composition_warm_in_tsf()` を1回だけ
+    // 読み、ログと分岐判定の両方に同じ値を使う（`Ordering::Relaxed` の
+    // atomic 読み取りのため、2回呼ぶと値が食い違いログと実際の動作が矛盾しうる）。
     let candidate_visible = app.platform.is_composition_warm_in_tsf();
-    log::debug!(
+    tracing::debug!(
         "[ctrl-check] vk=0x{:02X} candidate_visible={candidate_visible}",
         event.vk_code
     );
     if candidate_visible {
-        // SAFETY: メインスレッドから呼ぶ。
-        unsafe { super::cancel_ime_composition() };
-        app.platform.on_ctrl_bypass_composition_cancel();
-        log::debug!(
+        cancel_composition(app, crate::output::ColdReason::CtrlKeyBypass);
+        tracing::debug!(
             "[ctrl-bypass] IME composition cancelled (vk=0x{:02X})",
             event.vk_code
         );
@@ -252,11 +384,11 @@ fn consume_post_bypass(
     match app.platform_state.gate.post_bypass.peek(now) {
         ScopeCheck::NotArmed => None,
         ScopeCheck::Expired => {
-            log::debug!("[post-bypass] expired: 前景が変わった → latch 失効");
+            tracing::debug!("[post-bypass] expired: 前景が変わった → latch 失効");
             None
         }
         ScopeCheck::Live(arm) => {
-            log::debug!(
+            tracing::debug!(
                 "[post-bypass] live: armed_focus_epoch={} current_focus_epoch={} \
                  (診断専用、判定には使わない)",
                 arm.armed_focus_epoch,
@@ -275,7 +407,7 @@ fn consume_post_bypass(
                 }
                 PostBypassKey::ConsumeAndPassthrough => {
                     app.platform_state.gate.post_bypass.disarm();
-                    log::debug!(
+                    tracing::debug!(
                         "[post-bypass] consumed: vk=0x{:02X} → direct passthrough (NICOLA skipped)",
                         event.vk_code
                     );
@@ -314,11 +446,11 @@ fn arm_post_bypass_if_matches(app: &mut Runtime, vk: VkCode) {
                 armed_focus_epoch: app.platform_state.focus.focus_epoch,
             },
         );
-        log::debug!(
+        tracing::debug!(
             "[ctrl-bypass] post_bypass armed (proc={proc:?} class={cls:?} scope={scope:?})"
         );
     } else {
-        log::debug!("[ctrl-bypass] post_bypass not armed: foreground scope unavailable");
+        tracing::debug!("[ctrl-bypass] post_bypass not armed: foreground scope unavailable");
     }
 }
 
@@ -351,12 +483,12 @@ pub(crate) unsafe fn handle_wm_timer(
             {
                 app.process_deferred_keys();
             }
-            // async タスクをスポーン（with_app を解放してから fetch）
+            // async タスクをスポーン（with_app を解放してから fetch）。
             app.spawn_ime_refresh();
         }
         Some(id) if id == TIMER_POWER_RESUME => {
             app.platform.timer.kill(TIMER_POWER_RESUME);
-            log::info!("Power resume recovery");
+            tracing::info!("Power resume recovery");
             app.invalidate_engine_context(ContextChange::InputLanguageChanged);
             app.platform_state.focus.focus_kind = FocusKind::Undetermined;
             app.schedule_ime_refresh(500);
@@ -364,7 +496,7 @@ pub(crate) unsafe fn handle_wm_timer(
         Some(id) if id == TIMER_OUTPUT_GUARD => {
             let outcomes = app
                 .executor
-                .on_output_guard_timer(&mut app.platform, &app.platform_state.ime);
+                .on_output_guard_timer(&mut app.platform, &mut app.platform_state.ime);
             app.dispatch_outcomes(outcomes);
         }
         Some(id) if id == TIMER_TSF_PROBE => {
@@ -378,12 +510,16 @@ pub(crate) unsafe fn handle_wm_timer(
             for entry in app.platform.drain_journal_entries() {
                 app.platform_state.ime.journal.absorb(entry);
             }
+            // ADR-227: give-up と同じ tick で、外部クローズの読み直し(追随の判定)を始める。
+            if let Some(evidence) = app.platform.take_giveup_evidence() {
+                app.ir_follow_after_literal_giveup(evidence);
+            }
         }
         Some(id) if id == TIMER_TSF_GATE => {
             app.platform.timer.kill(TIMER_TSF_GATE);
             let held = app.platform.on_tsf_warmup_timeout();
             if !held.is_empty() {
-                log::debug!(
+                tracing::debug!(
                     "[tsf-gate-timeout] draining {} held keys via INPUT_DEFER",
                     held.len()
                 );
@@ -392,7 +528,7 @@ pub(crate) unsafe fn handle_wm_timer(
         }
         Some(id) if id == crate::TIMER_IME_OFF_RESCUE => {
             if let Some(pending_event) = app.take_ime_off_rescue_pending() {
-                log::info!(
+                tracing::info!(
                     "[ime-off-rescue] 50ms timer expired → 保留 vk=0x{:02X} を IME OFF として発火",
                     pending_event.vk_code
                 );
@@ -425,7 +561,7 @@ pub(crate) unsafe fn handle_wm_timer(
             app.platform.timer.kill(crate::TIMER_FOCUS_RESYNC);
             let generation = crate::focus_resync::FOCUS_RESYNC.current_generation();
             if crate::focus_resync::FOCUS_RESYNC.open_if_current(generation) {
-                log::debug!(
+                tracing::debug!(
                     "[focus-resync] ハード期限 {}ms 到達 → defer 中のキーを drain",
                     crate::tuning::FOCUS_RESYNC_DEADLINE_MS
                 );
@@ -441,15 +577,95 @@ pub(crate) unsafe fn handle_wm_timer(
             let now = hook::current_tick_ms();
             let stale_ms = now.saturating_sub(last_activity);
             if stale_ms > 5000 {
-                log::warn!("Hook watchdog: no activity for {stale_ms}ms");
+                // PR #349コードレビュー指摘: 「連続してフック生存を確認できた
+                // tick数」のカウントをここで途切れさせる（flicker耐性、
+                // `note_hook_watchdog_tick_alive`のdoc参照）。
+                app.note_hook_watchdog_tick_not_alive();
+                // issue #165（D&D不可・印刷不能、Geminiの「キーフックのフック落ち」説）
+                // の切り分け用診断。OS全体では直近に入力があったのに awase のフックだけ
+                // 古いままなら「フックにイベントが届いていない」疑いが強まる。OS側も
+                // 無操作なら、単にユーザーがキー/マウス操作をしていないだけと判断できる。
+                //
+                // 2026-09-28追記: `crates/e2e-uwp-inputsite-probe`によるCI実証実験
+                // （PR #347）で、他プロセスの`WH_KEYBOARD_LL`が`CallNextHookEx`を
+                // 呼ばずに握りつぶすとこのシグネチャが確実に発火し、その間の打鍵は
+                // 遅延ではなく awase の処理系に一切届かず完全消失することを確認した。
+                // hook_starved 側（下記）では`evaluate_hook_watchdog`（環境ガード
+                // 付き自己修復、opus-adversarial-consult round1対応）を呼ぶように
+                // なった——以前の「挙動は変えない、ログ文言の拡充のみ」という
+                // コメントはこの変更でもう正確ではない。
+                match hook::os_idle_ms(now) {
+                    Some(os_idle_ms) => {
+                        let hook_starved = os_idle_ms < 5000;
+                        tracing::warn!(
+                            "Hook watchdog: no activity for {stale_ms}ms (OS全体の最終入力は\
+                             {os_idle_ms}ms前{})",
+                            if hook_starved {
+                                " → フックにイベントが届いていない疑い(issue #165)"
+                            } else {
+                                "、OSも無操作のため単なるアイドルの可能性が高い"
+                            }
+                        );
+                        if hook_starved {
+                            // SAFETY: WM_TIMER ハンドラはメッセージループスレッド上で実行される。
+                            unsafe {
+                                sample_watchdog_kana_lock_edge(app, stale_ms, os_idle_ms);
+                            }
+                            // issue #165 自己修復（PR #347参照、opus-adversarial-consult
+                            // round1・round2対応）。まずカナリア（自己注入の無害な
+                            // キー）を送り、`CANARY_CONFIRM_MS`後に自分のフックへ
+                            // 届いたかで「本物のhook_starved」か「マウスのみの
+                            // 誤検知」かを見分けてから初めて再インストールする
+                            // （`confirm_hook_watchdog_canary`）。再インストールは
+                            // 旧フックを解除して新規installし直し、フックチェーンの
+                            // 先頭（LIFOで最後に登録したものが最初に呼ばれる）へ
+                            // 戻る。失った打鍵は戻せないが、同じ停止が続くのを防ぐ。
+                            // 昇格ウィンドウ・ロック中・secure desktop中・relayソフト
+                            // のフォアグラウンド中、バックオフ待機中、thrash上限
+                            // 超過はスキップする（`state::hook_watchdog::decide`参照）。
+                            let action = app.evaluate_hook_watchdog(now);
+                            // opus round2 n3: `SendCanary`/`ReinstallWithoutCanary`は
+                            // どちらも実際に自己修復へ進む（前者はカナリア確認後、
+                            // 後者はフック不在時に直接）ため、それ以外の
+                            // バリアントだけを「スキップ」としてログに出す。
+                            if !matches!(
+                                action,
+                                crate::state::hook_watchdog::HookWatchdogAction::SendCanary
+                                    | crate::state::hook_watchdog::HookWatchdogAction::ReinstallWithoutCanary
+                            ) {
+                                tracing::debug!("[hook-watchdog] 自己修復をスキップ: {action:?}");
+                            }
+                        }
+                    }
+                    None => {
+                        tracing::warn!(
+                            "Hook watchdog: no activity for {stale_ms}ms \
+                             (GetLastInputInfo取得失敗)"
+                        );
+                    }
+                }
             } else {
-                log::trace!("Hook watchdog: last activity {stale_ms}ms ago");
+                tracing::trace!("Hook watchdog: last activity {stale_ms}ms ago");
+                // hook が生存確認できた。`state::hook_watchdog::
+                // RECOVERY_CONFIRM_TICKS`連続でこれが起きて初めて、現在の
+                // hook_starved episodeが終わった（episode境界）とみなし、
+                // 次に検知したときのバックオフ/thrash履歴の起点をリセット
+                // する（round2 B1(ii)、PR #349コードレビュー指摘でflicker
+                // 耐性を追加）。
+                app.note_hook_watchdog_tick_alive();
             }
             crate::hook_channel::recover_stuck_wake_if_needed();
             recover_pending_drain_request();
         }
+        Some(id) if id == TIMER_HOOK_WATCHDOG_CANARY_CHECK => {
+            // 一発タイマー（issue #165自己修復 round2 B1(i)）。`TIMER_TSF_GATE`/
+            // `TIMER_POWER_RESUME`と同じ流儀で冒頭に自ら`kill`する。
+            app.platform.timer.kill(TIMER_HOOK_WATCHDOG_CANARY_CHECK);
+            let now = hook::current_tick_ms();
+            app.confirm_hook_watchdog_canary(now);
+        }
         Some(timer_id) => {
-            log::debug!("WM_TIMER fired: logical_id={timer_id}");
+            tracing::debug!("WM_TIMER fired: logical_id={timer_id}");
             // OUTPUT_GATE active 中はエンジンタイマー（TIMER_PENDING/TIMER_SPECULATIVE）を
             // drain 後に延期する。
             // OUTPUT_GATE active 期間中、後続キー（親指キー等）は INPUT_DEFER にキューされる。
@@ -472,7 +688,7 @@ pub(crate) unsafe fn handle_wm_timer(
             // ここで gate 判定を拡張するだけで両ゲートに対して正しく機能する。
             if crate::OUTPUT_GATE.is_active() || crate::focus_resync::FOCUS_RESYNC.is_gate_active()
             {
-                log::debug!(
+                tracing::debug!(
                     "[engine-timer] OUTPUT_GATE/FOCUS_RESYNC gate active → logical_id={timer_id} (os_id={wparam}) を drain 後に延期"
                 );
                 app.ime_coordinator
@@ -486,10 +702,6 @@ pub(crate) unsafe fn handle_wm_timer(
             // （timeout_pending_thumb 等）でもここを直さないとなりすましが機能しない。
             if hook::is_alt_impersonation_active() {
                 modifiers.alt = false;
-            }
-            // ADR-110 決定5 r3追記（`Runtime::build_ctx` の同様の補正参照）。
-            if hook::key_remap_ctrl_effectively_held() {
-                modifiers.ctrl = true;
             }
             let (left_thumb_down, right_thumb_down) = hook::thumb_down_timestamps();
             let ctx = super::build_input_context(
@@ -524,11 +736,40 @@ pub(crate) unsafe fn handle_wm_timer(
     recover_pending_drain_request();
 }
 
+/// hook watchdog が「フック詰まり」を検知した瞬間、OS のかな入力ロック状態を
+/// 受動サンプルする（issue #137/BUG-106追補5）。値が前回サンプルから変化した
+/// ときだけ1行ログする。belief には一切触れない（`Runtime::watchdog_kana_edge`
+/// への読み書きのみ）。`kana_lock_hysteresis`（1打鍵1サンプル前提で較正済み）
+/// とは完全に独立させること——混ぜると無打鍵でもトレイ警告が誤発火する。
+///
+/// # Safety
+/// `read_kana_lock`/`foreground_class_name` はメッセージループスレッド上から
+/// 呼ぶこと（`TIMER_HOOK_WATCHDOG` 分岐、`handle_wm_timer` 経由）。
+unsafe fn sample_watchdog_kana_lock_edge(app: &mut Runtime, stale_ms: u64, os_idle_ms: u64) {
+    let reading = unsafe { crate::observer::kana_lock::read_kana_lock() };
+    let previous = app.watchdog_kana_edge;
+    if previous == Some(reading) {
+        return;
+    }
+    // fg_class は今読んだ新鮮な値、process_name() は FocusTracker の追跡値で
+    // 出所が異なるが、is_own_ui_window は OR 判定のタグ付け（gateではない）
+    // なので、ずれても過剰タグ方向にしか効かず実害はない（新しい syscall を
+    // 足してまで揃える必要はない）。
+    let fg_class = unsafe { crate::observer::kana_lock::foreground_class_name() };
+    let own_ui =
+        crate::focus::class_names::is_own_ui_window(&fg_class, app.platform.focus.process_name());
+    tracing::warn!(
+        "Hook watchdog kana lock edge: {previous:?} → {reading:?} \
+         (fg_class={fg_class:?}, own_ui={own_ui}, stale_ms={stale_ms}, os_idle_ms={os_idle_ms})"
+    );
+    app.watchdog_kana_edge = Some(reading);
+}
+
 /// WM_EXECUTE_EFFECTS ハンドラ
 pub(crate) unsafe fn handle_wm_execute_effects(app: &mut Runtime) {
     let outcomes = app
         .executor
-        .drain_deferred(&mut app.platform, &app.platform_state.ime);
+        .drain_deferred(&mut app.platform, &mut app.platform_state.ime);
     app.dispatch_outcomes(outcomes);
     // H-4-a: Output が send_keys 中に積んだ RuntimeRequest を一括処理する。
     app.drain_runtime_requests();
@@ -549,10 +790,20 @@ pub(crate) unsafe fn handle_wm_execute_effects(app: &mut Runtime) {
 const fn encode_outcome(outcome: ImeOpenOutcome) -> isize {
     match outcome {
         ImeOpenOutcome::Applied => 0,
-        ImeOpenOutcome::FallbackSent => 1,
         ImeOpenOutcome::AlreadyMatched => 2,
         ImeOpenOutcome::Failed => 3,
         ImeOpenOutcome::UnsafeToToggle => 4,
+        ImeOpenOutcome::NotOwned => 5,
+        // ADR-167: async ImmCross の成功（`imm_cross_write`）は常にこの経路
+        // （`run_open_chain_async` → `post_async_ime_apply_complete` →
+        // このWM wire）を通るため、ここに追加しないと
+        // `on_ime_applied_inner`/`should_send_accompanying_warmup`が新
+        // variantを一度も観測できず、ADR-167が対象とするStandardプロファイル
+        // ×ImmCross失敗フォールバック時の随伴warmup重複が直らない
+        // （opus-adversarial-consult指摘）。
+        ImeOpenOutcome::AppliedWithoutSendInput => 6,
+        // ADR-090 A-2: `issue_open_warrant()` が授権を発行しなかった。
+        ImeOpenOutcome::Unwarranted => 7,
     }
 }
 
@@ -560,12 +811,15 @@ const fn encode_outcome(outcome: ImeOpenOutcome) -> isize {
 fn decode_outcome(value: isize) -> ImeOpenOutcome {
     match value {
         0 => ImeOpenOutcome::Applied,
-        1 => ImeOpenOutcome::FallbackSent,
+        // Code 1 is reserved for a removed outcome; keep the wire gap.
         2 => ImeOpenOutcome::AlreadyMatched,
         3 => ImeOpenOutcome::Failed,
         4 => ImeOpenOutcome::UnsafeToToggle,
+        5 => ImeOpenOutcome::NotOwned,
+        6 => ImeOpenOutcome::AppliedWithoutSendInput,
+        7 => ImeOpenOutcome::Unwarranted,
         other => {
-            log::error!("WM_ASYNC_IME_APPLY_COMPLETE: unknown outcome code {other}");
+            tracing::error!("WM_ASYNC_IME_APPLY_COMPLETE: unknown outcome code {other}");
             ImeOpenOutcome::UnsafeToToggle
         }
     }
@@ -579,9 +833,8 @@ fn decode_outcome(value: isize) -> ImeOpenOutcome {
 /// `reason` は wparam の bit1 にエンコードする（BUG-34 横展開 D、2026-08-19）。
 /// 以前はこの経路の唯一の生成元が `executor.rs::dispatch_ime_set_open`
 /// （常に `EngineDecision`）だったため固定値にしていたが、
-/// `try_force_on_bootstrap`（`Bootstrap`）が2つ目の生成元として加わったため、
-/// 呼び出し元が申告した reason を実際に運ぶ必要がある。**`EngineDecision` と
-/// `Bootstrap` の2値のみエンコードする**（1 bit）。この async 経路に将来
+/// `try_force_on_bootstrap`（`Bootstrap`、`621bf93c` で撤去済み）が2つ目の生成元として加わったため、
+/// 呼び出し元が申告した reason を実際に運ぶ必要がある。**`EngineDecision`・`Bootstrap`・`ShadowToggle` の3値のみエンコードする**（2 bit、ADR-213）。この async 経路に将来
 /// 別の `OpenApplyReason` を渡す呼び出し元を追加する場合は、この関数と
 /// `decode_reason` のビット幅を拡張すること（さもないと未知の reason が
 /// 静かに `EngineDecision` に丸められる）。
@@ -596,11 +849,7 @@ pub(crate) fn post_async_ime_apply_complete(
     // （旧 `generation.unwrap_or(0)` は `next_seq()` 由来の `generation == 0`
     // が bootstrap 経路で実際に払い出されうる番兵衝突を抱えていた）。
     let generation = crate::state::ApplyGeneration::to_wire(generation);
-    let reason_bit = usize::from(matches!(
-        reason,
-        crate::state::ime_event::OpenApplyReason::Bootstrap
-    ));
-    let wparam = ((generation as usize) << 2) | (reason_bit << 1) | usize::from(open);
+    let wparam = encode_apply_wparam(generation, reason, open);
     // エンジンスレッド上（win32-async の spawn_local タスク完了）から呼ばれるため
     // ログ出力してよい。post が失敗すると ImmCross の非同期 SetOpen 完了通知が
     // 握りつぶされ、pending generation の IME open belief が未解決のまま残る
@@ -612,7 +861,7 @@ pub(crate) fn post_async_ime_apply_complete(
         wparam,
         encode_outcome(outcome),
     ) {
-        log::warn!(
+        tracing::warn!(
             "[async-ime-apply] WM_ASYNC_IME_APPLY_COMPLETE の post に失敗しました \
              (open={open} generation={generation} reason={reason:?}) — \
              このIME適用完了通知は失われ、pending generation が未解決のまま残ります"
@@ -620,12 +869,35 @@ pub(crate) fn post_async_ime_apply_complete(
     }
 }
 
+/// `WM_ASYNC_IME_APPLY_COMPLETE` の wparam を組み立てる（下位 bit: open、次の 2 bit: reason、残り: generation）。
+fn encode_apply_wparam(
+    generation: u64,
+    reason: crate::state::ime_event::OpenApplyReason,
+    open: bool,
+) -> usize {
+    let reason_code = match reason {
+        crate::state::ime_event::OpenApplyReason::Bootstrap => 1usize,
+        // ADR-213: shadow toggle の ImmCross async 完了も運ぶ。
+        crate::state::ime_event::OpenApplyReason::ShadowToggle => 2,
+        crate::state::ime_event::OpenApplyReason::EngineDecision => 0,
+        // この async 経路に渡す呼び出し元が無い reason。渡すなら上のビット幅を拡張すること。
+        other => {
+            debug_assert!(
+                false,
+                "未対応の OpenApplyReason を async 完了に渡した: {other:?}"
+            );
+            0
+        }
+    };
+    ((generation as usize) << 3) | (reason_code << 1) | usize::from(open)
+}
+
 /// [`post_async_ime_apply_complete`] の reason bit の逆変換。
 fn decode_reason(wparam: usize) -> crate::state::ime_event::OpenApplyReason {
-    if (wparam >> 1) & 1 != 0 {
-        crate::state::ime_event::OpenApplyReason::Bootstrap
-    } else {
-        crate::state::ime_event::OpenApplyReason::EngineDecision
+    match (wparam >> 1) & 3 {
+        1 => crate::state::ime_event::OpenApplyReason::Bootstrap,
+        2 => crate::state::ime_event::OpenApplyReason::ShadowToggle,
+        _ => crate::state::ime_event::OpenApplyReason::EngineDecision,
     }
 }
 
@@ -636,45 +908,12 @@ fn decode_reason(wparam: usize) -> crate::state::ime_event::OpenApplyReason {
 pub(crate) fn handle_wm_async_ime_apply_complete(app: &mut Runtime, wparam: usize, lparam: isize) {
     let open = (wparam & 1) != 0;
     let reason = decode_reason(wparam);
-    let generation = crate::state::ApplyGeneration::from_wire((wparam >> 2) as u64);
+    let generation = crate::state::ApplyGeneration::from_wire((wparam >> 3) as u64);
     let outcome = decode_outcome(lparam);
     if outcome == ImeOpenOutcome::Failed {
-        log::warn!("apply_ime_open({open}) failed (async)");
+        tracing::warn!("apply_ime_open({open}) failed (async)");
     }
     app.on_ime_apply_complete(open, outcome, generation, reason);
-}
-
-/// WM_GJI_CHARSET_FN_KEY_ACTIVATED ハンドラ。
-///
-/// `gji_charset_popup` がバックグラウンドスレッドで `config1.db` への書き込みに
-/// 成功した直後に `post_to_main_thread_with` で投函する（`wparam` に
-/// 有効化する `VkCode` の生値を積む）。メインスレッドに戻ってから
-/// `with_app` 経由で反映することで、`SingleThreadCell`（`RUNTIME`）への
-/// クロススレッドアクセスを避ける。
-pub(crate) fn handle_wm_gji_charset_fn_key_activated(app: &mut Runtime, wparam: usize) {
-    let Ok(raw) = u16::try_from(wparam) else {
-        log::warn!(
-            "[gji-charset-popup] WM_GJI_CHARSET_FN_KEY_ACTIVATED: wparam が VkCode 範囲外: {wparam}"
-        );
-        return;
-    };
-    let vk = VkCode(raw);
-    log::info!("[gji-charset-popup] config1.db 書き込み成功をメインスレッドで反映: {vk:?}");
-    app.set_muhenkan_dedicated_fn_key_auto(Some(vk));
-}
-
-/// WM_GJI_REINIT_RETRY_COMPLETE ハンドラ。
-pub(crate) fn handle_wm_gji_reinit_retry_complete(app: &mut Runtime, wparam: usize, lparam: isize) {
-    let Ok(token) = u32::try_from(wparam) else {
-        log::warn!("[chrome-reinit-retry] completion token out of range: {wparam}");
-        return;
-    };
-    let Some(status) = crate::output::GjiReinitPollStatus::decode(lparam) else {
-        log::warn!("[chrome-reinit-retry] unknown completion status: {lparam}");
-        return;
-    };
-    app.platform.complete_gji_reinit_retry(token, status);
-    app.drain_runtime_requests();
 }
 
 /// WM_PANIC_RESET ハンドラ
@@ -694,23 +933,15 @@ pub(crate) unsafe fn handle_wm_panic_reset(app: &mut Runtime) {
 ///
 /// `Engine` 側は `special_keys.ime_toggle`（手動設定）の内容に関わらず常に
 /// `set_ime_toggle_auto_keys` の結果も併用する（2026-08-16 ユーザー判断、
-/// 明示 ∪ 自動）ため、ここでは無条件に呼んでよい。`set_muhenkan/henkan_delegate_to_open_axis`は
-/// `muhenkan_solo_tap_dedicated_fn_key`（専用Fnキー）が設定されていれば
-/// `Engine`側でそちらが優先されるため、こちらも無条件に呼んでよい。
+/// 明示 ∪ 自動）ため、ここでは無条件に呼んでよい。
 pub(crate) fn sync_ime_toggle_auto_detect(app: &mut Runtime) {
     let toggle_assignment = crate::msime_key_assignment::read_toggle_assignment_from_registry();
-    log::info!("[msime-keyassign] toggle assignment: {toggle_assignment:?}");
+    tracing::info!("[msime-keyassign] toggle assignment: {toggle_assignment:?}");
     let skip_shift_space = app.space_is_thumb_key();
     app.engine
         .set_ime_toggle_auto_keys(toggle_assignment.to_combos(skip_shift_space));
-
-    let delegate_assignment =
-        crate::msime_key_assignment::read_delegate_to_open_axis_assignment_from_registry();
-    log::info!("[msime-keyassign] delegate-to-open-axis assignment: {delegate_assignment:?}");
-    app.engine
-        .set_muhenkan_delegate_to_open_axis(delegate_assignment.muhenkan);
-    app.engine
-        .set_henkan_delegate_to_open_axis(delegate_assignment.henkan);
+    // ADR-191: 無変換/変換の単独タップの代行（delegate）とshadow_action overrideは撤去した。
+    // MS-IMEのレジストリ由来の割り当ては、IMEが自身で処理する（awaseは書き込まず観測に追随する）。
 }
 
 /// IME 種別を観測値から pull し、warmup 戦略切替 + MS-IME 割当てチェックに反映する。
@@ -725,7 +956,7 @@ pub(crate) fn sync_ime_kind_from_observation(app: &mut Runtime, source: &str) {
     let obs = crate::tsf::observer::tsf_obs();
     let kind = obs.active_ime_kind();
     let detected = obs.ime_kind_detected();
-    log::info!("[runtime] IME kind sync ({source}): {kind:?} (detected={detected})");
+    tracing::info!("[runtime] IME kind sync ({source}): {kind:?} (detected={detected})");
     app.platform.output.set_active_ime_kind(kind);
     if matches!(
         kind,
@@ -733,47 +964,30 @@ pub(crate) fn sync_ime_kind_from_observation(app: &mut Runtime, source: &str) {
     ) && app.platform_state.ime.model().applied.applied_open() == Some(true)
     {
         let mode = app.platform.output.injection_mode;
-        log::debug!("[runtime] GJI warmup FSM sync: applied_open=true → ImeOn");
+        tracing::debug!("[runtime] GJI warmup FSM sync: applied_open=true → ImeOn");
         app.platform.gji_on_ime_on(mode);
         for entry in app.platform.drain_journal_entries() {
             app.platform_state.ime.journal.absorb(entry);
         }
     }
 
-    // GJI 検出時、config1.db から専用Fnキー変換モード（ADR-091 §D3.2）と
-    // IME ON/OFF/トグルキー（ADR-092 決定D Step4c）を自動判定する。MS-IME
-    // 割当てチェックと対称に、この「IME 種別に依存する副作用の単一の
-    // 合流点」に置き、同じ理由で detected を見る（未検出時の
-    // active_ime_kind() が安全デフォルトとして MicrosoftIme を返す実装
-    // 詳細に暗黙に依存せず、明示的にゲートする）。
-    //
-    // **MS-IME 側（次のブロック）より先に呼ぶこと（Opus コードレビュー
-    // 指摘、意図的な順序）**: `ime_toggle_auto` は GJI/MS-IME 両方の
-    // 自動検出が共有する`Engine`フィールドで、GJI 離脱時に
-    // `sync_gji_charset_autodetect` が（自分専用の`ime_on_auto`/
-    // `ime_off_auto`と一緒に）`ime_toggle_auto`も解除する。GJI→MS-IME の
-    // 遷移で MS-IME 側が先に新しい値を設定してしまうと、後から走る GJI
-    // 離脱処理がその値を上書き消去してしまう（実際に発生していた回帰、
-    // 詳細は`gji_charset_autodetect.rs`のコメント参照）。GJI 側を先に
-    // 走らせれば、GJI→MS-IME遷移時は「GJI離脱で3リストとも解除→直後に
-    // MS-IME側が`ime_toggle_auto`を新しい値で上書き」という正しい順序に
-    // なる。
-    crate::gji_charset_autodetect::sync_gji_charset_autodetect(
-        app,
-        detected
-            && matches!(
-                kind,
-                crate::tsf::observer::ActiveImeKind::GoogleJapaneseInput
-            ),
-    );
-    if detected
-        && matches!(
+    if detected {
+        app.check_state_dependent_mode_keys(matches!(
             kind,
             crate::tsf::observer::ActiveImeKind::GoogleJapaneseInput
-        )
-    {
-        crate::gji_charset_popup::maybe_show_setup_popup(app);
+        ));
     }
+
+    // GJI 検出時に config1.db から無変換/変換/ひらがな/カタカナの意味論を自動判定して、
+    // awase 自身が代行・上書きする経路は、ADR-191 で撤去した（GJI の設定どおりに GJI 自身が動く）。
+    // したがって GJI 検出時にここで行う副作用は、上の warmup FSM 同期だけである。
+    // config1.db の分類は、bug report（ADR-148）が必要なときに読む。
+    //
+    // 専用Fnキー変換（ADR-091 §D3.2）の自動判定・設定支援ポップアップ・
+    // config1.db書き込みは、実験的機能のまま撤去し忘れて出荷されていた
+    // ため2026-09-02に全撤去した（未実装の再検討はADR-091追補参照）。
+    // `muhenkan_solo_tap_dedicated_fn_key` の手動設定（config.toml）による
+    // 内部配線は残っている。
 
     // MS-IME と確定したら、無変換/変換キーの IME オン/オフ割り当て（awase と
     // 競合し belief 乖離を起こす）をチェックして解除を案内する
@@ -781,7 +995,7 @@ pub(crate) fn sync_ime_kind_from_observation(app: &mut Runtime, source: &str) {
     // detected を見るのは、未検出時の active_ime_kind() が安全デフォルトとして
     // MicrosoftIme を返すため — これを見ないと GJI ユーザーの起動時にも誤発動する。
     if detected && matches!(kind, crate::tsf::observer::ActiveImeKind::MicrosoftIme) {
-        crate::msime_key_assignment::check_and_warn();
+        crate::msime_key_assignment::check_and_warn(app);
         sync_ime_toggle_auto_detect(app);
     }
 }
@@ -795,7 +1009,7 @@ pub(crate) unsafe fn handle_wm_ime_kind_changed(app: &mut Runtime) {
 
 /// WM_DUPLICATE_INSTANCE ハンドラ
 pub(crate) unsafe fn handle_wm_duplicate_instance(app: &mut Runtime) {
-    log::info!("Duplicate instance notification received");
+    tracing::info!("Duplicate instance notification received");
     app.platform
         .tray
         .show_balloon("awase", "awase はすでに起動しています");
@@ -808,7 +1022,7 @@ pub(crate) unsafe fn handle_wm_duplicate_instance(app: &mut Runtime) {
 pub(crate) unsafe fn handle_wm_powerbroadcast(app: &mut Runtime, pbt: usize) {
     use windows::Win32::UI::WindowsAndMessaging::{PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND};
     if pbt == PBT_APMRESUMESUSPEND as usize || pbt == PBT_APMRESUMEAUTOMATIC as usize {
-        log::info!("Power resume detected (PBT=0x{pbt:02X}), scheduling deferred recovery");
+        tracing::info!("Power resume detected (PBT=0x{pbt:02X}), scheduling deferred recovery");
         app.platform.timer.kill(TIMER_IME_REFRESH);
         app.platform
             .timer
@@ -822,17 +1036,25 @@ pub(crate) unsafe fn handle_wts_session_change(app: &mut Runtime, session_event:
     const WTS_SESSION_UNLOCK: u32 = 8;
     match session_event {
         WTS_SESSION_LOCK => {
-            log::info!("Session locked, flushing engine state");
+            tracing::info!("Session locked, flushing engine state");
+            // issue #165 自己修復 F2ガード用（hook watchdog がロック中に再
+            // インストールしても意味が無いためスキップする）。
+            app.set_session_locked(true);
             app.invalidate_engine_context(ContextChange::FocusChanged);
         }
         WTS_SESSION_UNLOCK => {
-            log::info!("Session unlocked, scheduling deferred recovery");
+            tracing::info!("Session unlocked, scheduling deferred recovery");
+            app.set_session_locked(false);
             // ロック中 (Secure Desktop) は WH_KEYBOARD_LL にイベントが届かないため、
             // ロック直前に押されていた物理キーの KeyUp が失われうる。PHYSICAL_KEY_STATE は
             // OR で左右を合成するため、片側が stuck するだけで mods.shift/ctrl が恒久的に
             // true になる（2026-07-09 実機で確認）。アンロック時点では物理キーはどれも
             // 離されていると仮定してよいため、無条件でリセットする。
             hook::reset_physical_key_state();
+            // [[keymap]] latch も同じ理由で解放する（ADR-114 決定4「latch
+            // 漏れ対策」経路5）。ロック中に失われた KeyUp が latch を stuck
+            // させたままになるのを防ぐ。
+            app.platform_state.keymap.keymap_latch.release_all();
             app.platform.timer.kill(TIMER_IME_REFRESH);
             app.platform
                 .timer
@@ -844,7 +1066,7 @@ pub(crate) unsafe fn handle_wts_session_change(app: &mut Runtime, session_event:
 
 /// WM_INPUTLANGCHANGE ハンドラ
 pub(crate) unsafe fn handle_wm_inputlangchange(app: &mut Runtime) {
-    log::info!("Input language changed, flushing pending state");
+    tracing::info!("Input language changed, flushing pending state");
     app.invalidate_engine_context(ContextChange::InputLanguageChanged);
     app.refresh_ime_state_cache();
     check_keyboard_layout_on_change();
@@ -882,9 +1104,9 @@ pub(crate) unsafe fn handle_wm_focus_kind_update(app: &mut Runtime, wparam: usiz
     // 意図的に戻す。sync 分類（既知クラス・WS_EX_NOIME・MSAA）は従来どおり機能する。
     let _ = app;
     if GetGUIThreadInfo(0, &raw mut info).is_ok() && info.hwndFocus != result_hwnd {
-        log::debug!("UIA result for stale hwnd, ignoring");
+        tracing::debug!("UIA result for stale hwnd, ignoring");
     } else {
-        log::debug!(
+        tracing::debug!(
             "UIA async result received (kind={kind:?} app_kind_u8={app_kind_u8}) — \
              BUG-12 により適用せずログのみ"
         );
@@ -903,15 +1125,22 @@ pub(crate) unsafe fn handle_wm_hotkey_focus_override(app: &mut Runtime) {
 
 /// WM_APP (トレイメッセージ) ハンドラ
 pub(crate) unsafe fn handle_wm_app_tray(hwnd: HWND, lparam: LPARAM) {
-    log::debug!(
+    tracing::debug!(
         "WM_APP received: hwnd={:?} lparam=0x{:016X}",
         hwnd,
         lparam.0
     );
-    let (layout_names, current_layout_name): (Vec<String>, String) = with_app_ref(|app| {
+    let (layout_names, current_layout_name, kana_lock_warned, update_check_enabled): (
+        Vec<String>,
+        String,
+        bool,
+        bool,
+    ) = with_app_ref(|app| {
         (
             app.layouts.iter().map(|e| e.name.clone()).collect(),
             app.platform.tray.current_layout_name().to_string(),
+            app.platform.tray.kana_lock_warned(),
+            app.update_check_enabled,
         )
     })
     .unwrap_or_default();
@@ -921,12 +1150,14 @@ pub(crate) unsafe fn handle_wm_app_tray(hwnd: HWND, lparam: LPARAM) {
         &layout_names,
         &current_layout_name,
         crate::is_elevated(),
+        kana_lock_warned,
+        update_check_enabled,
     );
 }
 
 /// WM_RELOAD_CONFIG ハンドラ
 pub(crate) fn handle_wm_reload_config() {
-    log::info!("Config reload requested via WM_RELOAD_CONFIG");
+    tracing::info!("Config reload requested via WM_RELOAD_CONFIG");
     reload_config();
 }
 
@@ -958,7 +1189,11 @@ pub(crate) unsafe fn handle_wm_command(wparam: WPARAM) {
         }
         Some(tray::TrayCommand::ToggleAutoStart) => tray::handle_autostart_toggle(),
         Some(tray::TrayCommand::Restart) => tray::restart_self(),
-        Some(tray::TrayCommand::About) => tray::show_about_dialog(),
+        Some(tray::TrayCommand::About) => {
+            let enabled = with_app_ref(|app| app.update_check_enabled).unwrap_or(false);
+            tray::show_about_dialog(enabled);
+        }
+        Some(tray::TrayCommand::OpenUpdatePage) => tray::open_update_page(),
         Some(tray::TrayCommand::BugReport) => {
             let ime_kind = current_bug_report_ime_kind();
             let Some((dump_result, diagnostics)) = with_app(|app| {
@@ -972,27 +1207,41 @@ pub(crate) unsafe fn handle_wm_command(wparam: WPARAM) {
                         tick_ms: hook::current_tick_ms(),
                         hook_us: hook::now_timestamp_us(),
                     });
-                app.platform_state
-                    .ime
-                    .journal
-                    .record(crate::journal::JournalEntry::DumpTriggered);
-                let dump_result = app
-                    .platform_state
-                    .ime
-                    .journal
-                    .dump_to_file_capped(crate::bug_report::LOG_EXCERPT_MAX_BYTES);
-                (dump_result, current_bug_report_diagnostics(app))
+                let evicted = app.platform_state.ime.journal.evicted_by_lane();
+                let oldest = app.platform_state.ime.journal.oldest_elapsed_ms_by_lane();
+                app.platform_state.ime.journal.record(
+                    crate::journal::JournalEntry::DumpTriggered {
+                        evicted_state: evicted.state,
+                        evicted_timing: evicted.timing,
+                        evicted_actuation: evicted.actuation,
+                        evicted_key_input: evicted.key_input,
+                        oldest_elapsed_ms_state: oldest.state,
+                        oldest_elapsed_ms_timing: oldest.timing,
+                        oldest_elapsed_ms_actuation: oldest.actuation,
+                        oldest_elapsed_ms_key_input: oldest.key_input,
+                    },
+                );
+                // ADR-222: ring の中身を全部出す（旧: 200KiB のバイト配分で間引いていた）。
+                let dump_result = app.platform_state.ime.journal.dump_to_file_for_report();
+                (dump_result, current_bug_report_diagnostics(app, ime_kind))
             }) else {
-                log::error!("[bug-report] runtime unavailable");
+                tracing::error!("[bug-report] runtime unavailable");
                 return;
             };
             let diagnostics_path = match write_bug_report_diagnostics(&diagnostics) {
                 Ok(path) => Some(path),
                 Err(e) => {
-                    log::warn!("[bug-report] diagnostics dump failed: {e}");
+                    tracing::warn!("[bug-report] diagnostics dump failed: {e}");
                     None
                 }
             };
+            // ADR-139 決定2: awase.log は BufWriter でラップされており、末尾の
+            // 未flush分（クラッシュ直前の最も価値の高い行を含みうる）が
+            // 不具合報告に読み込まれる前に確実にディスクへ出るよう、ここで
+            // 明示的に flush する。awase.log を実際に読むのは
+            // `--applog` 引数で起動される別プロセス（awase-settings.exe）であり、
+            // awase.exe 側のこの flush を経ないと反映されない。
+            crate::app::flush_log_writer();
             let app_log_path = crate::app::bug_report_log_path();
             let app_log_path = app_log_path.exists().then_some(app_log_path.as_path());
             match dump_result {
@@ -1000,7 +1249,7 @@ pub(crate) unsafe fn handle_wm_command(wparam: WPARAM) {
                     launch_bug_report(&path, ime_kind, diagnostics_path.as_deref(), app_log_path);
                 }
                 Err(e) => {
-                    log::error!("[bug-report] journal dump failed: {e}");
+                    tracing::error!("[bug-report] journal dump failed: {e}");
                     let _ = with_app(|app| {
                         app.platform
                             .tray
@@ -1013,8 +1262,7 @@ pub(crate) unsafe fn handle_wm_command(wparam: WPARAM) {
             crate::ime::toggle_caps_lock();
         }
         Some(tray::TrayCommand::ResetState) => {
-            let caps_lock_on =
-                windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x14) & 1 != 0;
+            let caps_lock_on = crate::ime::is_caps_lock_on();
             if caps_lock_on {
                 crate::ime::toggle_caps_lock();
             }
@@ -1034,7 +1282,27 @@ pub(crate) unsafe fn handle_wm_command(wparam: WPARAM) {
             // なっていても、この操作で必ず Engine ON まで復帰させる。
             let _ = with_app(Runtime::force_engine_on);
         }
-        Some(tray::TrayCommand::ClearImmCache) | None => {}
+        Some(tray::TrayCommand::KanaLockHelp) => tray::show_kana_lock_help_dialog(),
+        Some(tray::TrayCommand::ClearImmCache) => {
+            // BUG-108: 誤学習した IMM32 能力キャッシュ（BUG-56・BUG-107）の回復手段。
+            // 学習表（keymap-learn-table.json）と cache.toml の他セクションには触れない。
+            let _ = with_app(|app| {
+                let (removed, persisted) = app.platform.clear_imm_capability_cache();
+                tracing::info!(
+                    "[tray] IMM capability cache cleared: {removed} entries (persisted={persisted})"
+                );
+                // cache.toml へ書けなかったときは再起動で旧エントリが戻るので、成功と伝えない。
+                let message = if persisted {
+                    format!("IME 制御の学習キャッシュをクリアしました（{removed} 件）")
+                } else {
+                    format!(
+                        "メモリ上の学習キャッシュは消しましたが、cache.toml に反映できませんでした（{removed} 件）。再起動すると元に戻ります。cache.toml を確認してください"
+                    )
+                };
+                app.platform.tray.show_balloon("awase", &message);
+            });
+        }
+        None => {}
     }
 }
 
@@ -1053,7 +1321,10 @@ fn current_bug_report_ime_kind() -> crate::bug_report::BugReportImeKind {
     }
 }
 
-fn current_bug_report_diagnostics(app: &Runtime) -> crate::bug_report::BugReportDiagnostics {
+fn current_bug_report_diagnostics(
+    app: &Runtime,
+    ime_kind: crate::bug_report::BugReportImeKind,
+) -> crate::bug_report::BugReportDiagnostics {
     let (is_japanese, lang_id) = crate::ime::keyboard_layout_info();
     let now_ms = hook::current_tick_ms();
     let resources = process_resource_snapshot();
@@ -1074,23 +1345,299 @@ fn current_bug_report_diagnostics(app: &Runtime) -> crate::bug_report::BugReport
             .gate
             .idle_conv_check_in_flight_since_ms
             .map(|since| now_ms.saturating_sub(since)),
+        idle_conv_check_abandoned_resync_count:
+            crate::probe_actuation_fence::abandoned_resync_lifetime_count(),
+        idle_conv_check_abandoned_normal_count:
+            crate::probe_actuation_fence::abandoned_normal_lifetime_count(),
+        idle_conv_check_spawned_resync_count:
+            crate::probe_actuation_fence::spawned_resync_lifetime_count(),
+        idle_conv_check_spawned_normal_count:
+            crate::probe_actuation_fence::spawned_normal_lifetime_count(),
         process_uptime_secs: resources.process_uptime_secs,
         working_set_bytes: resources.working_set_bytes,
         handle_count: resources.handle_count,
         gdi_object_count: resources.gdi_object_count,
         user_object_count: resources.user_object_count,
+        // issue #165（D&D不可・印刷不能）の切り分け用診断値。挙動には一切影響しない。
+        low_level_hooks_timeout_ms: hook::low_level_hooks_timeout_ms(),
+        wake_post_failed_lifetime_count: crate::hook_channel::wake_post_failed_lifetime_count(),
+        hook_ring_max_occupancy: crate::hook_channel::HOOK_KEYS.peek_max_occupancy(),
     };
     let (config_toml, layout_yab) =
         crate::app::read_bug_report_attachments(app.platform.tray.current_layout_name());
+    // ADR-120 決定0a-report: 打鍵内容を含まない累積カウンタのみを写す。
+    let retro_eval_stats = Some(crate::bug_report::BugReportRetroEvalStats::from(
+        app.engine.retro_eval_stats(),
+    ));
+    // issue #165: 親指シフト機能そのものと競合するソフト(detect_conflicting_software)
+    // に加え、入力デリバリ経路に影響しうると既知のツール(detect_relay_or_remap_software)
+    // も診断情報として含める。後者は起動時「終了してください」警告の対象ではない。
+    let mut competing_software = crate::app::detect_conflicting_software();
+    competing_software.extend(crate::app::detect_relay_or_remap_software());
+    // ADR-148: GJI/MS-IMEのキーマップ・キー割当て設定。
+    let gji_keymap = Some(build_bug_report_gji_keymap_summary(app));
+    let msime_key_assignment = Some(build_bug_report_msime_key_assignment_summary(app, ime_kind));
+    // ADR-148 Phase 2: 旧UI（互換モード）の詳細キーカスタマイズ。
+    let legacy_msime_keymap = Some(build_bug_report_legacy_msime_keymap_summary());
+    // ADR196-T2 決定1e後半: 学習表の採否・自己検証・同梱表との突き合わせ・指紋。
+    let keymap_learn = Some(build_bug_report_keymap_learn_summary(app));
+    // issue #165（hook_starved）用（2026-09-28追記）。既定オフの独立チェック
+    // ボックスでのみ実際に送信される（`BugReportPayload::attach_running_processes`）。
+    let running_processes = Some(crate::app::list_all_running_process_names());
     crate::bug_report::BugReportDiagnostics {
         ime_product_name: crate::tsf::observer::current_ime_product_name(),
         keyboard_model: bug_report_keyboard_model(app.keyboard_model()).to_owned(),
         windows_keyboard_layout: format!("LANGID=0x{lang_id:04X} (Japanese={is_japanese})"),
-        competing_software: crate::app::detect_conflicting_software(),
+        competing_software,
         state_snapshot: Some(state_snapshot),
         config_toml,
         layout_yab,
+        retro_eval_stats,
+        gji_keymap,
+        msime_key_assignment,
+        legacy_msime_keymap,
+        keymap_learn,
+        running_processes,
     }
+}
+
+/// 学習表の状態を1項目にまとめる。ファイルは診断のたびに直接読み直す（キャッシュ経由に
+/// しない: 不採用理由を報告するのが目的で、採用時のセルではなくファイル自体の判定を見る）。
+fn build_bug_report_keymap_learn_summary(
+    app: &Runtime,
+) -> crate::bug_report::BugReportKeymapLearnSummary {
+    use crate::state::key_effect_runtime as ker;
+    // 不具合報告の同梱表との突き合わせ診断は、予測時に実際に使った`(preset, check_against_bundled)`
+    // （`RuntimeTableCache`が保持）で行う。GJI/本体どちらのキャッシュかを推測しない。
+    crate::bug_report::BugReportKeymapLearnSummary::from_paths(
+        ker::table_file_path().as_deref(),
+        ker::last_attempt_file_path().as_deref(),
+        app.use_learned_keymap_table,
+        // `use_learned_keymap_table`がfalseの間は`get`が呼ばれずcellsが古いまま残るため併せて見る。
+        app.use_learned_keymap_table && app.key_effect_runtime_table.is_active(),
+        app.key_effect_runtime_table.last_validation_key(),
+    )
+}
+
+/// `custom_keymap_table_is_effective`が`true`のときにのみ埋まる、
+/// GJIキーマップ抽出結果（ADR-148）。
+///
+/// フィールド名は`BugReportGjiKeymapSummary`の対応フィールドとあえて
+/// 揃えている（`let GjiCustomKeymapFields { ime_on_keys, .. } = ...`の
+/// ような分解を分かりやすくするため）ので、`*_keys`共通後置の
+/// clippy指摘は抑止する。
+///
+/// 位置引数タプルではなく名前付きフィールドの構造体にしているのは
+/// 可読性目的だけではない: 複数の`None`を並べた裸のタプルリテラルは、
+/// `architecture_guard.rs::build_input_context_callers_do_not_drop_
+/// thumb_down_state`がファイル全体を空白除去した上で特定の部分文字列の
+/// 有無だけを見て判定する設計のため、`build_input_context`呼び出しとは
+/// 無関係なこの箇所でも誤検出（false positive）を起こす。名前付き
+/// フィールドの`Default::default()`はその部分文字列を生成しない。
+#[derive(Default)]
+#[allow(clippy::struct_field_names)]
+struct GjiCustomKeymapFields {
+    ime_on_keys: Option<Vec<String>>,
+    ime_off_keys: Option<Vec<String>>,
+    ime_toggle_keys: Option<Vec<String>>,
+    mode_set_keys: Option<Vec<(String, String)>>,
+    mode_toggle_alphanumeric_keys: Option<Vec<String>>,
+    mode_toggle_kana_type_keys: Option<Vec<String>>,
+}
+
+/// GJI（`config1.db`）から、無変換/変換キーのIME意味論・キーマップ設定を
+/// 要約する（ADR-148）。「生値・分類系」は`ime_kind`に関わらず常に計算する
+/// （ADR-191で撤去した「採用系」はADR-217でフィールドごと削除した）。
+///
+/// 報告生成時点の`config1.db`を
+/// 都度読み直す（Runtime側に`GjiRawConfig`のキャッシュは存在しないため。
+/// 報告時点のファイル内容と、Engineが最後に採用した値とが理論上ズレうる
+/// 限界については ADR-148「実装スコープの訂正」参照）。
+fn build_bug_report_gji_keymap_summary(
+    app: &Runtime,
+) -> crate::bug_report::BugReportGjiKeymapSummary {
+    let bytes = crate::gji_charset_autodetect::read_config1_db();
+    let bytes_read_ok = bytes.is_some();
+    let raw = bytes
+        .as_deref()
+        .and_then(awase_gji_config::wire::parse_top_level);
+    let config1_db_status = if raw.is_some() {
+        "Ok"
+    } else if bytes_read_ok {
+        "ParseFailed"
+    } else {
+        "NotFound"
+    }
+    .to_owned();
+
+    let default_raw = awase_gji_config::wire::GjiRawConfig::default();
+    let raw_ref = raw.as_ref().unwrap_or(&default_raw);
+
+    let session_keymap = raw_ref.session_keymap;
+    let has_henkan_muhenkan_overlay = raw_ref
+        .overlay_keymaps
+        .contains(&awase_gji_config::SESSION_KEYMAP_OVERLAY_HENKAN_MUHENKAN_TO_IME_ON_OFF);
+    let custom_keymap_table_present = raw_ref.custom_keymap_table.is_some();
+    // /code-review指摘: 実際に抽出処理へ到達する条件は
+    // 「session_keymap == CUSTOM」**かつ**「custom_keymap_tableが存在する」の
+    // 両方（`gji_charset_autodetect.rs`の`classify_*`と同じゲート）。
+    // 前者だけをここで再現すると、CUSTOM選択中だがfield 42が不在の
+    // 環境（本文doc「custom_keymap_table_present」との組み合わせが
+    // (true, false)になるケース）で本フィールドが誤って`true`になり、
+    // 実際には抽出処理に到達しない状態を「有効」と報告してしまう。
+    let custom_keymap_table_is_effective = session_keymap
+        == Some(awase_gji_config::SESSION_KEYMAP_CUSTOM)
+        && custom_keymap_table_present;
+
+    let custom_keymap_fields = if custom_keymap_table_is_effective {
+        let table = raw_ref.custom_keymap_table.as_deref().unwrap_or("");
+        let ime_keys = awase_gji_config::keymap::extract_ime_keys(table);
+        let mode_keys = awase_gji_config::keymap::extract_mode_keys(table);
+        GjiCustomKeymapFields {
+            ime_on_keys: Some(ime_keys.on),
+            ime_off_keys: Some(ime_keys.off),
+            ime_toggle_keys: Some(ime_keys.toggle),
+            mode_set_keys: Some(
+                mode_keys
+                    .set_mode
+                    .into_iter()
+                    .map(|(vk, mode)| (vk, gji_composition_mode_str(mode).to_owned()))
+                    .collect(),
+            ),
+            mode_toggle_alphanumeric_keys: Some(mode_keys.toggle_alphanumeric),
+            mode_toggle_kana_type_keys: Some(mode_keys.toggle_kana_type),
+        }
+    } else {
+        GjiCustomKeymapFields::default()
+    };
+    let GjiCustomKeymapFields {
+        ime_on_keys,
+        ime_off_keys,
+        ime_toggle_keys,
+        mode_set_keys,
+        mode_toggle_alphanumeric_keys,
+        mode_toggle_kana_type_keys,
+    } = custom_keymap_fields;
+
+    let (henkan_classified, muhenkan_classified) =
+        crate::gji_charset_autodetect::classify_thumb_key_ime_actions(raw_ref);
+    let henkan_classified_kind = henkan_classified
+        .map(ime_toggle_kind_str)
+        .map(str::to_owned);
+    let muhenkan_classified_kind = muhenkan_classified
+        .map(ime_toggle_kind_str)
+        .map(str::to_owned);
+
+    let muhenkan_dedicated_fn_key_configured = app.muhenkan_dedicated_fn_key_configured();
+
+    crate::bug_report::BugReportGjiKeymapSummary {
+        config1_db_status,
+        session_keymap,
+        has_henkan_muhenkan_overlay,
+        custom_keymap_table_present,
+        custom_keymap_table_is_effective,
+        ime_on_keys,
+        ime_off_keys,
+        ime_toggle_keys,
+        mode_set_keys,
+        mode_toggle_alphanumeric_keys,
+        mode_toggle_kana_type_keys,
+        henkan_classified_kind,
+        muhenkan_classified_kind,
+        muhenkan_dedicated_fn_key_configured,
+    }
+}
+
+/// MS-IME「キーとタッチのカスタマイズ」（シンプルキー割当て）のレジストリ
+/// 値を要約する（ADR-148）。生のDWORD5個は`ime_kind`に関わらず常に読む。
+/// `adopted_ime_toggle_combos`は`ime_kind == MsIme`のときのみ`Some`（Opus敵対的レビュー
+/// G1、GJI側と同じ理由）。
+fn build_bug_report_msime_key_assignment_summary(
+    app: &Runtime,
+    ime_kind: crate::bug_report::BugReportImeKind,
+) -> crate::bug_report::BugReportMsImeKeyAssignmentSummary {
+    let raw_dwords = crate::msime_key_assignment::read_raw_key_assignment_dwords();
+    let muhenkan_dedicated_fn_key_configured = app.muhenkan_dedicated_fn_key_configured();
+
+    // ADR-191: 無変換/変換の「open軸への肩代わり(delegate)」採用は撤去した（以前は
+    // レジストリ値から「採用した」と称して値を返しており、ADR-148 の診断を誤らせた、
+    // レビュー指摘C-M5）。ADR-217で常に`None`だった`adopted_*_delegate`はフィールドごと削除した。
+    let adopted_ime_toggle_combos = if ime_kind == crate::bug_report::BugReportImeKind::MsIme {
+        let toggle_assignment = crate::msime_key_assignment::read_toggle_assignment_from_registry();
+        let combos = toggle_assignment.to_combos(app.space_is_thumb_key());
+        // Opus敵対的コードレビューM-1: 空でも`Some(vec![])`にする。
+        // `ime_kind == MsIme`の枝に入った時点で「採用値を計算した」ことは
+        // 確定しているため、`None`（GJI側`ime_*_keys`同様「非該当」の意味）
+        // と「採用ゼロ件」を区別する。
+        Some(combos.iter().copied().map(parsed_key_combo_label).collect())
+    } else {
+        None
+    };
+
+    crate::bug_report::BugReportMsImeKeyAssignmentSummary {
+        is_key_assignment_enabled: raw_dwords.is_key_assignment_enabled,
+        key_assignment_muhenkan: raw_dwords.key_assignment_muhenkan,
+        key_assignment_henkan: raw_dwords.key_assignment_henkan,
+        key_assignment_ctrl_space: raw_dwords.key_assignment_ctrl_space,
+        key_assignment_shift_space: raw_dwords.key_assignment_shift_space,
+        adopted_ime_toggle_combos,
+        muhenkan_dedicated_fn_key_configured,
+    }
+}
+
+/// 旧UI（互換モードでのみ到達できる詳細キーカスタマイズ）の要約
+/// （ADR-148 Phase 2、ADR-197決定4で`legacy_compat_mode_enabled`を追加）。
+/// `msime_legacy_keymap`モジュールdoc参照。`ime_kind`に関わらず常に読む
+/// （レジストリの内容自体は現在のフォーカス先IMEと無関係に存在するため、
+/// 上位の`msime_key_assignment`の生DWORDと同じ扱い）。
+fn build_bug_report_legacy_msime_keymap_summary(
+) -> crate::bug_report::BugReportLegacyMsImeKeymapSummary {
+    let assignment = crate::msime_legacy_keymap::read_legacy_toggle_assignment();
+    crate::bug_report::BugReportLegacyMsImeKeymapSummary {
+        active_style: assignment.active_style.map(|s| s.as_str().to_owned()),
+        muhenkan_legacy_toggle_assigned: assignment.muhenkan_legacy_toggle_assigned,
+        henkan_legacy_toggle_assigned: assignment.henkan_legacy_toggle_assigned,
+        legacy_compat_mode_enabled: crate::msime_legacy_keymap::read_legacy_compat_mode_enabled(),
+    }
+}
+
+fn ime_toggle_kind_str(kind: crate::gji_charset_autodetect::ImeToggleKind) -> &'static str {
+    use crate::gji_charset_autodetect::ImeToggleKind;
+    match kind {
+        ImeToggleKind::On => "On",
+        ImeToggleKind::Off => "Off",
+        ImeToggleKind::Toggle => "Toggle",
+    }
+}
+
+fn gji_composition_mode_str(mode: awase_gji_config::command::GjiCompositionMode) -> &'static str {
+    use awase_gji_config::command::GjiCompositionMode;
+    match mode {
+        GjiCompositionMode::Hiragana => "Hiragana",
+        GjiCompositionMode::FullKatakana => "FullKatakana",
+        GjiCompositionMode::HalfKatakana => "HalfKatakana",
+        GjiCompositionMode::FullAlphanumeric => "FullAlphanumeric",
+        GjiCompositionMode::HalfAlphanumeric => "HalfAlphanumeric",
+    }
+}
+
+/// `combo.vk`は見ずSpace固定（レビューR-1）: `MsImeToggleAssignment::
+/// to_combos`が現状生成するのは`VK_SPACE`のみのため実害はないが、
+/// 将来`to_combos`が他のVKを返すようになった場合はこの関数も
+/// 追随させること。
+fn parsed_key_combo_label(combo: awase::config::ParsedKeyCombo) -> String {
+    let mut label = String::new();
+    if combo.ctrl {
+        label.push_str("Ctrl+");
+    }
+    if combo.shift {
+        label.push_str("Shift+");
+    }
+    if combo.alt {
+        label.push_str("Alt+");
+    }
+    label.push_str("Space");
+    label
 }
 
 /// 「長時間使うと重くなる」報告の切り分け用プロセスリソーススナップショット
@@ -1198,7 +1745,7 @@ pub(crate) unsafe fn handle_wm_drain_output_queue() {
     // タイムスタンプで突き合わせるための起点ログ。
     let drain_start_us = hook::now_timestamp_us();
     let queue_len_initial = crate::INPUT_DEFER.pending_len_nonblocking();
-    log::debug!(
+    tracing::debug!(
         "[drain-start] now={}us queue_len={}",
         drain_start_us,
         queue_len_initial.map_or_else(|| "?".to_owned(), |n| n.to_string()),
@@ -1218,7 +1765,7 @@ pub(crate) unsafe fn handle_wm_drain_output_queue() {
         begin_key_batch(app);
         for ev in &mut events {
             app.enrich_ime_relevance(ev);
-            log::debug!("[drain] vk=0x{:02X} {:?}", ev.vk_code, ev.event_type);
+            tracing::debug!("[drain] vk=0x{:02X} {:?}", ev.vk_code, ev.event_type);
         }
         events
     });
@@ -1239,7 +1786,7 @@ pub(crate) unsafe fn handle_wm_drain_output_queue() {
         let mut any_reinject = false;
         let processed = with_app(|app| {
             for queued_event in &queue {
-                log::debug!(
+                tracing::debug!(
                     "[output-drain] replay vk=0x{:02X} {:?} event_ts={}us now={}us delta={}ms",
                     queued_event.vk_code,
                     queued_event.event_type,
@@ -1249,7 +1796,7 @@ pub(crate) unsafe fn handle_wm_drain_output_queue() {
                 );
                 let delivery = deliver_key_event(app, *queued_event, KeyOrigin::DeferredReplay);
                 if matches!(delivery, KeyDelivery::Reinjected) {
-                    log::debug!(
+                    tracing::debug!(
                         "[output-drain] PassThrough → enqueue ReinjectKey vk=0x{:02X} {:?} (drain has no hook→OS path)",
                         queued_event.vk_code, queued_event.event_type,
                     );
@@ -1289,14 +1836,14 @@ pub(crate) unsafe fn handle_wm_drain_output_queue() {
         for (timer_id, os_id) in deferred {
             let current = app.platform.timer.current_os_id(timer_id);
             if current == Some(os_id) {
-                log::debug!(
+                tracing::debug!(
                     "[deferred-timer] drain 後に replay logical_id={timer_id} (os_id={os_id})"
                 );
                 let decision = app.engine.on_timeout(timer_id, &ctx);
                 notify_if_solo_off_triggered(app);
                 app.execute_decision(decision);
             } else {
-                log::debug!(
+                tracing::debug!(
                     "[deferred-timer] logical_id={timer_id} (os_id={os_id}) は drain 中に変化 (current={current:?}) → skip"
                 );
             }
@@ -1344,6 +1891,46 @@ pub(crate) mod drain_pending_test_api {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn encode_decode_outcome_roundtrips_for_all_variants() {
+        // ADR-167: WM_ASYNC_IME_APPLY_COMPLETE のwparam/lparamエンコードは
+        // ImeOpenOutcomeの全variantを損失なく往復できなければならない。
+        // これが崩れると、対応する物理経路（executor.rs::dispatch_ime_set_open/
+        // mod.rs::force_on_and_correct_romaji の非同期完了）で
+        // AppliedWithoutSendInputがUnsafeToToggleへ誤って落ち、
+        // should_send_accompanying_warmupの区別が非同期経路だけ効かなくなる。
+        for outcome in [
+            super::ImeOpenOutcome::Applied,
+            super::ImeOpenOutcome::AppliedWithoutSendInput,
+            super::ImeOpenOutcome::AlreadyMatched,
+            super::ImeOpenOutcome::Failed,
+            super::ImeOpenOutcome::UnsafeToToggle,
+            super::ImeOpenOutcome::NotOwned,
+        ] {
+            let encoded = super::encode_outcome(outcome);
+            assert_eq!(
+                super::decode_outcome(encoded),
+                outcome,
+                "roundtrip failed for {outcome:?} (encoded as {encoded})"
+            );
+        }
+    }
+
+    /// 欠番になった符号(旧 `FallbackSent` = 1、ADR-190)や未知値は、apply を行わない
+    /// 安全側の `UnsafeToToggle` に倒れること。番号を詰めると全 outcome がこの値に
+    /// 化けるので、欠番のまま残す規則をここで固定する。
+    #[test]
+    fn retired_or_unknown_outcome_codes_decode_to_unsafe_to_toggle() {
+        assert_eq!(
+            super::decode_outcome(1),
+            super::ImeOpenOutcome::UnsafeToToggle
+        );
+        assert_eq!(
+            super::decode_outcome(99),
+            super::ImeOpenOutcome::UnsafeToToggle
+        );
+    }
+
+    #[test]
     fn drain_pending_reentrant_request_is_recovered_by_next_handler() {
         super::drain_pending_test_api::reset();
 
@@ -1360,7 +1947,7 @@ mod tests {
 
 /// TaskbarCreated ハンドラ（Explorer 再起動時にトレイアイコンを復元）
 pub(crate) unsafe fn handle_taskbar_created(app: &mut Runtime) {
-    log::info!("Explorer restarted, re-registering tray icon");
+    tracing::info!("Explorer restarted, re-registering tray icon");
     app.platform.tray.recreate();
 }
 
@@ -1372,7 +1959,7 @@ pub(crate) fn handle_wm_dump_journal(app: &mut Runtime) {
         || stats.hwnd_mismatch_same_root > 0
         || stats.hwnd_mismatch_cross_root > 0
     {
-        log::info!(
+        tracing::info!(
             "[probe-admission] rejected since last dump: epoch_mismatch={} \
              hwnd_mismatch_same_root={} hwnd_mismatch_cross_root={}",
             stats.epoch_mismatch,
@@ -1383,7 +1970,7 @@ pub(crate) fn handle_wm_dump_journal(app: &mut Runtime) {
     // HOOK_KEYS の最大占有数（指摘2-4）: overflow の頻度を実測できるようにする。
     let max_occupancy = crate::hook_channel::HOOK_KEYS.take_max_occupancy();
     if max_occupancy > 0 {
-        log::info!(
+        tracing::info!(
             "[hook-ring] max occupancy since last dump: {max_occupancy}/{}",
             crate::hook_channel::CAP
         );
@@ -1398,19 +1985,48 @@ pub(crate) fn handle_wm_dump_journal(app: &mut Runtime) {
             tick_ms: hook::current_tick_ms(),
             hook_us: hook::now_timestamp_us(),
         });
+    let evicted = app.platform_state.ime.journal.evicted_by_lane();
+    let oldest = app.platform_state.ime.journal.oldest_elapsed_ms_by_lane();
     app.platform_state
         .ime
         .journal
-        .record(crate::journal::JournalEntry::DumpTriggered);
+        .record(crate::journal::JournalEntry::DumpTriggered {
+            evicted_state: evicted.state,
+            evicted_timing: evicted.timing,
+            evicted_actuation: evicted.actuation,
+            evicted_key_input: evicted.key_input,
+            oldest_elapsed_ms_state: oldest.state,
+            oldest_elapsed_ms_timing: oldest.timing,
+            oldest_elapsed_ms_actuation: oldest.actuation,
+            oldest_elapsed_ms_key_input: oldest.key_input,
+        });
     match app.platform_state.ime.journal.dump_to_file() {
         Ok(path) => {
-            log::info!("[journal] ダンプ完了: {}", path.display());
+            tracing::info!("[journal] ダンプ完了: {}", path.display());
             app.platform
                 .tray
                 .show_balloon("awase journal", &format!("ダンプ完了: {}", path.display()));
         }
         Err(e) => {
-            log::error!("[journal] ダンプ失敗: {e}");
+            tracing::error!("[journal] ダンプ失敗: {e}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod apply_wparam_tests {
+    use super::{decode_reason, encode_apply_wparam};
+
+    #[test]
+    fn apply_wparam_round_trips_reason_open_and_generation() {
+        use crate::state::ime_event::OpenApplyReason as R;
+        for reason in [R::EngineDecision, R::Bootstrap, R::ShadowToggle] {
+            for open in [false, true] {
+                let w = encode_apply_wparam(5, reason, open);
+                assert_eq!(decode_reason(w), reason, "reason {reason:?}");
+                assert_eq!((w & 1) != 0, open);
+                assert_eq!(w >> 3, 5);
+            }
         }
     }
 }

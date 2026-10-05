@@ -7,8 +7,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 
 use awase::types::RawKeyEvent;
 
-/// リング容量。`RawKeyEvent` は Copy な POD (数十バイト程度) のため、
-/// 256→1024 への引き上げは static 領域を数十KB増やすだけで済む
+/// リング容量。`RawKeyEvent` は Copy な POD（ADR-129 の
+/// `left_thumb_down_snapshot`/`right_thumb_down_snapshot`（`Option<Timestamp>`
+/// は `Timestamp = u64` のニッチ最適化が効かず16バイト、×2で+32バイト）
+/// 追加後も数十バイト程度）のため、256→1024 への引き上げは static 領域を
+/// 数十KB増やすだけで済む
 /// (タイミング定数ではないため `tuning-constants.md` の実測義務対象外)。
 pub(crate) const CAP: usize = 1024;
 const MASK: usize = CAP - 1;
@@ -91,7 +94,7 @@ impl HookKeyRing {
             // 状態が生じ、以後誰も clear を呼ばずラッチが恒久固着しえた。
             let _ = self
                 .overflow_state
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |old| {
                     let count = (old & OVERFLOW_COUNT_MASK).wrapping_add(1) & OVERFLOW_COUNT_MASK;
                     Some(count | OVERFLOW_LATCH_BIT)
                 });
@@ -151,6 +154,14 @@ impl HookKeyRing {
         self.max_occupancy.swap(0, Ordering::AcqRel)
     }
 
+    /// プロセス生存期間中の最大占有数をリセットせずに読む（不具合報告用診断、
+    /// issue #165）。`take_max_occupancy` と異なり消費しないため、
+    /// `WM_DUMP_JOURNAL` 側のリセットタイミングと競合しない。
+    #[must_use]
+    pub fn peek_max_occupancy(&self) -> u32 {
+        self.max_occupancy.load(Ordering::Acquire)
+    }
+
     pub fn has_pending(&self) -> bool {
         let head = self.head.load(Ordering::Acquire);
         let tail = self.tail.load(Ordering::Acquire);
@@ -179,6 +190,14 @@ pub static WAKE_PENDING: AtomicBool = AtomicBool::new(false);
 #[cfg(windows)]
 static WAKE_POST_FAILED: AtomicBool = AtomicBool::new(false);
 
+/// `WAKE_POST_FAILED` が発生した累計回数（プロセス生存期間中、リセットしない）。
+/// `WAKE_POST_FAILED`（`recover_stuck_wake_if_needed` が毎ウォッチドッグ tick で
+/// consume してしまう）とは別に持つ、不具合報告スナップショット用の診断値
+/// （issue #165: エンジンスレッド詰まり/`PostMessageW`失敗の既存センサを可視化）。
+#[cfg(windows)]
+static WAKE_POST_FAILED_LIFETIME_COUNT: crate::lifetime_counter::LifetimeCounter =
+    crate::lifetime_counter::LifetimeCounter::new();
+
 /// `WH_KEYBOARD_LL` フックコールバックから同期的に呼ぶ。
 ///
 /// ロック取得・アロケーション・ブロッキング呼び出し・ログ出力を一切行わない
@@ -190,7 +209,15 @@ pub fn request_engine_wake() {
     {
         WAKE_PENDING.store(false, Ordering::Release);
         WAKE_POST_FAILED.store(true, Ordering::Release);
+        WAKE_POST_FAILED_LIFETIME_COUNT.increment();
     }
+}
+
+/// `WAKE_POST_FAILED_LIFETIME_COUNT` を消費せずに読む（不具合報告用診断）。
+#[cfg(windows)]
+#[must_use]
+pub fn wake_post_failed_lifetime_count() -> u32 {
+    WAKE_POST_FAILED_LIFETIME_COUNT.read() as u32
 }
 
 /// エンジンスレッド側のウォッチドッグから呼ぶ。フック側で記録された post 失敗を
@@ -198,10 +225,10 @@ pub fn request_engine_wake() {
 #[cfg(windows)]
 pub fn recover_stuck_wake_if_needed() {
     if WAKE_POST_FAILED.swap(false, Ordering::AcqRel) {
-        log::warn!("[hook-ring] request_engine_wake の PostMessageW が失敗した形跡があります");
+        tracing::warn!("[hook-ring] request_engine_wake の PostMessageW が失敗した形跡があります");
     }
     if HOOK_KEYS.has_pending() && WAKE_PENDING.swap(false, Ordering::AcqRel) {
-        log::warn!("[hook-ring] WAKE_PENDING recovered by hook watchdog");
+        tracing::warn!("[hook-ring] WAKE_PENDING recovered by hook watchdog");
         request_engine_wake();
     }
 }
@@ -214,6 +241,8 @@ mod tests {
 
     fn ev(n: u16) -> RawKeyEvent {
         RawKeyEvent {
+            was_down: false,
+            press_id: None,
             vk_code: VkCode(n),
             scan_code: ScanCode(u32::from(n)),
             event_type: KeyEventType::KeyDown,
@@ -224,6 +253,8 @@ mod tests {
             ime_relevance: ImeRelevance::default(),
             modifier_key: None,
             modifier_snapshot: ModifierState::default(),
+            left_thumb_down_snapshot: None,
+            right_thumb_down_snapshot: None,
             injected: false,
         }
     }
@@ -320,6 +351,25 @@ mod tests {
             "clear 後の新規 overflow でラッチが再び立つこと"
         );
         assert_eq!(ring.take_dropped_and_clear_latch(), 1);
+    }
+
+    #[test]
+    fn peek_max_occupancy_does_not_reset() {
+        let ring = HookKeyRing::new();
+        for n in 0..10 {
+            assert_eq!(ring.produce(ev(n)), ProduceResult::Accepted);
+        }
+        // peek は take と異なり同じ値を何度読んでもリセットされない（不具合報告
+        // スナップショット用診断、issue #165: WM_DUMP_JOURNAL 側の take とは
+        // 独立して読めることを確認する）。
+        assert_eq!(ring.peek_max_occupancy(), 9);
+        assert_eq!(ring.peek_max_occupancy(), 9, "peek はリセットしない");
+        assert_eq!(
+            ring.take_max_occupancy(),
+            9,
+            "peek 後も take は正しい値を返す"
+        );
+        assert_eq!(ring.peek_max_occupancy(), 0, "take 後は peek も 0 を返す");
     }
 
     #[test]

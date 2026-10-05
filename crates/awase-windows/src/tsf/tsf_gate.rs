@@ -41,6 +41,12 @@
 //! PendingWarmup → Bypass ─── (DrainHeld)
 //! ```
 
+// このファイルの型は意図的に `Gate*`/`TsfGate*` プレフィックスを揃えている
+// （モジュール名`tsf_gate`との重複はclippyの検出通りだが、`TsfGate`との混同を避ける
+// ための命名規約——上記ドキュメントコメント参照）。ファイル内の全アイテムに掛かるため
+// ここで一括allowする。
+#![allow(clippy::module_name_repetitions)]
+
 use std::time::Duration;
 
 use timed_fsm::{Response, TimedStateMachine};
@@ -57,7 +63,6 @@ const HELD_MAX: usize = 64;
 
 /// TsfGate への外部イベント。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(clippy::module_name_repetitions)]
 pub enum GateEvent {
     /// フォーカス変更検知（win_event_proc T=0）
     FocusChange,
@@ -71,7 +76,6 @@ pub enum GateEvent {
 
 /// TsfGate のタイマー ID。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(clippy::module_name_repetitions)]
 pub enum GateTimer {
     /// PendingWarmup のフォールバックタイムアウト
     WarmupTimeout,
@@ -79,7 +83,6 @@ pub enum GateTimer {
 
 /// TsfGate のステート。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(clippy::module_name_repetitions)]
 pub enum TsfGateState {
     /// フォーカス変更直後。TSF モードが確定するまでキーを保留する。
     PendingWarmup,
@@ -103,7 +106,6 @@ pub enum TsfGateState {
 /// `TsfGate` は TSF probe のタイムアウト（500ms）をトリガーとするが、
 /// `SyncKeyGate` は sync key 直後のキー保留を担当する（モジュール doc 参照）。
 #[derive(Debug)]
-#[allow(clippy::module_name_repetitions)]
 pub struct TsfGateMachine {
     state: TsfGateState,
 }
@@ -170,7 +172,7 @@ impl TimedStateMachine for TsfGateMachine {
 
     fn on_timeout(&mut self, _id: GateTimer) -> Response<GateAction, GateTimer> {
         if self.state == TsfGateState::PendingWarmup {
-            log::warn!(
+            tracing::warn!(
                 "[tsf-gate] WarmupTimeout: PendingWarmup が {WARMUP_TIMEOUT_MS}ms 継続 → Bypass にフォールバック"
             );
             self.state = TsfGateState::Bypass;
@@ -194,7 +196,6 @@ impl TimedStateMachine for TsfGateMachine {
 /// - `on_tsf_confirmed()` / `on_bypass()` 後 → `TIMER_TSF_GATE` を kill
 /// - `message_handlers.rs` の `TIMER_TSF_GATE` ハンドラ → `on_warmup_timeout()` を呼ぶ
 #[derive(Debug)]
-#[allow(clippy::module_name_repetitions)]
 pub struct TsfGate {
     inner: HoldingGate<TsfGateMachine, RawKeyEvent>,
 }
@@ -221,7 +222,7 @@ impl TsfGate {
         // `InitiateHold` アクションを `HoldingGate` が受けて
         // 自動的に held クリア + 保留モード ON を行う。
         let _ = self.inner.on_event(GateEvent::FocusChange);
-        log::debug!("[tsf-gate] focus change → PendingWarmup (held cleared)");
+        tracing::debug!("[tsf-gate] focus change → PendingWarmup (held cleared)");
     }
 
     /// TSF モードと確定した場合に呼ぶ。
@@ -234,7 +235,7 @@ impl TsfGate {
     pub fn on_tsf_confirmed(&mut self) -> Vec<RawKeyEvent> {
         let (_, drained) = self.inner.on_event(GateEvent::TsfConfirmed);
         if !drained.is_empty() {
-            log::debug!(
+            tracing::debug!(
                 "[tsf-gate] TSF confirmed → Probing (releasing {} held keys)",
                 drained.len()
             );
@@ -250,7 +251,7 @@ impl TsfGate {
     pub fn on_bypass(&mut self) -> Vec<RawKeyEvent> {
         let (_, drained) = self.inner.on_event(GateEvent::BypassConfirmed);
         if !drained.is_empty() {
-            log::debug!(
+            tracing::debug!(
                 "[tsf-gate] → Bypass (releasing {} held keys)",
                 drained.len()
             );
@@ -262,7 +263,7 @@ impl TsfGate {
     pub fn on_ready(&mut self) {
         let _ = self.inner.on_event(GateEvent::ProbeComplete);
         if self.inner.machine.state() == TsfGateState::Ready {
-            log::debug!("[tsf-gate] TSF probe complete → Ready");
+            tracing::debug!("[tsf-gate] TSF probe complete → Ready");
         }
     }
 
@@ -290,12 +291,12 @@ impl TsfGate {
         let etype = event.event_type;
         let ok = self.inner.try_hold(event);
         if ok {
-            log::debug!(
+            tracing::debug!(
                 "[tsf-gate] held vk=0x{vk:02X} {etype:?} (total={})",
                 self.inner.len(),
             );
         } else {
-            log::warn!(
+            tracing::warn!(
                 "[tsf-gate] held queue full (max={HELD_MAX}), passing through vk=0x{vk:02X} {etype:?}",
             );
         }
@@ -329,7 +330,6 @@ impl Default for TsfGate {
 /// `awase-windows` の `Output::tsf_readiness()` メソッドで生成する。
 /// このメソッドを通じてすべての条件が一箇所に集約される。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(clippy::module_name_repetitions)]
 pub struct TsfReadiness {
     /// ゲートの現在状態
     pub gate: TsfGateState,
@@ -340,15 +340,6 @@ pub struct TsfReadiness {
 }
 
 impl TsfReadiness {
-    /// eager warmup (F2 前送信) を実行できる状態か。
-    ///
-    /// `ime_on && is_tsf_mode` が満たされればゲート状態によらず送信する。
-    /// `PendingWarmup` 中も warmup は送信可能（むしろ先行送信が目的）。
-    #[must_use]
-    pub const fn can_warmup(&self) -> bool {
-        self.ime_on && self.is_tsf_mode
-    }
-
     /// キーをゲートで保留すべき状態か。
     ///
     /// `PendingWarmup` 中はキーを `held` に蓄積し、TSF/Bypass 確定後に再投入する。
@@ -655,6 +646,8 @@ mod tests {
         gate.on_focus_change(); // PendingWarmup へ（HoldingGate 内部で holding=true）
 
         let dummy = RawKeyEvent {
+            was_down: false,
+            press_id: None,
             vk_code: VkCode(0x41), // 'A'
             scan_code: ScanCode(0x1E),
             event_type: KeyEventType::KeyDown,
@@ -665,6 +658,8 @@ mod tests {
             ime_relevance: ImeRelevance::default(),
             modifier_key: None,
             modifier_snapshot: ModifierState::default(),
+            left_thumb_down_snapshot: None,
+            right_thumb_down_snapshot: None,
             injected: false,
         };
         assert!(gate.try_hold(dummy));
@@ -682,18 +677,6 @@ mod tests {
             ime_on,
             is_tsf_mode,
         }
-    }
-
-    /// can_warmup: ime_on && is_tsf_mode が必要十分条件
-    #[test]
-    fn readiness_can_warmup() {
-        // 両方 true → warmup 可
-        assert!(readiness(TsfGateState::PendingWarmup, true, true).can_warmup());
-        assert!(readiness(TsfGateState::Ready, true, true).can_warmup());
-        // ime_on=false → 不可
-        assert!(!readiness(TsfGateState::Ready, false, true).can_warmup());
-        // is_tsf_mode=false → 不可
-        assert!(!readiness(TsfGateState::Ready, true, false).can_warmup());
     }
 
     /// is_holding: PendingWarmup 中のみ true

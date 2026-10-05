@@ -14,8 +14,6 @@
 //!     （[`ime_key_for`]）。キーは必ず [`crate::vk`] の名前付き定数（VK hex 直書き禁止, D-1）。
 //! - **担わない（呼び出し側 = `ime_controller.rs` に現行ロジックを残す動的判断）**:
 //!   - `ImmCrossProcessStrategy` の `ImmSetOpenStatus` クロスプロセス API（VK を送らない）。
-//!   - `KanjiToggleStrategy` の `post_kanji_toggle_to_focused`（VK_KANJI をフォーカス窓へ送る
-//!     専用経路。`send_ime_mode_key` とは送信機構が異なるためこの表には載せない）。
 //!   - `shadow_on` スキップ（GjiDirect ON）・ROMAN pre-mode（`set_ime_romaji_mode`）・
 //!     フォールバック前の実状態確認（`3510a08`, [[feedback_immcross_fallback_state_check]]）。
 //!     いずれも observation 依存の動的判断。MsImeDirect ON はかつて `VK_DBE_HIRAGANA`
@@ -24,35 +22,39 @@
 //!     に conv-mode に触れない `VK_IME_ON` へ移行しこの判断自体を撤去した。
 //!
 //! # アプリ分岐を持ち込まない（C-4）
-//! 述語は `AppImeProfile` / `ActiveImeKind` までの抽象で判断する。アプリ名文字列や class_name
+//! 述語は `AppImeProfile` / `ImeKindId` までの抽象で判断する。アプリ名文字列や class_name
 //! マッチはここに新設しない（それらは focus 層の classifier が所有する）。
 
 use crate::focus::class_names::AppImeProfile;
-use crate::tsf::observer::ActiveImeKind;
+use crate::state::ime_kind::ImeKindId;
 use crate::vk::{VK_IME_OFF, VK_IME_ON};
 use awase::types::VkCode;
 
 // ── 戦略選択の適用条件（ime_controller の is_applicable が引く述語）─────────────────
 
 /// `ImmCrossProcessStrategy` の適用条件: IMM32 クロスプロセス制御が使えるプロファイルか。
+///
+/// `#[track_caller]`（opus code review S3で追加、理由は`Runtime::
+/// can_use_imm32_cross_process`のdoc参照）: このラッパ自身も薄いため、無いと
+/// `AppImeProfile::can_use_imm32_cross_process`の観測ログに真の呼び出し元ではなく
+/// このラッパのfile:lineだけが記録される。
 #[must_use]
-pub(crate) const fn imm_cross_applicable(profile: AppImeProfile) -> bool {
+#[track_caller]
+pub(crate) fn imm_cross_applicable(profile: AppImeProfile) -> bool {
     profile.can_use_imm32_cross_process()
 }
 
 /// `GjiDirectStrategy` の適用条件: GJI が検出済みか（全プロファイルで適用）。
 #[must_use]
-pub(crate) const fn gji_direct_applicable(kind: ActiveImeKind) -> bool {
-    matches!(kind, ActiveImeKind::GoogleJapaneseInput)
+pub(crate) const fn gji_direct_applicable(kind: ImeKindId) -> bool {
+    matches!(kind, ImeKindId::Gji)
 }
 
-/// `MsImeDirectStrategy` の適用条件: MS-IME 検出済み かつ IMM32 クロスプロセス不可。
+/// `MsImeDirectStrategy` の適用条件: MS-IME 検出済み。
 #[must_use]
-pub(crate) const fn ms_ime_direct_applicable(kind: ActiveImeKind, profile: AppImeProfile) -> bool {
-    matches!(kind, ActiveImeKind::MicrosoftIme) && !profile.can_use_imm32_cross_process()
+pub(crate) const fn ms_ime_direct_applicable(kind: ImeKindId) -> bool {
+    matches!(kind, ImeKindId::MsIme)
 }
-
-// KanjiToggleStrategy は最終フォールバックで常に true。自明なため述語関数は設けない。
 
 // ── 送信キー表（冪等モードキー機構）──────────────────────────────────────────────
 
@@ -81,8 +83,7 @@ impl ImeOperation {
 
 /// `send_ime_mode_key` で冪等モードキーを送る適用機構。
 ///
-/// `ImmCrossProcessStrategy`（API 呼び出し）と `KanjiToggleStrategy`（専用フォーカス窓経路）は
-/// 送信機構が異なるためこの enum に含めない。
+/// `ImmCrossProcessStrategy`（API 呼び出し）は送信機構が異なるためこの enum に含めない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeyMechanism {
     /// `GjiDirectStrategy`: VK_IME_ON / VK_IME_OFF（GJI が TSF 層で処理する冪等キー）。
@@ -96,6 +97,26 @@ pub(crate) enum KeyMechanism {
 ///
 /// 呼び出し側は `crate::ime::send_ime_mode_key(ime_key_for(..))` で送る。各行の挙動根拠
 /// （コミットハッシュ）は P2-1 ゴールデンに集約済み。キー変更はこの match 1行の diff になる。
+///
+/// # 否定の宣言（ADR-158 D3、`docs/experiments.md`エントリ01）
+///
+/// `(GjiDirect | MsImeDirect, Close)` に `VK_DBE_ALPHANUMERIC` を選ぶ変更は**再導入禁止**。
+/// TsfNative + GJIのIME OFFキー選択は5日間に6回、採用と撤回が反転した
+/// （`534051a` → `098c663` → `adb856c` → `b271aee` → … → `489cdf1`、詳細は
+/// `docs/experiments.md`エントリ01）。`VK_DBE_ALPHANUMERIC`は複数回「IME OFFキー」として
+/// 採用・撤回され、そのたびに「これは半角英数（IME ON）であって直接入力ではない」という
+/// 同じ事実が再発見された。この4アームの組み合わせを変更する場合は必ずエントリ01を読み、
+/// 同じ実験を繰り返していないか確認すること。
+///
+/// **検出は下記`gji_direct_keys`/`ms_ime_direct_keys`テストが既に4アームすべてを
+/// ピン留めしており担っている**——D3が追加するのは検出ではなく、失敗時にこのコメントで
+/// 「なぜ前回捨てたか」を即座に読めるようにすることのみ（新しいdylint/マクロ機構は
+/// 導入しない。ADR-161「判断の手順」問い4の下位チェック——既存テストが同じ事実を
+/// 既に固定していないか——により、新機構は不要と判断した）。
+///
+/// **適用範囲の限界**: このmatch表の選択ミスは防げるが、GJIキーマップの実行時読み取り・
+/// config文字列パース・注入経路といった実行時に決まる経路の失敗（`docs/experiments.md`
+/// エントリ07・08・09）は防げない。
 #[must_use]
 // GjiDirect/Close と MsImeDirect/Close は現在同じ VK_IME_OFF を送るが、この表は
 // 「1行 = 1 (機構, 操作) の送信キー根拠（コミットハッシュ付き）」という宣言的テーブル
@@ -107,11 +128,13 @@ pub(crate) const fn ime_key_for(mechanism: KeyMechanism, op: ImeOperation) -> Vk
     use ImeOperation::{Close, Open};
     use KeyMechanism::{GjiDirect, MsImeDirect};
     match (mechanism, op) {
-        // GjiDirect: post_gji_ime_on/off 相当（GJI+TsfNative の OFF も VK_IME_OFF, 489cdf1）。
+        // GjiDirect（GJI+TsfNative の OFF も VK_IME_OFF, 489cdf1）。
         (GjiDirect, Open) => VK_IME_ON,
         (GjiDirect, Close) => VK_IME_OFF,
-        // MsImeDirect: ON=post_ime_on_direct(VK_IME_ON, 2026-08-06 BUG-50根治)、
-        // OFF=post_ime_off_direct(VK_IME_OFF, 48a667a)。
+        // MsImeDirect: ON=VK_IME_ON(2026-08-06 BUG-50根治)、OFF=VK_IME_OFF(48a667a)。
+        // 実送信は ime_controller.rs の `MechanismCommand::SendVk` 経由
+        // （旧 `post_ime_on_direct`/`post_ime_off_direct` は本番呼び出し元ゼロのため
+        // ADR-168 で削除、この2テストが唯一かつ十分な回帰検知）。
         (MsImeDirect, Open) => VK_IME_ON,
         (MsImeDirect, Close) => VK_IME_OFF,
     }
@@ -135,7 +158,9 @@ mod tests {
         );
         assert_eq!(
             ime_key_for(KeyMechanism::GjiDirect, ImeOperation::Close),
-            VK_IME_OFF
+            VK_IME_OFF,
+            "ADR-158 D3: IME OFFキーにVK_DBE_ALPHANUMERIC等を再導入していないか確認せよ。\
+             docs/experiments.mdエントリ01（5日間に6回反転した記録）を読むこと。"
         );
     }
 
@@ -147,7 +172,9 @@ mod tests {
         );
         assert_eq!(
             ime_key_for(KeyMechanism::MsImeDirect, ImeOperation::Close),
-            VK_IME_OFF
+            VK_IME_OFF,
+            "ADR-158 D3: IME OFFキーにVK_DBE_ALPHANUMERIC等を再導入していないか確認せよ。\
+             docs/experiments.mdエントリ01（5日間に6回反転した記録）を読むこと。"
         );
     }
 
@@ -162,28 +189,14 @@ mod tests {
 
     #[test]
     fn gji_direct_any_profile_when_gji() {
-        assert!(gji_direct_applicable(ActiveImeKind::GoogleJapaneseInput));
-        assert!(!gji_direct_applicable(ActiveImeKind::MicrosoftIme));
+        assert!(gji_direct_applicable(ImeKindId::Gji));
+        assert!(!gji_direct_applicable(ImeKindId::MsIme));
     }
 
     #[test]
-    fn ms_ime_direct_requires_non_imm_cross() {
-        // MS-IME × 非 Standard のみ true。
-        assert!(ms_ime_direct_applicable(
-            ActiveImeKind::MicrosoftIme,
-            AppImeProfile::Imm32Unavailable
-        ));
-        assert!(ms_ime_direct_applicable(
-            ActiveImeKind::MicrosoftIme,
-            AppImeProfile::TsfNative
-        ));
-        assert!(!ms_ime_direct_applicable(
-            ActiveImeKind::MicrosoftIme,
-            AppImeProfile::Standard
-        ));
-        assert!(!ms_ime_direct_applicable(
-            ActiveImeKind::GoogleJapaneseInput,
-            AppImeProfile::TsfNative
-        ));
+    fn ms_ime_direct_requires_ms_ime_kind() {
+        // profile には依存しない。ImmCross × MsIme のフォールバックでも使う。
+        assert!(ms_ime_direct_applicable(ImeKindId::MsIme));
+        assert!(!ms_ime_direct_applicable(ImeKindId::Gji));
     }
 }

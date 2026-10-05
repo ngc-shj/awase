@@ -1,3 +1,15 @@
+---
+id: ADR-051
+title: |-
+  HoldingGate の timed-fsm クレートへの移植
+status: |-
+  採用・実装済み(HoldingGate/GateAction は crates/timed-fsm/src/gate.rs に移植済みで src/gate.rs は re-export、2026-10-04 確認)。旧: 採用済み
+related_adr:
+  - "ADR-008"
+  - "ADR-015"
+  - "ADR-042"
+---
+
 # ADR-051: HoldingGate の timed-fsm クレートへの移植
 
 ## ステータス

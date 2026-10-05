@@ -1,259 +1,271 @@
-//! GJI検出時、`config1.db`の`custom_keymap_table`から専用Fnキー変換モード
-//! （ADR-091 §D3.2）を自動判定する（同§D3.1項目1）。
+//! GJI検出時、`config1.db`の`custom_keymap_table`からIME ON/OFF/トグルキー
+//! （ADR-092 決定D Step4c）を自動判定する。
+//!
+//! 専用Fnキー変換（ADR-091 §D3.2）の自動判定・設定支援ポップアップ・
+//! config1.db書き込みは、実験的機能のまま撤去し忘れて出荷され、実機で
+//! ユーザーの混乱を招いた（GJIのキー設定が実際にはカスタムなのに
+//! 「カスタム以外」と誤診断されるなど）ため2026-09-02に全撤去した
+//! （`gji_charset_popup.rs`/`gji_charset_write.rs`ごと削除）。
+//! `GeneralConfig::muhenkan_solo_tap_dedicated_fn_key`による手動設定
+//! （config.toml）経由の内部配線（`nicola_fsm.rs`の専用Fnキー送出）は
+//! そのまま残っている。
 //!
 //! # 設計方針
 //!
 //! - **新しいbeliefは持たない**（ADR-091の中心方針）。ここでの判定は
 //!   `config1.db`という外部ファイルの現在の中身を毎回そのまま読むだけで、
 //!   awase側で過去の観測を蓄積・推測することはしない。
-//! - **継続的なポーリングはしない**（ADR-091決定3項目2）。GJIが継続して
-//!   アクティブな間は一度判定したら再読み込みしない（[`sync_gji_charset_autodetect`]
-//!   のラッチ参照）。GJI以外へ遷移したら自動検出は解除する（F21等の専用Fnキーが
-//!   他IMEへ漏れるのを防ぐ）。
-//! - **手動設定が常に優先**。`GeneralConfig::muhenkan_solo_tap_dedicated_fn_key`
-//!   が明示設定されている間は、この自動判定は一切介入しない
-//!   （`Runtime::muhenkan_dedicated_fn_key_is_manual`/`set_muhenkan_dedicated_fn_key_auto`
-//!   参照）。
+//! - **継続的なポーリングはしない**（ADR-091決定3項目2）。呼び出し側（較正結果の保存、
+//!   bug report〈ADR-148〉）が必要なときに1回だけ読む。ADR-191でGJI検出時の自動同期
+//!   （`sync_gji_charset_autodetect`、ラッチ付き）は撤去した。
 //! - **config1.db未存在（GJI未インストール等）はエラーではない**。読めなければ
-//!   静かに何もしない（既定の「抑止」のまま）。`awase-gji-config`crate自体の
-//!   「パース失敗は常に空の結果に静かにフォールバック」という既存方針を踏襲する。
+//!   静かに何もしない。`awase-gji-config`crate自体の「パース失敗は常に
+//!   空の結果に静かにフォールバック」という既存方針を踏襲する。
 
-use awase::config::ParsedKeyCombo;
-use awase::types::VkCode;
-
-use crate::vk::VkCodeExt as _;
-
-/// 専用Fnキー変換として自動採用してよいVK名の範囲。
-///
-/// `src/config.rs::validate_dedicated_fn_key`と同じ基準（`VK_F15`-`VK_F24`の
-/// うち`VK_F13`/`VK_F14`を除く）。`VK_F13`/`VK_F14`はターミナルエスケープ
-/// シーケンス漏れが実機確認済み（ADR-057）のため、config1.dbにこれらへの
-/// バインドが見つかっても絶対に採用しない。
-#[cfg_attr(not(windows), allow(dead_code))]
-fn is_in_safe_autodetect_range(vk_name: &str) -> bool {
-    matches!(
-        vk_name,
-        "VK_F15"
-            | "VK_F16"
-            | "VK_F17"
-            | "VK_F18"
-            | "VK_F19"
-            | "VK_F20"
-            | "VK_F21"
-            | "VK_F22"
-            | "VK_F23"
-            | "VK_F24"
-    )
+/// GJIが無変換/変換キーに割り当てているIME意味論の分類（BUG-115）。
+/// `session_keymap`/`custom_keymap_table`/`overlay_keymaps`のどれ由来でも
+/// 同じ3値に潰す。この分類は較正結果の保存とbug report（ADR-148）の診断表示にだけ使う
+/// （ADR-191: awaseがこの結果からIMEの開閉を代行・上書きすることはない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImeToggleKind {
+    /// このキー単独でIMEをONにする。
+    On,
+    /// このキー単独でIMEをOFFにする。
+    Off,
+    /// 現在のIME開閉状態に応じて反転する（`ctx.ime_on`依存、非冪等）。
+    Toggle,
 }
 
-/// `config1.db`の`custom_keymap_table`（TSV文字列）から、専用Fnキー変換として
-/// 自動的に有効化すべき`VkCode`を判定する（ADR-091 §D3.1項目1）。
+/// GJIの現在の設定（`config1.db`）が、無変換/変換キー単体にどのIME意味論
+/// （[`ImeToggleKind`]）を割り当てているかを判定する（BUG-115）。
+/// `config1.db`の3つの独立した情報源を、優先順位付きで1つの結論に
+/// まとめる純粋関数。Linux上でもテスト可能（Windows APIに依存しない）。
 ///
-/// 安全範囲内（[`is_in_safe_autodetect_range`]）で`SwitchKanaType`
-/// （`ToggleKanaType`に分類される）に割り当てられているキーがちょうど1つ
-/// なら、それを採用する。0個、または複数（どれを使うべきか一意に定まらない）
-/// なら`None`（安全側、既定の「抑止」のまま変更しない）。
+/// 優先順位（Mozcがoverlayをbase keymapの上に重ね掛けする実装、
+/// `session.cc`/`keymap.cc::ApplyOverlaySessionKeymap`と対応させてある）:
+///
+/// 1. **`overlay_keymaps`に`OVERLAY_HENKAN_MUHENKAN_TO_IME_ON_OFF`(100)が
+///    含まれる**: `session_keymap`の値に関わらず最優先（ATOKや後述の
+///    CUSTOMトークンと同時に該当していても、overlayが勝つ）。
+///    Henkan→`On`・Muhenkan→`Off`（`overlay_henkan_muhenkan_to_ime_on_off.tsv`
+///    で2026-09-05確認済み: 状態非依存で一貫しているため`Toggle`にはならず
+///    警告不要）。
+/// 2. **`session_keymap == CUSTOM`（overlay無し）**: `custom_keymap_table`
+///    （field 42）に、ユーザーが（例えばATOKベースからカスタムを作った
+///    場合など）literal に`Henkan`/`Muhenkan`トークンを含めていることが
+///    ある（BUG-115で判明。`awase-gji-config::keymap::extract_ime_keys`が
+///    これらのトークンを認識し、`STATUSES_WHEN_IME_OFF`/
+///    `STATUSES_WHEN_IME_ON`に基づき`On`/`Off`/`Toggle`へ分類する——ATOK
+///    プリセット由来の行をそのままコピーした場合は4.と同じ`Toggle`に
+///    classifyされる）。Henkan/Muhenkanそれぞれ独立に判定する
+///    （一方だけ設定されている場合もある）。
+/// 3. **`session_keymap`がCUSTOM以外でも`custom_keymap_table`に該当行が
+///    ある場合はそれを優先する**（ADR-174実機検証、2026-09-15）:
+///    `session_keymap`がプリセット値（実機でMSIME=2を確認）のままでも、
+///    `custom_keymap_table`にユーザーが個別上書きした行
+///    （`DirectInput\tHenkan\tIMEOn`等、F15-F19のSetMode割り当てと
+///    共存する形で実機確認済み）が残っていることがある。テーブルに
+///    該当行が無ければ4.のプリセット静的知識へフォールスルーする。
+/// 4. **`session_keymap == ATOK`（overlay無し、custom無し）**:
+///    `google/mozc`の`src/data/keymap/atok.tsv`（2026-09-05取得）は、
+///    Henkan/Muhenkan双方を`DirectInput`状態で`IMEOn`、`Precomposition`
+///    状態で`CancelAndIMEOff`に割り当てている——`ctx.ime_on`の値に応じて
+///    反転する割当てだが、`ShadowImeAction::Toggle`
+///    （`Engine::apply_ime_open_request`の`Toggle => !ctx.ime_on`）で
+///    **正確に表現できる**（「表現不能」ではない）。
+/// 5. **それ以外**（`MSIME`/`MOBILE`/`KOTOERI`/`CHROMEOS`/フィールド不在/
+///    未知の値、または`CUSTOM`だがHenkan/Muhenkanトークンが無い）:
+///    割り当てなし。`ms-ime.tsv`/`mobile.tsv`はHenkanが`Reconvert`
+///    （IME開閉と無関係）でMuhenkanは該当行自体が無く、`kotoeri.tsv`/
+///    `chromeos.tsv`はHenkan/Muhenkan関連行が無い（いずれも2026-09-05
+///    取得して確認済み）。フィールド不在/`NONE`もここに落ちるが、
+///    Windows版GJIでは`ConfigHandler::GetDefaultKeyMap()`
+///    （`config_handler.cc`で確認済み）により実質MSIME相当なので、この
+///    fail-closedな既定は実際のGJI挙動とも一致する。
+///
+/// ADR-191: この分類は、bug report（ADR-148）の診断表示と較正結果の保存にだけ使う。awaseが
+/// この結果からIMEの開閉を代行・上書きすることはない（`gji_thumb_key_ime_toggle`設定と採用機構は撤去済み）。
 #[must_use]
 #[cfg_attr(not(windows), allow(dead_code))]
-pub(crate) fn detect_dedicated_fn_key(custom_keymap_table: &str) -> Option<VkCode> {
-    let mode_keys = awase_gji_config::keymap::extract_mode_keys(custom_keymap_table);
-    let mut candidates = mode_keys
-        .toggle_kana_type
-        .iter()
-        .filter(|vk_name| is_in_safe_autodetect_range(vk_name));
-    let only = candidates.next()?;
-    if candidates.next().is_some() {
-        log::warn!(
-            "[gji-charset-autodetect] 安全範囲内に複数の SwitchKanaType キーが \
-             見つかったため自動判定を見送りました（一意に定まらない）"
-        );
-        return None;
-    }
-    VkCode::from_name(only)
-}
-
-/// `config1.db`の`custom_keymap_table`から、IME ON/OFF/トグルの自動検出用
-/// `ParsedKeyCombo`リストを判定する（ADR-092 決定D Step4c）。戻り値は
-/// `(on, off, toggle)`で、それぞれ`Engine::set_ime_on_auto_keys`等へ渡す。
-///
-/// `awase_gji_config::keymap::extract_ime_keys`が返すVK名は`VK_KANJI`
-/// （Hankaku/Zenkakuも同一）・`VK_IME_ON`・`VK_IME_OFF`・`VK_DBE_ALPHANUMERIC`
-/// （Eisu）を含みうる。これらはBUG-14で確認済みの「MS-IME/CTFが注入する
-/// 合成イベントと衝突しうるキー」であり、`SpecialKeyCombos::match_event`が
-/// `event.injected`を見ずにマッチするため、そのまま採用するとBUG-14と同種の
-/// 誤トグルを招く。[`is_in_safe_autodetect_range`]（専用FnキーF15-F24のみ）
-/// で必ず絞り込み、上記4エイリアスを一律除外する。
-///
-/// GJIが無変換/変換等の親指キーにIME ON/OFFを割り当てるケースは、そもそも
-/// `mozc_key_to_vk_name`の出力範囲（F1-F24と上記4エイリアスのみ）に無変換/
-/// 変換のVK名が含まれないため発生しない（Step4bの無変換/変換
-/// delegate-to-open-axisとは競合し得ない）。
-#[must_use]
-#[cfg_attr(not(windows), allow(dead_code))]
-fn extract_ime_on_off_toggle_combos(
-    custom_keymap_table: &str,
-) -> (
-    Vec<ParsedKeyCombo>,
-    Vec<ParsedKeyCombo>,
-    Vec<ParsedKeyCombo>,
-) {
-    let keys = awase_gji_config::keymap::extract_ime_keys(custom_keymap_table);
-    let to_combos = |names: &[String]| -> Vec<ParsedKeyCombo> {
-        names
-            .iter()
-            .filter(|name| is_in_safe_autodetect_range(name))
-            .filter_map(|name| VkCode::from_name(name))
-            .map(|vk| ParsedKeyCombo {
-                ctrl: false,
-                shift: false,
-                alt: false,
-                vk,
-            })
-            .collect()
-    };
+pub(crate) fn classify_thumb_key_ime_actions(
+    raw: &awase_gji_config::wire::GjiRawConfig,
+) -> (Option<ImeToggleKind>, Option<ImeToggleKind>) {
     (
-        to_combos(&keys.on),
-        to_combos(&keys.off),
-        to_combos(&keys.toggle),
+        classify_mode_key_ime_action(ModeKeyCandidate::Henkan, raw),
+        classify_mode_key_ime_action(ModeKeyCandidate::Muhenkan, raw),
     )
 }
 
+/// GJIがIME on/off意味論を割り当てうる候補キー（BUG-115）。
+///
+/// 無変換(`Muhenkan`)・変換(`Henkan`)だけを扱う（`ImeKeyKind::from_vk`に含まれないキー）。
+/// ADR-191で、この分類結果を awase が自動採用する機構（`*_delegate_to_open_axis`、
+/// shadow_action override）は撤去した。分類は bug report の診断（[`classify_mode_key_ime_action`]）に使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) enum ModeKeyCandidate {
+    Henkan,
+    Muhenkan,
+}
+
+impl ModeKeyCandidate {
+    /// `awase::types::VkCode::from_name`が受理するVK名。
+    const fn vk_name(self) -> &'static str {
+        match self {
+            Self::Henkan => "VK_CONVERT",
+            Self::Muhenkan => "VK_NONCONVERT",
+        }
+    }
+}
+
+/// [`ModeKeyCandidate`]の現在のGJI設定によるIME意味論を判定する（BUG-115）。
+/// `config1.db`の3つの独立した情報源を、優先順位付きで1つの結論に
+/// まとめる純粋関数。Linux上でもテスト可能（Windows APIに依存しない）。
+///
+/// 優先順位（Mozcがoverlayをbase keymapの上に重ね掛けする実装、
+/// `session.cc`/`keymap.cc::ApplyOverlaySessionKeymap`と対応させてある）:
+///
+/// 1. **`overlay_keymaps`に`OVERLAY_HENKAN_MUHENKAN_TO_IME_ON_OFF`(100)が
+///    含まれる**: `session_keymap`の値に関わらず最優先。Henkan→`On`・
+///    Muhenkan→`Off`（`overlay_henkan_muhenkan_to_ime_on_off.tsv`で
+///    2026-09-05確認済み: 状態非依存で一貫しているため`Toggle`にはならず
+///    警告不要）。Hiragana/Katakanaはこのoverlayの対象外——このソースでは
+///    次のソースへフォールスルーする。
+/// 2. **`session_keymap == CUSTOM`（overlayが対象外、または無し）**:
+///    `custom_keymap_table`（field 42）に、ユーザーが（例えばATOK/MSIME
+///    ベースからカスタムを作った場合など）literal に該当キーのトークンを
+///    含めていることがある（BUG-115で判明。
+///    `awase-gji-config::keymap::extract_ime_keys`がこれらのトークンを
+///    認識し、`STATUSES_WHEN_IME_OFF`/`STATUSES_WHEN_IME_ON`に基づき
+///    `On`/`Off`/`Toggle`へ分類する）。
+/// 3. **`session_keymap`がCUSTOM以外でも`custom_keymap_table`に該当行が
+///    ある場合はそれを優先する**（ADR-174実機検証、2026-09-15）:
+///    `session_keymap`がプリセット値（実機でMSIME=2を確認）のままでも、
+///    `custom_keymap_table`にユーザーが個別上書きした行
+///    （`DirectInput\tHenkan\tIMEOn`等、F15-F19のSetMode割り当てと
+///    共存する形で実機確認済み）が残っていることがある。テーブルに
+///    該当行が無ければ4.のプリセット静的知識へフォールスルーする。
+/// 4. **`session_keymap`がプリセット（overlay/custom無し）**:
+///    `google/mozc`の各プリセットtsv（2026-09-05取得）の静的知識。
+///    - `ATOK`: Henkan/Muhenkan双方を`DirectInput`状態で`IMEOn`、
+///      `Precomposition`状態で`CancelAndIMEOff`に割り当てている——
+///      `ctx.ime_on`の値に応じて反転する割当てだが、`ShadowImeAction::Toggle`
+///      （`Engine::apply_ime_open_request`の`Toggle => !ctx.ime_on`）で
+///      **正確に表現できる**（「表現不能」ではない）。Hiragana/Katakanaへの
+///      割当ては無い。
+///    - `MSIME`/`MOBILE`: Hiragana/Katakana双方を`DirectInput`状態で
+///      `IMEOn`に割り当てている（`Precomposition`状態の
+///      `CompositionModeHiragana`/`CompositionModeFullKatakana`はIME
+///      開閉と無関係の絶対モード設定なので矛盾しない、単純に`On`）。
+///      Henkan/Muhenkanへの割当ては`Reconvert`のみでIME開閉と無関係。
+///    - `KOTOERI`/`CHROMEOS`: 該当行なし。
+/// 5. **それ以外**（フィールド不在/未知の値、または`CUSTOM`だが該当
+///    トークンが無い）: 割り当てなし。フィールド不在/`NONE`は、Windows版
+///    GJIでは`ConfigHandler::GetDefaultKeyMap()`（`config_handler.cc`で
+///    確認済み）により実質MSIME相当なので、`MSIME`の分岐へ委ねる
+///    fail-closedな既定が実際のGJI挙動とも一致する。
+///
+/// ADR-191: この分類は、bug report（ADR-148）の診断表示と較正結果の保存にだけ使う。awaseが
+/// この結果からIMEの開閉を代行・上書きすることはない（`gji_thumb_key_ime_toggle`設定と採用機構は撤去済み）。
+///
+/// 注（ADR-209、実機X1）: `MSIME`プリセットで「表を優先する」前提は否定された。GJI はプリセットのとき
+/// `custom_keymap_table`を読まない。この分類は診断用で、予測（`key_effect_predictor`）とは独立。
+#[must_use]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn classify_mode_key_ime_action(
+    key: ModeKeyCandidate,
+    raw: &awase_gji_config::wire::GjiRawConfig,
+) -> Option<ImeToggleKind> {
+    if raw
+        .overlay_keymaps
+        .contains(&awase_gji_config::SESSION_KEYMAP_OVERLAY_HENKAN_MUHENKAN_TO_IME_ON_OFF)
+    {
+        match key {
+            ModeKeyCandidate::Henkan => return Some(ImeToggleKind::On),
+            ModeKeyCandidate::Muhenkan => return Some(ImeToggleKind::Off),
+        }
+    }
+    if raw.session_keymap == Some(awase_gji_config::SESSION_KEYMAP_CUSTOM) {
+        let Some(table) = &raw.custom_keymap_table else {
+            return None;
+        };
+        let keys = awase_gji_config::keymap::extract_ime_keys(table);
+        return classify_vk_in_ime_keys(&keys, key.vk_name());
+    }
+    // ADR-174実機検証（2026-09-15）: `session_keymap`が`CUSTOM`以外の値
+    // （実機でMSIME=2を確認）でも、`custom_keymap_table`にこのキーの
+    // 明示的な行（実機で`DirectInput\tHenkan\tIMEOn`を確認）が実在する
+    // ことがある——旧実装はこの場合`custom_keymap_table`を一切参照せず
+    // 下記プリセット静的知識（Henkan/Muhenkanは`None`）へ落ち、実際に
+    // GJIがIMEを開いてもawaseのbeliefが追従しなかった。`session_keymap`
+    // がプリセット値のままでも`custom_keymap_table`にユーザーが個別に
+    // 上書きした行が残る実例（F15-F19のSetMode等と共存）が実機で確認
+    // 済みのため、テーブルに該当行があればプリセットの静的知識より
+    // 優先する。テーブルに該当行が無ければ下記のプリセット分岐へ
+    // フォールスルーする（`session_keymap == CUSTOM`の場合はこの
+    // フォールスルーを行わない——真にCUSTOM選択時は「テーブルに無い
+    // ＝割り当てなし」がGJIの実際の意味論であり、他プリセットの静的
+    // 知識を借用する根拠が無いため、上のCUSTOM専用分岐のまま`None`を
+    // 返す）。
+    // ADR-186(実機スパイク、2026-09-20): `session_keymap == ATOK`では、`config1.db`に残る
+    // 古い`custom_keymap_table`は**GJIに使われない**。実機(ATOK)で、表に
+    // `DirectInput\tHenkan\tIMEOn`/`Precomposition\tHenkan\tCompositionModeHiragana`が残って
+    // いても、変換は`atok.tsv`どおり開閉トグル(ON中→OFF)として動いた(`docs/adr/186-measurements/`)。
+    // 表を優先するとHenkanが`On`(冪等・belief追随のみ・生キー素通し)と誤分類され、GJIの実トグル
+    // とbeliefが逆になる(Muhenkanは表に行が無くATOKの`Toggle`になり非対称)。ATOKでは表を読まず
+    // 下のプリセット分岐へ進む。MSIME等はADR-174の実機根拠があるため従来どおり表を優先する。
+    if raw.session_keymap != Some(awase_gji_config::SESSION_KEYMAP_ATOK) {
+        if let Some(table) = &raw.custom_keymap_table {
+            let keys = awase_gji_config::keymap::extract_ime_keys(table);
+            if let Some(found) = classify_vk_in_ime_keys(&keys, key.vk_name()) {
+                return Some(found);
+            }
+        }
+    }
+    match raw.session_keymap {
+        Some(v) if v == awase_gji_config::SESSION_KEYMAP_ATOK => Some(ImeToggleKind::Toggle),
+        // MSIME/MOBILE/フィールド不在(実質MSIME相当)/KOTOERI/CHROMEOS/未知の値: 無変換/変換は静的には決めない。
+        Some(_) | None => None,
+    }
+}
+
+/// `GjiImeKeys`（`awase-gji-config::keymap::extract_ime_keys`の戻り値）から
+/// 特定のVK名がon/off/toggleのどれに分類されているかを引く。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn classify_vk_in_ime_keys(
+    keys: &awase_gji_config::keymap::GjiImeKeys,
+    vk_name: &str,
+) -> Option<ImeToggleKind> {
+    if keys.toggle.iter().any(|v| v == vk_name) {
+        Some(ImeToggleKind::Toggle)
+    } else if keys.on.iter().any(|v| v == vk_name) {
+        Some(ImeToggleKind::On)
+    } else if keys.off.iter().any(|v| v == vk_name) {
+        Some(ImeToggleKind::Off)
+    } else {
+        None
+    }
+}
+
+/// ADR196-T2「1e前半」: 学習プロセス（`awase-keymap-learn-win`、別クレート）が
+/// 開始時・終了時の`config1.db`比較（opus-adversarial-consult 2026-09-23 B-3）と
+/// 既知構成判定に直接呼べるよう`pub`で再エクスポートする。
 #[cfg(windows)]
-pub(crate) use windows_impl::sync_gji_charset_autodetect;
+pub use windows_impl::{bundled_preset_for_adjudication, read_config1_db, BundledPresetLookup};
+#[cfg(windows)]
+pub(crate) use windows_impl::{config1_db_stamp, is_configured_thumb_key, read_key_effect_keymap};
 
 #[cfg(windows)]
 mod windows_impl {
-    use std::sync::atomic::{AtomicU8, Ordering};
+    use awase::types::VkCode;
 
-    use crate::runtime::Runtime;
-
-    use super::{detect_dedicated_fn_key, extract_ime_on_off_toggle_combos};
-
-    const NOT_GJI: u8 = 0;
-    const GJI_CHECKED: u8 = 1;
-
-    /// GJIが継続してアクティブな「区間」ごとに一度だけ判定するためのラッチ。
-    /// `NOT_GJI`（GJI以外、または未判定）/`GJI_CHECKED`（この区間で判定済み）
-    /// の2値。`sync_gji_charset_autodetect`以外から触らない。
-    static LAST_GJI_STREAK_CHECKED: AtomicU8 = AtomicU8::new(NOT_GJI);
-
-    /// `runtime::message_handlers::sync_ime_kind_from_observation`から呼ぶ、
-    /// GJI検出/離脱の唯一の合流点（`msime_key_assignment::check_and_warn`と対）。
-    /// 専用Fnキー変換（ADR-091）とIME ON/OFF/トグルキー（ADR-092 Step4c）の
-    /// 2つの独立した自動判定を行う。
-    ///
-    /// - **GJI以外への遷移**: 直前がGJI継続区間だった場合のみ、自動検出して
-    ///   いた専用Fnキー変換・`ime_on_auto`/`ime_off_auto`を解除する
-    ///   （`ime_toggle_auto`は意図的に対象外、関数内コメント参照）。
-    /// - **GJIへの新規遷移**: `config1.db`を読み、(1)安全範囲内のFnキー
-    ///   バインドがちょうど1つ見つかれば専用Fnキー変換として自動的に有効化し、
-    ///   (2)宣言されているIME ON/OFF/トグルキー（安全範囲内のみ）を
-    ///   `Engine`の自動検出リストへ反映する。既にこのGJI継続区間でチェック
-    ///   済みなら（ラッチが`GJI_CHECKED`のまま）何もしない——継続的な
-    ///   ポーリングをしないため（ADR-091決定3項目2）。
-    ///
-    /// `app.muhenkan_dedicated_fn_key_is_manual()`（ユーザーが
-    /// `muhenkan_solo_tap_dedicated_fn_key`を明示設定済み）による手動優先
-    /// ガードは**専用Fnキー変換の自動検出にのみ**適用され、IME ON/OFF/
-    /// トグルキーの自動検出（Step4c）には適用されない——Step4c側の手動優先
-    /// は`Engine::match_ime_on_off_auto`/`match_ime_toggle_auto`が
-    /// `special_keys`側で独立に行う（Opus コードレビュー指摘: 以前は
-    /// この関数全体が同じガードで早期returnしており、専用Fnキーを手動
-    /// 設定しているユーザーがStep4cの機能を丸ごと失っていた）。
-    pub(crate) fn sync_gji_charset_autodetect(app: &mut Runtime, is_gji: bool) {
-        if !is_gji {
-            if LAST_GJI_STREAK_CHECKED.swap(NOT_GJI, Ordering::Relaxed) == GJI_CHECKED {
-                log::info!(
-                    "[gji-charset-autodetect] GJI から離脱: 自動検出した専用Fnキー変換・\
-                     IME ON/OFFキーを解除"
-                );
-                app.set_muhenkan_dedicated_fn_key_auto(None);
-                // ime_on_auto/ime_off_auto/ime_toggle_auto を全て解除する
-                // （さもないと GJI 離脱後も別アプリ/別IMEの文脈にF15-F24の
-                // バインドが残留してしまう）。ime_toggle_auto は MS-IME 側
-                // （sync_ime_toggle_auto_detect）とも共有するフィールドだが、
-                // 呼び出し元（message_handlers::sync_ime_kind_from_observation）
-                // が GJI 側の同期を MS-IME 側より**先に**呼ぶ順序になっている
-                // ため、GJI→MS-IME遷移ではここで解除した直後に MS-IME 側が
-                // 新しい値で上書きし、破綻しない（Opus コードレビュー指摘:
-                // 以前は逆順だったため、ここで解除すると MS-IME 側の値を
-                // 上書き消去してしまう懸念からime_toggle_autoを対象外にして
-                // いたが、その代わりの前提「GJI側は次回アクティブ化時に
-                // 必ず自分の現在値で上書きする」も
-                // `muhenkan_dedicated_fn_key_is_manual()`等の早期returnで
-                // 成立しない場合があり誤りだった）。
-                app.clear_gji_ime_on_off_auto_keys();
-            }
-            return;
-        }
-        if LAST_GJI_STREAK_CHECKED.swap(GJI_CHECKED, Ordering::Relaxed) == GJI_CHECKED {
-            return;
-        }
-        let Some(bytes) = read_config1_db() else {
-            log::debug!(
-                "[gji-charset-autodetect] config1.db を読めませんでした \
-                 （GJI 未インストール、または初回起動でまだ作成されていない等）"
-            );
-            return;
-        };
-        let Some(raw) = awase_gji_config::wire::parse_top_level(&bytes) else {
-            return;
-        };
-        if raw.session_keymap != Some(awase_gji_config::SESSION_KEYMAP_CUSTOM) {
-            // session_keymap が CUSTOM でなければ（ATOK/MS-IME 等のプリセット
-            // 選択中）、custom_keymap_table に何が残っていても GJI はそれを
-            // 参照しない。古いカスタムテーブルの残骸を誤って有効と判定しない
-            // ための必須ガード（Opus レビュー指摘）。
-            log::debug!(
-                "[gji-charset-autodetect] session_keymap が CUSTOM ではないため \
-                 自動判定をスキップ: {:?}",
-                raw.session_keymap
-            );
-            return;
-        }
-        let Some(table) = raw.custom_keymap_table else {
-            return;
-        };
-
-        // ADR-092 決定D Step4c: IME ON/OFF/トグルキーの自動検出は専用Fnキー
-        // 変換（ToggleKanaType）の検出可否・`muhenkan_dedicated_fn_key_is_manual`
-        // に依存しない、独立した判定のため、下の専用Fnキー検出（手動設定
-        // ガード付き）より前に行う（Opus コードレビュー指摘: 以前はこの
-        // ブロックが `muhenkan_dedicated_fn_key_is_manual()` の早期return
-        // より後にあり、専用Fnキーを手動設定しているユーザーは本Stepの
-        // 機能を丸ごと失っていた——doc の「独立した判定」という主張と矛盾
-        // していた）。2026-08-16 ユーザー判断: `Engine::match_ime_on_off_auto`/
-        // `match_ime_toggle_auto`は`special_keys.ime_on/ime_off/ime_toggle`が
-        // 非空でも自動リストを併用する（明示 ∪ 自動、手動排他ではない）ため、
-        // ここでの事前チェックは元々不要（Step4aと同じ規約）。
-        let (on, off, toggle) = extract_ime_on_off_toggle_combos(&table);
-        if !on.is_empty() || !off.is_empty() || !toggle.is_empty() {
-            log::info!(
-                "[gji-charset-autodetect] config1.db から IME ON/OFF/トグルキーを \
-                 自動検出しました: on={on:?} off={off:?} toggle={toggle:?}"
-            );
-        }
-        app.set_gji_ime_on_off_toggle_auto_keys(on, off, toggle);
-
-        // 専用Fnキー変換の自動検出は、Step4cと異なり手動設定
-        // （`muhenkan_solo_tap_dedicated_fn_key`）が優先される
-        // （`Runtime::set_muhenkan_dedicated_fn_key_auto` が内部で同じ
-        // ガードを持つため、ここでの事前チェックは主にログ・処理の無駄な
-        // 実行を避けるための早期return）。
-        if app.muhenkan_dedicated_fn_key_is_manual() {
-            log::debug!(
-                "[gji-charset-autodetect] muhenkan_solo_tap_dedicated_fn_key が \
-                 手動設定済みのため専用Fnキーの自動判定をスキップ"
-            );
-            return;
-        }
-        let Some(vk) = detect_dedicated_fn_key(&table) else {
-            return;
-        };
-        log::info!(
-            "[gji-charset-autodetect] config1.db から専用Fnキー変換を自動検出しました: {vk:?}"
-        );
-        app.set_muhenkan_dedicated_fn_key_auto(Some(vk));
+    /// `vk`が現在`left_thumb_key`/`right_thumb_key`のいずれかに設定されて
+    /// いるか（BUG-115）。`crate::hook::thumb_vk_codes()`
+    /// （`apply_config_update`/起動時に更新される、常に最新の親指キー
+    /// ペア）と比較する汎用ヘルパー——無変換/変換に限らず任意のVKに使える。
+    pub(crate) fn is_configured_thumb_key(vk: VkCode) -> bool {
+        let (left, right) = crate::hook::thumb_vk_codes();
+        vk == left || vk == right
     }
 
     /// `config1.db`のパス。`%USERPROFILE%\AppData\LocalLow\Google\Google Japanese Input\config1.db`
@@ -271,173 +283,312 @@ mod windows_impl {
     }
 
     /// `config1.db`を読む。存在しない・読めない場合は`None`（エラーにしない、
-    /// GJI未インストール環境を正常系として扱う）。
-    fn read_config1_db() -> Option<Vec<u8>> {
+    /// GJI未インストール環境を正常系として扱う）。ADR-148（bug report）が
+    /// 報告生成時点の内容を都度読み直すためにも使う（Runtime側にキャッシュされた
+    /// `GjiRawConfig`は存在しないため）。
+    #[must_use]
+    pub fn read_config1_db() -> Option<Vec<u8>> {
         let path = config1_db_path()?;
         std::fs::read(&path).ok()
+    }
+
+    /// `config1.db`の版（更新時刻のナノ秒+長さ）。読めなければ`None`。`KeymapCache`が
+    /// 打鍵ごとに全体を読み直さないための判定材料（statだけ）。
+    pub(crate) fn config1_db_stamp() -> Option<(u64, u64)> {
+        let meta = std::fs::metadata(config1_db_path()?).ok()?;
+        let modified = meta
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        Some((u64::try_from(modified.as_nanos()).ok()?, meta.len()))
+    }
+
+    /// ADR-191 決定3: `config1.db`から、打鍵時点の予測（`key_effect_predictor`）に使うキーマップを読む。
+    /// 呼び出しは`KeymapCache`が版の変化時だけに絞る（打鍵ごとに読まない）。パスが解決できない・
+    /// `config1.db`が読めない・パースできない場合は`None`。ファイルが**無い**ときはMozcと同じく
+    /// 既定のキーマップ（MS-IMEプリセット相当）を返す（ADR-199 決定6-3・決定8 (ii)、
+    /// `KeyEffectKeymap::from_config1_db_read`）。`session_keymap`がATOK/MSIME以外
+    /// （CUSTOM・MOBILE等）でも、ADR-195段階4 B3対応により`KeymapPreset::Custom`として`Some`を返す
+    /// （同梱表による予測は無いが、学習済み表があれば`predict_with_override`経由で使える）。
+    pub(crate) fn read_key_effect_keymap(
+    ) -> Option<crate::state::key_effect_predictor::KeyEffectKeymap> {
+        let path = config1_db_path()?;
+        crate::state::key_effect_predictor::KeyEffectKeymap::from_config1_db_read(std::fs::read(
+            &path,
+        ))
+    }
+
+    /// [`bundled_preset_for_adjudication`]の戻り値（ADR196-T2「1e前半」決定1c）。
+    ///
+    /// `NotKnown`と`ConfigUnreadable`を区別する——前者は「既知構成でない」という
+    /// 確定した判定結果、後者は「判定できなかった」という不確実性そのものを表す
+    /// （opus-adversarial-consult 2026-09-23 C-5: 「既知でない」と「読めなかった」を
+    /// 同じ値に潰すと、不具合報告で原因を切り分けられなくなる）。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum BundledPresetLookup {
+        /// 内蔵表との突き合わせに使うプリセットが確定した。
+        Known(crate::state::key_effect_predictor::KeymapPreset),
+        /// GJIだが既知構成でない、またはGJI以外（Microsoft IME本体・その他のTIP）で
+        /// 既知構成判定が未実装（T2タスク1c「未着手のうちは既知構成と判定しない」）。
+        NotKnown,
+        /// `TipIdentity::Gji`なのに`config1.db`が読めない・パースできない・パスが解決できない
+        /// （異常系）。ファイルが**無い**ときはここに入れない: Mozcはファイル不在を既定設定
+        /// （Windowsでは`session_keymap = MSIME`）として扱う（ADR-199 決定6-3・決定8）。
+        ConfigUnreadable,
+    }
+
+    /// ADR196-T2決定1c: 学習対象のIME（学習窓で同定した`TipIdentity`）と、現在の
+    /// `config1.db`（GJIのときのみ）から、内蔵表との突き合わせ（[`super::super::state::
+    /// key_effect_runtime::diff_against_bundled`]）に使うプリセットを決める。
+    ///
+    /// `config1.db`は学習対象がGJIでなくても読めてしまう（GJIがインストールされて
+    /// いれば常に存在するファイル）ため、`TipIdentity::Gji`のときだけ読む
+    /// （opus-adversarial-consult 2026-09-23 B-2: ゲート無しだと、GJIを「ATOKプリセット」に
+    /// 設定したままATOK本体やMicrosoft IME本体で学習したセッションが、誤ってGJIのATOK同梱表と
+    /// 突き合わされ、偽の不一致になる）。
+    #[must_use]
+    pub fn bundled_preset_for_adjudication(
+        tip: crate::state::ime_kind::TipIdentity,
+    ) -> BundledPresetLookup {
+        use crate::state::ime_kind::TipIdentity;
+
+        if tip != TipIdentity::Gji {
+            // MsImeNative: T2タスク1cのMicrosoft IME本体側判定はADR196-T5待ち(未着手)。
+            // Other: 内蔵表を持たない構成(ATOK本体・Japanist等)。
+            return BundledPresetLookup::NotKnown;
+        }
+        let Some(path) = config1_db_path() else {
+            return BundledPresetLookup::ConfigUnreadable;
+        };
+        lookup_from_config1_db_read(std::fs::read(&path))
+    }
+
+    /// [`bundled_preset_for_adjudication`]の、`config1.db`の読み取り結果の解釈部分。
+    /// 不在（`NotFound`）は既定設定（`session_keymap`等のフィールド無し）として判定する
+    /// （予測側の`KeyEffectKeymap::from_config1_db_read`と同じ扱い。ADR-199 決定8で不在の
+    /// 指紋が計算可能になり学習表が採用されうるので、突き合わせもそれに揃える）。
+    fn lookup_from_config1_db_read(read: std::io::Result<Vec<u8>>) -> BundledPresetLookup {
+        use crate::state::key_effect_predictor::KeymapPreset;
+        use awase_gji_config::known_keymap::{classify_known_gji_keymap, KnownGjiKeymap};
+
+        let raw = match read {
+            Ok(bytes) => match awase_gji_config::wire::parse_top_level(&bytes) {
+                Some(raw) => raw,
+                None => return BundledPresetLookup::ConfigUnreadable,
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                awase_gji_config::wire::GjiRawConfig::default()
+            }
+            Err(_) => return BundledPresetLookup::ConfigUnreadable,
+        };
+        match classify_known_gji_keymap(
+            raw.session_keymap,
+            &raw.overlay_keymaps,
+            raw.custom_keymap_table.as_deref(),
+        ) {
+            Some(KnownGjiKeymap::Atok) => BundledPresetLookup::Known(KeymapPreset::Atok),
+            Some(KnownGjiKeymap::MsIme) => BundledPresetLookup::Known(KeymapPreset::MsIme),
+            None => BundledPresetLookup::NotKnown,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::state::ime_kind::TipIdentity;
+
+        /// B-2回帰テスト(opus-adversarial-consult 2026-09-23): GJI以外のTIPでは
+        /// config1.dbを一切読まず(読めても)常に`NotKnown`を返す。`MsImeNative`は
+        /// T2タスク1cのMicrosoft IME本体側判定が未実装のため、`Other`は内蔵表を
+        /// 持たない構成のため、どちらも既知構成の対象外。
+        /// `#[cfg(windows)]`配下(Win32型`TipIdentity`比較を含む)のため、Windows
+        /// ターゲットでのみ実行される(`cargo check --target x86_64-pc-windows-msvc`
+        /// で存在確認、実行はwindows-build CI)。
+        /// ADR-199 決定8: `config1.db`不在は既定（MSIMEプリセット）の既知構成として突き合わせる。
+        /// 読めない・パースできないときは従来どおり`ConfigUnreadable`。
+        #[test]
+        fn missing_config1_db_is_the_known_msime_default() {
+            use crate::state::key_effect_predictor::KeymapPreset;
+            let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+            assert_eq!(
+                lookup_from_config1_db_read(Err(missing)),
+                BundledPresetLookup::Known(KeymapPreset::MsIme)
+            );
+            let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+            assert_eq!(
+                lookup_from_config1_db_read(Err(denied)),
+                BundledPresetLookup::ConfigUnreadable
+            );
+            assert_eq!(
+                lookup_from_config1_db_read(Ok(Vec::new())),
+                BundledPresetLookup::ConfigUnreadable
+            );
+        }
+
+        #[test]
+        fn non_gji_tip_never_reads_config1_db() {
+            assert_eq!(
+                bundled_preset_for_adjudication(TipIdentity::MsImeNative),
+                BundledPresetLookup::NotKnown
+            );
+            assert_eq!(
+                bundled_preset_for_adjudication(TipIdentity::Other),
+                BundledPresetLookup::NotKnown
+            );
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{detect_dedicated_fn_key, extract_ime_on_off_toggle_combos};
-    use crate::vk::VkCodeExt as _;
-    use awase::types::VkCode;
+    // ── classify_thumb_key_ime_actions (BUG-115) ──
 
-    fn table_with_toggle_kana_type(vk_key: &str) -> String {
-        format!(
-            "status\tkey\tcommand\n\
-             Composition\t{vk_key}\tSwitchKanaType\n\
-             Conversion\t{vk_key}\tSwitchKanaType\n"
-        )
-    }
+    use super::{
+        classify_mode_key_ime_action, classify_thumb_key_ime_actions, ImeToggleKind,
+        ModeKeyCandidate,
+    };
+    use awase_gji_config::wire::GjiRawConfig;
 
-    #[test]
-    fn detects_single_safe_range_key() {
-        let table = table_with_toggle_kana_type("F21");
-        assert_eq!(detect_dedicated_fn_key(&table), VkCode::from_name("VK_F21"));
-    }
-
-    #[test]
-    fn detects_key_at_edge_of_safe_range() {
-        for key in ["F15", "F20", "F23", "F24"] {
-            let table = table_with_toggle_kana_type(key);
-            assert!(
-                detect_dedicated_fn_key(&table).is_some(),
-                "{key} は安全範囲内のはず"
-            );
+    fn raw_with_overlay() -> GjiRawConfig {
+        GjiRawConfig {
+            overlay_keymaps: vec![
+                awase_gji_config::SESSION_KEYMAP_OVERLAY_HENKAN_MUHENKAN_TO_IME_ON_OFF,
+            ],
+            ..GjiRawConfig::default()
         }
     }
 
-    /// ADR-057: F13/F14はターミナルエスケープシーケンス漏れが実機確認済みの
-    /// ため、config1.dbにバインドが見つかっても絶対に自動採用しない。
+    fn raw_with_session_keymap(value: i64) -> GjiRawConfig {
+        GjiRawConfig {
+            session_keymap: Some(value),
+            ..GjiRawConfig::default()
+        }
+    }
+
     #[test]
-    fn never_adopts_f13_or_f14() {
-        for key in ["F13", "F14"] {
-            let table = table_with_toggle_kana_type(key);
+    fn classify_overlay_yields_on_off_unconditionally() {
+        let (henkan, muhenkan) = classify_thumb_key_ime_actions(&raw_with_overlay());
+        assert_eq!(henkan, Some(ImeToggleKind::On));
+        assert_eq!(muhenkan, Some(ImeToggleKind::Off));
+    }
+
+    /// overlayはsession_keymapに関わらず最優先（Mozcがoverlayをbase
+    /// keymapの上に重ね掛けする実装と対応）。ATOKと同時に該当していても
+    /// overlayが勝つ。
+    #[test]
+    fn classify_overlay_wins_over_atok_session_keymap() {
+        let raw = GjiRawConfig {
+            session_keymap: Some(awase_gji_config::SESSION_KEYMAP_ATOK),
+            overlay_keymaps: vec![
+                awase_gji_config::SESSION_KEYMAP_OVERLAY_HENKAN_MUHENKAN_TO_IME_ON_OFF,
+            ],
+            ..GjiRawConfig::default()
+        };
+        let (henkan, muhenkan) = classify_thumb_key_ime_actions(&raw);
+        assert_eq!(henkan, Some(ImeToggleKind::On));
+        assert_eq!(muhenkan, Some(ImeToggleKind::Off));
+    }
+
+    #[test]
+    fn classify_atok_preset_yields_toggle_for_both_keys() {
+        let raw = raw_with_session_keymap(awase_gji_config::SESSION_KEYMAP_ATOK);
+        let (henkan, muhenkan) = classify_thumb_key_ime_actions(&raw);
+        assert_eq!(henkan, Some(ImeToggleKind::Toggle));
+        assert_eq!(muhenkan, Some(ImeToggleKind::Toggle));
+    }
+
+    /// MSIME/MOBILE/KOTOERI/CHROMEOS、フィールド不在はいずれも
+    /// 割り当てなし（本家の各tsvにHenkan/Muhenkanの開閉意味論が無いことを
+    /// 2026-09-05に確認済み）。
+    #[test]
+    fn classify_other_presets_and_absent_yield_none() {
+        for value in [2, 4, 3, 5] {
+            let raw = raw_with_session_keymap(value);
             assert_eq!(
-                detect_dedicated_fn_key(&table),
-                None,
-                "{key} は安全範囲外のため自動採用してはならない"
+                classify_thumb_key_ime_actions(&raw),
+                (None, None),
+                "session_keymap={value}"
             );
         }
+        assert_eq!(
+            classify_thumb_key_ime_actions(&GjiRawConfig::default()),
+            (None, None)
+        );
     }
 
+    /// BUG-115: CUSTOMキーマップにliteralなHenkan/Muhenkanトークンが
+    /// 含まれる場合、`extract_ime_keys`経由で分類される。
     #[test]
-    fn no_binding_yields_none() {
-        assert_eq!(detect_dedicated_fn_key(""), None);
+    fn classify_custom_keymap_with_literal_henkan_muhenkan_tokens() {
+        let table = "status\tkey\tcommand\nDirectInput\tHenkan\tIMEOn\n";
+        let raw = GjiRawConfig {
+            session_keymap: Some(awase_gji_config::SESSION_KEYMAP_CUSTOM),
+            custom_keymap_table: Some(table.to_string()),
+            ..GjiRawConfig::default()
+        };
+        let (henkan, muhenkan) = classify_thumb_key_ime_actions(&raw);
+        assert_eq!(henkan, Some(ImeToggleKind::On));
+        assert_eq!(muhenkan, None);
     }
 
+    /// ADR-186(実機スパイク、2026-09-20): ATOKプリセットでは、`config1.db`に残る古い
+    /// `custom_keymap_table`(実機に実在した`DirectInput\tHenkan\tIMEOn`等)を読まない。
+    /// 変換・無変換ともATOKの`Toggle`(開閉トグル)になる。MSIME(ADR-174)は表を優先するまま。
     #[test]
-    fn out_of_range_key_yields_none() {
-        // F1 はToggleKanaTypeに割り当てられていても安全範囲外。
-        let table = table_with_toggle_kana_type("F1");
-        assert_eq!(detect_dedicated_fn_key(&table), None);
-    }
-
-    /// 安全範囲内に複数のToggleKanaTypeキーが存在する場合、どちらを使うべきか
-    /// 一意に定まらないため採用しない（安全側）。
-    #[test]
-    fn multiple_safe_range_candidates_yields_none() {
+    fn classify_atok_session_keymap_ignores_stale_custom_table() {
         let table = "status\tkey\tcommand\n\
-                      Composition\tF21\tSwitchKanaType\n\
-                      Composition\tF22\tSwitchKanaType\n";
-        assert_eq!(detect_dedicated_fn_key(table), None);
+            DirectInput\tHenkan\tIMEOn\n\
+            Precomposition\tHenkan\tCompositionModeHiragana\n\
+            Composition\tHenkan\tCompositionModeHiragana\n";
+        let atok = GjiRawConfig {
+            session_keymap: Some(awase_gji_config::SESSION_KEYMAP_ATOK),
+            custom_keymap_table: Some(table.to_string()),
+            ..GjiRawConfig::default()
+        };
+        assert_eq!(
+            classify_mode_key_ime_action(ModeKeyCandidate::Henkan, &atok),
+            Some(ImeToggleKind::Toggle)
+        );
+        assert_eq!(
+            classify_mode_key_ime_action(ModeKeyCandidate::Muhenkan, &atok),
+            Some(ImeToggleKind::Toggle)
+        );
+        // 同じ表でもMSIMEでは従来どおり表を優先する（ADR-174の回帰防止）。
+        let msime = GjiRawConfig {
+            session_keymap: Some(awase_gji_config::SESSION_KEYMAP_MSIME),
+            custom_keymap_table: Some(table.to_string()),
+            ..GjiRawConfig::default()
+        };
+        assert_eq!(
+            classify_mode_key_ime_action(ModeKeyCandidate::Henkan, &msime),
+            Some(ImeToggleKind::On)
+        );
     }
 
-    /// BUG-64のconfig1.db残骸バインド（F21→IMEOn）が残っていても、この関数は
-    /// `IMEOn`コマンドの行を`ToggleKanaType`には分類しない（extract_mode_keysが
-    /// classify_commandで区別する）ため誤検出しない。
+    /// `custom_keymap_table`が存在してもHenkan/Muhenkanに該当する行が
+    /// 無ければ、MSIMEプリセットの静的知識（`None`）へフォールスルーする
+    /// （2.5節が3節を上書きしないことの固定）。
     #[test]
-    fn ime_on_binding_is_not_confused_with_switch_kana_type() {
+    fn classify_msime_session_keymap_with_table_lacking_henkan_falls_back_to_preset() {
         let table = "status\tkey\tcommand\nDirectInput\tF21\tIMEOn\n";
-        assert_eq!(detect_dedicated_fn_key(table), None);
+        let raw = GjiRawConfig {
+            session_keymap: Some(awase_gji_config::SESSION_KEYMAP_MSIME),
+            custom_keymap_table: Some(table.to_string()),
+            ..GjiRawConfig::default()
+        };
+        assert_eq!(classify_thumb_key_ime_actions(&raw), (None, None));
     }
 
-    /// ADR-091 §D3.2の推奨構成そのもの: Precomposition/DirectInputは未バインド、
-    /// Composition/Conversion/Prediction/SuggestionにSwitchKanaType。
+    /// CUSTOMだがHenkan/Muhenkanトークンが無いテーブルは割り当てなし。
     #[test]
-    fn detects_full_d32_recommended_binding_set() {
-        let table = "status\tkey\tcommand\n\
-                      Composition\tF21\tSwitchKanaType\n\
-                      Conversion\tF21\tSwitchKanaType\n\
-                      Prediction\tF21\tSwitchKanaType\n\
-                      Suggestion\tF21\tSwitchKanaType\n";
-        assert_eq!(detect_dedicated_fn_key(table), VkCode::from_name("VK_F21"));
-    }
-
-    // ── extract_ime_on_off_toggle_combos (ADR-092 決定D Step4c) ──
-
-    fn combo(vk_name: &str) -> awase::config::ParsedKeyCombo {
-        awase::config::ParsedKeyCombo {
-            ctrl: false,
-            shift: false,
-            alt: false,
-            vk: VkCode::from_name(vk_name).unwrap(),
-        }
-    }
-
-    #[test]
-    fn no_bindings_yields_all_empty() {
-        let (on, off, toggle) = extract_ime_on_off_toggle_combos("");
-        assert_eq!(on, vec![]);
-        assert_eq!(off, vec![]);
-        assert_eq!(toggle, vec![]);
-    }
-
-    /// `awase-gji-config::keymap`側の`extracts_toggle_on_off_from_fixture`と
-    /// 同じフィクスチャ。安全範囲外（F13/`VK_DBE_ALPHANUMERIC`/`VK_IME_ON`/
-    /// `VK_IME_OFF`/`VK_KANJI`）は全て除外され、F15-F24範囲内のF21/F22だけが
-    /// 残ることを確認する（BUG-14 注入イベント衝突リスクの回避、Opusレビュー
-    /// 指摘の反映）。
-    #[test]
-    fn filters_out_bug14_risky_aliases_and_out_of_range_fn_keys() {
-        let table = "status\tkey\tcommand
-Composition\tHankaku/Zenkaku\tIMEOff
-Conversion\tHankaku/Zenkaku\tIMEOff
-DirectInput\tHankaku/Zenkaku\tIMEOn
-Precomposition\tHankaku/Zenkaku\tIMEOff
-Composition\tKanji\tIMEOff
-Conversion\tKanji\tIMEOff
-DirectInput\tKanji\tIMEOn
-Precomposition\tKanji\tIMEOff
-DirectInput\tF13\tIMEOn
-DirectInput\tF21\tIMEOn
-Precomposition\tF21\tIMEOn
-Composition\tF21\tIMEOn
-Conversion\tF21\tIMEOn
-Precomposition\tF22\tIMEOff
-Composition\tF22\tIMEOff
-Conversion\tF22\tIMEOff
-Composition\tON\tIMEOn
-Composition\tOFF\tIMEOff
-Conversion\tON\tIMEOn
-Conversion\tOFF\tIMEOff
-DirectInput\tON\tIMEOn
-Precomposition\tON\tIMEOn
-Precomposition\tOFF\tIMEOff
-DirectInput\tEisu\tIMEOn
-Composition\tEisu\tToggleAlphanumericMode
-Conversion\tEisu\tToggleAlphanumericMode
-Precomposition\tEisu\tToggleAlphanumericMode
-";
-        let (on, off, toggle) = extract_ime_on_off_toggle_combos(table);
-        // 生の GjiImeKeys.on は [VK_DBE_ALPHANUMERIC, VK_F13, VK_F21, VK_IME_ON]
-        // だが、安全範囲(F15-F24)外を全て除外すると VK_F21 のみ残る。
-        assert_eq!(on, vec![combo("VK_F21")]);
-        // 生の GjiImeKeys.off は [VK_F22, VK_IME_OFF] だが VK_IME_OFF は除外。
-        assert_eq!(off, vec![combo("VK_F22")]);
-        // 生の GjiImeKeys.toggle は [VK_KANJI] のみで、安全範囲外のため全除外。
-        assert_eq!(toggle, vec![]);
-    }
-
-    /// 安全範囲内（F15-F24）のトグルキーはそのまま採用される。
-    #[test]
-    fn safe_range_toggle_key_is_kept() {
-        let table = "status\tkey\tcommand\nDirectInput\tF20\tIMEOn\nPrediction\tF20\tIMEOff\n";
-        let (on, off, toggle) = extract_ime_on_off_toggle_combos(table);
-        assert_eq!(on, vec![]);
-        assert_eq!(off, vec![]);
-        assert_eq!(toggle, vec![combo("VK_F20")]);
+    fn classify_custom_keymap_without_henkan_muhenkan_yields_none() {
+        let table = "status\tkey\tcommand\nDirectInput\tF21\tIMEOn\n";
+        let raw = GjiRawConfig {
+            session_keymap: Some(awase_gji_config::SESSION_KEYMAP_CUSTOM),
+            custom_keymap_table: Some(table.to_string()),
+            ..GjiRawConfig::default()
+        };
+        assert_eq!(classify_thumb_key_ime_actions(&raw), (None, None));
     }
 }

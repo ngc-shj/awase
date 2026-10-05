@@ -54,31 +54,52 @@ pub(crate) struct BatchResult {
     pub sync_outcomes: Vec<ImeApplyPair>,
 }
 
-/// 実 actuation の 1 件を起案する（ADR-090 §2.A A-1、INV-47）。
-///
-/// `DecisionExecutor` は `Runtime` を持たないため
-/// `Runtime::issue_actuation_order` を使えないが、4 つの公開入口
-/// （`execute_from_hook` / `execute_from_loop` / `drain_deferred` /
-/// `on_output_guard_timer`）が**既に `ime: &ImeStateHub` を受け取っている**ので、
-/// それを `dispatch_ime_set_open` まで通すだけで warrant を発行できる。
-///
-/// **`crate::with_app` で `ImeStateHub` を取りに行ってはならない**——ここは
-/// 既に `with_app` の内側であり、再入すると panic せず `None` が返る。
-/// つまり「取れなかった」ことと「授権が下りなかった」が区別できない形で
-/// 静かに落ち、A-1 の shadow ログが測ろうとしている当のものが汚染される
-/// （ADR-090 §2.A.2(1)・§4.2）。
-fn issue_order(
-    ime: &ImeStateHub,
-    open: bool,
-    strategy: &'static str,
-) -> crate::state::actuation_chain::ActuationOrder {
-    let origin = crate::state::event_origin::EventOrigin::new(
-        crate::state::event_origin::EventSource::SelfActuated { strategy },
-        crate::state::event_origin::Generation::INITIAL,
-    );
-    let now = std::time::Instant::now();
-    let now_ms = crate::state::TickMs(crate::hook::current_tick_ms());
-    ime.issue_actuation_order(open, origin, now, now_ms)
+impl ImeStateHub {
+    /// 実 actuation の 1 件を起案する（ADR-090 §2.A A-1、INV-47）。
+    ///
+    /// `DecisionExecutor` は `Runtime` を持たないため
+    /// [`Runtime::issue_actuation_order`](super::Runtime::issue_actuation_order) を
+    /// 使えないが、4 つの公開入口（`execute_from_hook` / `execute_from_loop` /
+    /// `drain_deferred` / `on_output_guard_timer`）が**既に `ime: &mut ImeStateHub` を
+    /// 受け取っている**ので、それを `dispatch_ime_set_open` まで通すだけで
+    /// warrant を発行できる。
+    ///
+    /// **`crate::with_app` で `ImeStateHub` を取りに行ってはならない**——ここは
+    /// 既に `with_app` の内側であり、再入すると panic せず `None` が返る。
+    /// つまり「取れなかった」ことと「授権が下りなかった」が区別できない形で
+    /// 静かに落ち、A-1 の shadow ログが測ろうとしている当のものが汚染される
+    /// （ADR-090 §2.A.2(1)・§4.2）。
+    ///
+    /// # 似た名前のメソッドとの違い（意図的に区別すること）
+    ///
+    /// - [`Self::issue_actuation_order`]（`state/platform_state.rs`）: 最下層。
+    ///   `origin`/`now`/`now_ms` を呼び出し元が組み立てて渡す。本メソッドの
+    ///   実装はこれをそのまま呼ぶ。
+    /// - [`Runtime::issue_actuation_order`](super::Runtime::issue_actuation_order) /
+    ///   [`Runtime::issue_actuation_order_with_origin`](super::Runtime::issue_actuation_order_with_origin)
+    ///   （`runtime/mod.rs`）: `Runtime` を持つ呼び出し元向けの同型の便利メソッド。
+    ///   本メソッドはそれの `ImeStateHub` 版（`Runtime` を持たない
+    ///   `DecisionExecutor` 用）であり、**ロジックは意図的に重複している**
+    ///   （統合すると `DecisionExecutor` に `Runtime` 依存を持ち込むことになり、
+    ///   上記のとおりそれ自体が本メソッドの存在理由を壊す）。
+    ///
+    /// 2026-09-10、自由関数`issue_order`からメソッドへ変更した際、`Runtime::
+    /// issue_actuation_order`と紛らわしいと指摘を受け`issue_self_actuation_order`
+    /// にリネームした（常に`EventSource::SelfActuated`を組み立てることを名前に
+    /// 反映）。挙動は変更していない。
+    fn issue_self_actuation_order(
+        &self,
+        open: bool,
+        strategy: &'static str,
+    ) -> crate::state::actuation_chain::ActuationOrder {
+        let origin = crate::state::event_origin::EventOrigin::new(
+            crate::state::event_origin::EventSource::SelfActuated { strategy },
+            crate::state::event_origin::Generation::INITIAL,
+        );
+        let now = std::time::Instant::now();
+        let now_ms = crate::state::TickMs(crate::hook::current_tick_ms());
+        self.issue_actuation_order(open, origin, now, now_ms)
+    }
 }
 
 pub(crate) struct DecisionExecutor {
@@ -110,46 +131,6 @@ impl std::fmt::Debug for DecisionExecutor {
     }
 }
 
-/// FocusTransition settle 期間中に Engine が発行した `ImeEffect::SetOpen` を decision から取り除く。
-///
-/// 「settle 中は SetOpen を実行させない」という不変条件の**一次フィルタ（decision 除去）の
-/// 単一実装**。SetOpen が実行に到達する Decision 経路は 2 つだけ（`435e2d3` の調査）:
-/// - キーボード経路: `key_pipeline::kp_run_inner`（`focus_transition_was_pending` スナップショット）
-/// - 非キーボード経路: `execute_from_loop`（`is_focus_transition_settling` のライブ評価）
-///
-/// どちらの settle 判定を使うかは呼び出し元が持ち（barrier consume タイミングが異なるため）、
-/// ここでは `settling` を受け取るだけで判定条件自体は変えない。belief（`desired_open` 等）を
-/// 汚染させない最終防衛線は `ImeStateHub::handle_engine_set_open` にある（意図が異なるため別に残す）。
-///
-/// settle 中に落とした事実は必ずログに残す（無音で消すと focus 遷移バグの調査コストが跳ね上がるため）。
-///
-/// 戻り値 `Some(target)` は「本来 apply されるはずだった SetOpen(target) を握りつぶした」ことを
-/// 呼び出し元に伝える。`Engine::check_active_transition` は該当する Active/Inactive 遷移を
-/// この呼び出しより前に確定させており（`prev_activation` 更新はログ出力と同時、effect 実行より
-/// 前）、以後 belief が変わらない限り同じ遷移は二度と検知されない＝この SetOpen は自然には
-/// 再発行されない。呼び出し元は `Some` を受けたら settle 明けの再試行
-/// （`focus_settle_ms() + 50`ms 後、`apply_force_on_for_imm_broken` 等と同じ確立済みパターン）を
-/// 必ずスケジュールすること（さもないと GjiFsm 等 apply 完了通知でしか同期しないサブシステムが
-/// 実 IME 状態と乖離したまま固着する。2026-07-08 実機: 「このせっけい」が「せっけい」に文字欠落）。
-#[must_use]
-pub(crate) fn strip_ime_set_open_if_settling(
-    decision: &mut Decision,
-    settling: bool,
-) -> Option<bool> {
-    if !settling {
-        return None;
-    }
-    let target = decision.find_ime_set_open()?;
-    decision
-        .effects_mut()
-        .retain(|e| !matches!(e, Effect::Ime(ImeEffect::SetOpen { .. })));
-    log::debug!(
-        "[focus-settle] SetOpen({target}) effect stripped from decision \
-         (focus transition barrier still settling)"
-    );
-    Some(target)
-}
-
 impl DecisionExecutor {
     pub(crate) fn new() -> Self {
         Self {
@@ -168,10 +149,11 @@ impl DecisionExecutor {
     /// （旧 Filter モードは 2026-07-06 撤去 — relay-defer/INPUT_DEFER 対称性/
     /// NonText パススルー等がすべて Relay 前提で設計・実機検証されており、
     /// Filter は長期間テストされていないレガシー経路だったため。）
+    #[tracing::instrument(level = "debug", skip_all)]
     pub(crate) fn execute_from_hook(
         &mut self,
         platform: &mut WindowsPlatform,
-        ime: &ImeStateHub,
+        ime: &mut ImeStateHub,
         decision: Decision,
         raw_event: &RawKeyEvent,
         physical: PhysicalKeyDisposition,
@@ -188,34 +170,21 @@ impl DecisionExecutor {
     /// この関数はキーボード経路（`execute_from_hook`）と違い `kp_stage_focus_probe` による
     /// barrier 消費を経ないため、ここで `is_focus_transition_settling` を素直に評価してよい。
     ///
-    /// 2026-07-05: Alt+Tab 中間ウィンドウへの一瞬のフォーカスで `Engine::on_command`
-    /// (`FocusChanged`/`RefreshState`) が Active/Inactive 遷移を検知し `ImeEffect::SetOpen`
-    /// を発行 → ここで無条件に実行されて実際に SendInput してしまうバグを修正。
-    /// settle 期間中は `SetOpen` effect を取り除いてから実行する
-    /// （`key_pipeline.rs` の `kp_run_inner` と同じパターン）。
-    ///
-    /// 戻り値の第3要素は `strip_ime_set_open_if_settling` が握りつぶした SetOpen の目標値。
-    /// `Some` の場合、呼び出し元は settle 明けの再試行を必ずスケジュールすること
-    /// （`Engine::prev_activation` は該当遷移を確定済みで、同じ SetOpen は自然には
-    /// 再発行されないため。2026-07-08: GjiFsm が resync できず「このせっけい」の
-    /// 文字欠落に至った実機ログから判明）。
+    /// ADR-213 P2d-2: かつてここと `kp_run_inner` にあった settle 中の `SetOpen` 除去
+    /// （2026-07-05 の Alt+Tab 中間窓対策）は撤去した。`SetOpen` を出すのは明示操作だけで、
+    /// settle 直後の書き込みも Chrome×GJI・Chrome×MS-IME に受け付けられると実測したため
+    /// （`docs/experiments.md` エントリ 30）。
+    #[tracing::instrument(level = "debug", skip_all)]
     pub(crate) fn execute_from_loop(
         &mut self,
         platform: &mut WindowsPlatform,
-        ime: &ImeStateHub,
-        mut decision: Decision,
-    ) -> (CallbackResult, Vec<ImeApplyPair>, Option<bool>) {
+        ime: &mut ImeStateHub,
+        decision: Decision,
+    ) -> (CallbackResult, Vec<ImeApplyPair>) {
         self.applied_snapshot = ime.model().applied;
         self.belief_input_mode = ime.input_mode();
-        // 非キーボード経路の一次フィルタ。ここは barrier consume を経ないので settling をライブ評価する。
-        let stripped_set_open = strip_ime_set_open_if_settling(
-            &mut decision,
-            ime.is_focus_transition_settling(std::time::Instant::now()),
-        );
         let (consumed, effects) = match decision {
-            Decision::PassThrough => {
-                return (CallbackResult::PassThrough, Vec::new(), stripped_set_open)
-            }
+            Decision::PassThrough => return (CallbackResult::PassThrough, Vec::new()),
             Decision::PassThroughWith { effects } => (false, effects),
             Decision::Consume { effects } => (true, effects),
         };
@@ -233,7 +202,7 @@ impl DecisionExecutor {
         } else {
             CallbackResult::PassThrough
         };
-        (callback, sync_outcomes, stripped_set_open)
+        (callback, sync_outcomes)
     }
 
     /// `WM_EXECUTE_EFFECTS` ハンドラ、および `TIMER_OUTPUT_GUARD` タイマーから呼ぶ。
@@ -245,7 +214,7 @@ impl DecisionExecutor {
     pub(crate) fn drain_deferred(
         &mut self,
         platform: &mut WindowsPlatform,
-        ime: &ImeStateHub,
+        ime: &mut ImeStateHub,
     ) -> Vec<ImeApplyPair> {
         // 同一 drain 呼び出し内で最初の ReinjectKey だけ OUTPUT_GUARD を適用する。
         // 連続する reinject (例: Win_DOWN→X_DOWN→X_UP→Win_UP) を個別にガードすると
@@ -258,7 +227,7 @@ impl DecisionExecutor {
         //    guard 解除済みなら execute_one してから queue に進む (batching を継続)。
         if let Some(event) = self.guard_held.take() {
             if let Some(remaining) = self.reinject_wait_remaining(platform, &event) {
-                log::debug!(
+                tracing::debug!(
                     "[reinject-guard] held event, suspending for {remaining}ms (vk={:#04x})",
                     event.vk_code,
                 );
@@ -281,7 +250,7 @@ impl DecisionExecutor {
                     unreachable!("is_reinject was true")
                 };
                 if let Some(remaining) = self.reinject_wait_remaining(platform, &event) {
-                    log::debug!(
+                    tracing::debug!(
                         "[reinject-guard] suspending drain for {remaining}ms (vk={:#04x})",
                         event.vk_code,
                     );
@@ -313,7 +282,7 @@ impl DecisionExecutor {
     pub(crate) fn on_output_guard_timer(
         &mut self,
         platform: &mut WindowsPlatform,
-        ime: &ImeStateHub,
+        ime: &mut ImeStateHub,
     ) -> Vec<ImeApplyPair> {
         platform.timer.kill(crate::TIMER_OUTPUT_GUARD);
         self.drain_deferred(platform, ime)
@@ -367,11 +336,25 @@ impl DecisionExecutor {
     /// drain 経路 (`WM_DRAIN_OUTPUT_QUEUE`) 専用: PassThrough を OS に届けるための
     /// `ReinjectKey` を末尾にキューイングする。
     ///
-    /// 通常 hook 経路では PassThrough は `CallNextHookEx` で OS に直接届く。
-    /// しかし OUTPUT_GATE active 期間や with_app 再入セーフネットで `INPUT_DEFER` へ
-    /// Consumed として退避されたキーは drain で engine に replay されたあと
-    /// `CallbackResult::PassThrough` が返っても hook 経路に戻らないため、
-    /// 明示的に SendInput で送出する必要がある。
+    /// **訂正（2026-09-05、BUG-116 調査で発覚）**: 以前このコメントは「通常
+    /// hook 経路では PassThrough は `CallNextHookEx` で OS に直接届く」と
+    /// 書いていたが、これは誤り。フック (`hook.rs::hook_proc`) は
+    /// `produce_result` が通常時（`ProduceResult::Accepted`）は常に
+    /// `LRESULT(1)` を返して元イベントを消費する（`hook.rs:1195-1199`）ため、
+    /// **通常 hook 経路でも PassThrough は必ず `enqueue_reinject`（
+    /// `runtime/message_handlers.rs:244-250`）経由で SendInput により
+    /// 再送出される**。`CallNextHookEx` で OS に直接届く経路は存在しない。
+    /// この誤った mental model が、`docs/adr/137-...md`（BUG-116）で
+    /// 「`PhysicalKeyDisposition::plan` が Allow を返せば OS に届く」という
+    /// 前提の一因になっていた（実際には reinject が `wScan: 0` を使うため、
+    /// scan 依存のモードキー処理に影響しうる）。
+    ///
+    /// drain 経路 (`WM_DRAIN_OUTPUT_QUEUE`) がこの関数を明示的に呼ぶ理由は
+    /// 元々の記述どおり: OUTPUT_GATE active 期間や with_app 再入セーフネットで
+    /// `INPUT_DEFER` へ Consumed として退避されたキーは drain で engine に
+    /// replay されたあと `CallbackResult::PassThrough` が返っても hook 経路
+    /// （そもそも通常 hook 経路も `enqueue_reinject` を通る）には戻らないため、
+    /// ここから明示的に呼び出す必要がある。
     pub(crate) fn enqueue_reinject(&mut self, event: RawKeyEvent) {
         self.queue
             .push_back(Effect::Input(InputEffect::ReinjectKey(event)));
@@ -390,7 +373,7 @@ impl DecisionExecutor {
     fn execute_relay(
         &mut self,
         platform: &mut WindowsPlatform,
-        ime: &ImeStateHub,
+        ime: &mut ImeStateHub,
         decision: Decision,
         raw_event: &RawKeyEvent,
         physical: PhysicalKeyDisposition,
@@ -406,7 +389,7 @@ impl DecisionExecutor {
                         sync_outcomes: Vec::new(),
                     };
                 }
-                let callback = self.run_passthrough_pipeline(platform, ime, raw_event);
+                let callback = self.run_passthrough_pipeline(platform, raw_event);
                 BatchResult {
                     has_pending: self.has_pending(),
                     callback,
@@ -417,7 +400,7 @@ impl DecisionExecutor {
                 // flush 出力あり → Consume して flush + キー再注入を FIFO でキュー。
                 // physical=Suppress（KANJI 物理キー抑止）の場合は reinject を積まない。
                 let reinject = physical == PhysicalKeyDisposition::Allow;
-                log::debug!(
+                tracing::debug!(
                     "[relay-flush] PassThroughWith: queue {} effect(s){} (vk={:#04x} {})",
                     effects.len(),
                     if reinject {
@@ -475,14 +458,11 @@ impl DecisionExecutor {
     ///
     /// 段階:
     ///   A. [transport] KeyUp 対称性 — deferred Down に対応する Up も reinject に揃える
-    ///   B. [platform]  確認キー KeyUp warmup / Ctrl↑ cold recovery（副作用のみ）
-    ///   C. [transport] output guard defer — 出力 in-flight 中は reinject 経由で順序保証
-    ///   D. [platform]  確認キー KeyDown passthrough 後処理（副作用のみ）
-    ///   → PassThrough
+    ///   B. [transport] output guard defer — 出力 in-flight 中は reinject 経由で順序保証
+    ///   → PassThrough（確認キー KeyDown の cold 化・warmup は reinject 段 `handle_reinject` だけが担う）
     fn run_passthrough_pipeline(
         &mut self,
-        platform: &mut WindowsPlatform,
-        ime: &ImeStateHub,
+        platform: &WindowsPlatform,
         raw_event: &RawKeyEvent,
     ) -> CallbackResult {
         let is_key_down = matches!(raw_event.event_type, awase::types::KeyEventType::KeyDown);
@@ -493,11 +473,7 @@ impl DecisionExecutor {
             return CallbackResult::Consumed;
         }
 
-        // B. [platform] 副作用（defer されても FSM は進める）
-        self.try_pending_warmup_on_keyup(platform, ime, raw_event);
-        self.handle_ctrl_up_recovery(platform, ime, raw_event);
-
-        // C. [transport] output guard defer
+        // B. [transport] output guard defer
         let in_flight_ms = platform.output_in_flight_ms();
         let output_in_flight = in_flight_ms < crate::tuning::OUTPUT_GUARD_MS;
         // BUG-58: `self.has_pending()` は executor 自身の effect queue しか見ない。
@@ -518,7 +494,7 @@ impl DecisionExecutor {
         // ケースは残存する既知の限界（BUG-58 のフリーズ解消と比べて実害は小さいと
         // 判断、将来 PassThrough 全般を defer する場合は改めて検討）。
         let has_pending = self.has_pending() || platform.has_pending_tsf_work();
-        log::debug!(
+        tracing::debug!(
             "[relay-guard] vk={:#04x} {} in_flight_ms={} has_pending={} output_in_flight={}",
             raw_event.vk_code,
             if is_key_down { "down" } else { "up" },
@@ -540,14 +516,11 @@ impl DecisionExecutor {
             return CallbackResult::Consumed;
         }
 
-        // D. [platform] 確認キー後処理
-        self.handle_confirm_key_passthrough(platform, ime, raw_event);
-
         if matches!(
             raw_event.key_classification,
             awase::types::KeyClassification::Passthrough
         ) {
-            log::debug!(
+            tracing::debug!(
                 "[relay-passthrough] PassThrough idle: direct OS pass-through (vk={:#04x} {})",
                 raw_event.vk_code,
                 if is_key_down { "down" } else { "up" },
@@ -556,77 +529,18 @@ impl DecisionExecutor {
         CallbackResult::PassThrough
     }
 
-    /// warm+TSF Enter/Space/Escape KeyDown で保留した eager warmup を KeyUp で送信する。
-    /// KeyDown 時は SendInput(F2) → CallNextHookEx(Enter↓) の順になり WezTerm が
-    /// F2 (新 composition 開始) を受け取った後に Enter で即確定してしまう。
-    /// KeyUp タイミングでは Enter↓ が既に処理済みのため F2 との競合なし。
-    ///
-    /// 保留状態は `CompositionFsm` が `PendingWarmupOnKeyUp` として持つ。
-    /// KeyUp を FSM に feed し、保留があれば dispatcher が warmup を送信する。
-    fn try_pending_warmup_on_keyup(
-        &self,
-        platform: &mut WindowsPlatform,
-        ime: &ImeStateHub,
-        raw_event: &RawKeyEvent,
-    ) {
-        let is_key_down = matches!(raw_event.event_type, awase::types::KeyEventType::KeyDown);
-        if !is_key_down && raw_event.vk_code.is_composition_confirm_key() {
-            platform.composition_confirm_key_up(
-                raw_event.vk_code,
-                ime.resolve_warmup_ime_on(self.applied_snapshot),
-            );
-        }
-    }
-
-    /// Ctrl↑: cold 状態であれば eager_warmup_sent_ms をリセット（この→kおの バグ対策）。
-    /// Ctrl が WezTerm に届いている間、GJI TSF 初期化が中断される可能性がある。
-    /// Ctrl↑ を起点としてタイマーを再計測し GJI recovery 時間（500ms）を確保する。
-    /// cold 判定・warmup 送信は `CompositionFsm`（CtrlUp）に委譲する。副作用のみ。
-    fn handle_ctrl_up_recovery(
-        &self,
-        platform: &mut WindowsPlatform,
-        ime: &ImeStateHub,
-        raw_event: &RawKeyEvent,
-    ) {
-        let is_key_down = matches!(raw_event.event_type, awase::types::KeyEventType::KeyDown);
-        if !is_key_down && raw_event.vk_code.is_ctrl_variant() {
-            platform.composition_ctrl_up(ime.resolve_warmup_ime_on(self.applied_snapshot));
-        }
-    }
-
-    /// Space/Enter/Esc KeyDown の直接 passthrough: warm+TSF または cold の composition 確定処理。
-    /// 副作用のみで CallbackResult は返さない。
-    fn handle_confirm_key_passthrough(
-        &self,
-        platform: &mut WindowsPlatform,
-        ime: &ImeStateHub,
-        raw_event: &RawKeyEvent,
-    ) {
-        let is_key_down = matches!(raw_event.event_type, awase::types::KeyEventType::KeyDown);
-        // Space/Enter/Escape の直接 passthrough (KeyDown) は composition を
-        // 確定・キャンセルしてコンテキストをアイドル状態に戻す。
-        // mark_cold / eager warmup / warmup の KeyUp 遅延は CompositionFsm（on_passthrough_key
-        // 経由）に委譲する。保留状態は FSM が PendingWarmupOnKeyUp として持つ。
-        if is_key_down && raw_event.vk_code.is_composition_confirm_key() {
-            platform.on_passthrough_key(
-                raw_event.vk_code,
-                true,
-                ime.resolve_warmup_ime_on(self.applied_snapshot),
-            );
-        }
-    }
-
     // ── 共通 ──
 
+    #[tracing::instrument(level = "debug", skip_all, fields(?generation))]
     fn execute_one(
         &mut self,
         platform: &mut WindowsPlatform,
-        ime: &ImeStateHub,
+        ime: &mut ImeStateHub,
         effect: Effect,
         generation: Option<crate::state::ApplyGeneration>,
     ) -> Option<ImeApplyCompletion> {
         if let Effect::Input(InputEffect::ReinjectKey(event)) = effect {
-            self.handle_reinject(platform, ime, event);
+            Self::handle_reinject(platform, event);
             return None;
         }
         self.dispatch_effect(platform, ime, effect, generation)
@@ -641,36 +555,18 @@ impl DecisionExecutor {
             })
     }
 
-    /// F2-TSF 特殊扱い + 通常 reinject + confirm キー後処理。
-    fn handle_reinject(
-        &self,
-        platform: &mut WindowsPlatform,
-        ime: &ImeStateHub,
-        event: RawKeyEvent,
-    ) {
+    /// 通常 reinject + confirm キー後処理。
+    fn handle_reinject(platform: &mut WindowsPlatform, event: RawKeyEvent) {
         let is_key_down = matches!(event.event_type, awase::types::KeyEventType::KeyDown);
         let dir = if is_key_down { "down" } else { "up" };
 
-        // F2 (VK_DBE_HIRAGANA) in TSF mode: deferred F2 も reinject しない。
-        // pending 中に F2 が来た場合も ReinjectKey としてキューに入るが、
-        // TSF モードでは物理 F2 を WezTerm に届けないことで double-F2 を防ぐ。
-        if event.vk_code == crate::vk::VK_DBE_HIRAGANA && platform.is_tsf_mode() {
-            if is_key_down {
-                // mark_cold(NativeF2Consumed) + eager warmup を platform に委譲する。
-                platform.on_reinject_key(
-                    event.vk_code,
-                    true,
-                    ime.resolve_warmup_ime_on(self.applied_snapshot),
-                );
-            } else {
-                log::debug!(
-                    "[reinject-tsf] vk=0xf2 KeyUp TSF mode → consuming (paired KeyDown was consumed)",
-                );
-            }
-            return;
-        }
+        // BUG-173: 以前はここで TSF mode の deferred F2 を reinject せず握りつぶしていた
+        // （「warmup が F2 を代わりに再送する」double-F2 防止）。ADR-100 決定2 で warmup が
+        // `VK_IME_ON` 単発になり代替 F2 が無くなったため、物理 F2 は通常キーと同様に
+        // reinject する。cold 化は `kp_stage_execute` の `composition_native_f2_down` が
+        // KeyDown ごとに既に実行している（`VK_IME_ON` は送らない）。
 
-        log::debug!(
+        tracing::debug!(
             "[reinject] vk={:#04x} {dir} (queued passthrough now firing)",
             event.vk_code,
         );
@@ -680,11 +576,7 @@ impl DecisionExecutor {
         // on_reinject_key を reinject() の前後どちらで呼んでも観測可能な差がない。
         // これにより spawn_local 内の with_app 呼び出しを除去できる。
         if is_key_down && event.vk_code.is_composition_confirm_key() {
-            platform.on_reinject_key(
-                event.vk_code,
-                true,
-                ime.resolve_warmup_ime_on(self.applied_snapshot),
-            );
+            platform.on_reinject_key(event.vk_code, true);
         }
 
         // OutputActiveGuard を先に取得してから spawn_local で SendInput を RUNTIME 借用外に移す。
@@ -705,15 +597,27 @@ impl DecisionExecutor {
     fn dispatch_effect(
         &mut self,
         platform: &mut WindowsPlatform,
-        ime: &ImeStateHub,
+        ime: &mut ImeStateHub,
         effect: Effect,
         generation: Option<crate::state::ApplyGeneration>,
     ) -> Option<(bool, awase::platform::ImeOpenOutcome)> {
         // ImeEffect::SetOpen は ImmCross-first か否かで async / sync を分岐するため
         // 先に処理する（後段の `let platform_rt = platform` が `platform`
         // を独占する前に `build_ime_control_view` を呼ぶ必要がある）。
-        if let Effect::Ime(ImeEffect::SetOpen { open, .. }) = effect {
-            return self.dispatch_ime_set_open(platform, ime, open, generation);
+        if let Effect::Ime(ImeEffect::SetOpen { open, press }) = effect {
+            // ADR-212 P2: 実 actuation を起こした SetOpen をログで数える（outcome も同じ行に出す。
+            // 以前の `origin=`（ActivationSync/ExplicitUserAction）は ADR-213 P2c で SetOpenOrigin ごと撤去し、
+            // 全て明示操作になった）。async（ImmCross 先の窓）は `generation` で、後から届く
+            // `on_ime_apply_complete{generation outcome}` の行と突き合わせる。
+            let result = self.dispatch_ime_set_open(platform, ime, open, press, generation);
+            let outcome = result.as_ref().map_or_else(
+                || "async".to_string(),
+                |(_, outcome)| format!("{outcome:?}"),
+            );
+            tracing::info!(
+                "[set-open] open={open} press={press:?} generation={generation:?} outcome={outcome}"
+            );
+            return result;
         }
         // EngineStateChanged: エンジン ON/OFF に連動して conv mutation ゲートを更新する。
         // platform_rt (&mut dyn PlatformRuntime) 変換前に行う必要がある。
@@ -729,8 +633,28 @@ impl DecisionExecutor {
             // 発動条件。フックスレッドから同期的に読めるようキャッシュを更新する。
             crate::hook::set_engine_enabled(*enabled);
         }
-        // send_engine_state_ime_key に渡す applied 値をトレイトオブジェクト取得前に確定する。
-        let applied_for_engine_key = self.applied_snapshot.applied_open();
+        if let Effect::Input(InputEffect::SendKeys(actions)) = &effect {
+            let passes_mode_key = actions.iter().any(|action| {
+                matches!(
+                    action,
+                    awase::types::KeyAction::Key(vk) if crate::vk::is_followed_mode_key(*vk)
+                )
+            });
+            if passes_mode_key {
+                let now = crate::hook::current_tick_ms();
+                ime.arm_mode_key_pass_mark(
+                    now,
+                    platform.current_app_profile().can_use_imm32_cross_process(),
+                );
+                platform.timer.set(
+                    crate::TIMER_IME_REFRESH,
+                    std::time::Duration::from_millis(20),
+                );
+                tracing::info!(
+                    "[mode-key-follow] mode key sent through FSM: IME refresh scheduled (20ms)"
+                );
+            }
+        }
         let platform_rt: &mut dyn PlatformRuntime = platform;
         match effect {
             Effect::Input(ie) => match ie {
@@ -754,14 +678,8 @@ impl DecisionExecutor {
                 ImeEffect::SetOpen { .. } => unreachable!("handled above"),
             },
             Effect::Ui(ue) => match ue {
-                UiEffect::EngineStateChanged {
-                    enabled,
-                    send_ime_key,
-                } => {
+                UiEffect::EngineStateChanged { enabled } => {
                     platform_rt.update_tray(enabled);
-                    if send_ime_key {
-                        platform_rt.send_engine_state_ime_key(enabled, applied_for_engine_key);
-                    }
                     None
                 }
             },
@@ -772,50 +690,118 @@ impl DecisionExecutor {
     ///
     /// `ImmCrossProcessStrategy` が現在のコンテキストで最初に適用可能な場合は
     /// `win32_async::spawn_local` で非同期実行し `None` を返す（spawn 済み）。
-    /// それ以外（GjiDirect / KanjiToggle 経路）はキー注入のみで非ブロッキングなため
+    /// それ以外（GjiDirect / MsImeDirect 経路）はキー注入のみで非ブロッキングなため
     /// 既存の同期 chain を維持し、`Some(..)` を返す。
+    ///
+    /// `press`（ADR-208 決定2 D1）: この `SetOpen` を起こしたユーザー打鍵（非リピート KeyDown）の押下 ID。
+    /// `Some` の書き込みは、(1) 同じ押下で既に同じ向きを予約済みなら書かず（BUG-113 の二重送信防止。向きが逆なら
+    /// Engine の明示コンボが優先して書く）、(2) view の `shadow_on` を `applied` が向きと一致していても未知にして
+    /// GjiDirect の already-matched 省略を外す（S-1: Blind 窓で stale な `applied` により絶対キーが握りつぶされ続ける
+    /// 固着の解消）。`None`（自動リピート等）は従来どおり `applied_snapshot` のまま。
+    #[tracing::instrument(level = "debug", skip_all, fields(open = open, ?press, ?generation))]
     fn dispatch_ime_set_open(
         &mut self,
         platform: &WindowsPlatform,
-        ime: &ImeStateHub,
+        ime: &mut ImeStateHub,
         open: bool,
+        press: Option<awase::types::PressId>,
         generation: Option<crate::state::ApplyGeneration>,
     ) -> Option<(bool, awase::platform::ImeOpenOutcome)> {
         // view は imm_first 判定と sync path の両方で使うため一度だけ構築する。
-        let mut view = platform.build_ime_control_view(self.applied_snapshot.to_pair());
+        // D1: 押下の書き込みは `applied` を省略の根拠にしない（`applied` 自体は書き換えない）。ただし TsfNative の窓は
+        // BUG-124 型の「@」の実機 A/B（ADR-208 L3'）が済むまで従来のまま（`engine_press_unknowns_applied`）。
+        let unknowns_applied = press.is_some()
+            && crate::state::ime_actuation_decision::engine_press_unknowns_applied(
+                platform
+                    .current_app_profile()
+                    .is_effectively_tsf_native(platform.focus.class_name()),
+            );
+        let mut view = platform.build_ime_control_view(
+            crate::state::ime_actuation_decision::explicit_press_applied_pair(
+                self.applied_snapshot.applied_open(),
+                open,
+                unknowns_applied,
+            ),
+        );
         view.belief_input_mode = self.belief_input_mode;
+        let gate_inputs = (&view).into();
+        if matches!(
+            crate::state::ime_actuation_decision::decide_gate(gate_inputs),
+            crate::state::ime_actuation_decision::GateResult::NotOwned
+        ) {
+            // /code-review指摘（B-3、PR #201）: ADR-163がDecisionSite::
+            // DispatchImeSetOpenを新設した理由は、この早期gate（下のimm_first
+            // 判定・sync path双方より前の、executor側だけが持つ独立した
+            // 判定点）を「Syncに畳むと回帰が記録上区別できなくなる」ため
+            // 区別する必要があったからだが、以前はこのgateがNotOwnedを
+            // 返すケースを一切記録していなかった。ここで初めて実際に
+            // site=DispatchImeSetOpenのレコードを積む。まだ`ActuationOrder`は
+            // 発行されていない（両分岐が自分の理由文字列で個別に発行する）ため、
+            // この記録専用に使い捨てのorderを発行する——`ActuationOrder::issue`
+            // はA-1（shadow）段階の純粋な読み取りで、発行して`chain`に通さず
+            // 破棄しても既存の警告(warrant)会計に副作用は無い
+            // （`state/platform_state.rs::issue_actuation_order`のdoc参照）。
+            let gate_reject_order =
+                ime.issue_self_actuation_order(open, "dispatch_ime_set_open_gate_not_owned");
+            let record = crate::state::actuation_decision_record::ActuationDecisionRecord {
+                site: crate::state::ime_actuation_decision::DecisionSite::DispatchImeSetOpen,
+                gate_inputs,
+                order: crate::state::actuation_decision_record::ActuationOrderRecord::from(
+                    &gate_reject_order,
+                ),
+                chain: [None; crate::state::actuation_decision_record::MAX_WRITE_MECHANISMS],
+                chain_len: 0,
+                attempts: [None; crate::state::actuation_decision_record::MAX_WRITE_MECHANISMS],
+                attempts_len: 0,
+                caller: None,
+            };
+            ime.journal
+                .record(crate::journal::JournalEntry::ActuationDecision { record });
+            return Some((open, awase::platform::ImeOpenOutcome::NotOwned));
+        }
+        // ADR-208 D1: この押下で既に書いた（同じ向き）なら書かない。order の発行直前に予約する
+        // （ImmCross の async は完了が WM 経由で後から届くため、完了時の記録では同じ打鍵の二重送信を防げない）。
+        // 非同期（ImmCross 先頭の窓）は完了が後から届くので、書けなくても予約は解かない（次の押下で直る）。
+        // 同期は何も送らなかったときだけ下で解く（`release_press_write`）。上の gate（NotOwned）で返済みなので、
+        // 書かない窓では予約しない。
+        let claim =
+            ime.claim_press_write(press, open, crate::state::press_ledger::PressSource::Engine);
+        if !claim.writes() {
+            tracing::debug!(
+                "[dispatch-ime] 同じ押下で既に書いた（{}）→ 書かない press={press:?} open={open}",
+                claim.label()
+            );
+            // 完了へ流す outcome は「送っていない」もの（`AlreadyMatched` だと書いていない押下が applied=Confirmed になる）。
+            return Some((open, crate::state::press_ledger::DUPLICATE_OUTCOME));
+        }
         let imm_first = crate::ime_controller::ImeController::imm_cross_is_first_applicable(&view);
         if imm_first {
             // ── async path (ImmCross が選ばれるアプリ) ──
             // OutputActiveGuard を先に取得しておくことで、await 中に走るフックコールバックは
             // INPUT_DEFER へ退避され、SetOpen 進行中に新キーが engine に届かない。
             //
-            // 同一エフェクトバッチ内で直後に処理される UiEffect::EngineStateChanged →
-            // send_engine_state_ime_key が applied_snapshot を見て VK_F4/VK_F3 を
-            // 送信するかを決める。async 完了前は applied_snapshot が旧値のままなので
-            // 「不整合あり→モードキー送信」と判断されてしまう。
-            // LINE/Qt 等の ImmCross アプリはこの VK_F4 Up に対して VK_F3 Down を
-            // 生成し（extra=0x0、マーカーなし）、shadow toggle が ON→OFF に反転する。
-            // → 楽観的に applied_snapshot を更新して send_engine_state_ime_key をスキップさせる。
+            // async 完了前は applied_snapshot が旧値のままなので、同一バッチ内の後続 effect や
+            // 次の判定（`build_ime_control_view` の `shadow_on` 供給、`resolve_warmup_ime_on`）が
+            // 「まだ揃っていない」と誤判断しないよう、楽観的に更新する。
+            // （かつては `send_engine_state_ime_key` のモードキー送信を止める役目もあった。
+            // ADR-207 で撤去したが、上記の消費者があるためこの更新は残す。）
             self.applied_snapshot = crate::state::AppliedImeState::Optimistic(open);
             // IMM が set_ime_open_cross_process(open) 完了後に注入する VK_DBE_DBCSCHAR/
             // VK_DBE_SBCSCHAR KeyUp は key_pipeline の suppress_physical (ImmCross プロファイル
             // の KANJI VK 全 Consume) で構造的に遮断されるため、ここでは applied_snapshot 更新のみ。
-            log::debug!(
-                "[dispatch-ime] ImmCross async: optimistic applied_snapshot={open} \
-                 (suppress send_engine_state_ime_key)"
-            );
+            tracing::debug!("[dispatch-ime] ImmCross async: optimistic applied_snapshot={open}");
             // ImmCross の set_ime_open_cross_process は IMC_SETOPENSTATUS のみ設定し
             // conv mode は変更しない。IME がかなモード (conv=0x09) のまま ON になると
             // NICOLA エンジンが is_romaji_capable=false で起動できない。
             // MsImeDirectStrategy と同じく ObservedKana 以外なら ROMAN ビットを補完する。
             // ImmCross アプリは ir_poll_and_learn で ObservedKana の観測を抑制するため
             // belief は ObservedKana にならず、ここに到達したときは常に補完対象になる。
-            let belief_input_mode = self.belief_input_mode;
             // ADR-090 §2.A A-1（shadow）: 起案は spawn_local の**外**で行う
             // ——future の中では `with_app` 再入で `ImeStateHub` に届かない
             // （ADR-090 §4.2）。
-            let order = issue_order(ime, open, "engine_decision_async");
+            let order = ime
+                .issue_self_actuation_order(open, "engine_decision_async")
+                .with_press(press);
             let guard = crate::tsf::probe_bridge::OutputActiveGuard::begin();
             // ADR-086 §1.2 欠陥1 是正（opus レビュー指摘 2026-08-08）: 「open と
             // 同じウィンドウへ ROMAN ビットを補完する」という意図を、open/conv を
@@ -825,15 +811,17 @@ impl DecisionExecutor {
             // focus_gen を捕獲し、実際の verify → open → conv はすべて
             // set_ime_open_then_conv_for_target 1回に閉じ込めて同一 hwnd を使い回す。
             let focus_gen = platform.output.ime_mode_focus_gen.get();
-            let conv_after_open =
-                if open && !matches!(belief_input_mode, InputModeState::ObservedKana) {
-                    crate::ime::ConvAfterOpen::Write(None)
-                } else {
-                    crate::ime::ConvAfterOpen::Skip
-                };
+            let conv_after_open: crate::ime::ConvAfterOpen =
+                crate::state::ime_actuation_decision::decide_dispatch_conv_after_open(
+                    (&view).into(),
+                    open,
+                )
+                .into();
             win32_async::spawn_local(async move {
                 let Some(target) = crate::ime::ActuationTarget::capture(focus_gen).await else {
-                    log::debug!("[dispatch-ime] capture 失敗（フォーカス無し） → UnsafeToToggle");
+                    tracing::debug!(
+                        "[dispatch-ime] capture 失敗（フォーカス無し） → UnsafeToToggle"
+                    );
                     crate::runtime::message_handlers::post_async_ime_apply_complete(
                         open,
                         awase::platform::ImeOpenOutcome::UnsafeToToggle,
@@ -854,6 +842,10 @@ impl DecisionExecutor {
                         conv_after_open,
                         focus_gen,
                     },
+                    crate::state::ime_actuation_decision::DecisionSite::DispatchImeSetOpen,
+                    // ADR-163 Part D S-8対応: `site`自体が`DispatchImeSetOpen`
+                    // として一意に識別できるため、追加のラベルは不要。
+                    None,
                 )
                 .await;
                 // sync path（sync_outcomes → dispatch_outcomes → on_ime_apply_complete）と
@@ -871,73 +863,26 @@ impl DecisionExecutor {
             None
         } else {
             // ── sync path (Chrome / GJI 経路 / TsfNative 経路) ──
-            //
-            // 観測値は冒頭で構築済みの view から読む（tsf_obs() の二重呼び出し回避）。
-            //
-            // 【doc 訂正、2026-08-10、ADR-087 §5 Phase 3 item14 棚卸しで判明】
-            // 元々このコメントは「EngineIntent かつ ImmCross/GJI で確認できない環境では
-            // confident=false → already_matched=false → 必ず apply する」という設計意図
-            // だったが、`belief.confident` を読んで already_matched 判定に使う本番コードは
-            // 現在存在しない（`already_matched`/`AlreadyMatched` は
-            // `ime_controller::ImeController::apply` が `view.control.shadow_on` から独立に
-            // 判定する）。`belief.confident` の本番消費者は診断ログ
-            // （`platform.rs::apply_ime_open_with_view` の `log::debug!`）のみ。
-            let now_ms = crate::hook::current_tick_ms();
-
-            // BUG-34 横展開 B: 以前はここで MS-IME + TsfNative の場合のみ
-            // get_ime_conversion_mode_raw_timeout(5) を同期的に呼んでいた
-            // （SendMessageTimeoutW ベース、SMTO_ABORTIFHUNG は呼び出し中に
-            // ハングし始めた相手には効かず最大 HungAppTimeout ~5s ブロックしうる、
-            // known-bugs.md BUG-34）。この打鍵経路は毎打鍵で走るため、ブロックすると
-            // その打鍵の IME open/close 判定そのものが Win32 往復の後ろに回る。
-            //
-            // この read の唯一の消費先は belief_inputs.conv_mode →
-            // reduce_open_belief → belief.effective_open/confident だが、
-            // apply_ime_open_with_view (platform.rs) は belief を log::debug! に
-            // 渡すだけで、実行本体 ImeController::apply(order, view) は belief
-            // 引数を受け取っていない（読んだ値は最終的にログ2行にしか影響しない）。
-            // そのため fence や degrade 方針を設計する必要はなく、単純に conv_mode
-            // を常に None にして同期 read を削除するだけで安全に打鍵経路の
-            // ブロックを解消できる。
-            //
-            // BUG-34 横展開レビュー指摘: 当初はここに fire-and-forget の診断読み取り
-            // （spawn_local + offload、結果は log のみ）を残していたが、この経路は
-            // 「毎打鍵で走る」（本関数冒頭のコメント参照）ため、キー入力のたびに
-            // OS スレッドを spawn する（`win32_async::offload` は呼び出しごとに
-            // `std::thread::spawn`）・宣言タイムアウトを 5ms→50ms に引き上げた
-            // クロスプロセス `SendMessageTimeoutW` を送る・その結果が
-            // `send_health::record` に給餌されグローバルなサーキットブレーカを
-            // 誤って作動させうる、という副作用があった。BUG-34 の第1修正
-            // （`kp_stage_idle_conv_check`）がまさにこの積み上がりを防ぐために
-            // in-flight ガードを持つのに対し、この診断はその保護を持たない
-            // 一回性イベント向けの idiom（shift-conv-guard entry verify）を
-            // 毎打鍵経路へ転用したものだった。唯一の消費先がログだけである以上、
-            // 削除するのが最も一貫した選択（fence/ガードを新設する価値がない）。
-            let conv_mode = None;
-
-            let belief_inputs = crate::output::OpenBeliefInputs {
-                shadow_on: view.control.shadow_on,
-                applied: self.applied_snapshot,
-                candidate_visible: view.observed.candidate_visible,
-                candidate_was_seen: view.observed.candidate_was_seen,
-                gji_monitor_ok: view.observed.gji_monitor_ok,
-                conv_mode,
-                can_imm32_cross_process: view.focus.profile.can_use_imm32_cross_process(),
-                now_ms,
-            };
-            let belief = crate::output::reduce_open_belief(&belief_inputs, open);
-            log::debug!(
-                "[dispatch-ime] belief: effective={} confident={} conv={:?} (profile={:?})",
-                belief.effective_open,
-                belief.confident,
-                conv_mode,
-                view.focus.profile
-            );
             // ADR-090 §2.A A-1（shadow）。
-            let order = issue_order(ime, open, "engine_decision_sync");
-            let outcome = platform.apply_ime_open_with_view(order, &view, belief);
+            let order = ime
+                .issue_self_actuation_order(open, "engine_decision_sync")
+                .with_press(press);
+            let (outcome, mut record) = platform.apply_ime_open_with_view(order, &view);
+            // 同期の書き込みが何も送らなかったなら予約を解く（同じ押下の次の経路が書ける。async は解けない）。
+            if crate::state::press_ledger::outcome_sent_nothing(outcome) {
+                ime.release_press_write(press, open);
+            }
+            // /code-review指摘（B-2、PR #201）: `site`は上書きしない——
+            // `decide_attempt`は常に`Sync`で呼ばれておりrecord.siteもSyncの
+            // ままなので、`replay_record`のchain再導出/ImmCross command
+            // 再計算検証を維持できる。呼び出し元の識別は独立の`caller`
+            // フィールドに記録する。
+            record.caller =
+                Some(crate::state::ime_actuation_decision::DecisionSite::DispatchImeSetOpen);
+            ime.journal
+                .record(crate::journal::JournalEntry::ActuationDecision { record });
             if outcome == awase::platform::ImeOpenOutcome::Failed {
-                log::warn!("apply_ime_open({open}) failed");
+                tracing::warn!("apply_ime_open({open}) failed");
             }
             Some((open, outcome))
         }
@@ -945,7 +890,7 @@ impl DecisionExecutor {
 
     /// intra-batch の applied_snapshot のみを更新する。
     ///
-    /// sync SetOpen 直後に同一バッチ内の後続 effect（`send_engine_state_ime_key` 等）が
+    /// sync SetOpen 直後に同一バッチ内の後続 effect が
     /// 参照するキャッシュを更新するためだけに使う（`execute_one` からのみ呼ばれる）。
     /// B（`on_ime_applied`）と C（ImeModel write-back）は `Runtime::on_ime_apply_complete`
     /// に委譲済み。UnsafeToToggle は送信していないので更新しない。
@@ -955,15 +900,20 @@ impl DecisionExecutor {
     /// 完了時の intra-batch 更新は不要（`on_ime_apply_complete` が SSOT を更新する）。
     fn update_intra_batch_applied(&mut self, open: bool, outcome: awase::platform::ImeOpenOutcome) {
         use awase::platform::ImeOpenOutcome;
-        if outcome == ImeOpenOutcome::UnsafeToToggle {
+        if matches!(
+            outcome,
+            ImeOpenOutcome::UnsafeToToggle | ImeOpenOutcome::NotOwned | ImeOpenOutcome::Unwarranted
+        ) {
             return;
         }
         let effective = match outcome {
             ImeOpenOutcome::Applied
-            | ImeOpenOutcome::FallbackSent
+            | ImeOpenOutcome::AppliedWithoutSendInput
             | ImeOpenOutcome::AlreadyMatched => open,
             ImeOpenOutcome::Failed => !open,
-            ImeOpenOutcome::UnsafeToToggle => unreachable!(),
+            ImeOpenOutcome::UnsafeToToggle
+            | ImeOpenOutcome::NotOwned
+            | ImeOpenOutcome::Unwarranted => unreachable!(),
         };
         self.applied_snapshot = crate::state::AppliedImeState::Confirmed {
             open: effective,
@@ -972,184 +922,15 @@ impl DecisionExecutor {
     }
 }
 
-/// `reduce_open_belief` および `AppliedImeState` の unit tests。
+/// `AppliedImeState` の unit tests。
 ///
 /// `awase-windows` クレートは `#![cfg(windows)]` で囲まれているため
 /// Windows 実機でのみ実行される。
 #[cfg(test)]
 mod tests {
-    use crate::output::{reduce_open_belief, OpenBeliefInputs};
     use crate::state::AppliedImeState;
 
-    /// Chrome 相当の設定（can_imm32=false, gji=false, EngineIntent）で confident を返すヘルパー。
-    /// `kanji_needs_context_override(...)` == `!chrome_intent(...).confident`
-    fn chrome_intent_confident(
-        desired: bool,
-        applied: AppliedImeState,
-        shadow_on: bool,
-        now_ms: u64,
-    ) -> bool {
-        let inputs = OpenBeliefInputs {
-            shadow_on,
-            applied,
-            candidate_visible: false,
-            candidate_was_seen: false,
-            gji_monitor_ok: false,
-            conv_mode: None,
-            can_imm32_cross_process: false,
-            now_ms,
-        };
-        reduce_open_belief(&inputs, desired).confident
-    }
-
-    // 6-C ケース 1: フォーカス直後 (Unknown) → confident=false（必ず apply）
-    #[test]
-    fn not_confident_when_unknown() {
-        assert!(!chrome_intent_confident(
-            false,
-            AppliedImeState::Unknown,
-            false,
-            1000
-        ));
-    }
-
-    // 6-C ケース 2: Optimistic のみ → confident=false
-    #[test]
-    fn not_confident_when_optimistic_only() {
-        assert!(!chrome_intent_confident(
-            false,
-            AppliedImeState::Optimistic(false),
-            false,
-            1000
-        ));
-    }
-
-    // ケース 3a: Confirmed OFF + 目標 OFF + 300ms 以内 → confident（二重送信防止）
-    #[test]
-    fn confident_when_confirmed_off_within_300ms() {
-        assert!(chrome_intent_confident(
-            false,
-            AppliedImeState::Confirmed {
-                open: false,
-                at_ms: 900
-            },
-            false,
-            1000
-        ));
-    }
-
-    // ケース 3b: Confirmed OFF + 目標 OFF + 300ms 超過 → not confident（desync 修正のため再送）
-    #[test]
-    fn not_confident_when_confirmed_off_over_300ms() {
-        assert!(!chrome_intent_confident(
-            false,
-            AppliedImeState::Confirmed {
-                open: false,
-                at_ms: 500
-            },
-            false,
-            1000
-        ));
-    }
-
-    // ケース 4: Confirmed + 目標 ON + 300ms 以内 → confident（二重送信防止）
-    #[test]
-    fn confident_when_confirmed_within_300ms() {
-        assert!(chrome_intent_confident(
-            true,
-            AppliedImeState::Confirmed {
-                open: false,
-                at_ms: 800
-            },
-            true,
-            1000
-        ));
-    }
-
-    // ケース 5: Confirmed + 300ms 超過 → not confident（再試行許容）
-    #[test]
-    fn not_confident_when_confirmed_over_300ms() {
-        assert!(!chrome_intent_confident(
-            true,
-            AppliedImeState::Confirmed {
-                open: false,
-                at_ms: 500
-            },
-            true,
-            1000
-        ));
-    }
-
-    // ケース 6: IMM32 使用可 → confident（ImmCross が先行するのでここには来ないが念のため）
-    #[test]
-    fn confident_when_imm32_available() {
-        let inputs = OpenBeliefInputs {
-            shadow_on: false,
-            applied: AppliedImeState::Unknown,
-            candidate_visible: false,
-            candidate_was_seen: false,
-            gji_monitor_ok: false,
-            conv_mode: None,
-            can_imm32_cross_process: true,
-            now_ms: 1000,
-        };
-        assert!(reduce_open_belief(&inputs, false).confident);
-    }
-
-    // ケース 7: GJI 健全 → confident
-    #[test]
-    fn confident_when_gji_healthy() {
-        let inputs = OpenBeliefInputs {
-            shadow_on: false,
-            applied: AppliedImeState::Unknown,
-            candidate_visible: false,
-            candidate_was_seen: false,
-            gji_monitor_ok: true,
-            conv_mode: None,
-            can_imm32_cross_process: false,
-            now_ms: 1000,
-        };
-        assert!(reduce_open_belief(&inputs, false).confident);
-    }
-
-    // （旧ケース 8「EngineIntent でない → confident」は 2026-07-06 到達不能パス監査
-    // B6 で撤去 — SetOpen は常に Engine の意図であり is_engine_intent 区別ごと畳んだ。）
-
-    // ケース 9: Confirmed ON + 目標 ON + 300ms 以内 → confident。
-    // 300ms超過後は他ケース同様not confidentになる(7a24442でOFF方向の「永続
-    // スキップ」を廃止した設計と一貫させるため、confidentは時間無制限の
-    // 「永続」ではなく300msの再検証ウィンドウという設計)。旧now_ms=100_000/
-    // at_ms=500(elapsed=99,500ms)はテスト新設(f7f09bc, 2026-06-04)時点で
-    // 既に300ms窓の外にあり、Windows実機で初めてこのテストを実行するまで
-    // (2026-07-25)発見されなかった。
-    #[test]
-    fn confident_when_confirmed_on_desired_on() {
-        assert!(chrome_intent_confident(
-            true,
-            AppliedImeState::Confirmed {
-                open: true,
-                at_ms: 900
-            },
-            true,
-            1000
-        ));
-    }
-
     // AppliedImeState ヘルパーメソッドのテスト
-    #[test]
-    fn applied_ime_state_to_pair() {
-        assert_eq!(AppliedImeState::Unknown.to_pair(), None);
-        assert_eq!(AppliedImeState::Optimistic(true).to_pair(), Some((true, 0)));
-        assert_eq!(
-            AppliedImeState::Confirmed {
-                open: false,
-                at_ms: 42
-            }
-            .to_pair(),
-            Some((false, 42))
-        );
-    }
-
     #[test]
     fn applied_ime_state_applied_open() {
         assert_eq!(AppliedImeState::Unknown.applied_open(), None);
@@ -1173,102 +954,5 @@ mod tests {
             at_ms: 1
         }
         .is_confirmed());
-    }
-
-    // ── strip_ime_set_open_if_settling (P3-1: focus-settle SetOpen 一次フィルタ) ──
-
-    use awase::engine::{Decision, Effect, ImeEffect, SetOpenOrigin, TimerEffect};
-
-    fn set_open_effect(open: bool) -> Effect {
-        Effect::Ime(ImeEffect::SetOpen {
-            open,
-            origin: SetOpenOrigin::ExplicitUserAction,
-        })
-    }
-
-    // settling=true: SetOpen effect は decision から除去され、除去された目標値が返る。
-    #[test]
-    fn strip_removes_set_open_when_settling() {
-        let mut decision = Decision::consumed_with(vec![set_open_effect(true)].into());
-        let stripped = super::strip_ime_set_open_if_settling(&mut decision, true);
-        assert!(
-            decision.find_ime_set_open().is_none(),
-            "settle 中は SetOpen effect が除去される"
-        );
-        assert_eq!(
-            stripped,
-            Some(true),
-            "呼び出し元が settle 明けの再試行をスケジュールできるよう、\
-             除去した目標値を返す必要がある"
-        );
-    }
-
-    // settling=false: SetOpen effect はそのまま保持され、何も除去していないので None が返る。
-    #[test]
-    fn strip_keeps_set_open_when_not_settling() {
-        let mut decision = Decision::consumed_with(vec![set_open_effect(true)].into());
-        let stripped = super::strip_ime_set_open_if_settling(&mut decision, false);
-        assert_eq!(
-            decision.find_ime_set_open(),
-            Some(true),
-            "settle 外では SetOpen effect は保持される"
-        );
-        assert_eq!(stripped, None, "何も除去していないので None");
-    }
-
-    // settling=true だが SetOpen effect が無い場合: 除去対象が無いので None
-    // （retry のスケジュールも不要 — 呼び出し元は Some のときだけ再試行すればよい）。
-    #[test]
-    fn strip_returns_none_when_settling_but_no_set_open_effect() {
-        let mut decision =
-            Decision::consumed_with(vec![Effect::Timer(TimerEffect::Kill(0))].into());
-        let stripped = super::strip_ime_set_open_if_settling(&mut decision, true);
-        assert_eq!(
-            stripped, None,
-            "SetOpen effect が無ければ settling=true でも None"
-        );
-        let remaining = match &decision {
-            Decision::Consume { effects } => effects.len(),
-            _ => unreachable!("Consume のまま"),
-        };
-        assert_eq!(remaining, 1, "SetOpen 以外の effect は手つかずのまま残る");
-    }
-
-    // settling=true でも SetOpen 以外の effect（Timer 等）は保持される（対象集合を SetOpen に限定）。
-    #[test]
-    fn strip_preserves_non_set_open_effects_when_settling() {
-        let mut decision = Decision::consumed_with(
-            vec![set_open_effect(false), Effect::Timer(TimerEffect::Kill(0))].into(),
-        );
-        let stripped = super::strip_ime_set_open_if_settling(&mut decision, true);
-        assert!(
-            decision.find_ime_set_open().is_none(),
-            "SetOpen は除去される"
-        );
-        assert_eq!(stripped, Some(false), "除去した目標値 false が返る");
-        let remaining = match &decision {
-            Decision::Consume { effects } => effects.len(),
-            _ => unreachable!("Consume のまま"),
-        };
-        assert_eq!(remaining, 1, "SetOpen 以外の effect（Timer）は残る");
-    }
-
-    // 2026-07-08: 実機で GjiFsm が resync できず「このせっけい」の文字欠落に至った
-    // シナリオの再発防止。settle 中に握りつぶした SetOpen(true) の戻り値を呼び出し元
-    // （execute_decision / kp_run_inner）が無視すると、Engine::prev_activation は既に
-    // 遷移確定済みのため、同じ SetOpen は二度と自然発行されない。
-    // この関数の契約（Some を返したら呼び出し元は必ず settle 明け再試行をスケジュールする）
-    // を型レベルで思い出させるため #[must_use] を付けている。ここでは戻り値の意味そのもの
-    // （「再試行が必要かどうか」の判定に使えること）を固定する。
-    #[test]
-    fn strip_stripped_value_signals_retry_is_owed() {
-        let mut decision = Decision::consumed_with(vec![set_open_effect(true)].into());
-        let stripped = super::strip_ime_set_open_if_settling(&mut decision, true);
-        // 呼び出し元の実装（execute_decision / kp_run_inner）はこの `is_some()` で
-        // schedule_ime_refresh(focus_settle_ms + 50) を呼ぶかどうかを判断する。
-        assert!(
-            stripped.is_some(),
-            "SetOpen を握りつぶしたら再試行が必要という事実を呼び出し元へ伝える"
-        );
     }
 }

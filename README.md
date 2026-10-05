@@ -17,17 +17,68 @@ awase は低レベルキーボードフックで物理キー入力を横取り�
 ## 特徴
 
 - **NICOLA 準拠の同時打鍵判定** — d1/d2 比較による 3 キー仲裁
-- **5 つの確定モード** — wait / speculative / two\_phase / adaptive\_timing / ngram\_predictive
+- **2 つの確定モード** — wait / ngram\_predictive
 - **n-gram 適応閾値** — Wikipedia コーパス由来の 2/3-gram で判定ウィンドウを動的調整し精度向上
 - **やまぶき互換 `.yab` 配列ファイル** — 既存の配列データをそのまま利用可能
 - **幅広いアプリ対応** — Win32 / UWP / TSF ネイティブ（Chrome・VS Code・WezTerm 等）を自動識別
 - **多重耐障害設計** — フック死活監視・スリープ復帰・IME 検出失敗フォールバック・TSF コールドスタート自動回復を多段装備
 - **非同期アーキテクチャ** — Windows メッセージループベースの非同期エグゼキュータ、ブロッキング API は別スレッドで隔離しタイムアウト保護
 - **フォーカス自動検出** — テキスト入力欄以外では変換を自動停止
-- **システムトレイ常駐** — 配列切替・設定画面・有効/無効トグル
+- **システムトレイ常駐** — 配列切替・設定画面・親指シフト入力／ローマ字入力トグル
 - **US配列対応** — `keyboard_model = "us"` で US 物理配列に切替。無変換/変換キーが無いぶん、左右 Alt キーへの親指キーなりすまし・Space 親指キー化にも対応
 
 技術的な設計の詳細は [ARCHITECTURE.md](ARCHITECTURE.md) を参照してください。
+
+---
+
+## v1 の保守終了と v2 への移行
+
+awase v2.0.0 のリリース（2026-10-04）に伴い、**v1 系（1.x）は保守を終了しました**（保守終了日: v2.0.0 の公開日 2026-10-04）。
+以後、v1 には不具合修正も新機能も入りません。v1 の最後のバージョンは 1.21.2 です。
+
+- **v2 への更新をおすすめします。** ダウンロードは [GitHub Releases](https://github.com/cuzic/awase/releases) から。v1 と v2 の違い全体は [v1 から v2 への違いと移行ガイド](docs/migration-v1-to-v2.md) にあります。
+- v1 で直らない既知の問題は [v1 に残る既知の問題](#v1-に残る既知の問題) にまとめています。
+- 設定ファイル（`config.toml`）はそのまま引き継げますが、一部の設定は v2 で変わります。
+  [v1 から v2 への移行で設定が変わる点](#v1-から-v2-への移行で設定が変わる点) を確認してください。
+- v1.21.1 以降のアプリ内更新通知では v2 は通知されません。このページか GitHub Releases で確認してください。
+
+### v2 で修正した主な不具合
+
+実機（物理キー・実アプリ）で確認できていないものは、その旨を書いています。詳細は各 BUG の記録（`docs/known-bugs/`）にあります。
+
+- Windows Terminal など TSF ネイティブなアプリ + Google 日本語入力で、カタカナのまま戻れなくなる不具合（BUG-173）を修正しました。実機での最終確認は未了です。
+- Chrome + Google 日本語入力で、高速打鍵時に入力中の文字が消える不具合（BUG-168）を修正しました。CI・実機での確認待ちです。
+- Chrome 系ウィンドウ + Google 日本語入力で、他のプログラムが注入したキーで IME を閉じられたあと、NICOLA 入力が ON のままローマ字が入る不具合（BUG-172）を修正しました。CI（GitHub Actions の Windows 実機）で確認済みで、実機の Edge でも効果を確認しましたが、実機で「IME が開いたままなのに NICOLA が OFF になる」現象を 1 回見ており原因は未特定です（BUG-176）。MS-IME は対象外です。
+- 起動直後に、IME を閉じていても awase が開けに行く不具合（BUG-163）を修正しました（実機未検証）。
+- `config.toml` のキー名の書き方がどの設定項目でも同じ規則で読まれるようになり、間違った設定は黙って無視されず警告が出ます。
+- 無変換／変換の単独タップの動作を整理しました（下記の移行の節を参照。Windows Terminal + Google 日本語入力で「@」が出る件への効果は実機未確認）。
+
+### v1 に残る既知の問題
+
+v1 の最終版（1.21.2）には次の問題が残り、v1 では直りません。
+
+| 起きること | どんなとき | 回避策 | v2 での状況 |
+|---|---|---|---|
+| ひらがなに戻れず、カタカナで入力され続ける（BUG-173） | Google 日本語入力 + Windows Terminal など（TSF ネイティブ）で、いったんカタカナになったあと | 半角/全角キーで IME を切り替え直す | 修正（実機未確認） |
+| 入力中の文字が超高速打鍵で消える（BUG-168） | Chrome・Edge 系 + Google 日本語入力 | 打ち直す | 修正（CI・実機確認待ち） |
+| 途中の語で入力中の文字が消える（BUG-171） | Chrome・Edge 系 + Google 日本語入力で、しばらく使っていない状態から打つとき | 打ち直す。一度確定してから続ける | v2 でも未修正 |
+| 他のプログラムが IME を閉じたあと、NICOLA 入力に戻らずローマ字がそのまま入る（BUG-172） | Chrome 系 + Google 日本語入力 | 物理キー（半角/全角など）で切り替える | 修正（MS-IME は対象外） |
+| MS-IME 本体で最初のひらがなキーが効かず IME が閉じることがある（BUG-152） | IME への切り替え要求がタイムアウトした最初の 1 回だけ | もう一度ひらがなキーを押す | 修正 |
+| 起動直後、IME を閉じても何度か ON に戻される（BUG-163） | IME を閉じた状態で awase を起動した直後 | 起動後しばらくしてから切り替える | 修正（実機未検証） |
+| 半角/全角キーを連打すると IME が ON に固まる（BUG-142） | Windows Terminal + Google 日本語入力 | `keys.ime_detect.toggle` を設定する | 恒久修正は未 |
+| MS-IME 本体 + Chrome で、入力中の文字が残っている間に OFF を押すと IME が閉じず半角英数になる（BUG-185） | MS-IME 本体 + Chrome 系 | ON キーでかなに戻る。Chrome では Google 日本語入力をおすすめします | v2 でも対応しない（MS-IME の挙動） |
+| 設定画面で n-gram ファイル欄を空にしても既定値に戻り、無効にできない（BUG-169） | 設定画面 | `config.toml` で直接設定する | v2 でも未修正 |
+
+### v1 から v2 への移行で設定が変わる点
+
+`config.toml` は引き継げます。次の設定は v2 で扱いが変わります。
+
+- **`keys.ime_toggle` の既定値が空になりました。** 以前の既定は `VK_KANJI`（半角/全角）でした。`config.toml` に `VK_KANJI` を明示している場合は、その設定を尊重します（消しません）。ただし v1 の設定画面が書き出した旧既定と同じ値（`["VK_KANJI"]`）は空として扱われ、保存すると消えます。
+- **`keys.ime_detect.on` / `off` の既定値が空になりました**（以前は `IMEオン` / `IMEオフ`）。IMEオン／IMEオフキーへの追随は指定しなくても自動で行われます。書いてある値はそのまま使われます。
+- **`keys.engine_on_ime_key` / `engine_off_ime_key` を撤去しました。** 2026-08-15 より前に設定画面で保存した人は、旧既定値が `config.toml` に残っていて、エンジンの ON/OFF に合わせて全角/半角モードキーを送る機能が有効だった場合があります。v2 ではその機能が止まります（`config.toml` に残っていても無視され、起動時に通知が出ます。設定画面で保存するとその行は消えます）。代わりの設定はありません。IME の開閉は `keys.ime_on` / `ime_off` で設定できます。
+- **`muhenkan_solo_tap_ime_action` / `henkan_solo_tap_ime_action` を撤去しました。** 読み込み時に `keys.ime_*` 相当へ移行し、警告が出ます（同じキーの設定が既にあれば移行しません）。無変換／変換の単独タップは、Suppress／Passthrough の設定に従います。
+- **確定モード `confirm_mode` は `wait` と `ngram_predictive` の 2 択になりました。** 旧い値は読込時に `wait` として扱われ、保存時に `wait` へ書き換わります。
+- **`config.toml` のキー名の解釈が統一されました。** これまで黙って無視されていた書き方（`VK_` 無し、小文字、日本語名など）が有効になります。心当たりのある再割り当てが、更新しただけで効き始めることがあります。旧表記 `[[keymap]]`（正しくは `[[keymaps]]`）も効き始めます。
 
 ---
 
@@ -83,7 +134,12 @@ cargo build --release --target x86_64-pc-windows-msvc
 awase.exe
 config.toml          ← 設定ファイル
 layout/
-  nicola.yab         ← NICOLA 配列（同梱）
+  nicola.yab         ← NICOLA 配列（Backspace/Escape 代用版）
+  nicola_keytop.yab  ← NICOLA 配列（記号キートップ通り出力版、新規インストールの既定）
+  nicola_kakutei.yab ← NICOLA 配列（記号キートップ通り出力版 + 句読点で確定）
+  nicola_f.yab       ← 富士通純正親指シフトキーボード(FKB7628-801等)向け
+  nicola_kb232.yab   ← 富士通純正親指シフトキーボード(FMV-KB232)向け
+  nicola_us.yab      ← US 配列
 data/
   ngram_hiragana.csv.gz  ← n-gram コーパス（任意）
 ```
@@ -92,14 +148,14 @@ data/
 
 `awase.exe` をダブルクリックするとシステムトレイに常駐します。
 
-### 4. エンジンを ON にする
+### 4. 親指シフト入力にする
 
 デフォルトのキーバインド：
 
 | 操作 | キー |
 |------|------|
-| エンジン ON | **Ctrl+Shift+変換** |
-| エンジン OFF | **Ctrl+Shift+無変換** |
+| 親指シフト入力にする | **Ctrl+Shift+変換** |
+| ローマ字入力にする | **Ctrl+Shift+無変換** |
 | IME ON | **Ctrl+変換**（IME が既に ON の場合はひらがな・ローマ字・CapsLock OFF へリセット） |
 | IME OFF | **Ctrl+無変換** |
 | IME-ON 半角英数トグル（MS-IME のみ） | **左Shift 単独タップ**（他キーを介さず押して離す。もう一度タップで解除） |
@@ -118,14 +174,16 @@ data/
 
 最小構成：
 
+<!-- example-begin: readme-minimal asis -->
 ```toml
 [general]
 simultaneous_threshold_ms = 100   # 同時打鍵判定の閾値（ms）。NICOLA 規格は 100ms
 left_thumb_key  = "無変換"
 right_thumb_key = "変換"
 layouts_dir     = "layout"
-default_layout  = "nicola.yab"
+default_layout  = "nicola_keytop.yab"
 ```
+<!-- example-end -->
 
 フルサンプルは同梱の `config.toml` を参照してください。
 
@@ -137,21 +195,35 @@ default_layout  = "nicola.yab"
 | `left_thumb_key` | `無変換` | 左親指シフトキー |
 | `right_thumb_key` | `変換` | 右親指シフトキー |
 | `confirm_mode` | `wait` | 確定モード（後述） |
-| `output_mode` | `unicode` | 出力方式（通常は変更不要） |
-| `engine_toggle_hotkey` | なし | エンジン ON/OFF トグルホットキー |
+| `engine_toggle_hotkey` | なし | 親指シフト入力／ローマ字入力トグルホットキー |
 | `keyboard_model` | `jis` | 物理キーボード配列。US 配列なら `"us"`（`default_layout` も `nicola_us.yab` に変更） |
+
+### 無変換／変換キーの単独タップと IME のキー設定
+
+無変換／変換を親指キーにしている場合、**単独で押したとき**の扱いは設定画面（または `muhenkan_solo_tap_always_suppress` / `henkan_solo_tap_always_suppress`）で選びます。
+
+| 設定画面の選択肢 | 動作 |
+|------------------|------|
+| 無効にする（既定） | NICOLA 入力中（IME ON）は、単独で押しても何も起きません（awase が飲み込み、IME にも送りません）。 |
+| IME に任せる（パススルー） | 単独タップを IME に送ります。IME のキー設定で無変換／変換に割り当てた機能（IME のオン/オフ、再変換など）が使えます。 |
+
+IME のオン/オフや再変換などを無変換／変換で行いたい場合は、**IME 側のキー設定で割り当て**、awase 側は「IME に任せる」にします。
+
+- Microsoft IME: 「キーとタッチのカスタマイズ」（設定画面の「Microsoft IME の設定を開く」から設定ページを開けます）
+- Google 日本語入力: プロパティの「キー設定」（「モード」「入力キー」「コマンド」を設定します。設定画面の「Google 日本語入力のプロパティを開く」からプロパティを開けます。ボタンで開けない場合は、タスクトレイの「あ」/「A」アイコンを右クリックして「プロパティ」を選びます）
+
+`keys.ime_on` / `ime_off` / `ime_toggle` は、IME の通常の切替用ではなく、**モードずれが起きたときに awase と IME の状態を強制的にそろえる**ためのキーです。無変換／変換をここに設定すると、単独タップは「IME の状態をそろえる」動作になり、生のキーは IME に届きません（「IME に任せる」にしても同じです。設定の読み込み時に警告が出ます）。
 
 ### 確定モード
 
 | モード | 特徴 |
 |--------|------|
 | `wait` | タイムアウトまで待機。最も正確、わずかに遅延あり |
-| `speculative` | 即座に出力し誤りなら取消・再送。高速だがちらつきあり |
-| `two_phase` | 短い待機後に投機出力。wait と speculative の中間 |
-| `adaptive_timing` | 打鍵速度に応じて自動調整 |
 | `ngram_predictive` | Wikipedia 由来の n-gram 統計で閾値を動的調整（n-gram ファイル推奨） |
 
-迷ったら `wait` から始め、遅延が気になったら `adaptive_timing` を試してください。
+迷ったら `wait` から始め、遅延が気になったら `ngram_predictive` を試してください。
+
+> 旧バージョンの `speculative` / `two_phase` / `adaptive_timing` は廃止されました。`config.toml` に残っていても読込時に警告を出し、`wait` として扱います。
 
 n-gram の仕組みの詳細は [ARCHITECTURE.md](ARCHITECTURE.md#n-gram-による同時打鍵判定の精度向上) を参照してください。
 
@@ -159,13 +231,14 @@ n-gram の仕組みの詳細は [ARCHITECTURE.md](ARCHITECTURE.md#n-gram-によ�
 
 特定アプリで動作が合わない場合に強制指定します。
 
+<!-- example-begin: readme-app-overrides asis -->
 ```toml
 [app_overrides]
 # 常にテキスト入力として扱う
 force_text = [
     { process = "myapp.exe", class = "Edit" },
 ]
-# エンジンを常に無効にする
+# 常にローマ字入力にする（awase を素通しする）
 force_bypass = [
     { process = "launcher.exe", class = "LauncherClass" },
 ]
@@ -174,6 +247,7 @@ force_tsf = [
     { process = "wezterm-gui.exe", class = "org.wezfurlong.wezterm" },
 ]
 ```
+<!-- example-end -->
 
 プロセス名とクラス名は `RUST_LOG=debug awase.exe` のログで確認できます。
 
@@ -199,9 +273,30 @@ u, si,te,ke,se, ha,to,ki, i, nn, 後, 逃
 ...
 ```
 
-NICOLA 標準配列は `layout/nicola.yab`（JIS 配列）と `layout/nicola_us.yab`（US 配列）として同梱しています。US 配列では無変換/変換キーが物理的に無いため、設定画面で左右 Alt キーを親指キーとしてなりすまさせる、または Space キーを親指キーに割り当てることができます。
+NICOLA 標準配列は JIS 配列として2種類同梱しています。両方ともかな44キー配置は NICOLA 本家仕様と同一で、本家仕様が未定義のまま余っている物理キー位置（数字段12-13列目・Q段11-12列目・A段〈ホームロー〉11-12列目）の扱いだけが異なります。
+
+- `layout/nicola_keytop.yab`（**新規インストールの既定**）: 標準 JIS キーボードのキートップに実際に印字されている記号（＠／［／］／：／￥／＾）を出力します。ただし ＠ は物理 @ キーが NICOLA 本家仕様で「、」（読点）に割り当てられているため、無変換/変換キーを併用した親指シフト時のみ ＠ が出ます（単独タップは引き続き「、」）。
+- `layout/nicola.yab`（v1.16.1 以前の既定）: 同じ物理キー位置をソフトウェアで Backspace/Escape に代用します。既存インストールをアップグレードしても `layout/nicola.yab` の中身は変わりません（ユーザーが配列編集タブで直接編集している可能性があるファイルを無言で上書きしない設計のため）。新しい記号キートップ通り出力に乗り換えたい場合は、`default_layout` を `"nicola_keytop.yab"` に手動で変更してください。
+
+### 句読点で確定するレイアウト
+
+`layout/nicola_kakutei.yab` は `nicola_keytop.yab` と同一の配列に、「。」「、」の
+2セルだけ変更を加えたものです。この2キーを押すと、句読点を出力した直後に
+Ctrl+M（IME の全確定ショートカット）を送るようになります。やまぶき／やまぶきR・
+DvorakJ にある「句読点で確定」機能と同じ仕組みです。
+
+設定画面の「レイアウト」で `nicola_kakutei.yab` を選ぶだけで使えます
+（打鍵列機能は既定 On）。
+
+使用する IME（Google 日本語入力 / MS-IME）側で Ctrl+M が「全確定」に
+割り当てられていることを確認してください。他のアプリで Ctrl+M が別機能に
+割り当てられている場合は競合します。
+
+US 配列では `layout/nicola_us.yab` を使用します。無変換/変換キーが物理的に無いため、設定画面で左右 Alt キーを親指キーとしてなりすまさせる、または Space キーを親指キーに割り当てることができます。
 
 富士通純正親指シフトキーボード（FKB7628-801 等）向けに `layout/nicola_f.yab` も同梱しています。物理キー配列・スキャンコードは JIS キーボードと共通のため `keyboard_model` は `"jis"` のままで構いません。`default_layout` を `"nicola_f.yab"` に変更してください。
+
+富士通純正親指シフトキーボード「FMV-KB232」は `nicola_f.yab` とも記号配置が異なるため、専用の `layout/nicola_kb232.yab` を用意しています。`default_layout` を `"nicola_kb232.yab"` に変更してください（`keyboard_model` は `"jis"` のまま）。ユーザー1名の実機環境から提供された配列のため、他の個体・型番違いで記号配置が一致しない可能性があります。
 
 ---
 
@@ -222,7 +317,7 @@ awase はフォーカス中のアプリを自動識別し、出力方式を切�
 ## トラブルシューティング
 
 **文字が入力されない / おかしな文字になる**  
-→ エンジンが OFF になっている可能性。Ctrl+Shift+変換 で ON にする。
+→ ローマ字入力になっている可能性。Ctrl+Shift+変換 で親指シフト入力にする。
 
 **特定アプリで動作しない**  
 → `RUST_LOG=debug awase.exe` で起動してログを確認し、`[app_overrides]` に追加。

@@ -7,15 +7,26 @@
 use crate::ngram::NgramModel;
 use crate::types::Timestamp;
 
-/// 3キー仲裁のタイミングマージン（閾値の30%）
-/// d1 と d2 の差がこれ以上ならタイミングだけで判定する
-const TIMING_MARGIN_PERCENT: u64 = 30;
+/// 3キー仲裁のタイミングマージン（閾値の30%）の既定値。
+/// d1 と d2 の差がこれ以上ならタイミングだけで判定する。
+/// `GeneralConfig::timing_margin_percent` でユーザーが上書きできる
+/// （`TimingJudge::with_margins` 参照）。この定数は `NicolaFsm::new` の初期値。
+pub(crate) const TIMING_MARGIN_PERCENT: u64 = 30;
 
-/// 重なり不足判定のマージン（閾値の15%）
+/// 重なり不足判定のマージン（閾値の15%）の既定値。
 /// char2 が来ないまま char1+thumb を確定する2鍵ケースで、thumb 押下から
 /// char1 解放までの重なり時間がこれ未満なら「重なり不足」とみなし、
 /// n-gram タイブレークに回す（`confirms_char_thumb_chord` 参照）。
-const MIN_OVERLAP_MARGIN_PERCENT: u64 = 15;
+///
+/// **この定数自体を変更しても本番挙動（`NicolaFsm`）は変わらない。**
+/// `NicolaFsm::timing_judge` は必ず `with_margins` で上書きするため、この
+/// 定数は `TimingJudge::new` 単体呼び出し（本モジュール自身の単体テスト）
+/// でのみ有効なアルゴリズム基準値。本番経路の実質的な既定値は
+/// `GeneralConfig::min_overlap_margin_percent`（config.rs、現在0%固定、
+/// ADR-112決定1）が決める——`nicola_fsm.rs::RUNTIME_MIN_OVERLAP_MARGIN_PERCENT`
+/// はさらにその手前の構築直後の初期値に過ぎない。実用値への引き戻し
+/// （決定3）をこの定数だけ変えて済ませないこと。
+pub(crate) const MIN_OVERLAP_MARGIN_PERCENT: u64 = 15;
 
 /// n-gram 予測で投機出力を選択する最小スコア差
 const SPECULATIVE_SCORE_THRESHOLD: f32 = 0.5;
@@ -30,12 +41,34 @@ pub enum ThreeKeyResult {
     PairWithChar2,
 }
 
+/// ADR-120 決定0a: `three_key_pairing` がどの段階で決定に至ったか。
+/// 集計専用（`RetroEvalStats`）で、判定式そのものには一切影響しない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecisionPhase {
+    NoNgram,
+    Phase1,
+    Phase2,
+}
+
+/// ADR-120 決定0a: `three_key_pairing_traced` が判定過程を集計向けに
+/// 持ち帰るための付帯情報。判定結果（`ThreeKeyResult`）には影響しない。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ThreeKeyTrace {
+    pub phase: DecisionPhase,
+    /// Phase2 のときだけ `Some`。
+    pub score_a: Option<f32>,
+    /// Phase2 のときだけ `Some`。
+    pub score_b: Option<f32>,
+}
+
 /// 同時打鍵のタイミング判定器
 #[derive(Debug)]
 pub struct TimingJudge<'a> {
     threshold_us: u64,
     ngram_model: Option<&'a NgramModel>,
     recent_kana: Vec<char>,
+    timing_margin_percent: u64,
+    min_overlap_margin_percent: u64,
 }
 
 impl<'a> TimingJudge<'a> {
@@ -49,7 +82,31 @@ impl<'a> TimingJudge<'a> {
             threshold_us,
             ngram_model,
             recent_kana,
+            timing_margin_percent: TIMING_MARGIN_PERCENT,
+            min_overlap_margin_percent: MIN_OVERLAP_MARGIN_PERCENT,
         }
+    }
+
+    /// `timing_margin_percent`/`min_overlap_margin_percent` を既定値から
+    /// 上書きする（`GeneralConfig` のユーザー設定値を反映する用途、
+    /// `NicolaFsm::timing_judge` 参照）。`new` 単体の呼び出し元（timing.rs の
+    /// 単体テスト等）は既定値のまま使えるよう、`new` 本体には手を入れていない。
+    ///
+    /// ADR-112 決定1: `min_overlap_margin_percent` は `NicolaFsm` 側
+    /// （`GeneralConfig::min_overlap_margin_percent`）の既定値が0のままである限り、
+    /// `char1_released_at` が実際に埋まるようになった（決定2、Phase 0 修正）後も
+    /// 重なり不足判定は実質的に無効（常に重なり十分）のまま。実機ソーク後、
+    /// 実測付きで別コミット/別ADRとして引き締める（決定3、本モジュールの
+    /// スコープ外）。
+    #[must_use]
+    pub const fn with_margins(
+        mut self,
+        timing_margin_percent: u64,
+        min_overlap_margin_percent: u64,
+    ) -> Self {
+        self.timing_margin_percent = timing_margin_percent;
+        self.min_overlap_margin_percent = min_overlap_margin_percent;
+        self
     }
 
     /// 2キー判定: pending_ts と new_ts の間隔が閾値内か。
@@ -82,24 +139,70 @@ impl<'a> TimingJudge<'a> {
         char1_single_kana: Option<char>,
         char2_thumb_kana: Option<char>,
     ) -> ThreeKeyResult {
+        self.three_key_pairing_traced(
+            char1_ts,
+            thumb_ts,
+            char2_ts,
+            char1_thumb_kana,
+            char1_single_kana,
+            char2_thumb_kana,
+        )
+        .0
+    }
+
+    /// `three_key_pairing` と同一の判定式を実行しつつ、ADR-120 決定0a の
+    /// 集計（`RetroEvalStats`）向けに判定過程（`ThreeKeyTrace`）を併せて返す。
+    /// 公開 API である `three_key_pairing` の型・挙動を変えないための内部専用
+    /// バリアント — 判定式は1文字も変えていない。
+    pub(crate) fn three_key_pairing_traced(
+        &self,
+        char1_ts: Timestamp,
+        thumb_ts: Timestamp,
+        char2_ts: Timestamp,
+        char1_thumb_kana: Option<char>,
+        char1_single_kana: Option<char>,
+        char2_thumb_kana: Option<char>,
+    ) -> (ThreeKeyResult, ThreeKeyTrace) {
         let d1 = thumb_ts.saturating_sub(char1_ts);
         let d2 = char2_ts.saturating_sub(thumb_ts);
 
         let Some(model) = self.ngram_model else {
-            return if d1 < d2 {
+            let result = if d1 < d2 {
                 ThreeKeyResult::PairWithChar1
             } else {
                 ThreeKeyResult::PairWithChar2
             };
+            return (
+                result,
+                ThreeKeyTrace {
+                    phase: DecisionPhase::NoNgram,
+                    score_a: None,
+                    score_b: None,
+                },
+            );
         };
 
         // Phase 1: タイミング差が大きければタイミングだけで決定
-        let margin = self.threshold_us * TIMING_MARGIN_PERCENT / 100;
+        let margin = self.threshold_us * self.timing_margin_percent / 100;
         if d1 + margin < d2 {
-            return ThreeKeyResult::PairWithChar1;
+            return (
+                ThreeKeyResult::PairWithChar1,
+                ThreeKeyTrace {
+                    phase: DecisionPhase::Phase1,
+                    score_a: None,
+                    score_b: None,
+                },
+            );
         }
         if d2 + margin < d1 {
-            return ThreeKeyResult::PairWithChar2;
+            return (
+                ThreeKeyResult::PairWithChar2,
+                ThreeKeyTrace {
+                    phase: DecisionPhase::Phase1,
+                    score_a: None,
+                    score_b: None,
+                },
+            );
         }
 
         // Phase 2: n-gram スコアで判定
@@ -115,12 +218,18 @@ impl<'a> TimingJudge<'a> {
             _ => f32::NEG_INFINITY,
         };
 
-        log::trace!(
+        tracing::trace!(
             "3-key arbitration: d1={d1}µs d2={d2}µs score_a={score_a:.3} score_b={score_b:.3}"
         );
 
+        let trace = ThreeKeyTrace {
+            phase: DecisionPhase::Phase2,
+            score_a: Some(score_a),
+            score_b: Some(score_b),
+        };
+
         // スコアが高いほうを選択。同点ならタイミング
-        if (score_a - score_b).abs() > f32::EPSILON {
+        let result = if (score_a - score_b).abs() > f32::EPSILON {
             if score_a > score_b {
                 ThreeKeyResult::PairWithChar1
             } else {
@@ -130,7 +239,8 @@ impl<'a> TimingJudge<'a> {
             ThreeKeyResult::PairWithChar1
         } else {
             ThreeKeyResult::PairWithChar2
-        }
+        };
+        (result, trace)
     }
 
     /// 投機出力判定: 通常面のスコアが親指面より十分高ければ投機出力する。
@@ -184,8 +294,12 @@ impl<'a> TimingJudge<'a> {
         chord_kana: Option<char>,
         solo_kana: Option<char>,
     ) -> bool {
-        if let Some(verdict) = overlap_only_verdict(self.threshold_us, thumb_ts, char1_released_at)
-        {
+        if let Some(verdict) = overlap_only_verdict(
+            self.threshold_us,
+            thumb_ts,
+            char1_released_at,
+            self.min_overlap_margin_percent,
+        ) {
             return verdict;
         }
 
@@ -229,13 +343,14 @@ pub(crate) fn overlap_only_verdict(
     threshold_us: u64,
     thumb_ts: Timestamp,
     char1_released_at: Option<Timestamp>,
+    min_overlap_margin_percent: u64,
 ) -> Option<bool> {
     let Some(released_ts) = char1_released_at else {
         // char1 がまだ押下中 → 重なりが構造的に保証されているため常に確定 true
         return Some(true);
     };
     let overlap_us = released_ts.saturating_sub(thumb_ts);
-    let min_overlap_us = threshold_us * MIN_OVERLAP_MARGIN_PERCENT / 100;
+    let min_overlap_us = threshold_us * min_overlap_margin_percent / 100;
     (overlap_us >= min_overlap_us).then_some(true)
 }
 

@@ -150,12 +150,24 @@ use std::time::Duration;
 use crate::types::{KeyAction, RawKeyEvent};
 
 /// `apply_ime_open` の実行結果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(
+    strum::IntoStaticStr, Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
 pub enum ImeOpenOutcome {
-    /// IMM 経由で確実に設定できた
+    /// 実 `SendInput`（VK送信）を伴って確実に設定できた（`GjiDirectStrategy`/
+    /// `MsImeDirectStrategy`）。
     Applied,
-    /// フォールバック（VK_KANJI 等）を送信済み。OS 処理完了まで不確定
-    FallbackSent,
+    /// `ImmSetOpenStatus`（クロスプロセスIMM32 API）のみで設定できた。VK は
+    /// 一切送っていない（ADR-167）。`ImmCrossProcessStrategy`（`Standard`
+    /// プロファイル限定）専用。旧実装ではこのケースも`Applied`に潰していたが、
+    /// 「`Applied` == 実SendInputを伴う」という
+    /// [`should_send_accompanying_warmup`] の前提が`ImmCrossProcessStrategy`
+    /// には成立しないため、この専用variantに分離した（ADR-149の随伴warmup
+    /// ゲートがStandardプロファイル全体を無条件例外にしていたことで、
+    /// `ImmCrossProcessStrategy`が`Failed`を返し`GjiDirectStrategy`へ
+    /// フォールスルーした場合に随伴warmupが実送信の直後へ重複する欠陥が
+    /// あった）。
+    AppliedWithoutSendInput,
     /// shadow が既に目標状態のためスキップ
     AlreadyMatched,
     /// 設定に失敗（非日本語環境など）
@@ -166,63 +178,37 @@ pub enum ImeOpenOutcome {
     /// shadow が stale な状態でトグルすると意図と逆方向に反転する恐れがある。
     /// このケースでは apply は行われていないため applied_snapshot / state は更新しない。
     UnsafeToToggle,
+    /// このフォーカス先は awase が IME actuation を所有しないため、
+    /// 機構を一切試行しなかった（issue #136 / BUG-90、`AppImeProfile::InputRelay`）。
+    /// `UnsafeToToggle` と同じく「送っていない」ので applied / belief を書かない。
+    NotOwned,
+    /// `issue_open_warrant()` が授権を発行しなかったため、機構を一切試行
+    /// しなかった（ADR-090 §2.A A-2、根拠軸）。`NotOwned`（InputRelay、
+    /// プロファイル所有権軸）とは別の理由なので別 variant にする——同じ
+    /// 「送っていない」結果でも診断ログ・journal を読む側が「なぜ」を
+    /// 区別できなくなる（ADR-106決定5が戒める「別目的の値を1つの機構に
+    /// 混ぜる」の逆、ここでは逆に「別目的の結果を1つのvariantに混ぜない」）。
+    /// `UnsafeToToggle`/`NotOwned`と同じく送っていないため applied / belief
+    /// を書かない。
+    Unwarranted,
 }
 
-/// eager TSF warmup に渡す「IME が開いている」という根拠（ADR-098 決定1-b、BUG-69）。
-///
-/// # なぜ `Option<bool>` ではなく専用型か
-///
-/// warmup 経路は「実 actuation の記録（`applied`）」が不明のとき `None` →
-/// `unwrap_or(false)` に潰れる。`applied` が長く `Unknown` のままになりうる
-/// 状況（TsfNative のフォーカス復帰直後など）では、この潰れが「belief は
-/// ON なのに warmup が送られない」窓を複数の呼び出し箇所に同時に開ける
-/// （実際、この型を導入する直前の設計ラウンドで1箇所しか付け替えず6箇所を
-/// 見落とし、cold-start リテラル化を再燃させかけた）。
-///
-/// かといって呼び出し側に生の belief を渡させると、belief が evidence
-/// として再流入する既知の欠陥パターン（BUG-19/33/48/68/69）を warmup 経路に
-/// 量産することになる。値の作り方をコンストラクタ3種に限定し、フィールドを
-/// private にすることで「生値を渡す」経路をコンパイラで塞ぐ。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WarmupImeOn(bool);
-
-impl WarmupImeOn {
-    /// 実 actuation の結果として得た確定値（`on_ime_applied` の `effective` 等）。
+impl ImeOpenOutcome {
+    /// この outcome が「実際に何らかの機構で open 軸へ書き込んだ」ことを
+    /// 意味するか（`Applied`/`AppliedWithoutSendInput`の2つ、
+    /// ADR-167）。網羅 `match` で書くことで、将来 variant を追加した際に
+    /// このヘルパーの呼び出し元全てがコンパイルエラーで追随を強制される
+    /// （非網羅な `matches!` の書き直しを1箇所に集約する狙い）。
     #[must_use]
-    pub const fn from_actuated(open: bool) -> Self {
-        Self(open)
-    }
-
-    /// `applied` があればそれを、`Unknown` のときだけ belief を使う（`applied ?? belief`）。
-    ///
-    /// 「belief にフォールバックする」ことを明示的に許すのはこのコンストラクタ
-    /// だけであり、それも `applied` が既知の間は決して belief を優先しない
-    /// （単調性: `applied` が `Some` の間は今日と同じ値を返す）。
-    #[must_use]
-    pub const fn from_applied_or_belief(applied: Option<bool>, belief_open: bool) -> Self {
-        match applied {
-            Some(open) => Self(open),
-            None => Self(belief_open),
+    pub const fn wrote_open_state(self) -> bool {
+        match self {
+            Self::Applied | Self::AppliedWithoutSendInput => true,
+            Self::AlreadyMatched
+            | Self::Failed
+            | Self::UnsafeToToggle
+            | Self::NotOwned
+            | Self::Unwarranted => false,
         }
-    }
-
-    /// 「IME 状態不明・warmup しない」。
-    ///
-    /// 用途は2種類: (1) 到達不能な保険経路（呼び出し規約上ここには来ない
-    /// はずだが、シグネチャ上 `WarmupImeOn` が必須なので安全側の値を渡す）。
-    /// (2) warmup を出さないイベント種別（例: `CompositionEvent::FocusChange`
-    /// は `EmitWarmup` を一切返さないため値そのものが don't-care）に対する
-    /// 明示的なプレースホルダ。いずれも「この値で実際に warmup が発火する」
-    /// ことは無い、という点は共通。
-    #[must_use]
-    pub const fn off() -> Self {
-        Self(false)
-    }
-
-    /// warmup 判定に使う IME 開状態。
-    #[must_use]
-    pub const fn is_on(self) -> bool {
-        self.0
     }
 }
 
@@ -260,29 +246,10 @@ pub trait PlatformRuntime {
     ///
     /// このメソッド自体は `awase-windows` の `runtime/ime_refresh.rs`
     /// （focus change 強制 OFF・drift correction の ImmCross 経路）で実際に
-    /// 呼ばれている。以下の `apply_ime_open`（このトレイトのデフォルト実装）
-    /// を使うようにという doc は実態と逆転していたため訂正する
-    /// （2026-08-10、ADR-087 §5 Phase 3 item14 実 actuation 入口棚卸しで判明）。
+    /// 呼ばれている（2026-08-10、ADR-087 §5 Phase 3 item14 実 actuation 入口棚卸しで判明。
+    /// ADR-158 TA1でこのメソッドをラップするだけだった`apply_ime_open`デフォルト実装を
+    /// 削除したため、この段落の「以下のapply_ime_open」という言及も併せて削除した）。
     fn set_ime_open(&mut self, open: bool) -> bool;
-
-    /// IME の ON/OFF を設定し、実行結果を返す。
-    ///
-    /// **2026-08-10 時点で `awase-windows` からの呼び出し元がゼロ**（`WindowsPlatform`
-    /// は `apply_ime_open_with_belief`/`_with_view`/`_with_applied` という別系統の
-    /// 独自メソッド群を実際の入口として使っており、このトレイトメソッドの
-    /// オーバーライド（`crates/awase-windows/src/platform.rs`）はどこからも
-    /// 呼ばれない死んだコードになっている）。ADR-087 §5 Phase 3 で
-    /// `issue_open_warrant()` 経由の入口へ実配線する際に、このメソッドを
-    /// 実際に使うか削除するか判断すること。デフォルト実装は `set_ime_open` を
-    /// ラップする。プラットフォーム実装はオーバーライドしてフォールバック
-    /// 戦略を組み込める。
-    fn apply_ime_open(&mut self, open: bool) -> ImeOpenOutcome {
-        if self.set_ime_open(open) {
-            ImeOpenOutcome::Applied
-        } else {
-            ImeOpenOutcome::Failed
-        }
-    }
 
     /// IME 状態キャッシュの非同期リフレッシュを要求する
     fn post_ime_refresh(&mut self);
@@ -297,15 +264,6 @@ pub trait PlatformRuntime {
 
     /// 配列名をトレイに表示する
     fn set_tray_layout_name(&mut self, name: &str);
-
-    // ── Engine 状態変化時 IME モードキー送信 ──
-
-    /// Engine ON/OFF 時に IME 制御キーを送信する。
-    ///
-    /// `applied` は直前に apply された IME 開閉状態（executor の `applied_snapshot` から渡す）。
-    /// `Some(v)` で `v == enabled` なら apply_ime_open 済みとして mode key 送信をスキップできる。
-    /// プラットフォームが IME モードキー送信をサポートしない場合は何もしない。
-    fn send_engine_state_ime_key(&self, _enabled: bool, _applied: Option<bool>) {}
 }
 
 /// TSF / IMM composition 特有の platform フック（Windows 固有の意味論）。
@@ -345,37 +303,10 @@ pub trait TsfComposition {
     /// executor は outcome を受け取ったら必ずこのメソッドを呼ぶこと。
     fn on_ime_applied(&mut self, _open: bool, _outcome: ImeOpenOutcome) {}
 
-    /// キー通過（パススルー）時の composition 状態更新フック。
-    ///
-    /// F2+TSF mark_cold、confirm キー KeyDown の mark_cold を処理する。
-    /// executor がキーを OS に通す直前（late path — output_guard_defer チェック後）に呼ぶ。
-    ///
-    /// 戻り値: `true` なら KeyUp タイミングで eager warmup を送るべき（warmup deferred）。
-    /// `warmup_ime_on`: warmup を送ってよいかの判定に使う IME 開状態。`applied` が
-    /// `Unknown`（TsfNative のフォーカス復帰直後など）のときは belief にフォール
-    /// バックした値が入る（`WarmupImeOn::from_applied_or_belief`、ADR-098 決定1-b）。
-    /// 呼び出し側が生の `bool`/`Option<bool>` を渡すことはできない。
-    fn on_passthrough_key(
-        &mut self,
-        _vk: crate::types::VkCode,
-        _is_keydown: bool,
-        _warmup_ime_on: WarmupImeOn,
-    ) -> bool {
-        false
-    }
-
     /// キー再注入時の composition 状態更新フック。
     ///
-    /// F2-TSF deferred / confirm キー reinject の mark_cold + eager warmup を処理する。
-    ///
-    /// `warmup_ime_on`: 上記 `on_passthrough_key` と同じ（ADR-098 決定1-b）。
-    fn on_reinject_key(
-        &mut self,
-        _vk: crate::types::VkCode,
-        _is_keydown: bool,
-        _warmup_ime_on: WarmupImeOn,
-    ) {
-    }
+    /// confirm キー KeyDown の reinject 時に cold 化する（`VK_IME_ON` の eager warmup は送らない）。
+    fn on_reinject_key(&mut self, _vk: crate::types::VkCode, _is_keydown: bool) {}
 }
 
 #[cfg(test)]
@@ -398,6 +329,19 @@ mod tests {
         assert_eq!(mode, cloned);
         // Verify Debug is implemented
         let _debug = format!("{:?}", mode);
+    }
+
+    #[test]
+    fn wrote_open_state_distinguishes_real_send_from_immcross_only() {
+        // ADR-167: 「何か書き込んだか」（wrote_open_state）は3つとも true、
+        // 「実SendInputを伴ったか」（should_send_accompanying_warmupの否定）は
+        // AppliedWithoutSendInputだけ異なる、という非対称性を固定する。
+        assert!(ImeOpenOutcome::Applied.wrote_open_state());
+        assert!(ImeOpenOutcome::AppliedWithoutSendInput.wrote_open_state());
+        assert!(!ImeOpenOutcome::AlreadyMatched.wrote_open_state());
+        assert!(!ImeOpenOutcome::Failed.wrote_open_state());
+        assert!(!ImeOpenOutcome::UnsafeToToggle.wrote_open_state());
+        assert!(!ImeOpenOutcome::NotOwned.wrote_open_state());
     }
 
     #[test]

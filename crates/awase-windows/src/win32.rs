@@ -2,11 +2,12 @@
 // Win32 API 呼び出しに unsafe が必須(lib.rsのクレート全体allowから個別移管、Task #9)
 //! Windows API の安全ラッパー
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_KEYBOARD, KEYEVENTF_UNICODE,
+    SendInput, INPUT, INPUT_KEYBOARD, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, PostMessageW, GUITHREADINFO,
@@ -16,6 +17,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
 ///
 /// `win32_async::run_with_timeout` の re-export。
 pub use win32_async::run_with_timeout;
+
+/// 呼び出し元専用の孤児スレッドプールで`run_with_timeout`する版、および
+/// そのプール型自体の re-export（`win32_async::run_with_timeout_in`/
+/// `win32_async::LeakedThreadPool`）。IMM32/MSAA/UIA用の既定共有プールとは
+/// 別に、独立した用途（例: キーボードフック再インストールのjoin待ち）が
+/// 専用プールを持てるようにするためのもの。
+pub use win32_async::{run_with_timeout_in, LeakedThreadPool};
 
 /// `HWND` の null チェック拡張トレイト。
 pub trait HwndExt {
@@ -98,7 +106,7 @@ pub fn post_to_main_thread(msg: u32) -> bool {
 ///
 /// 戻り値は「エンジン HWND 宛の post が成功したか」。`engine_hwnd()` が未作成の間の
 /// NULL-hwnd フォールバックは、呼び出しスレッド自身への thread message になりうるため
-/// `false` を返す。失敗時は `log::warn!` を出す。**`WH_KEYBOARD_LL` フックコールバック
+/// `false` を返す。失敗時は `tracing::warn!` を出す。**`WH_KEYBOARD_LL` フックコールバック
 /// のスタックから同期的に呼んではならない**（ロック取得を伴うログ出力を持ち込むため）。
 /// フック経由の合図には [`post_to_main_thread_quiet`] を使うこと。
 #[allow(clippy::must_use_candidate)]
@@ -111,7 +119,7 @@ pub fn post_to_main_thread_with(msg: u32, wparam: usize, lparam: isize) -> bool 
 /// `WH_KEYBOARD_LL` フックコールバックのスタックから同期的に呼ばれる
 /// `hook_channel::request_engine_wake` 専用（ADR-102 決定2 / Opus敵対的レビュー指摘、
 /// 2026-08-26）。フックコールバック上でロック取得を伴うログ出力を追加しないという
-/// 制約を守るため、失敗しても `log::warn!` を呼ばない。失敗の可視化は呼び出し元
+/// 制約を守るため、失敗しても `tracing::warn!` を呼ばない。失敗の可視化は呼び出し元
 /// （`hook_channel`）がアトミックフラグで持ち回り、エンジンスレッド側のウォッチドッグ
 /// がそのフラグを見てログを出す。
 pub(crate) fn post_to_main_thread_quiet(msg: u32) -> bool {
@@ -144,7 +152,7 @@ fn post_to_main_thread_inner(msg: u32, wparam: usize, lparam: isize, log_on_fail
         )
     } {
         if log_on_failure {
-            log::warn!("[post-main] PostMessageW(engine_hwnd) failed msg=0x{msg:X}: {err}");
+            tracing::warn!("[post-main] PostMessageW(engine_hwnd) failed msg=0x{msg:X}: {err}");
         }
         return false;
     }
@@ -169,6 +177,162 @@ fn input_may_mutate_conv(input: &INPUT) -> bool {
     crate::vk::vk_may_mutate_conv(awase::types::VkCode(ki.wVk.0))
 }
 
+/// `input` が awase 自身の IME actuation 送信（`send_ime_mode_key` 等、または
+/// TSF eager warmup の `VK_IME_ON` 送信）かどうかを `dwExtraInfo` のマーカーで
+/// 判定する（ADR-140 Step0 診断ログ用）。判定できた場合、どちらのマーカー由来かを
+/// ログの `kind=` に出せるよう返す。
+///
+/// VK の固定リストでは判定しない: 送る VK が経路ごとに違い（`VK_IME_ON/OFF`・`VK_DBE_*` 等、
+/// かつて `keys.engine_on_ime_key` で任意の VK もありえた〈ADR-207 で撤去〉）、固定リストでは
+/// actuation が不可視になる経路が出て、測定したい対象が測定できなくなる本末転倒を招く。
+///
+/// **`IME_KANJI_MARKER` だけでは不十分**（ADR-140コードレビュー指摘、MAJOR）:
+/// `tsf/send.rs::send_eager_warmup_vk_pair`（ADR-140が確認済みの3経路のうち
+/// warmup経路(c)）は`tsf/output.rs::make_tsf_key_input`経由で`TSF_MARKER`を
+/// 使い`IME_KANJI_MARKER`を使わないため、`IME_KANJI_MARKER`単独判定だと
+/// この経路のVK_IME_ON送信が診断ログに一切出ない「ログが無い＝発火していない」
+/// という誤読を招く（この診断が防ごうとしている罠そのもの）。
+///
+/// **`TSF_MARKER`単独では判定しない**: このマーカーは通常のローマ字文字出力
+/// （`output/key_injector.rs::InjectionMode::Tsf`）やF2 warmup
+/// （`VK_DBE_HIRAGANA`）にも広く使われる「サブシステム単位」のマーカーであり、
+/// これだけで actuation と判定すると通常の文字出力のたびに誤検出（ノイズ）を
+/// 生む。`TSF_MARKER`は`VK_IME_ON`/`VK_IME_OFF`（open/close軸）と組み合わさった
+/// 場合に限定して actuation とみなす——これが`send_eager_warmup_vk_pair`が
+/// 実際に送る唯一の組み合わせ。
+fn ime_actuation_marker_kind(input: &INPUT) -> Option<&'static str> {
+    if input.r#type != INPUT_KEYBOARD {
+        return None;
+    }
+    // SAFETY: r#type == INPUT_KEYBOARD を確認済みなので Anonymous.ki は
+    //         このユニオンの有効なアクティブフィールドである。
+    let ki = unsafe { input.Anonymous.ki };
+    if ki.dwExtraInfo == crate::tsf::output::IME_KANJI_MARKER {
+        return Some("kanji_marker");
+    }
+    let vk = awase::types::VkCode(ki.wVk.0);
+    if ki.dwExtraInfo == crate::tsf::output::TSF_MARKER
+        && (vk == crate::vk::VK_IME_ON || vk == crate::vk::VK_IME_OFF)
+    {
+        return Some("tsf_marker_warmup");
+    }
+    None
+}
+
+/// `inputs` バッチに含まれる非ゼロ `wVk`（Unicode モードの `wVk=0` を除く）を
+/// 出現順・重複なしで集める。BUG-113 で確定した「1打鍵に対する複数回
+/// actuation」の内訳（`docs/adr/149-physical-ime-key-activation-defers-forced-set-open.md`
+/// 参照）を後から実機ログで追跡するための恒久診断。
+///
+/// `kind=kanji_marker` は現在 `send_ime_mode_key`（GjiDirect/MsImeDirect の
+/// VK_IME_ON=0x16/VK_IME_OFF=0x1A）からだけ使われる。
+/// 実 VK 値はこの2値が互いに異なるため、ここで戦略を一意に判別できる。
+fn actuation_vks(inputs: &[INPUT]) -> Vec<u16> {
+    let mut vks = Vec::new();
+    for input in inputs {
+        if input.r#type != INPUT_KEYBOARD {
+            continue;
+        }
+        // SAFETY: r#type == INPUT_KEYBOARD を確認済み。
+        let vk = unsafe { input.Anonymous.ki }.wVk.0;
+        if vk != 0 && !vks.contains(&vk) {
+            vks.push(vk);
+        }
+    }
+    vks
+}
+
+/// 最後に awase 自身が actuation（`ime_actuation_marker_kind` が `Some` を
+/// 返した）SendInput を発行した `now_timestamp_us()` 時刻。0 は「まだ一度も
+/// 発行していない」センチネル。BUG-113 の内訳追跡用の恒久診断:
+/// `hook.rs` の `[hook] IME-mode` 行がこの値との差分を出し、フックに届いた
+/// IME モードキーが直前の自己 actuation からどれだけ経過したかを見えるように
+/// する。
+static LAST_ACTUATION_ISSUE_US: AtomicU64 = AtomicU64::new(0);
+
+/// [`LAST_ACTUATION_ISSUE_US`] を読む。診断ログ専用。
+#[must_use]
+pub(crate) fn last_actuation_issue_us() -> u64 {
+    LAST_ACTUATION_ISSUE_US.load(Ordering::Relaxed)
+}
+
+/// `send_input_safe` が送った 1 キーボードイベントの記録（不具合報告用、journal の
+/// `SentInput` へ変換される）。`INPUT` の生値のうち、送信内容の再構成に要るものだけを持つ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SentKeyEvent {
+    /// `wVk`。Unicode 送信（`KEYEVENTF_UNICODE`）では 0。
+    pub vk: u16,
+    /// `wScan`。Unicode 送信では UTF-16 code unit そのもの。
+    pub scan: u16,
+    pub up: bool,
+    pub unicode: bool,
+    /// `dwExtraInfo`（自己注入マーカー。どの送信経路かの識別に使う）。
+    pub marker: usize,
+}
+
+/// `send_input_safe` 1 回ぶん（= `SendInput` 1 回）の記録。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentInputBatch {
+    /// 発行直前の `hook::now_timestamp_us()`（KeyInput の `timestamp_us` と同じ系）。
+    pub issue_us: u64,
+    /// `SendInput` の戻り値（OS が受理したイベント数。`events.len()` より小さければ一部が捨てられた）。
+    pub accepted: u32,
+    /// 発行時に採番した journal の `(seq, elapsed_ms)`（[`install_sent_input_stamp_source`] 未設定なら `None`）。
+    pub stamp: Option<(u64, u64)>,
+    pub events: Vec<SentKeyEvent>,
+}
+
+/// 未 drain の送信記録の上限。drain されない経路（ワーカースレッド等）で無限に溜めないため。
+const SENT_INPUT_TRACE_CAP: usize = 512;
+
+std::thread_local! {
+    /// 直近の `send_input_safe` の送信内容。呼んだスレッドごとの thread_local で、
+    /// メインスレッドぶんだけ `WindowsPlatform::drain_journal_entries` が journal の `SentInput` へ移す
+    /// （ワーカースレッドから呼ばれたぶんは移されず、上限で古いものから捨てられる）。
+    ///
+    /// 不具合報告で「awase が実際に何を送ったか」を追えなかった（LINE で「いまは」が
+    /// 「いいい」になった報告 01M43NK5P13Q7EQP7CS0N3X4ED。journal の `KeyInput` は物理入力のみで、
+    /// 送信側は IME 操作キー用の `[shadow-send]`〈debug ログ〉しか無かった）ための恒久診断。
+    static SENT_INPUT_TRACE: std::cell::RefCell<std::collections::VecDeque<SentInputBatch>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+
+    /// 発行時に journal の `(seq, elapsed_ms)` を採番する関数（`WindowsPlatform::new` が設定）。
+    /// `win32` が `journal` へ依存しないよう、関数として受ける。
+    static SENT_INPUT_STAMP_SOURCE: std::cell::RefCell<Option<Box<dyn Fn() -> (u64, u64)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// [`SentInputBatch::stamp`] の採番元を設定する（呼んだスレッドの `send_input_safe` にだけ効く）。
+pub(crate) fn install_sent_input_stamp_source(source: Box<dyn Fn() -> (u64, u64)>) {
+    let _ = SENT_INPUT_STAMP_SOURCE.try_with(|slot| *slot.borrow_mut() = Some(source));
+}
+
+/// 溜まった送信記録を全件取り出す。
+pub(crate) fn drain_sent_input_trace() -> Vec<SentInputBatch> {
+    SENT_INPUT_TRACE
+        .try_with(|trace| std::mem::take(&mut *trace.borrow_mut()).into())
+        .unwrap_or_default()
+}
+
+fn sent_key_events(inputs: &[INPUT]) -> Vec<SentKeyEvent> {
+    inputs
+        .iter()
+        .filter(|input| input.r#type == INPUT_KEYBOARD)
+        .map(|input| {
+            // SAFETY: r#type == INPUT_KEYBOARD を確認済みなので Anonymous.ki は
+            //         このユニオンの有効なアクティブフィールドである。
+            let ki = unsafe { input.Anonymous.ki };
+            SentKeyEvent {
+                vk: ki.wVk.0,
+                scan: ki.wScan,
+                up: ki.dwFlags.contains(KEYEVENTF_KEYUP),
+                unicode: ki.dwFlags.contains(KEYEVENTF_UNICODE),
+                marker: ki.dwExtraInfo,
+            }
+        })
+        .collect()
+}
+
 /// `SendInput` の安全ラッパー（`size_of` キャストを安全に処理）
 ///
 /// BUG-34 横展開 Step0-a: このクレートの全 `SendInput` 呼び出しは本関数を
@@ -187,10 +351,49 @@ pub(crate) fn send_input_safe(inputs: &[INPUT]) -> u32 {
     if inputs.iter().any(input_may_mutate_conv) {
         crate::conv_mutation::bump();
     }
+    if let Some(kind) = inputs.iter().find_map(ime_actuation_marker_kind) {
+        // ADR-140 Step1 決定B: probe/actuation フェンスの bump は、この診断ログと
+        // 完全に同一の条件（`ime_actuation_marker_kind` が `Some` を返す）で行う。
+        // 判定を共有することで将来の乖離を防ぐ（`crate::probe_actuation_fence` doc 参照）。
+        // 実際の `SendInput` 呼び出しより前にこの分岐があるため、bump は syscall の
+        // 前に完了する（決定Bの必須要件）。
+        crate::probe_actuation_fence::bump();
+        let issue_us = crate::hook::now_timestamp_us();
+        LAST_ACTUATION_ISSUE_US.store(issue_us, Ordering::Relaxed);
+        let vks = actuation_vks(inputs);
+        tracing::debug!(
+            "[ime-io] actuation SendInput kind={kind} vk={vks:02X?} issue_us={issue_us}"
+        );
+        // ADR-159 段階2(TF2、`shadow_send_trace`doc参照): 上と同一の条件で
+        // 実際の送信内容を構造化記録する。新しい条件は増やさない。
+        crate::shadow_send_trace::record_send_input(kind, &vks, issue_us);
+    }
     let size = i32::try_from(size_of::<INPUT>()).expect("INPUT size fits in i32");
+    let issue_us = crate::hook::now_timestamp_us();
     // SAFETY: inputs スライスは呼び出し中有効であり、size は sizeof::<INPUT>() の正確な値。
     //         SendInput はスライスの範囲外を読まない。
-    unsafe { SendInput(inputs, size) }
+    let accepted = unsafe { SendInput(inputs, size) };
+    let events = sent_key_events(inputs);
+    if !events.is_empty() {
+        // 診断用の記録なので、thread_local が破棄済み（スレッド終了処理中）でも panic させない。
+        let _ = SENT_INPUT_TRACE.try_with(|trace| {
+            let stamp = SENT_INPUT_STAMP_SOURCE
+                .try_with(|source| source.borrow().as_ref().map(|f| f()))
+                .ok()
+                .flatten();
+            let mut trace = trace.borrow_mut();
+            if trace.len() >= SENT_INPUT_TRACE_CAP {
+                trace.pop_front();
+            }
+            trace.push_back(SentInputBatch {
+                issue_us,
+                accepted,
+                stamp,
+                events,
+            });
+        });
+    }
+    accepted
 }
 
 /// `&str` を NUL 終端 UTF-16 `Vec<u16>` に変換する。
@@ -199,6 +402,27 @@ pub(crate) fn send_input_safe(inputs: &[INPUT]) -> u32 {
 #[must_use]
 pub fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// 子プロセスの stdin/stdout/stderr を明示的に `Stdio::null()` にした
+/// `Command` を構築する（BUG-79/BUG-134）。
+///
+/// 指定しないと Rust は親の標準入出力ハンドルを子プロセスに継承させようと
+/// し、その際に構築される継承ハンドル許可リストが awase.exe 実機環境
+/// （フック・タイマー・非同期ワーカースレッドを多数抱えた長時間稼働
+/// プロセス）でのみ `CreateProcessW` を `ERROR_NOT_SUPPORTED`（os error 50）
+/// で失敗させる（`docs/known-bugs/BUG-079.md` 参照、実機A/Bテストで確認
+/// 済み）。`launch_settings_with_args`（設定画面起動）と`restart_self`
+/// （トレイの「再起動」）が個別にこの定型句を持っていた（BUG-134）ため
+/// ここに集約する——`awase.exe` から自分自身や兄弟プロセスを spawn する
+/// 新しい呼び出し元は、この定型句を再実装せず必ずこの関数を経由すること。
+#[must_use]
+pub fn spawn_command_with_null_stdio(path: &std::path::Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(path);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    cmd
 }
 
 /// 起動失敗などの致命的なエラーを `MessageBoxW` で表示する。

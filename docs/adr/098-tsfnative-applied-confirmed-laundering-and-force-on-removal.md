@@ -1,3 +1,21 @@
+---
+id: ADR-098
+title: |-
+  TsfNative フォーカス復帰時の `applied` 偽装確定を止め、到達不能な force-on ブロックを撤去する（BUG-69）
+summary: |-
+  BUG-34追補4(eisuガード撤去)完了直後、「eager warmupもGJIなら不要では」という疑問を機にeager warmup/drift correction/TsfNative force-onブロックの3機構をOpus premortemで監査(BUG-69)。TsfNative force-onブロックは`ir_post_focus_change_snapshot`が常にfocus settle barrier内で呼ばれるため到達不能(F1)、同関数の`mirror_applied_open`が何もapplyせずbeliefを`applied=Confirmed`へ偽装しfocus_tracking.rsの「TsfNativeはapplied=Unknown維持」不変条件に違反、`apply_force_on_for_imm_broken`(BUG-16修正)のスパムガードを誤発火させ恒久的に無効化する(F2、核心)。結果TsfNative+GJIのフォーカス復帰時に発火する唯一のactuationはeager warmupのみとなり(F3)、そのscan付き`VK_DBE_HIRAGANA`はBUG-15追補7が「実IME確実ON時のみ」と禁止する危険な注入形態を無監査で行っていた(F4)。**ADR-087の「`AppliedImeState`がConfirmedに遷移する契機が無い」という前提がF2により誤りと判明**、Phase3配線着手前の再検証が必要。決定: F2修正(mirror_applied_openをTsfNativeで呼ばない)→force-onブロック撤去→eager warmupゲート強化、の順で段階的に実施。drift correctionはKEEP AS-IS
+status: |-
+  一部撤去・残りは実装済み(2026-10-04 確認)。決定0/1-a/1-b/2/4/6 の applied 偽装確定の停止・到達不能 force-on ブロック撤去は反映済み。決定1-c の force-on クールダウンと force-on 機構そのもの(`apply_force_on_for_imm_broken`/`try_force_on_bootstrap`/`force_on_and_correct_romaji`)は ADR-179 領域A 2/3(621bf93c、2026-09-18)で撤去済みで現行コードに無い。実機での再現・ソークは記録なし。
+  旧(2026-10-04 更新前):
+  **実装済み（クロスコンパイル検証のみ、Windows実機未検証、2026-08-21）**。決定0/1-a/1-b/1-c/2/4/6-a/6-b/6-cをコード反映済み、`cargo xwin check/build/clippy`全クリーン・Linuxで実行可能なテスト504件全成功。Windows実機での再現・検証・ソークは未実施
+related_adr:
+  - "ADR-044"
+  - "ADR-080"
+  - "ADR-087"
+  - "ADR-089"
+  - "ADR-100"
+---
+
 # ADR-098: TsfNative フォーカス復帰時の `applied` 偽装確定を止め、到達不能な force-on ブロックを撤去する（BUG-69）
 
 ## ステータス
@@ -536,3 +554,7 @@ force-on ブロック撤去 + `apply_ime_open_with_applied` 削除 + `architectu
 - 決定3-c（GJI warmup を `VK_IME_ON` に置き換えられるかの実機実験）は [ADR-100](100-gji-warmup-vk-ime-on-reinit.md) が引き取り、2026-08-22 に実機検証（群B）を経て採用・実装済み（`docs/known-bugs.md` BUG-50 追補2参照）。
 - 決定1〜2の実装順序を守らないと、単独修正が別の未監査の穴を露出させ regression する構造（BUG-34 追補4の3ラウンド premortem と同型）である。決定1（1-a+1-b+1-cを同一コミット）→決定2の順で進めること（実装ではこの順序で行い、分割コミットはしなかった）。
 - **`sync_ime_kind_from_observation`（`runtime/message_handlers.rs:444`）への波及は未検証。** この関数は `applied.applied_open() == Some(true)` を条件に `gji_on_ime_on(mode)`（GjiFsm 遷移トリガー）を呼ぶ。決定1-a により TsfNative では `applied` がフォーカス入場後 `Unknown` のまま残るため、`WM_IME_KIND_CHANGED`（GJI 検出）がこの関数を real actuation より先に呼んだ場合、この経路単独では即時に GjiFsm を同期しなくなる。ただし ADR-089 §2.4（INV-42）の `ActuationReceipt.settle()` → `GjiSyncSink::sync_gji(GjiFsmSync::OnImeOn)`（`platform.rs:1057`）が実際の actuation 完了時に独立して GjiFsm を同期するため、force-ON（決定1-c）や drift correction が一度でも実行されれば追いつくはずだが、この2経路の相互作用は実機で未検証。GjiFsm が OffCold に残り続けたら BUG-18 型の退行として扱い、`sync_ime_kind_from_observation` 側にも `warmup_ime_on()` 相当の belief フォールバックを追加するか検討すること（ソーク項目#11）。
+
+## 撤去の記録（2026-09-24追記）
+
+決定1-c（force-onの再試行クールダウン）を含むforce-on機構は、`621bf93c`（2026-09-18、`apply_force_on_for_imm_broken`/`try_force_on_bootstrap`/`ForceOnRetryState`/`FORCE_ON_RETRY_COOLDOWN_MS`を削除）で**撤去済み**。旧178番（当時の呼称は「ADR-178撤去プロジェクト」）の領域A、根拠は現[ADR-179](179-mode-key-actuation-follow-only-vs-toggle-ownership.md)の「領域A・Cの撤去」節参照。冒頭のstatusは撤去前の状態を述べたもの。`ForceOnReason::BrokenAppBootstrap`のenum variantは意図的に残されたが、追加する本番コードは無い（死蔵コード、review-2026-09-24-10のB-6）。

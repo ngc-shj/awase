@@ -147,7 +147,7 @@ mod imp {
     /// 打鍵は観測ベースだと旧状態で判定されて素通り/誤変換する
     /// （英字モード→かな→即 k で「き」でなく k が出る問題）。
     ///
-    /// 実測（2026-09-02、ATOK atok36、英数⇄かな 往復 102 回、BUG-101）:
+    /// 実測（2026-09-02、ATOK atok36、英数⇄かな 往復 102 回、BUG-187）:
     /// 「かな」キー送出から TIS が新入力ソースを報告するまで p50 ~60ms /
     /// p90 ~160ms / **max 208ms**（2 回の計測で max 191ms → 208ms と伸びた）。
     /// OFF 側は max 122ms。実測最大 208ms + マージン 92ms = 300ms とする。
@@ -187,7 +187,7 @@ mod imp {
     /// リテラルが消えたことだけを根拠にしないこと。
     ///
     /// `AWASE_MACOS_SETTLE_MS` で上書きできる（この値を実機で詰めるための
-    /// 診断用。BUG-101）。
+    /// 診断用。BUG-187）。
     ///
     /// フィールド検証（2026-09-05〜09-10、通常使用 6 日、切替 2,600 回超）:
     /// settle 完了から 50〜59ms で送出したケースを多数含みつつ、リテラル化・
@@ -204,7 +204,7 @@ mod imp {
             else {
                 return OBSERVATION_SETTLE;
             };
-            log::info!("OBSERVATION_SETTLE overridden to {ms}ms (AWASE_MACOS_SETTLE_MS)");
+            tracing::info!("OBSERVATION_SETTLE overridden to {ms}ms (AWASE_MACOS_SETTLE_MS)");
             Duration::from_millis(ms)
         })
     }
@@ -279,7 +279,7 @@ mod imp {
         /// 直近に観測した入力ソース ID（種別を問わない）。遷移をログへ残す
         /// ためだけに持つ — `last_japanese_id` はかなモードの ID しか記録
         /// しないため、ATOK Roman → ABC keylayout のような日本語 IM の外へ
-        /// 出る遷移が誰の直後に起きたのか追えなかった（BUG-101 の追跡課題）。
+        /// 出る遷移が誰の直後に起きたのか追えなかった（BUG-187 の追跡課題）。
         last_observed_id: std::cell::RefCell<Option<String>>,
         /// 最後に観測した「IME OFF を意味する入力ソース」の ID。ABC keylayout も
         /// ATOK の英字モードも、ユーザーが使っている方をそのまま記憶する。
@@ -287,23 +287,23 @@ mod imp {
         /// ON 側（`last_japanese_id`）と対称にするためのもの。`select_for(false)` が
         /// 「同ファミリの Roman/Eiji を優先し、無ければ keylayout」という優先順位で
         /// 選ぶと、ABC を使っている環境が ATOK の英字モードへ勝手に移り、macOS が
-        /// それを記憶して以後ずっと変わってしまう（BUG-104。実際に BUG-102 の
+        /// それを記憶して以後ずっと変わってしまう（BUG-190。実際に BUG-188 の
         /// 張り直し経路がこれを起こした）。優先順位を押し付けず、観測した実物を
         /// 復元する。
         last_off_id: std::cell::RefCell<Option<String>>,
         /// 観測されないまま猶予切れした切替の目標状態。呼び出し側が
-        /// `take_failed_switch` で一度だけ受け取り、張り直しに使う（BUG-102）。
+        /// `take_failed_switch` で一度だけ受け取り、張り直しに使う（BUG-188）。
         failed_switch: std::cell::Cell<Option<bool>>,
         /// 直近の切替が観測で確認された時刻。`pending` は settle 完了で消えるので
         /// 別に持つ — 「切替の何 ms 後に注入したか」をログに残し、
-        /// `OBSERVATION_SETTLE` を実測で詰めるために使う（BUG-101）。
+        /// `OBSERVATION_SETTLE` を実測で詰めるために使う（BUG-187）。
         last_confirmed_at: std::cell::Cell<Option<Instant>>,
     }
 
     impl ImeDetector {
         #[must_use]
         pub fn new() -> Self {
-            log::info!("IME detector: TISCopyCurrentKeyboardInputSource");
+            tracing::info!("IME detector: TISCopyCurrentKeyboardInputSource");
             let detector = Self {
                 last_japanese_id: std::cell::RefCell::new(None),
                 last_japanese_prefix: std::cell::RefCell::new(None),
@@ -344,7 +344,7 @@ mod imp {
             self.pending.borrow().as_ref().map(|exp| exp.expected)
         }
 
-        /// 観測されないまま猶予切れした切替を一度だけ受け取る（BUG-102）。
+        /// 観測されないまま猶予切れした切替を一度だけ受け取る（BUG-188）。
         ///
         /// 切替キーが IME に届かなかったということなので、呼び出し側は
         /// `set_ime_on` で張り直す。判定を進めるため、先に `is_ime_on` を
@@ -353,7 +353,7 @@ mod imp {
             self.failed_switch.take()
         }
 
-        /// 直近の切替が観測で確認されてからの経過時間（BUG-101 の実測用）。
+        /// 直近の切替が観測で確認されてからの経過時間（BUG-187 の実測用）。
         ///
         /// 「切替の N ms 後に注入した打鍵が消えた／化けた」を突き合わせて
         /// `OBSERVATION_SETTLE` を詰めるために使う。
@@ -380,9 +380,9 @@ mod imp {
             if !was_confirmed {
                 if let Some(confirmed) = exp.confirmed {
                     self.last_confirmed_at.set(Some(confirmed));
-                    // settle 定数の実測用（BUG-101）。切替キー送出から TIS が
+                    // settle 定数の実測用（BUG-187）。切替キー送出から TIS が
                     // 新入力ソースを報告するまでの実時間を残す
-                    log::debug!(
+                    tracing::debug!(
                         "IME switch observed: open={expected} after {}ms, \
                          holding output {}ms for settle",
                         confirmed.duration_since(exp.started).as_millis(),
@@ -395,7 +395,7 @@ mod imp {
                 Expectation::Settling => observed,
                 Expectation::Clear => {
                     if observed != Some(expected) {
-                        log::warn!(
+                        tracing::warn!(
                             "IME switch to open={expected} not observed within {}ms; \
                              injected output would be read by the old input source",
                             EXPECTATION_GRACE.as_millis(),
@@ -414,7 +414,7 @@ mod imp {
             {
                 let mut last = self.last_observed_id.borrow_mut();
                 if last.as_deref() != Some(id.as_str()) {
-                    log::debug!(
+                    tracing::debug!(
                         "input source: {} -> {id}",
                         last.as_deref().unwrap_or("(unknown)")
                     );
@@ -433,19 +433,19 @@ mod imp {
                 if is_japanese_kana_mode(&id) {
                     let mut last = self.last_japanese_id.borrow_mut();
                     if last.as_deref() != Some(&id) {
-                        log::debug!("IME observed: {id}");
+                        tracing::debug!("IME observed: {id}");
                         *last = Some(id.clone());
                     }
                 }
             }
             let observed = classify_input_source(&id);
             // OFF 側も ON 側と対称に、ユーザーが実際に使っている入力ソースを
-            // 記憶する（BUG-104）。`select_for(false)` が優先順位で選ぶと、
+            // 記憶する（BUG-190）。`select_for(false)` が優先順位で選ぶと、
             // ABC を使っている環境が ATOK の英字モードへ勝手に移る
             if observed == Some(false) {
                 let mut last = self.last_off_id.borrow_mut();
                 if last.as_deref() != Some(id.as_str()) {
-                    log::debug!("IME off-source observed: {id}");
+                    tracing::debug!("IME off-source observed: {id}");
                     *last = Some(id);
                 }
             }
@@ -497,7 +497,7 @@ mod imp {
                     if select_input_source_matching(|c| c == id) {
                         return true;
                     }
-                    log::warn!("IME restore failed for {id}, trying family prefix");
+                    tracing::warn!("IME restore failed for {id}, trying family prefix");
                 }
                 if let Some(ref prefix) = prefix {
                     if select_input_source_matching(|c| {
@@ -506,7 +506,7 @@ mod imp {
                         return true;
                     }
                 }
-                log::warn!(
+                tracing::warn!(
                     "IME set_open(true): no Japanese IME observed yet; refusing to pick \
                      an arbitrary input source"
                 );
@@ -519,7 +519,7 @@ mod imp {
                     if select_input_source_matching(|c| c == id) {
                         return true;
                     }
-                    log::warn!("IME off-source restore failed for {id}, trying fallbacks");
+                    tracing::warn!("IME off-source restore failed for {id}, trying fallbacks");
                 }
                 // 未観測（英字モードで起動した等）のときだけ優先順位に頼る
                 if let Some(ref prefix) = prefix {
@@ -609,7 +609,7 @@ mod imp {
             assert_eq!(at(&mut exp, None, 30 * MS), Expectation::Hold(true));
         }
 
-        /// BUG-101 の回帰: TIS が切替済みを報告した瞬間に保留を解いてはならない。
+        /// BUG-187 の回帰: TIS が切替済みを報告した瞬間に保留を解いてはならない。
         /// ここが `Clear` に戻ると、アプリの入力コンテキストが新入力ソースへ
         /// 繋がる前にローマ字が流れ、「きょう」が `kilyou` になる。
         #[test]
@@ -657,7 +657,7 @@ mod imp {
             assert!(exp.confirmed.is_none());
         }
 
-        /// BUG-104 の一部: ATOK の英字モードも ABC keylayout も等しく
+        /// BUG-190 の一部: ATOK の英字モードも ABC keylayout も等しく
         /// 「OFF を意味する入力ソース」として分類される。ここが片方だけだと
         /// `last_off_id` に記録されず、`select_for(false)` が優先順位で
         /// 選び直してユーザーの入力ソースを勝手に移してしまう。

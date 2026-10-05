@@ -2,9 +2,9 @@
 simultaneous_threshold_ms = 100
 engine_toggle_hotkey = "Ctrl+Shift+F12"
 layouts_dir = "layout"
-default_layout = "nicola.yab"
+default_layout = "nicola_keytop.yab"
 
-# confirm_mode = "wait"  # wait / speculative / two_phase / adaptive_timing / ngram_predictive
+# confirm_mode = "wait"  # wait / ngram_predictive（旧 speculative / two_phase / adaptive_timing は wait 扱い）
 # speculative_delay_ms = 30
 
 # n-gram コーパスファイル（実行ファイルからの相対パス）。
@@ -17,20 +17,28 @@ ngram_file = "data/ngram_hiragana.csv.gz"
 # ngram_max_threshold_ms = 120
 
 # キーバインディング設定
+# example-begin: config-keys-engine uncomment
 # [keys]
-# エンジン ON/OFF キー（複数指定可、デフォルト: Ctrl+Shift+変換で ON、Ctrl+Shift+無変換で OFF）
+# 親指シフト入力／ローマ字入力 切替キー（複数指定可、デフォルト: Ctrl+Shift+変換で親指シフト入力、Ctrl+Shift+無変換でローマ字入力）
 # engine_on = ["Ctrl+Shift+Convert"]
 # engine_off = ["Ctrl+Shift+Nonconvert"]
+# example-end
 
 # IME 検出設定（シャドウ IME 状態追跡用キー定義）
+# example-begin: config-ime-detect uncomment
 # [keys.ime_detect]
+# 注意: toggle に書いたキーを keys.ime_toggle（awase が能動的に処理する側）にも書くと二重処理で
+# そのキーが壊れるため、同じキーを両方に書かないこと（keys.ime_toggle の既定は空）。
 # toggle = ["VK_KANJI"]
+# 既定は toggle/on/off すべて空（VK_IME_ON/VK_IME_OFF＝IMEオン/IMEオフ キーの追随は指定なしで自動）。
 # on = ["VK_DBE_DBCSCHAR", "VK_IME_ON"]
 # off = ["VK_DBE_SBCSCHAR", "VK_IME_OFF"]
+# example-end
 
 # フォーカス判定の永続オーバーライド
 # 特定の (プロセス名, クラス名) の組み合わせに対して、
 # 自動判定を無視してテキスト入力 / 非テキストを強制する。
+# example-begin: config-app-overrides uncomment
 # [app_overrides]
 # force_text = [
 #     { process = "chrome.exe", class = "Chrome_RenderWidgetHostHWND" },
@@ -38,6 +46,7 @@ ngram_file = "data/ngram_hiragana.csv.gz"
 # force_bypass = [
 #     { process = "explorer.exe", class = "CabinetWClass" },
 # ]
+# example-end
 
 # ローマ字出力を VK キーストローク経由で送るアプリの明示指定。
 # Chrome/Edge/Electron 等 IME composition を VK 経由でないと扱えないアプリ向け。
@@ -71,6 +80,30 @@ force_tsf = [
 # process : プロセス名フィルタ（省略=全アプリ、部分一致、大文字小文字無視）
 # class   : ウィンドウクラスフィルタ（省略=全クラス、部分一致）
 #
+# example-begin: config-post-bypass uncomment
 # [[post_bypass]]
 # key = "Ctrl+J"
 # process = "WindowsTerminal"   # Windows Terminal (wt.exe) でのみ有効
+# example-end
+
+# 診断・自己修復系のキルスイッチ（issue #165）。既定で全て有効。
+# example-begin: config-diagnostics uncomment
+# [diagnostics]
+# hook_self_heal = true  # hook_starved 検知時にキーボードフックを自己修復する
+# example-end
+
+# ── macOS: 記号の正確な出力（[macos_symbol_romaji]） ──
+#
+# IME は "/" を ・ に、"[" を 「 に変換するため、キーストローク経由では
+# ／［］ をそのまま出せない。Unicode 直接注入は変換中（未確定文字列がある間）
+# に IME へ飲まれてしまう。
+#
+# IME 側のローマ字テーブル（ATOK: 環境設定 → 入力・変換 → ローマ字 →
+# キー・ローマ字カスタマイザ）に独自の入力列を登録し、その列をここに書くと、
+# 変換中でも未確定文字列に正確な文字が入る。つづりは英字のみにすること
+# （ATOK は記号を含むつづりのカスタマイズを拒否する）。
+#
+# [macos_symbol_romaji]
+# "／" = "zsl"
+# "［" = "zbl"
+# "］" = "zbr"

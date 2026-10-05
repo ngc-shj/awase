@@ -49,19 +49,18 @@ pub(crate) trait ImeWarmupStrategy {
         None
     }
 
-    /// 次の `KeyInput` が long-cold（≥10s idle）の最初のキーか（Unicode cold defer 判定用）。
-    ///
-    /// MS IME は常に warm なので `false`（デフォルト）。
-    fn is_next_key_long_cold(&self) -> bool {
-        false
-    }
-
     /// この戦略が F2 (VK_DBE_HIRAGANA) cold-start probe を必要とするか。
     ///
     /// GJI は TSF composition context の事前初期化が必要なので `true`（デフォルト）。
     /// MS IME は常に warm なので `false`（[`MsImeStrategy`] がオーバーライド）。
     fn needs_f2_probe(&self) -> bool {
         true
+    }
+
+    /// `GjiFsm` が `OffCold`（IME OFF 扱い）か。MS-IME 戦略は FSM を持たないので常に `false`。
+    /// ADR-203 (i) の level 突合が使う。
+    fn is_off_cold(&self) -> bool {
+        false
     }
 
     /// 診断ログ用の現在状態ラベル。
@@ -73,6 +72,10 @@ pub(crate) trait ImeWarmupStrategy {
 // ── GjiFsm 実装 ───────────────────────────────────────────────────────────────
 
 impl ImeWarmupStrategy for crate::tsf::gji_fsm::GjiFsm {
+    fn is_off_cold(&self) -> bool {
+        matches!(self.state(), crate::tsf::gji_fsm::GjiState::OffCold)
+    }
+
     fn is_warm(&self) -> bool {
         use crate::tsf::gji_fsm::GjiState;
         matches!(
@@ -101,10 +104,6 @@ impl ImeWarmupStrategy for crate::tsf::gji_fsm::GjiFsm {
             GjiState::OnComposing { epoch, .. } => Some(*epoch),
             _ => None,
         }
-    }
-
-    fn is_next_key_long_cold(&self) -> bool {
-        Self::is_next_key_long_cold(self)
     }
 
     fn diagnostic_state_label(&self) -> String {

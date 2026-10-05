@@ -9,7 +9,7 @@ use crate::types::{ContextChange, KeyAction, RawKeyEvent};
 use crate::yab::YabLayout;
 
 use super::decision::{Decision, Effect, EffectVec, InputEffect, TimerEffect};
-use super::fsm_types::ComposingHint;
+use super::fsm_types::ThumbRawVkEmission;
 use super::input_tracker::PhysicalKeyState;
 use super::nicola_fsm::NicolaFsm;
 
@@ -44,9 +44,31 @@ impl FsmAdapter {
         Self::response_to_decision(resp)
     }
 
+    /// エンジン非活性時専用: chord 判定（`state`）には一切触れず、
+    /// `output_history` の解放索引だけを掃除して対応する `KeyUp` を発行する
+    /// （ADR-112決定2、`NicolaFsm::release_only` 参照）。
+    pub(super) fn release_only(&mut self, event: &RawKeyEvent) -> Decision {
+        let resp = self.fsm.release_only(event);
+        Self::response_to_decision(resp)
+    }
+
+    /// コンテキスト喪失（フォーカス変更・非活性化）時に `output_history` の
+    /// 解放索引を全て強制解放し、`KeyAction::Key(vk)` 型のエントリに対応する
+    /// `KeyUp(vk)` を `Effect` として返す（`NicolaFsm::release_all_pending_output`
+    /// 参照、ADR-112コードレビュー指摘）。`KeyLifecycle::flush_pending_key_ups`
+    /// と同期して呼ぶこと。
+    pub(super) fn release_all_pending_output(&mut self) -> EffectVec {
+        let actions = self.fsm.release_all_pending_output();
+        let mut effects = EffectVec::new();
+        if !actions.is_empty() {
+            effects.push(Effect::Input(InputEffect::SendKeys(actions)));
+        }
+        effects
+    }
+
     /// 保留中のキーをフラッシュし、Decision を返す。
-    pub(super) fn flush(&mut self, reason: ContextChange, composing: ComposingHint) -> Decision {
-        let resp = self.fsm.flush_pending(reason, composing);
+    pub(super) fn flush(&mut self, reason: ContextChange, raw_vk: ThumbRawVkEmission) -> Decision {
+        let resp = self.fsm.flush_pending(reason, raw_vk);
         Self::response_to_decision(resp)
     }
 
@@ -54,9 +76,9 @@ impl FsmAdapter {
     pub(super) fn flush_to_effects(
         &mut self,
         reason: ContextChange,
-        composing: ComposingHint,
+        raw_vk: ThumbRawVkEmission,
     ) -> EffectVec {
-        let resp = self.fsm.flush_pending(reason, composing);
+        let resp = self.fsm.flush_pending(reason, raw_vk);
         Self::response_to_effects(resp)
     }
 
@@ -83,6 +105,12 @@ impl FsmAdapter {
         self.fsm.set_threshold_ms(ms);
     }
 
+    /// テスト用: 重なり不足判定のマージンを上書きする（ADR-112決定1参照）。
+    #[cfg(test)]
+    pub(super) fn set_min_overlap_margin_percent_for_test(&mut self, pct: u64) {
+        self.fsm.set_min_overlap_margin_percent_for_test(pct);
+    }
+
     /// 確定モードと投機出力の待機時間を更新する。
     pub(super) fn set_confirm_mode(&mut self, mode: ConfirmMode, delay_ms: u32) {
         self.fsm.set_confirm_mode(mode, delay_ms);
@@ -91,6 +119,16 @@ impl FsmAdapter {
     /// n-gram モデルを設定する。
     pub(super) fn set_ngram_model(&mut self, model: NgramModel) {
         self.fsm.set_ngram_model(model);
+    }
+
+    /// 3キー仲裁・重なり判定のタイミングマージンを更新する。
+    pub(super) fn set_timing_margins(
+        &mut self,
+        timing_margin_percent: u32,
+        min_overlap_margin_percent: u32,
+    ) {
+        self.fsm
+            .set_timing_margins(timing_margin_percent, min_overlap_margin_percent);
     }
 
     /// ソロ N 連打でエンジン OFF を発動するキーを設定する。
@@ -105,6 +143,16 @@ impl FsmAdapter {
         config: super::fsm_types::TextKeyConfig,
     ) {
         self.fsm.set_space_thumb_config(space_thumb_vk, config);
+    }
+
+    /// ADR-120 決定0a 項目7(a)専用: 物理 BACKSPACE の VK コードを設定する。
+    pub(super) const fn set_backspace_vk(&mut self, vk: Option<crate::types::VkCode>) {
+        self.fsm.set_backspace_vk(vk);
+    }
+
+    /// ADR-120 決定0a: 3キー仲裁の判定過程・訂正発生を観測する累積カウンタを返す。
+    pub(super) const fn retro_eval_stats(&self) -> &super::retro_eval_stats::RetroEvalStats {
+        self.fsm.retro_eval_stats()
     }
 
     /// 無変換/変換キー単独タップの composing 中ガードの扱いを設定する。
@@ -150,27 +198,53 @@ impl FsmAdapter {
         self.fsm.take_engine_off_requested()
     }
 
-    /// 無変換/変換キー単独タップの IME open 軸への肩代わり（ADR-092 決定D
-    /// Step4b）を設定する。
-    pub(super) const fn set_muhenkan_delegate_to_open_axis(
-        &mut self,
-        action: Option<crate::types::ShadowImeAction>,
+    pub(super) const fn thumb_forced_open_actions(
+        &self,
+    ) -> (
+        Option<crate::types::ShadowImeAction>,
+        Option<crate::types::ShadowImeAction>,
     ) {
-        self.fsm.set_muhenkan_delegate_to_open_axis(action);
+        self.fsm.thumb_forced_open_actions()
     }
 
-    /// `set_muhenkan_delegate_to_open_axis` と対称（変換キー用）。
-    pub(super) const fn set_henkan_delegate_to_open_axis(
+    /// ADR-206: その親指の単独タップが要求する open 軸操作（`NicolaFsm::thumb_open_role_action`）。
+    pub(super) fn thumb_open_role_action(
+        &self,
+        vk: crate::types::VkCode,
+        composing: bool,
+    ) -> Option<crate::types::ShadowImeAction> {
+        self.fsm.thumb_open_role_action(vk, composing)
+    }
+
+    pub(super) const fn set_thumb_role_open_actions(
         &mut self,
-        action: Option<crate::types::ShadowImeAction>,
+        muhenkan: Option<crate::types::ShadowImeAction>,
+        henkan: Option<crate::types::ShadowImeAction>,
     ) {
-        self.fsm.set_henkan_delegate_to_open_axis(action);
+        self.fsm.set_thumb_role_open_actions(muhenkan, henkan);
+    }
+
+    pub(super) const fn thumb_role_open_actions(
+        &self,
+    ) -> (
+        Option<crate::types::ShadowImeAction>,
+        Option<crate::types::ShadowImeAction>,
+    ) {
+        self.fsm.thumb_role_open_actions()
+    }
+
+    pub(super) const fn set_thumb_forced_open_actions(
+        &mut self,
+        muhenkan: Option<crate::types::ShadowImeAction>,
+        henkan: Option<crate::types::ShadowImeAction>,
+    ) {
+        self.fsm.set_thumb_forced_open_actions(muhenkan, henkan);
     }
 
     /// IME open 軸への副作用要求を取り出す（1ショット、ADR-092 決定D Step4b）。
     pub(super) const fn take_ime_open_requested(
         &mut self,
-    ) -> Option<crate::types::ShadowImeAction> {
+    ) -> Option<super::fsm_types::ImeOpenRequest> {
         self.fsm.take_ime_open_requested()
     }
 
@@ -231,7 +305,7 @@ mod tests {
 
     use crate::config::ConfirmMode;
     use crate::engine::decision::{Decision, Effect, InputEffect, TimerEffect};
-    use crate::engine::fsm_types::ComposingHint;
+    use crate::engine::fsm_types::ThumbRawVkEmission;
     use crate::engine::input_tracker::{InputTracker, PhysicalKeyState};
     use crate::engine::nicola_fsm::NicolaFsm;
     use crate::ngram::NgramModel;
@@ -271,6 +345,8 @@ mod tests {
         pos: Option<PhysicalPos>,
     ) -> RawKeyEvent {
         RawKeyEvent {
+            was_down: false,
+            press_id: None,
             vk_code: vk,
             scan_code: scan,
             event_type,
@@ -281,6 +357,8 @@ mod tests {
             ime_relevance: ImeRelevance::default(),
             modifier_key: None,
             modifier_snapshot: Default::default(),
+            left_thumb_down_snapshot: None,
+            right_thumb_down_snapshot: None,
             injected: false,
         }
     }
@@ -607,7 +685,7 @@ mod tests {
     #[test]
     fn flush_when_idle_returns_consumed() {
         let mut adapter = make_adapter();
-        let decision = adapter.flush(ContextChange::ImeOff, ComposingHint::Trusted(false));
+        let decision = adapter.flush(ContextChange::ImeOff, ThumbRawVkEmission::Allowed(false));
         // Idle からのフラッシュは consume() が返る（タイマー Kill 2つ付き）
         assert!(decision.is_consumed());
     }
@@ -621,7 +699,10 @@ mod tests {
         let phys = tracker.process(&event);
         adapter.on_event(event, &phys);
 
-        let decision = adapter.flush(ContextChange::FocusChanged, ComposingHint::Trusted(false));
+        let decision = adapter.flush(
+            ContextChange::FocusChanged,
+            ThumbRawVkEmission::Allowed(false),
+        );
         assert!(decision.is_consumed());
         match decision {
             Decision::Consume { effects } => {
@@ -644,8 +725,8 @@ mod tests {
         let phys = tracker.process(&event);
         adapter.on_event(event, &phys);
 
-        let d1 = adapter.flush(ContextChange::ImeOff, ComposingHint::Trusted(false));
-        let d2 = adapter.flush(ContextChange::ImeOff, ComposingHint::Trusted(false));
+        let d1 = adapter.flush(ContextChange::ImeOff, ThumbRawVkEmission::Allowed(false));
+        let d2 = adapter.flush(ContextChange::ImeOff, ThumbRawVkEmission::Allowed(false));
 
         // 1回目は actions を含む
         let has_keys_1 = match &d1 {
@@ -672,7 +753,7 @@ mod tests {
     fn flush_to_effects_when_idle_returns_timer_kills() {
         let mut adapter = make_adapter();
         let effects =
-            adapter.flush_to_effects(ContextChange::ImeOff, ComposingHint::Trusted(false));
+            adapter.flush_to_effects(ContextChange::ImeOff, ThumbRawVkEmission::Allowed(false));
         // Idle → タイマー Kill x2 が必ず含まれる
         let kill_count = effects
             .iter()
@@ -692,8 +773,10 @@ mod tests {
         let phys = tracker.process(&event);
         adapter.on_event(event, &phys);
 
-        let effects =
-            adapter.flush_to_effects(ContextChange::FocusChanged, ComposingHint::Trusted(false));
+        let effects = adapter.flush_to_effects(
+            ContextChange::FocusChanged,
+            ThumbRawVkEmission::Allowed(false),
+        );
         let has_send_keys = effects.iter().any(|e| matches!(e, Effect::Input(_)));
         assert!(has_send_keys);
     }
@@ -749,9 +832,7 @@ mod tests {
     #[test]
     fn set_confirm_mode_does_not_panic() {
         let mut adapter = make_adapter();
-        adapter.set_confirm_mode(ConfirmMode::Speculative, 30);
-        adapter.set_confirm_mode(ConfirmMode::TwoPhase, 50);
-        adapter.set_confirm_mode(ConfirmMode::AdaptiveTiming, 0);
+        adapter.set_confirm_mode(ConfirmMode::NgramPredictive, 30);
         adapter.set_confirm_mode(ConfirmMode::Wait, 100);
     }
 
@@ -826,17 +907,21 @@ mod tests {
     #[test]
     fn flush_with_all_context_change_variants() {
         use ContextChange::*;
+        // 6variant全て（`BypassKey`も含む）。以前は5variantのみで`BypassKey`が
+        // 抜けていた——`nicola_fsm::tests::run_flush_matrix`の全数決定表
+        // （BUG-129調査、2026-09-11）で気付いた抜けを埋めた。
         let variants = [
             ImeOff,
             InputLanguageChanged,
             EngineDisabled,
             LayoutSwapped,
             FocusChanged,
+            BypassKey,
         ];
         for variant in variants {
             let mut adapter = make_adapter();
             // panic しないこと
-            let _decision = adapter.flush(variant, ComposingHint::Trusted(false));
+            let _decision = adapter.flush(variant, ThumbRawVkEmission::Allowed(false));
         }
     }
 

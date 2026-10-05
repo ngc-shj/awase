@@ -36,21 +36,39 @@
 //! 棄却された probe はアトミックカウンタに記録される。
 //! 診断ダンプ時に [`drain_stats`] で取り出し、ログ出力に使う。
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use super::ime_event::HwndId;
+use crate::lifetime_counter::LifetimeCounter;
 
-/// 棄却統計（グローバルアトミック）。
-static REJECTED_EPOCH_MISMATCH: AtomicU64 = AtomicU64::new(0);
-/// hwnd 不一致による棄却統計のうち、spawn 時と現在で top-level 祖先ウィンドウ
-/// （`root_hwnd`、`GetAncestor(hwnd, GA_ROOT)`）が同じだったケース（PR 109
-/// コードレビュー指摘1 Step1: ネイティブ Win32 マルチフィールドダイアログでの
-/// フィールド間 Tab 移動等、同一 top-level ウィンドウ内でのコントロール間
-/// フォーカス移動が疑われる。BUG-91 参照）。
-static REJECTED_HWND_MISMATCH_SAME_ROOT: AtomicU64 = AtomicU64::new(0);
-/// hwnd 不一致による棄却統計のうち、spawn 時と現在で `root_hwnd` が異なった
-/// ケース（真に別の top-level ウィンドウへの切替）。
-static REJECTED_HWND_MISMATCH_CROSS_ROOT: AtomicU64 = AtomicU64::new(0);
+/// 棄却統計（グローバルアトミック、ADR-164 フェーズ8）。
+///
+/// `admit()` と `record_hwnd_mismatch()` という2つの独立した呼び出し元から
+/// 書かれる診断カウンタで、単一の呼び出し木を持たないため引数引き回しは
+/// できない（ADR-164 分類C）。3フィールドを1つの singleton にまとめる。
+struct RejectionCounters {
+    /// FocusEpoch 不一致による棄却統計。
+    epoch_mismatch: LifetimeCounter,
+    /// hwnd 不一致による棄却統計のうち、spawn 時と現在で top-level 祖先ウィンドウ
+    /// （`root_hwnd`、`GetAncestor(hwnd, GA_ROOT)`）が同じだったケース（PR 109
+    /// コードレビュー指摘1 Step1: ネイティブ Win32 マルチフィールドダイアログでの
+    /// フィールド間 Tab 移動等、同一 top-level ウィンドウ内でのコントロール間
+    /// フォーカス移動が疑われる。BUG-91 参照）。
+    hwnd_mismatch_same_root: LifetimeCounter,
+    /// hwnd 不一致による棄却統計のうち、spawn 時と現在で `root_hwnd` が異なった
+    /// ケース（真に別の top-level ウィンドウへの切替）。
+    hwnd_mismatch_cross_root: LifetimeCounter,
+}
+
+impl RejectionCounters {
+    const fn new() -> Self {
+        Self {
+            epoch_mismatch: LifetimeCounter::new(),
+            hwnd_mismatch_same_root: LifetimeCounter::new(),
+            hwnd_mismatch_cross_root: LifetimeCounter::new(),
+        }
+    }
+}
+
+static REJECTION_COUNTERS: RejectionCounters = RejectionCounters::new();
 
 /// 棄却統計のスナップショット。
 #[derive(Debug, Default, Clone, Copy)]
@@ -69,9 +87,9 @@ pub struct RejectionStats {
 #[must_use]
 pub fn drain_stats() -> RejectionStats {
     RejectionStats {
-        epoch_mismatch: REJECTED_EPOCH_MISMATCH.swap(0, Ordering::Relaxed),
-        hwnd_mismatch_same_root: REJECTED_HWND_MISMATCH_SAME_ROOT.swap(0, Ordering::Relaxed),
-        hwnd_mismatch_cross_root: REJECTED_HWND_MISMATCH_CROSS_ROOT.swap(0, Ordering::Relaxed),
+        epoch_mismatch: REJECTION_COUNTERS.epoch_mismatch.drain(),
+        hwnd_mismatch_same_root: REJECTION_COUNTERS.hwnd_mismatch_same_root.drain(),
+        hwnd_mismatch_cross_root: REJECTION_COUNTERS.hwnd_mismatch_cross_root.drain(),
     }
 }
 
@@ -84,9 +102,9 @@ pub fn drain_stats() -> RejectionStats {
 #[cfg_attr(not(windows), allow(dead_code))]
 fn record_hwnd_mismatch(same_root: bool) {
     if same_root {
-        REJECTED_HWND_MISMATCH_SAME_ROOT.fetch_add(1, Ordering::Relaxed);
+        REJECTION_COUNTERS.hwnd_mismatch_same_root.increment();
     } else {
-        REJECTED_HWND_MISMATCH_CROSS_ROOT.fetch_add(1, Ordering::Relaxed);
+        REJECTION_COUNTERS.hwnd_mismatch_cross_root.increment();
     }
 }
 
@@ -108,7 +126,11 @@ pub type FocusEpoch = u64;
 /// hwnd/pid/class_name/process_name/app_profile/app_kind/focus_kind）とは別物。
 /// ADR-106 本文が提案する `FocusIdentity` という名前は既にこの別の型が使っているため
 /// 採用せず、`FocusFence` とした。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// `serde::Serialize` は `ImeEvent::InitialFocusFenceEstablished`（journal へ
+/// 直列化される値、ADR-082 決定1）が両軸を1つの値として運ぶために必要
+/// （BUG-102）。書き出し専用のため `Deserialize` は導出しない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 pub struct FocusFence {
     pub epoch: FocusEpoch,
     pub hwnd: HwndId,
@@ -133,7 +155,7 @@ pub struct FocusFence {
 ///         let _ = with_app(|app| {
 ///             let current = app.focus_fence();
 ///             if let Admission::Reject(r) = ticket.admit(current) {
-///                 log::debug!("[ImmCrossProbe] rejected: {r}");
+///                 tracing::debug!("[ImmCrossProbe] rejected: {r}");
 ///                 return;
 ///             }
 ///             app.platform_state.ime.write_imm_cross_probe(open, tick_ms);
@@ -263,7 +285,7 @@ impl ImmLikeTicket {
     #[must_use]
     pub fn admit(self, current: FocusFence) -> Admission {
         if current.epoch != self.fence.epoch {
-            REJECTED_EPOCH_MISMATCH.fetch_add(1, Ordering::Relaxed);
+            REJECTION_COUNTERS.epoch_mismatch.increment();
             return Admission::Reject(RejectReason::FocusEpochChanged {
                 at_spawn: self.fence.epoch,
                 current: current.epoch,
@@ -290,7 +312,7 @@ impl ImmLikeTicket {
 /// `ImmCrossProbe` / `FocusProbe` 系の複数の非同期完了ハンドラにほぼ同じ形で複製
 /// されていた（この struct 冒頭 doc の使用例が、まさにその複製されていたグルー
 /// コード）。受理されれば `f(app, accepted)` を呼び、棄却時は `reject_log` を
-/// そのまま `log::debug!` に渡して `None` を返す。
+/// そのまま `tracing::debug!` に渡して `None` を返す。
 ///
 /// `reject_log` は呼び出し元ごとに異なる（タグ名・文言）ログ本文をそのまま渡す
 /// （ログ文言自体は既存の観測結果であり、このリファクタで変更しない）。hwnd 不一致
@@ -317,11 +339,11 @@ pub(crate) fn admit_epoch_in_app<R>(
             let current_root = app.platform.focus.current.root_hwnd;
             let same_root = spawn_root == current_root;
             record_hwnd_mismatch(same_root);
-            log::debug!("{reject_log} (same_root={same_root})");
+            tracing::debug!("{reject_log} (same_root={same_root})");
             None
         }
         Admission::Reject(_) => {
-            log::debug!("{reject_log}");
+            tracing::debug!("{reject_log}");
             None
         }
     }

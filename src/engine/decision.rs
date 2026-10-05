@@ -43,42 +43,23 @@ pub enum TimerEffect {
 #[derive(Debug, Clone)]
 pub enum ImeEffect {
     /// IME の ON/OFF を設定する（常に Engine の意図。観測同期は別経路）。
-    SetOpen { open: bool, origin: SetOpenOrigin },
+    ///
+    /// `press`: この要求を起こしたユーザー打鍵（非リピート KeyDown）の押下 ID（ADR-208 決定2 D1）。
+    /// コンボ（Ctrl+変換等）・`keys.ime_*` はその打鍵の ID、無変換/変換の単独タップは保留開始 KeyDown の ID
+    /// （KeyUp/タイムアウトの確定まで `PendingThumbData` が運ぶ）。自動リピートの Down・タイマー由来等で
+    /// 押下に結びつかないものは `None`（従来どおり `applied` の already-matched 省略に任せる）。
+    SetOpen {
+        open: bool,
+        press: Option<crate::types::PressId>,
+    },
     // 旧 RequestRefresh は 2026-07-06 の到達不能パス監査で撤去（構築サイトゼロ）。
-}
-
-/// `ImeEffect::SetOpen` がどこから発行されたかを表す。
-///
-/// Platform 層（awase-windows）が `last_intent`（ユーザーの明示的意図）を書き換えて
-/// よいのは `ExplicitUserAction` のときだけ。`ActivationSync` は
-/// `Engine::check_active_transition` が active/inactive 遷移のたびに対称性のため
-/// 自動発行する「echo」であり、ユーザーが今まさに ON/OFF を選んだわけではない
-/// （`ctx.ime_on` が観測駆動で変化しただけの場合も含む）。
-///
-/// 2026-08-04: `ActivationSync` を区別せず `ExplicitUserAction` と同列に扱っていたため、
-/// 観測由来で一時的に `ctx.ime_on=true` になっただけで Engine が Active に遷移すると、
-/// その echo の SetOpen(true) が `last_intent=Some(true)` として確定してしまい、
-/// ユーザーが明示的に IME OFF にした直後でも Engine が勝手に ON へ戻る再発が発生した
-/// （`docs/known-bugs.md` 参照）。旧 `DecisionOrigin`/`EffectOrigin`
-/// （2026-07-06 の到達不能パス監査で「消費者が存在しない」として撤去）が担っていた区別を、
-/// 今回はじめて実際の消費者（`awase-windows::key_pipeline::kp_stage_post_decision`）
-/// 付きで再導入した。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SetOpenOrigin {
-    /// ユーザーが IME ON/OFF コンボ・エンジン ON/OFF コンボ・トレイ操作等で明示的に要求した。
-    ExplicitUserAction,
-    /// Engine 内部の active/inactive 遷移（`check_active_transition` 経由）が
-    /// 対称性のために自動発行した。ユーザーの明示的意図ではない。
-    ActivationSync,
 }
 
 /// UI に関する副作用
 #[derive(Debug, Clone)]
 pub enum UiEffect {
     /// エンジンの有効/無効が変わった。
-    /// `send_ime_key=false` の場合、IME モードキー送信を抑制する
-    /// （NotRomajiInput 等、ユーザーが既に望むモードを選択済みの場合）。
-    EngineStateChanged { enabled: bool, send_ime_key: bool },
+    EngineStateChanged { enabled: bool },
 }
 
 /// アプリケーション全体の副作用を表す宣言型。
@@ -190,6 +171,21 @@ impl Decision {
         matches!(self, Self::Consume { .. })
     }
 
+    /// `PassThrough`/`PassThroughWith` を `Consume`/`ConsumeWith` へ格上げする。
+    /// 既に `Consume` なら no-op。Effects は絶対に落とさない（ADR-112 決定2）。
+    ///
+    /// `KeyLifecycle` が「対応する KeyDown を Consume した」と記録している KeyUp に
+    /// 対して、`Engine::on_input` の唯一の出口でこれを呼ぶことで、FSM 自身が
+    /// （意図的にせよ設計漏れにせよ）`PassThrough` を返した場合でも、KeyDown を
+    /// OS へ渡していない以上 KeyUp も OS へ渡してはならないという不変条件を
+    /// 機械的に保証する。
+    pub fn force_consume(&mut self) {
+        if matches!(self, Self::PassThrough | Self::PassThroughWith { .. }) {
+            let effects = std::mem::take(self.effects_mut());
+            *self = Self::Consume { effects };
+        }
+    }
+
     /// effects に追加する。PassThrough なら PassThroughWith に昇格。
     pub fn push_effect(&mut self, effect: Effect) {
         self.effects_mut().push(effect);
@@ -197,28 +193,48 @@ impl Decision {
 
     /// Effects 内に `ImeEffect::SetOpen` があればその値を返す。
     /// フックコールバックで IME 制御キー検出後に即座に preconditions を更新するために使う。
-    /// `origin` を問わない（OS への実 apply は origin に関わらず必要なため）。
     #[must_use]
     pub fn find_ime_set_open(&self) -> Option<bool> {
-        self.find_ime_set_open_with_origin().map(|(open, _)| open)
-    }
-
-    /// `find_ime_set_open` に加え、その `SetOpenOrigin` も返す。
-    ///
-    /// belief（`desired_open`/`last_intent`）を更新してよいかどうかは呼び出し元が
-    /// `origin` を見て判断すること（`SetOpenOrigin` のドキュメント参照）。
-    #[must_use]
-    pub fn find_ime_set_open_with_origin(&self) -> Option<(bool, SetOpenOrigin)> {
         let effects = match self {
             Self::Consume { effects } | Self::PassThroughWith { effects } => effects,
             Self::PassThrough => return None,
         };
         for effect in effects {
-            if let Effect::Ime(ImeEffect::SetOpen { open, origin }) = effect {
-                return Some((*open, *origin));
+            if let Effect::Ime(ImeEffect::SetOpen { open, .. }) = effect {
+                return Some(*open);
             }
         }
         None
+    }
+
+    /// Effects 内の最初の `ImeEffect::SetOpen` の押下 ID を返す（`SetOpen` が無い、または押下に結びつかないなら `None`）。
+    #[must_use]
+    pub fn find_ime_set_open_press(&self) -> Option<crate::types::PressId> {
+        let effects = match self {
+            Self::Consume { effects } | Self::PassThroughWith { effects } => effects,
+            Self::PassThrough => return None,
+        };
+        effects.iter().find_map(|effect| match effect {
+            Effect::Ime(ImeEffect::SetOpen { press, .. }) => *press,
+            _ => None,
+        })
+    }
+
+    /// まだ押下 ID を持たない `SetOpen` に `press` を載せる（Engine の入口が、打鍵の ID を効果へ伝える。ADR-208 D1）。
+    /// 既に ID を持つもの・`SetOpen` 以外は変えない。
+    pub fn stamp_set_open_press(&mut self, press: Option<crate::types::PressId>) {
+        let Some(press) = press else {
+            return;
+        };
+        let effects = match self {
+            Self::Consume { effects } | Self::PassThroughWith { effects } => effects,
+            Self::PassThrough => return,
+        };
+        for effect in effects {
+            if let Effect::Ime(ImeEffect::SetOpen { press: slot, .. }) = effect {
+                slot.get_or_insert(press);
+            }
+        }
     }
 
     /// effects の先頭に `prefix` を挿入する。
@@ -314,6 +330,10 @@ pub enum EngineCommand {
         threshold_ms: u32,
         confirm_mode: crate::config::ConfirmMode,
         speculative_delay_ms: u32,
+        /// 3キー仲裁のタイミングマージン（%、`GeneralConfig::timing_margin_percent`）
+        timing_margin_percent: u32,
+        /// 重なり不足判定のマージン（%、`GeneralConfig::min_overlap_margin_percent`）
+        min_overlap_margin_percent: u32,
     },
     /// n-gram モデルを設定する
     SetNgramModel(crate::ngram::NgramModel),
@@ -333,10 +353,7 @@ mod tests {
     use super::*;
 
     fn test_effect() -> Effect {
-        Effect::Ui(UiEffect::EngineStateChanged {
-            enabled: true,
-            send_ime_key: true,
-        })
+        Effect::Ui(UiEffect::EngineStateChanged { enabled: true })
     }
 
     // ── Decision factory methods ──
@@ -389,6 +406,38 @@ mod tests {
     #[test]
     fn is_consumed_false_for_pass_through_with() {
         assert!(!Decision::pass_through_with(smallvec![]).is_consumed());
+    }
+
+    // ── force_consume (ADR-112 決定2) ──
+
+    #[test]
+    fn force_consume_on_pass_through_becomes_consume_with_empty_effects() {
+        let mut d = Decision::pass_through();
+        d.force_consume();
+        match d {
+            Decision::Consume { effects } => assert!(effects.is_empty()),
+            other => panic!("expected Consume, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn force_consume_on_pass_through_with_becomes_consume_preserving_effects() {
+        let mut d = Decision::pass_through_with(smallvec![test_effect(), test_effect()]);
+        d.force_consume();
+        match d {
+            Decision::Consume { effects } => assert_eq!(effects.len(), 2),
+            other => panic!("expected Consume, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn force_consume_on_consume_is_noop() {
+        let mut d = Decision::consumed_with(smallvec![test_effect()]);
+        d.force_consume();
+        match d {
+            Decision::Consume { effects } => assert_eq!(effects.len(), 1),
+            other => panic!("expected Consume, got {:?}", other),
+        }
     }
 
     // ── push_effect ──
@@ -450,7 +499,7 @@ mod tests {
         let mut d = Decision::consumed_with(smallvec![test_effect()]);
         d.prepend_effects(smallvec![Effect::Ime(ImeEffect::SetOpen {
             open: true,
-            origin: SetOpenOrigin::ExplicitUserAction
+            press: None
         })]);
         match d {
             Decision::Consume { effects } => {
@@ -505,7 +554,7 @@ mod tests {
             test_effect(),
             Effect::Ime(ImeEffect::SetOpen {
                 open: false,
-                origin: SetOpenOrigin::ExplicitUserAction
+                press: None
             }),
         ]);
         assert_eq!(d.find_ime_set_open(), Some(false));
@@ -523,7 +572,7 @@ mod tests {
             test_effect(),
             Effect::Ime(ImeEffect::SetOpen {
                 open: false,
-                origin: SetOpenOrigin::ExplicitUserAction
+                press: None
             }),
         ]);
         assert_eq!(d.find_ime_set_open(), Some(false));

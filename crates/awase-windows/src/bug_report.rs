@@ -13,23 +13,35 @@ pub const REPORT_HOST: &str = "report.awase.cc";
 // 90 days as a practical review window with a clear deletion expectation.
 pub const RETENTION_HINT: &str = "約90日間保管後に自動削除";
 pub const DESCRIPTION_MAX_CHARS: usize = 4_000;
-/// journal/app_log それぞれの添付上限。
+/// journal/app_log それぞれの**圧縮前**テキストの上限（ADR-222）。
 ///
-/// 旧値の 256KiB は journal + app_log の2本をフル添付しただけで
-/// 256*2=512KiB = `MAX_BODY_BYTES` に達し、他のフィールド（内部状態
-/// スナップショット・設定ファイル・配列ファイル・description等）の
-/// ぶんだけ確実に超過する構造だった。実機で「送信のたびに必ず自動切り詰めが
-/// 発生する」と報告され、200KiB×2=400KiBを引いた単純計算では他フィールド
-/// 用に~112KiBのマージンとなるよう引き下げた（`serde_json::to_string_pretty`
-/// のインデント・エスケープ等のオーバーヘッドを含めた実測では、
-/// `full_size_journal_and_app_log_fit_within_max_body_bytes_without_shrinking`
-/// テストのケースで ~102KiB）。
-pub const LOG_EXCERPT_MAX_BYTES: usize = 200 * 1024;
-pub const SCHEMA_VERSION: u8 = 3;
+/// 旧 `LOG_EXCERPT_MAX_BYTES`（200KiB）は、非圧縮の JSON をそのまま本体に入れる
+/// 前提の値で、journal の打鍵が 165 秒・73 件しか残らない原因の一つだった
+/// （report `01M42BME26GDQ3CJ4F5DMGT0MP`）。今は gzip して送る（実測: journal
+/// 204,753B → 15,886B、awase.log 204,800B → 19,867B）ので、この値は
+/// 圧縮前の最終防衛線（メモリと圧縮時間の上限）にすぎず、通常は当たらない。
+/// 本体が `MAX_BODY_BYTES` に収まらないときだけ、これを半分ずつ縮めて再圧縮する
+/// （`build_payload_json_fitting` / `attach_logs_to_preview_json`）。
+pub const LOG_EXCERPT_UNCOMPRESSED_MAX_BYTES: usize = 16 * 1024 * 1024;
+/// `running_processes`（issue #165用、実行中プロセス名一覧）の件数上限。
+///
+/// journal/app_log と違い `build_payload_json_fitting` の予算縮小ループの対象外
+/// （`build_payload_json_fitting`のドキュメント参照）だが、そのドキュメントが前提と
+/// する「急に肥大化しない」はプロセス一覧には成り立たない（常駐プロセスが多い高負荷
+/// マシンでは肥大化しうる、opusコードレビュー指摘）。縮小ループに参加させる代わりに、
+/// 常に有限件数へ切り詰めることで `MAX_BODY_BYTES` 超過に寄与しないようにする。
+pub const RUNNING_PROCESSES_MAX_ENTRIES: usize = 500;
+/// ADR-222: ログを gzip + base64 で送る版（4）。
+///
+/// `log_excerpt_gz` / `app_log_excerpt_gz` を追加し、非圧縮の `log_excerpt` /
+/// `app_log_excerpt` は新クライアントでは常に null にした。
+/// 古い Worker は知らないフィールドを黙って捨てて 201 を返す（ログだけが消える）ため、
+/// 上げて 400（`unsupported_schema_version`）で失敗させる。Worker を先にデプロイすること。
+pub const SCHEMA_VERSION: u8 = 4;
 /// `services/report-worker/src/index.ts` の `MAX_BODY_BYTES` と同じ値。
 /// サーバ側の 413 応答を待たず、送信前にクライアント側で分かりやすく警告する
 /// ための閾値としてのみ使う（サーバ側の実際の上限はサーバ側定数がSSOT）。
-pub const MAX_BODY_BYTES: usize = 512 * 1024;
+pub const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BugReportImeKind {
@@ -128,6 +140,22 @@ pub struct BugReportStateSnapshot {
     /// `None` なら in-flight なし。長時間 `Some` が続く場合は完了取りこぼし
     /// （旧: 永久ラッチのバグ、レビューで修正済みだが再発検知用に残す）を疑う。
     pub idle_conv_check_in_flight_ms: Option<u64>,
+    /// ADR-140 Step1 決定I: idle-conv-check probe が GJI actuation との交錯を
+    /// 検知して abandon した累計回数（resync 経路、`FocusResyncGate` 経由）。
+    /// resync 経路の abandon は defer 中のキーが `FOCUS_RESYNC_DEADLINE_MS`
+    /// まで出てこない体感遅延に直結するため、通常経路とは別に数える
+    /// （`crate::probe_actuation_fence` module doc 参照）。増え続ける場合は
+    /// probe の starvation（本来の目的であるタスクバーからのモード変更検知が
+    /// 機能不全に陥っている）を疑う。
+    pub idle_conv_check_abandoned_resync_count: u32,
+    /// 同上、通常経路（`kp_stage_idle_conv_check`）の累計回数。
+    pub idle_conv_check_abandoned_normal_count: u32,
+    /// ADR-140 Step1 実装レビュー指摘M1: 上記abandonカウンタの分母
+    /// （resync経路でprobeを実際にspawnした累計回数）。分母が無いと
+    /// abandonカウンタ単体では「頻発しているか」を判定できないため追加した。
+    pub idle_conv_check_spawned_resync_count: u32,
+    /// 同上、通常経路の累計回数。
+    pub idle_conv_check_spawned_normal_count: u32,
     /// 「長時間使うと重くなる」報告の切り分け用に追加したプロセスリソース
     /// スナップショット。単発の報告だけでは判断できないが、複数の報告を
     /// `process_uptime_secs` でソートして並べれば、稼働時間とともに
@@ -145,6 +173,371 @@ pub struct BugReportStateSnapshot {
     pub gdi_object_count: u32,
     /// プロセスが保持している USER オブジェクト数（`GetGuiResources(GR_USEROBJECTS)`）。
     pub user_object_count: u32,
+    /// `HKCU\Control Panel\Desktop\LowLevelHooksTimeout` の実値（ms）。未設定なら
+    /// `None`（Windows既定の5000msとみなしてよい）。issue #165「キーフックのフック
+    /// 落ち」仮説の切り分け用（`docs/bug-reports-triage.md` 01M1NET4A7D8Z9EYN3JM4WVETP
+    /// 行）。値そのものは診断専用で、awaseの挙動判定には使わない。
+    pub low_level_hooks_timeout_ms: Option<u32>,
+    /// `request_engine_wake` の `PostMessageW` が失敗した累計回数（プロセス生存期間
+    /// 中）。既存の `[hook-ring] request_engine_wake の PostMessageW が失敗した形跡が
+    /// あります` ログ（`hook_channel.rs::recover_stuck_wake_if_needed`）と同じ検出を
+    /// 不具合報告に持たせたもの。0 でなければエンジンスレッド側のメッセージキューが
+    /// 詰まった形跡がある（issue #165 H1: エンジンスレッド詰まり仮説）。
+    pub wake_post_failed_lifetime_count: u32,
+    /// `HOOK_KEYS`（フックスレッド→エンジンスレッド転送用リングバッファ）の
+    /// プロセス生存期間中の最大占有数。容量（1024）に近いほどエンジンスレッド側の
+    /// 処理が詰まっていた形跡が強い（issue #165 H1）。
+    pub hook_ring_max_occupancy: u32,
+}
+
+/// GJI（`config1.db`）から抽出した、無変換/変換キーのIME意味論・
+/// キーマップ設定の要約（ADR-148）。
+///
+/// フィールドは`config1.db`の内容を解釈するだけの**生値・分類系**
+/// （`session_keymap`/`custom_keymap_table_present`/
+/// `custom_keymap_table_is_effective`/`ime_*_keys`/`mode_*_keys`/
+/// `henkan_classified_kind`/`muhenkan_classified_kind`）で、現在のアクティブIME
+/// （`ime_kind`）に関わらず常に計算する。
+///
+/// ADR-191で撤去した「採用系」（`henkan_adopted_kind`/`muhenkan_adopted_kind`/
+/// `henkan_adopted_route`/`muhenkan_adopted_route`/`thumb_key_ime_warning`）は、
+/// ADR-217でフィールドごと削除した（常に`None`だったため）。`SCHEMA_VERSION`は
+/// 上げない（サーバは`schema_version`が一致しない報告を拒否する）。`deny_unknown_fields`
+/// を付けていないので、これらのキーを持つ旧JSONも読める
+/// （`gji_keymap_summary_with_removed_adopted_keys_still_deserializes`）。
+///
+/// # この型の安全性が依存している前提（レビューF7・S-2）
+///
+/// `ime_*_keys`/`mode_*_keys`に含まれるVK名は
+/// `awase_gji_config::keymap::mozc_key_vk_names`のallowlist
+/// （固定の別名表と`F1`-`F24`のみ）を通過したものだけであり、
+/// `config1.db`由来の任意文字列が混入する経路はない。**将来「未対応の
+/// キートークンも診断のため載せよう」という変更を加えると、この
+/// allowlistという唯一の防壁を素通りして`config1.db`由来の任意文字列を
+/// 送信するチャネルに変質する**ため、そのような変更は行わないこと。
+///
+/// # `ime_*_keys`はawaseが実際に採用したキー集合ではない（レビューS-3）
+///
+/// `ime_on_keys`/`ime_off_keys`/`ime_toggle_keys`は
+/// `awase_gji_config::keymap::extract_ime_keys`の抽出結果をそのまま
+/// 反映したものである。ADR-179以前はawase本体がこれらをさらにF15-F24
+/// 限定の安全範囲フィルタ（BUG-14対策で`VK_KANJI`等を除外）に通してから
+/// 専用Fnキーとして自動採用していたが、ADR-179でこの採用機構自体を
+/// 撤去した（無変換/変換のIME意味論は`classify_thumb_key_ime_actions`が
+/// 診断用に分類するだけ）。したがって、ここに含まれる
+/// VK名は`config1.db`側の生の宣言をそのまま見せているだけであり、
+/// awaseが実際に何かを採用したことを意味しない。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct BugReportGjiKeymapSummary {
+    /// `"NotFound"` / `"ParseFailed"` / `"Ok"`。
+    pub config1_db_status: String,
+    /// `SESSION_KEYMAP_CUSTOM`等の生値。
+    pub session_keymap: Option<i64>,
+    /// `overlay_keymaps`に`SESSION_KEYMAP_OVERLAY_HENKAN_MUHENKAN_TO_IME_ON_OFF`
+    /// を含むか。
+    pub has_henkan_muhenkan_overlay: bool,
+    /// `custom_keymap_table`（field 42）そのものが存在するか
+    /// （`session_keymap`の値は問わない）。
+    pub custom_keymap_table_present: bool,
+    /// `session_keymap == CUSTOM`のときのみ`true`。GJI本体が
+    /// `custom_keymap_table`を実際に参照するかどうかのガード
+    /// （`gji_charset_autodetect.rs`のガードを再現）。
+    pub custom_keymap_table_is_effective: bool,
+    /// `custom_keymap_table_is_effective`が`true`のときのみ`Some`。
+    pub ime_on_keys: Option<Vec<String>>,
+    pub ime_off_keys: Option<Vec<String>>,
+    pub ime_toggle_keys: Option<Vec<String>>,
+    /// VK名と`GjiCompositionMode`の文字列表現のペア。
+    pub mode_set_keys: Option<Vec<(String, String)>>,
+    pub mode_toggle_alphanumeric_keys: Option<Vec<String>>,
+    pub mode_toggle_kana_type_keys: Option<Vec<String>>,
+    /// `classify_thumb_key_ime_actions`（gate前）の結果。`"On"`/`"Off"`/
+    /// `"Toggle"`。
+    pub henkan_classified_kind: Option<String>,
+    pub muhenkan_classified_kind: Option<String>,
+    /// `muhenkan_solo_tap_dedicated_fn_key`が設定済みか。`true`の場合、
+    /// GJI/MS-IME共通の意味を持つため両summary型に同じフィールドを持たせる
+    /// （専用Fnキーの有無自体は診断に有用なので残す）。
+    pub muhenkan_dedicated_fn_key_configured: bool,
+}
+
+/// MS-IME「キーとタッチのカスタマイズ」（シンプルキー割当て）のレジストリ
+/// 値の要約（ADR-148）。
+///
+/// 生のDWORD5個は`ime_kind`に関わらず常に読む。`adopted_ime_toggle_combos`は
+/// `ime_kind == MsIme`のときのみ`Some`（MS-IMEが非アクティブなら、そのレジストリ値を
+/// awaseは採用していない）。`adopted_*_delegate`はADR-191で撤去し、ADR-217で
+/// フィールドごと削除した（[`BugReportGjiKeymapSummary`]のdoc参照）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct BugReportMsImeKeyAssignmentSummary {
+    pub is_key_assignment_enabled: Option<u32>,
+    pub key_assignment_muhenkan: Option<u32>,
+    pub key_assignment_henkan: Option<u32>,
+    pub key_assignment_ctrl_space: Option<u32>,
+    pub key_assignment_shift_space: Option<u32>,
+    /// `"Ctrl+Space"`/`"Shift+Space"`のような表現。`ime_kind == MsIme`の
+    /// ときのみ`Some`。
+    pub adopted_ime_toggle_combos: Option<Vec<String>>,
+    /// [`BugReportGjiKeymapSummary::muhenkan_dedicated_fn_key_configured`]
+    /// と同じ意味。
+    pub muhenkan_dedicated_fn_key_configured: bool,
+}
+
+/// 旧UI（互換モード「以前のバージョンのMicrosoft IMEを使う」でのみ到達
+/// できる詳細キーカスタマイズ）の要約（ADR-148 Phase 2、ADR-197決定4で
+/// `legacy_compat_mode_enabled`を追加）。
+///
+/// [`BugReportMsImeKeyAssignmentSummary`]（新UI・シンプルキー割当て）とは
+/// 別系統のレジストリ値。`msime_legacy_keymap::LegacyMsImeToggleAssignment`
+/// の実測範囲がそのまま出所——検出できるのは無変換/変換キー（修飾子なし）
+/// への「IMEオン/オフ」トグル割当ての有無のみで、**2026-09-23の実機検証
+/// （ADR-197）でこの割当てが実際にIME挙動へ影響する証拠は見つからなかった**
+/// （`msime_legacy_keymap`のモジュールdoc参照。`muhenkan_legacy_toggle_assigned`/
+/// `henkan_legacy_toggle_assigned`は「レジストリにこの割当てが存在するか」の事実の
+/// みを表し、実効性の指標ではない）。`ime_kind`に関わらず常に読む
+/// （[`BugReportMsImeKeyAssignmentSummary`]の生DWORDと同じ理由——
+/// レジストリの内容自体は現在のフォーカス先IMEと無関係に存在するため）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct BugReportLegacyMsImeKeymapSummary {
+    /// `keystyle`の実測値の既知集合のみ文字列化する（未知値は`"Other"`、
+    /// ADR-148 F7と同じ理由で自由文字列は送らない）。
+    pub active_style: Option<String>,
+    /// `None`=判定できなかった（未知プリセット・レジストリエラー等）。
+    /// `Some(false)`（割当てなしと確認できた）とは区別する
+    /// （コードレビュー指摘、`msime_legacy_keymap::LegacyMsImeToggleAssignment`
+    /// のdoc参照）。
+    ///
+    /// `#[serde(rename)]`でJSONキー名は`muhenkan_ime_on_toggle`のまま維持する
+    /// （コードレビュー指摘でRust側のフィールド名だけ`_assigned`へ訂正した
+    /// ——「実際にIME ONを引き起こす」という誤った含意を除くため——が、
+    /// `report.awase.cc`へ送信済み・サーバ側で読まれる可能性があるJSONの
+    /// キー名自体は変えない。`SCHEMA_VERSION`を上げる理由にもしない）。
+    #[serde(rename = "muhenkan_ime_on_toggle")]
+    pub muhenkan_legacy_toggle_assigned: Option<bool>,
+    #[serde(rename = "henkan_ime_on_toggle")]
+    pub henkan_legacy_toggle_assigned: Option<bool>,
+    /// 「以前のバージョンのMicrosoft IMEを使う」互換モードチェックボックスの
+    /// 状態（ADR-197決定4、`msime_legacy_keymap::read_legacy_compat_mode_enabled`）。
+    /// `None`=判定できなかった。
+    ///
+    /// `#[serde(default)]`必須（コードレビュー指摘）: `legacy_msime_keymap`
+    /// フィールド自体の`#[serde(default)]`（:477付近）は「このフィールド全体が
+    /// JSONに無い」場合しか救わない。本PRより前のビルドが書いた診断JSONには
+    /// `legacy_msime_keymap`オブジェクト自体は存在するが、その中に
+    /// `legacy_compat_mode_enabled`キーが無い——これを外すと、その旧データを
+    /// 読み込んだ際に`state_snapshot`等**既存の診断情報も含めて全部**が
+    /// `load_diagnostics`の`.ok()`で静かに消える（`retro_eval_stats`等の
+    /// コメントと同じ理由、`crates/awase-settings/src/bug_report.rs`参照）。
+    #[serde(default)]
+    pub legacy_compat_mode_enabled: Option<bool>,
+}
+
+/// ADR196-T2 決定1e後半: 学習表の採否・自己検証・同梱表との突き合わせ・指紋を1項目にまとめた診断添付。
+///
+/// `keymap-learn-table.json`が対象。`attach_ime_keymap`に相乗り
+/// （新規フラグは追加しない、`gji_keymap`等と同じ理由）。打鍵内容は含まない
+/// （セルは「IME状態×キー番号」のみ）。`SCHEMA_VERSION`は上げていない（追加のみ、
+/// `BugReportDiagnostics`側の`#[serde(default)]`で旧JSONも読める）。
+///
+/// 決定1b項目7〜9の再測定結果・ADR196-T1の外部書き込み観測は現状どこにも永続化
+/// されていないため添付できない（永続化された時点で本型へ追加すること）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct BugReportKeymapLearnSummary {
+    /// `not_learned`/`loaded`/`io_error`/`too_large`/`parse_error`/`schema_mismatch`/
+    /// `duplicate_cell`（固定語彙、自由文字列は送らない）。
+    pub table_file: String,
+    /// `config.general.use_learned_keymap_table`（opt-out）。
+    pub use_learned_keymap_table: bool,
+    /// 直近の予測で学習表が実際に採用されている（同梱表の代わりに使われている）か。
+    pub in_use: bool,
+    pub cell_count: Option<u32>,
+    /// `Accepted`/`NeedsConfirmation(..)`/`Rejected(..)`。`None`=判定フィールド無し
+    /// （旧v2ファイル）またはファイルを読めなかった。
+    pub judgement: Option<String>,
+    /// 学習時点のキーマップ指紋（16進、`Fingerprint`の2要素を連結）。
+    pub fingerprint: Option<String>,
+    pub self_verification: Option<BugReportKeymapLearnVerification>,
+    /// 既知3構成（同梱表と突き合わせ可能）のときだけ`Some`。
+    pub bundled_diff: Option<BugReportKeymapLearnBundledDiff>,
+    /// `keymap-learn-last-attempt.json`（不採用/要確認の退避）の判定。
+    pub last_attempt_judgement: Option<String>,
+    /// 学習表がトグルと矛盾すると示したキー（ADR-199決定6-2）。`"<TableKey>:<種類>"`の固定語彙
+    /// （例: `HankakuZenkaku:closed_stays_closed`）。採用の可否には依らず、読めた表のセルから求める。
+    #[serde(default)]
+    pub toggle_contradictions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BugReportKeymapLearnVerification {
+    pub correct: u32,
+    pub incorrect: u32,
+    pub not_in_table: u32,
+    pub seed: u64,
+}
+
+/// 同梱表との突き合わせ結果。`mismatched_cells`は先頭[`KEYMAP_LEARN_MISMATCH_LIST_MAX`]件のみ。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BugReportKeymapLearnBundledDiff {
+    pub matched: u32,
+    pub mismatched_count: u32,
+    pub mismatched_cells: Vec<String>,
+    /// 「表にのみ存在」するセル数（分母に含めない）。
+    pub only_in_one_table: u32,
+}
+
+pub const KEYMAP_LEARN_MISMATCH_LIST_MAX: usize = 64;
+
+fn clamp_u32(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+fn keymap_learn_judgement_label(j: awase_keymap_learn::judgement::TableJudgement) -> String {
+    use awase_keymap_learn::judgement::{NeedsConfirmationReason, RejectedReason, TableJudgement};
+    match j {
+        TableJudgement::Accepted => "Accepted".to_owned(),
+        TableJudgement::NeedsConfirmation(NeedsConfirmationReason::SystematicMismatch {
+            mismatch_percent,
+        }) => format!("NeedsConfirmation(SystematicMismatch:{mismatch_percent}%)"),
+        TableJudgement::NeedsConfirmation(NeedsConfirmationReason::UnverifiedMsImeNative) => {
+            "NeedsConfirmation(UnverifiedMsImeNative)".to_owned()
+        }
+        TableJudgement::Rejected(RejectedReason::LowAccuracy) => "Rejected(LowAccuracy)".to_owned(),
+        TableJudgement::Rejected(RejectedReason::HighDegeneration) => {
+            "Rejected(HighDegeneration)".to_owned()
+        }
+        TableJudgement::Rejected(RejectedReason::InsufficientSamples) => {
+            "Rejected(InsufficientSamples)".to_owned()
+        }
+        TableJudgement::Rejected(RejectedReason::FingerprintUnavailable) => {
+            "Rejected(FingerprintUnavailable)".to_owned()
+        }
+    }
+}
+
+fn keymap_learn_file_label(
+    reason: &crate::state::key_effect_runtime::RejectReason,
+) -> &'static str {
+    use crate::state::key_effect_runtime::RejectReason;
+    match reason {
+        RejectReason::NotFound => "not_learned",
+        RejectReason::TooLarge => "too_large",
+        RejectReason::Parse => "parse_error",
+        RejectReason::SchemaVersionMismatch => "schema_mismatch",
+        RejectReason::DuplicateCell => "duplicate_cell",
+        // 採否判定由来の理由は`read_persisted_table`からは返らない。
+        _ => "io_error",
+    }
+}
+
+impl BugReportKeymapLearnSummary {
+    /// 実ファイルを読んで組み立てる（本番の`build_bug_report_keymap_learn_summary`とCI検証が共有）。
+    /// `validation_key`は予測時に実際に使った`(preset, check_against_bundled)`。
+    #[must_use]
+    pub fn from_paths(
+        table_path: Option<&std::path::Path>,
+        last_attempt_path: Option<&std::path::Path>,
+        use_learned_keymap_table: bool,
+        in_use: bool,
+        validation_key: Option<(crate::state::key_effect_predictor::KeymapPreset, bool)>,
+    ) -> Self {
+        use crate::state::key_effect_runtime as ker;
+        let table = table_path.map_or(Err(ker::RejectReason::NotFound), ker::read_persisted_table);
+        let last_attempt = last_attempt_path.map(ker::read_persisted_table);
+        let bundled_diff = table.as_ref().ok().and_then(|t| {
+            let (preset, true) = validation_key? else {
+                return None;
+            };
+            Some(ker::diff_against_bundled(&t.cells, preset))
+        });
+        Self::from_parts(
+            &table,
+            &last_attempt,
+            use_learned_keymap_table,
+            in_use,
+            bundled_diff.as_ref(),
+        )
+    }
+
+    /// 純粋な構築関数（fs・キャッシュ参照は呼び出し側）。`table`が`Err`なら
+    /// ファイル自体を読めなかった状態を表す。
+    #[must_use]
+    pub fn from_parts(
+        table: &Result<
+            awase_keymap_learn::persist::PersistedTable,
+            crate::state::key_effect_runtime::RejectReason,
+        >,
+        last_attempt: &Option<
+            Result<
+                awase_keymap_learn::persist::PersistedTable,
+                crate::state::key_effect_runtime::RejectReason,
+            >,
+        >,
+        use_learned_keymap_table: bool,
+        in_use: bool,
+        bundled_diff: Option<&crate::state::key_effect_runtime::BundledDiff>,
+    ) -> Self {
+        let last_attempt_judgement = last_attempt.as_ref().map(|r| match r {
+            Ok(t) => t
+                .judgement
+                .map_or_else(|| "no_judgement".to_owned(), keymap_learn_judgement_label),
+            Err(crate::state::key_effect_runtime::RejectReason::NotFound) => "not_found".to_owned(),
+            Err(reason) => keymap_learn_file_label(reason).to_owned(),
+        });
+        let bundled_diff = bundled_diff.map(|d| BugReportKeymapLearnBundledDiff {
+            matched: d.matched,
+            mismatched_count: clamp_u32(d.mismatched.len()),
+            mismatched_cells: d
+                .mismatched
+                .iter()
+                .take(KEYMAP_LEARN_MISMATCH_LIST_MAX)
+                .map(|c| {
+                    format!(
+                        "open={} mode={} composing={} key={}",
+                        c.status.open, c.status.mode, c.status.composing, c.key.0
+                    )
+                })
+                .collect(),
+            only_in_one_table: d.only_in_one_table,
+        });
+        match table {
+            Err(reason) => Self {
+                table_file: keymap_learn_file_label(reason).to_owned(),
+                use_learned_keymap_table,
+                in_use,
+                last_attempt_judgement,
+                bundled_diff,
+                ..Self::default()
+            },
+            Ok(t) => Self {
+                table_file: "loaded".to_owned(),
+                use_learned_keymap_table,
+                in_use,
+                cell_count: Some(clamp_u32(t.cells.len())),
+                judgement: t.judgement.map(keymap_learn_judgement_label),
+                fingerprint: t.fingerprint.map(|f| format!("{:016x}{:016x}", f.0, f.1)),
+                self_verification: t.verification.as_ref().map(|v| {
+                    BugReportKeymapLearnVerification {
+                        correct: clamp_u32(v.score.correct),
+                        incorrect: clamp_u32(v.score.incorrect),
+                        not_in_table: clamp_u32(v.score.not_in_table),
+                        seed: v.seed,
+                    }
+                }),
+                bundled_diff,
+                last_attempt_judgement,
+                toggle_contradictions: {
+                    let cells = crate::state::key_effect_runtime::convert_cells(&t.cells);
+                    crate::state::key_effect_table::NARROWABLE_KEYS
+                        .iter()
+                        .filter_map(|&k| {
+                            crate::state::key_effect_table::toggle_contradiction(&cells, k)
+                                .map(|c| format!("{k:?}:{}", c.label()))
+                        })
+                        .collect()
+                },
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -166,12 +559,141 @@ pub struct BugReportPayload {
     pub attach_layout: bool,
     pub layout_yab: Option<String>,
     pub attach_log: bool,
+    /// 非圧縮の journal。schema_version 3 までのクライアントが使っていた。
+    /// 4 以降は常に None（`log_excerpt_gz` を使う）。
     pub log_excerpt: Option<String>,
+    /// ADR-222: journal（`UnifiedJournal` の JSON 配列）を gzip して base64 にしたもの。
+    #[serde(default)]
+    pub log_excerpt_gz: Option<String>,
     /// 実際の `log::` 出力（`awase.log`）の末尾。`log_excerpt`（構造化 journal）
     /// には無い send_health/degrade 系の警告等を拾うための別系統の添付
     /// （BUG-34 横展開）。`attach_log` チェックボックスで両方まとめて制御する。
     pub app_log_excerpt: Option<String>,
+    /// ADR-222: `awase.log` を gzip して base64 にしたもの（`app_log_excerpt` の後継）。
+    #[serde(default)]
+    pub app_log_excerpt_gz: Option<String>,
+    /// ADR-120 決定0a-report: 3キー仲裁の判定過程・訂正発生の観測カウンタ。
+    /// 打鍵内容・かな1文字も含まない、起動からの累積カウンタのみ。
+    pub attach_retro_eval_stats: bool,
+    pub retro_eval_stats: Option<BugReportRetroEvalStats>,
+    /// ADR-148: GJI/MS-IMEのキーマップ・キー割当て設定。
+    pub attach_ime_keymap: bool,
+    pub gji_keymap: Option<BugReportGjiKeymapSummary>,
+    pub msime_key_assignment: Option<BugReportMsImeKeyAssignmentSummary>,
+    /// ADR-148 Phase 2（2026-09-07追記）。`attach_ime_keymap`に相乗り
+    /// （新規フラグは追加しない、上記2フィールドと同じ理由）。
+    pub legacy_msime_keymap: Option<BugReportLegacyMsImeKeymapSummary>,
+    /// ADR196-T2 決定1e後半。`attach_ime_keymap`に相乗り。`#[serde(default)]`必須
+    /// （`SCHEMA_VERSION`を上げていないため、旧サーバ保存JSON・旧テストデータに無い）。
+    #[serde(default)]
+    pub keymap_learn: Option<BugReportKeymapLearnSummary>,
+    /// issue #165（hook_starved）の切り分け用（2026-09-28追記）。実行中の全
+    /// プロセスの実行ファイル名一覧（パスは含まない）。`competing_software`
+    /// は既知候補との照合に限られるため、まだ候補に挙げていない競合ソフトを
+    /// 後から遡って発見できるようにする。他の`attach_*`と異なり**既定オフ**
+    /// （他アプリの起動状況が丸ごと分かるため、既存の`attach_*`より開示範囲が
+    /// 広い）。`#[serde(default)]`必須（`SCHEMA_VERSION`を上げていないため）。
+    #[serde(default)]
+    pub attach_running_processes: bool,
+    #[serde(default)]
+    pub running_processes: Option<Vec<String>>,
     pub reported_at: String,
+}
+
+/// ADR-120 決定0a-report: 3キー仲裁の判定過程・訂正発生を観測する累積カウンタ
+/// （`awase::engine::RetroEvalStats` 相当）を bug report ペイロードへ写す型。
+/// 打鍵内容・かな1文字も含まない、起動からの累積カウンタのみで構成する。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BugReportRetroEvalStats {
+    pub three_key_total: u64,
+    pub phase2_reached: u64,
+    pub phase1_reached: u64,
+    pub no_ngram_count: u64,
+    pub score_a_neg_infinity_count: u64,
+    pub score_a_zero_count: u64,
+    pub score_a_finite_count: u64,
+    pub score_b_neg_infinity_count: u64,
+    pub score_b_zero_count: u64,
+    pub score_b_finite_count: u64,
+    pub char2_normal_hiragana_count: u64,
+    pub no_thumb_followup_count: u64,
+    pub thumb_watch_window_thumb_arrived_count: u64,
+    pub thumb_watch_window_abandoned_count: u64,
+    pub followup_elapsed_ms_histogram: [u64; 7],
+    pub followup_overwritten_count: u64,
+    pub followup_dropped_imprecise_count: u64,
+    pub phase2_decisions_total: u64,
+    pub phase2_correction_histogram: [u64; 7],
+    pub phase1_decisions_total: u64,
+    pub phase1_correction_histogram: [u64; 7],
+    pub baseline_decisions_total: u64,
+    pub baseline_correction_histogram: [u64; 7],
+    pub escape_output_count: u64,
+}
+
+impl From<&awase::engine::RetroEvalStats> for BugReportRetroEvalStats {
+    fn from(stats: &awase::engine::RetroEvalStats) -> Self {
+        // `RetroEvalStats` を `..` を使わずフィールド名で丸ごと分解する
+        // （`/code-review` 指摘対応）: `..` を使った部分アクセスや
+        // `stats.field` の個別参照だと、将来 `RetroEvalStats` に新しい
+        // フィールドを追加してもこの変換をコンパイラが強制してくれない
+        // （送信元に未使用フィールドがあってもエラーにならない）ため、
+        // 新カウンタが bug report に反映されないまま気づかれずに
+        // 出荷されるリスクがある。分解パターンを網羅的にすることで、
+        // フィールド追加時に必ずここがコンパイルエラーになるようにする。
+        let awase::engine::RetroEvalStats {
+            three_key_total,
+            phase2_reached,
+            phase1_reached,
+            no_ngram_count,
+            score_a_neg_infinity_count,
+            score_a_zero_count,
+            score_a_finite_count,
+            score_b_neg_infinity_count,
+            score_b_zero_count,
+            score_b_finite_count,
+            char2_normal_hiragana_count,
+            no_thumb_followup_count,
+            thumb_watch_window_thumb_arrived_count,
+            thumb_watch_window_abandoned_count,
+            followup_elapsed_ms_histogram,
+            followup_overwritten_count,
+            followup_dropped_imprecise_count,
+            phase2_decisions_total,
+            phase2_correction_histogram,
+            phase1_decisions_total,
+            phase1_correction_histogram,
+            baseline_decisions_total,
+            baseline_correction_histogram,
+            escape_output_count,
+        } = *stats;
+        Self {
+            three_key_total,
+            phase2_reached,
+            phase1_reached,
+            no_ngram_count,
+            score_a_neg_infinity_count,
+            score_a_zero_count,
+            score_a_finite_count,
+            score_b_neg_infinity_count,
+            score_b_zero_count,
+            score_b_finite_count,
+            char2_normal_hiragana_count,
+            no_thumb_followup_count,
+            thumb_watch_window_thumb_arrived_count,
+            thumb_watch_window_abandoned_count,
+            followup_elapsed_ms_histogram,
+            followup_overwritten_count,
+            followup_dropped_imprecise_count,
+            phase2_decisions_total,
+            phase2_correction_histogram,
+            phase1_decisions_total,
+            phase1_correction_histogram,
+            baseline_decisions_total,
+            baseline_correction_histogram,
+            escape_output_count,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -183,6 +705,30 @@ pub struct BugReportDiagnostics {
     pub state_snapshot: Option<BugReportStateSnapshot>,
     pub config_toml: Option<String>,
     pub layout_yab: Option<String>,
+    /// ADR-120 決定0a-report。`SCHEMA_VERSION` は上げていないため、旧クライアント
+    /// が生成した診断JSONにはこのフィールドが存在しない。`#[serde(default)]`
+    /// を外すと、その旧データを読み込んだ際に `state_snapshot` 等
+    /// **既存の診断情報も含めて全部**が `load_diagnostics` の `.ok()` で静かに
+    /// 消える（`crates/awase-settings/src/bug_report.rs` 参照）ため必須。
+    #[serde(default)]
+    pub retro_eval_stats: Option<BugReportRetroEvalStats>,
+    /// ADR-148。上記`retro_eval_stats`と同じ理由で`#[serde(default)]`必須
+    /// （`SCHEMA_VERSION`は上げていないため、旧クライアントが生成した
+    /// 診断JSONにはこの2フィールドが存在しない）。
+    #[serde(default)]
+    pub gji_keymap: Option<BugReportGjiKeymapSummary>,
+    #[serde(default)]
+    pub msime_key_assignment: Option<BugReportMsImeKeyAssignmentSummary>,
+    /// ADR-148 Phase 2。上記2フィールドと同じ理由で`#[serde(default)]`必須。
+    #[serde(default)]
+    pub legacy_msime_keymap: Option<BugReportLegacyMsImeKeymapSummary>,
+    /// ADR196-T2 決定1e後半。上記と同じ理由で`#[serde(default)]`必須。
+    #[serde(default)]
+    pub keymap_learn: Option<BugReportKeymapLearnSummary>,
+    /// issue #165（hook_starved）用（2026-09-28追記）。上記と同じ理由で
+    /// `#[serde(default)]`必須。
+    #[serde(default)]
+    pub running_processes: Option<Vec<String>>,
 }
 
 impl Default for BugReportDiagnostics {
@@ -195,6 +741,12 @@ impl Default for BugReportDiagnostics {
             state_snapshot: None,
             config_toml: None,
             layout_yab: None,
+            retro_eval_stats: None,
+            gji_keymap: None,
+            msime_key_assignment: None,
+            legacy_msime_keymap: None,
+            keymap_learn: None,
+            running_processes: None,
         }
     }
 }
@@ -221,6 +773,24 @@ pub struct BugReportInput<'a> {
     pub attach_config: bool,
     pub layout_yab: Option<&'a str>,
     pub attach_layout: bool,
+    /// ADR-120 決定0a-report。呼び出し側（`crates/awase-windows/src/runtime/message_handlers.rs`
+    /// の `current_bug_report_diagnostics`）が `Engine::retro_eval_stats()` から
+    /// 変換して渡す。
+    pub attach_retro_eval_stats: bool,
+    pub retro_eval_stats: Option<BugReportRetroEvalStats>,
+    /// ADR-148。呼び出し側（`current_bug_report_diagnostics`）が
+    /// `ime_kind`に応じたゲート済みの値を構築して渡す。
+    pub attach_ime_keymap: bool,
+    pub gji_keymap: Option<BugReportGjiKeymapSummary>,
+    pub msime_key_assignment: Option<BugReportMsImeKeyAssignmentSummary>,
+    /// ADR-148 Phase 2。呼び出し側（`current_bug_report_diagnostics`）が
+    /// 常に構築して渡す（上記2フィールドと同じ理由）。
+    pub legacy_msime_keymap: Option<BugReportLegacyMsImeKeymapSummary>,
+    pub keymap_learn: Option<BugReportKeymapLearnSummary>,
+    /// issue #165（hook_starved）用（2026-09-28追記）。既定オフの独立チェック
+    /// ボックス（`BugReportPayload::attach_running_processes`参照）。
+    pub attach_running_processes: bool,
+    pub running_processes: Option<Vec<String>>,
     pub reported_at: &'a str,
 }
 
@@ -230,10 +800,49 @@ pub enum BugReportPayloadError {
     DescriptionRequiredForOther,
     #[error("JSON シリアライズ失敗: {0}")]
     Serialize(#[from] serde_json::Error),
+    #[error("ログの圧縮に失敗: {0}")]
+    Compress(#[from] std::io::Error),
+    #[error("プレビューの JSON を読めません（編集で壊れた可能性があります）: {0}")]
+    InvalidPreview(String),
+}
+
+/// テキストを gzip して base64（標準アルファベット、パディングあり）にする（ADR-222）。
+/// Worker は `DecompressionStream('gzip')` で解凍できる（先頭は常に `H4sI`）。
+pub fn gzip_base64(text: &str) -> Result<String, std::io::Error> {
+    use base64::Engine as _;
+    use std::io::Write as _;
+    let mut encoder = flate2::write::GzEncoder::new(
+        Vec::with_capacity(text.len() / 8),
+        flate2::Compression::default(),
+    );
+    encoder.write_all(text.as_bytes())?;
+    let bytes = encoder.finish()?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+/// `gzip_base64` の逆変換。調査・テスト用で、展開後のサイズに上限を設ける
+/// （受付は誰でも送れるため、解凍爆弾対策。ADR-222 D8）。
+pub fn gunzip_base64(encoded: &str, max_bytes: usize) -> Result<String, std::io::Error> {
+    use base64::Engine as _;
+    use std::io::Read as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let mut out = Vec::new();
+    flate2::read::GzDecoder::new(&bytes[..])
+        .take(max_bytes as u64 + 1)
+        .read_to_end(&mut out)?;
+    if out.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "展開後のサイズが上限を超えました",
+        ));
+    }
+    String::from_utf8(out).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 /// `build_payload` と同じだが、journal/app_log 添付の切り詰め上限
-/// （既定は `LOG_EXCERPT_MAX_BYTES`）を呼び出し側で指定できる。
+/// （既定は `LOG_EXCERPT_UNCOMPRESSED_MAX_BYTES`）を呼び出し側で指定できる。
 /// `build_payload_json_fitting` が `MAX_BODY_BYTES` に収まるまで
 /// この上限を段階的に縮小しながら再構築するために使う。
 pub fn build_payload_with_log_budget(
@@ -244,17 +853,19 @@ pub fn build_payload_with_log_budget(
     if input.symptom_category == SymptomCategory::Other && description.is_empty() {
         return Err(BugReportPayloadError::DescriptionRequiredForOther);
     }
-    let log_excerpt = if input.attach_log {
+    let log_excerpt_gz = if input.attach_log {
         input
             .journal_json
-            .map(|log| truncate_journal_json_tail(log, log_excerpt_max_bytes))
+            .map(|log| gzip_base64(&truncate_journal_json_tail(log, log_excerpt_max_bytes)))
+            .transpose()?
     } else {
         None
     };
-    let app_log_excerpt = if input.attach_log {
+    let app_log_excerpt_gz = if input.attach_log {
         input
             .app_log
-            .map(|log| truncate_text_tail(log, log_excerpt_max_bytes))
+            .map(|log| gzip_base64(&truncate_text_tail(log, log_excerpt_max_bytes)))
+            .transpose()?
     } else {
         None
     };
@@ -270,6 +881,42 @@ pub fn build_payload_with_log_budget(
     };
     let layout_yab = if input.attach_layout {
         input.layout_yab.map(str::to_owned)
+    } else {
+        None
+    };
+    let retro_eval_stats = if input.attach_retro_eval_stats {
+        input.retro_eval_stats
+    } else {
+        None
+    };
+    let gji_keymap = if input.attach_ime_keymap {
+        input.gji_keymap.clone()
+    } else {
+        None
+    };
+    let msime_key_assignment = if input.attach_ime_keymap {
+        input.msime_key_assignment.clone()
+    } else {
+        None
+    };
+    let legacy_msime_keymap = if input.attach_ime_keymap {
+        input.legacy_msime_keymap.clone()
+    } else {
+        None
+    };
+    let keymap_learn = if input.attach_ime_keymap {
+        input.keymap_learn.clone()
+    } else {
+        None
+    };
+    let running_processes = if input.attach_running_processes {
+        input.running_processes.as_ref().map(|processes| {
+            processes
+                .iter()
+                .take(RUNNING_PROCESSES_MAX_ENTRIES)
+                .cloned()
+                .collect()
+        })
     } else {
         None
     };
@@ -291,8 +938,19 @@ pub fn build_payload_with_log_budget(
         attach_layout: input.attach_layout,
         layout_yab,
         attach_log: input.attach_log,
-        log_excerpt,
-        app_log_excerpt,
+        log_excerpt: None,
+        log_excerpt_gz,
+        app_log_excerpt: None,
+        app_log_excerpt_gz,
+        attach_retro_eval_stats: input.attach_retro_eval_stats,
+        retro_eval_stats,
+        attach_ime_keymap: input.attach_ime_keymap,
+        gji_keymap,
+        msime_key_assignment,
+        legacy_msime_keymap,
+        keymap_learn,
+        attach_running_processes: input.attach_running_processes,
+        running_processes,
         reported_at: input.reported_at.to_owned(),
     })
 }
@@ -300,7 +958,7 @@ pub fn build_payload_with_log_budget(
 pub fn build_payload(
     input: &BugReportInput<'_>,
 ) -> Result<BugReportPayload, BugReportPayloadError> {
-    build_payload_with_log_budget(input, LOG_EXCERPT_MAX_BYTES)
+    build_payload_with_log_budget(input, LOG_EXCERPT_UNCOMPRESSED_MAX_BYTES)
 }
 
 pub fn build_payload_json(input: &BugReportInput<'_>) -> Result<String, BugReportPayloadError> {
@@ -310,17 +968,19 @@ pub fn build_payload_json(input: &BugReportInput<'_>) -> Result<String, BugRepor
 /// `max_body_bytes` に収まるまで journal/app_log の添付を自動的に切り詰める。
 ///
 /// `build_payload_json` が生成した JSON が上限を超える場合、切り詰め上限
-/// （既定 `LOG_EXCERPT_MAX_BYTES`）を半分ずつ縮小しながら収まるまで
+/// （既定 `LOG_EXCERPT_UNCOMPRESSED_MAX_BYTES`）を半分ずつ縮小しながら収まるまで
 /// 再構築する。他の添付（内部状態スナップショット・設定ファイル・配列
 /// ファイル）は縮小の対象にしない — これらは journal/app_log と違って
 /// 個々のユーザー環境で急に肥大化するものではなく、診断上も基本情報として
-/// 全量が必要なため。
+/// 全量が必要なため。`running_processes` も縮小ループの対象外だが、これは
+/// 肥大化しないからではなく `RUNNING_PROCESSES_MAX_ENTRIES` で常時
+/// 有限件数に切り詰めているため（opusコードレビュー指摘）。
 ///
 /// 戻り値は `(生成された JSON, 実際に使った log_excerpt 上限バイト数)`。
 /// 予算が 0 になっても収まらない場合はそこで打ち切り、その JSON をそのまま
 /// 返す（呼び出し側の `MAX_BODY_BYTES` チェックがフォールバックとして働く）。
 ///
-/// 半減を毎回底(0)まで繰り返すと最大 log2(LOG_EXCERPT_MAX_BYTES) ≈ 18 回
+/// 半減を毎回底(0)まで繰り返すと最大 log2(LOG_EXCERPT_UNCOMPRESSED_MAX_BYTES) ≈ 18 回
 /// ペイロード全体（最大数百KB）を再シリアライズすることになり、これは
 /// UI スレッドから同期呼び出しされる場合に無視できないコストになる
 /// （journal/app_log 以外のフィールドだけで既に上限超過している場合、
@@ -333,7 +993,7 @@ pub fn build_payload_json_fitting(
     input: &BugReportInput<'_>,
     max_body_bytes: usize,
 ) -> Result<(String, usize), BugReportPayloadError> {
-    let mut budget = LOG_EXCERPT_MAX_BYTES;
+    let mut budget = LOG_EXCERPT_UNCOMPRESSED_MAX_BYTES;
     for _ in 0..MAX_HALVINGS {
         let json = serde_json::to_string_pretty(&build_payload_with_log_budget(input, budget)?)?;
         if json.len() <= max_body_bytes || budget == 0 {
@@ -343,6 +1003,257 @@ pub fn build_payload_json_fitting(
     }
     let json = serde_json::to_string_pretty(&build_payload_with_log_budget(input, 0)?)?;
     Ok((json, 0))
+}
+
+/// 1 本の gzip(base64) の最大長（Worker の `MAX_LOG_GZ_BASE64_CHARS` と同じ値）。
+/// 本体上限から、他の項目（状態・設定・配列ファイル等）の余裕 256KiB を引いた値。
+pub const MAX_LOG_GZ_BASE64_CHARS: usize = MAX_BODY_BYTES - 256 * 1024;
+
+/// 送信の最大回数（初回 + 縮めての再送 3 回）。
+pub const MAX_SEND_ATTEMPTS: u32 = 4;
+/// ネットワーク失敗（応答が無い・タイムアウト等）での最大回数。縮めても直らない失敗
+/// （オフライン等）で、接続のタイムアウトを何度も待たせないよう、再送は 1 回だけにする。
+pub const MAX_NETWORK_SEND_ATTEMPTS: u32 = 2;
+/// ログの最大の 1 本がこれ以下なら、縮めても本体はほとんど変わらないので再送しない。
+pub const RETRY_MIN_LOG_BYTES: usize = 16 * 1024;
+
+/// 送信の失敗（ADR-222 D13）。エラー文字列の先頭で種類を判断すると、文言を変えただけで
+/// 黙って壊れる（Opus round3）ので、HTTP の応答があった失敗と、応答が無い失敗を型で分ける。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendFailure {
+    /// HTTP の応答があった（201 以外）。
+    Http { status: u16, body: String },
+    /// 応答が無い（接続・送信・タイムアウト等）。メッセージは画面に出す文言。
+    Transport(String),
+}
+
+impl std::fmt::Display for SendFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Http { status, body } => write!(f, "HTTP {status}: {body}"),
+            Self::Transport(message) => f.write_str(message),
+        }
+    }
+}
+
+impl From<String> for SendFailure {
+    fn from(message: String) -> Self {
+        Self::Transport(message)
+    }
+}
+
+/// サイズが原因ではない 5xx（受付側の一時的な障害）を、同じ大きさで再送する最大の試行回数。
+pub const MAX_SAME_SIZE_SEND_ATTEMPTS: u32 = 3;
+
+/// 失敗した後に何をするか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryPlan {
+    /// 再送しない。
+    GiveUp,
+    /// ログを縮めて、すぐ再送する。
+    Shrink,
+    /// 同じ大きさのまま、少し待って再送する（一時的な障害を、ログを捨てずに乗り切る）。
+    SameSize { delay_secs: u64 },
+}
+
+/// 送信に失敗したとき、どう再送するか（ADR-222 D13）。`attempts_done` はここまでに試した
+/// 回数（1 以上）。
+///
+/// - 本体が大きいことが原因（`413`、`400` で本文が `*_too_large`、Workers Free の CPU 超過
+///   = Error 1102。本文に `1102` を含む）: **縮めて**再送（最大 `MAX_SEND_ATTEMPTS` 回）。
+/// - それ以外の `5xx`（R2 の一時障害、502/504 等）: 同じ大きさで、待ってから再送
+///   （最大 `MAX_SAME_SIZE_SEND_ATTEMPTS` 回、待ち時間は 3 秒 × 回数）。同じ大きさで通った
+///   はずのログを不要に捨てない（Opus round3 M-R2）。
+/// - `429`（レート制限）・それ以外の `4xx`: 縮めても直らない。再送しない。
+/// - 応答自体が無い（タイムアウト・切断）: 大きい本体のアップロードが遅い可能性があるので、
+///   1 回だけ縮めて再送（オフラインで接続のタイムアウトを何度も待たせない）。
+#[must_use]
+pub fn plan_retry(failure: &SendFailure, attempts_done: u32) -> RetryPlan {
+    match failure {
+        SendFailure::Transport(_) => {
+            if attempts_done < MAX_NETWORK_SEND_ATTEMPTS {
+                RetryPlan::Shrink
+            } else {
+                RetryPlan::GiveUp
+            }
+        }
+        SendFailure::Http { status, body } => {
+            let size_related = *status == 413
+                || (*status == 400 && body.contains("_too_large"))
+                || (matches!(status, 500..=599) && body.contains("1102"));
+            if size_related {
+                if attempts_done < MAX_SEND_ATTEMPTS {
+                    RetryPlan::Shrink
+                } else {
+                    RetryPlan::GiveUp
+                }
+            } else if matches!(status, 500..=599) && attempts_done < MAX_SAME_SIZE_SEND_ATTEMPTS {
+                RetryPlan::SameSize {
+                    delay_secs: 3 * u64::from(attempts_done),
+                }
+            } else {
+                RetryPlan::GiveUp
+            }
+        }
+    }
+}
+
+/// 再送（`attempts_done` 回目の失敗の後）の、圧縮前の上限。最大の 1 本を半分・4 分の 1・8 分の 1 に
+/// 縮める（古い側から落ちる）。上限を一律に半分にするだけだと、ログが上限より小さいときに
+/// 何も縮まないため、ログ自身の大きさを基準にする。
+#[must_use]
+pub const fn retry_budget_bytes(largest_log_bytes: usize, attempts_done: u32) -> usize {
+    let shifted = largest_log_bytes >> attempts_done;
+    if shifted < 1024 {
+        1024
+    } else {
+        shifted
+    }
+}
+
+/// ユーザーが送信前にログ一覧から行を削除した件数（ADR-222 / Opus round2 M-A2）。
+///
+/// journal の `ReportEdited` 行（印）として送信内容に残す。残さないと、ユーザーが
+/// 打鍵の行を消したのに、調査する側が「awase がキーを落とした」と誤読しうる
+/// （この ADR の発端の report も「打鍵が残らない」だった）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LogEditSummary {
+    pub journal_rows_deleted: usize,
+    pub app_log_rows_deleted: usize,
+    /// 何回目の送信か（0 = 初回）。失敗して縮めて再送したとき、調査する側が
+    /// 「ログが短いのは再送で縮めたからだ」と分かるように印へ残す。
+    pub send_attempt: u32,
+}
+
+/// journal の JSON 配列（`[` で始まる）の先頭に、編集の印の行を差し込む。
+fn with_edit_marker(journal: &str, marker: &str) -> String {
+    let Some(rest) = journal.trim_start().strip_prefix('[') else {
+        return journal.to_owned();
+    };
+    if rest.trim_start().starts_with(']') {
+        format!("[{marker}]")
+    } else {
+        format!("[{marker},{rest}")
+    }
+}
+
+/// 送信直前に、プレビュー JSON へ、画面に表示している journal / awase.log の現在の内容を gzip して差し込む。
+///
+/// ADR-222: プレビュー = 送信内容。ログは表示側で行を削除でき、消した行は圧縮データに
+/// 含まれない。プレビュー JSON はユーザーが編集しうるので、ログを送るかは
+/// **チェックボックスの値 `attach_log_checked` と、プレビューの `attach_log` の両方が
+/// true のときだけ**（Opus round2 B-A1: プレビューを編集済みだと古い `attach_log` が
+/// 残り、チェックボックスを外してもログが送られていた）。
+///
+/// 本体が `max_body_bytes` か 1 本の上限 `MAX_LOG_GZ_BASE64_CHARS` を超えるときは、
+/// 圧縮前の上限を半分ずつ縮めて再圧縮する（古い側から落ちる最終手段）。
+/// journal には、削除件数と縮めたかを記した `ReportEdited` の印の行を先頭に入れる。
+/// 戻り値は `(送信する JSON, 縮めたか)`。
+pub fn attach_logs_to_preview_json(
+    preview_json: &str,
+    attach_log_checked: bool,
+    journal_json: Option<&str>,
+    app_log: Option<&str>,
+    edits: LogEditSummary,
+    max_body_bytes: usize,
+) -> Result<(String, bool), BugReportPayloadError> {
+    attach_logs_with_budget(
+        preview_json,
+        attach_log_checked,
+        journal_json,
+        app_log,
+        edits,
+        max_body_bytes,
+        LOG_EXCERPT_UNCOMPRESSED_MAX_BYTES,
+    )
+}
+
+/// `attach_logs_to_preview_json` と同じだが、圧縮前の上限 `start_budget_bytes` から始める。
+///
+/// 送信に失敗して縮めて再送するとき、前回より小さい上限（`retry_budget_bytes`）を渡す。
+/// 各ログは、この上限を超える分が古い側から落とされる。戻り値の bool は、上限未満へ
+/// 縮めたか（`start_budget_bytes` が `LOG_EXCERPT_UNCOMPRESSED_MAX_BYTES` 未満、または
+/// 本体が収まらず半減した場合）。
+pub fn attach_logs_with_budget(
+    preview_json: &str,
+    attach_log_checked: bool,
+    journal_json: Option<&str>,
+    app_log: Option<&str>,
+    edits: LogEditSummary,
+    max_body_bytes: usize,
+    start_budget_bytes: usize,
+) -> Result<(String, bool), BugReportPayloadError> {
+    let serde_json::Value::Object(mut object) = serde_json::from_str(preview_json)
+        .map_err(|e| BugReportPayloadError::InvalidPreview(e.to_string()))?
+    else {
+        return Err(BugReportPayloadError::InvalidPreview(
+            "最上位がオブジェクトではありません".to_owned(),
+        ));
+    };
+    let attach_log = attach_log_checked
+        && object
+            .get("attach_log")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+    object.insert("attach_log".to_owned(), attach_log.into());
+    object.insert("schema_version".to_owned(), SCHEMA_VERSION.into());
+    object.insert("log_excerpt".to_owned(), serde_json::Value::Null);
+    object.insert("app_log_excerpt".to_owned(), serde_json::Value::Null);
+    let to_value = |gz: Option<String>| gz.map_or(serde_json::Value::Null, Into::into);
+    let mut budget = start_budget_bytes.min(LOG_EXCERPT_UNCOMPRESSED_MAX_BYTES);
+    let mut halvings = 0u32;
+    loop {
+        let shrunk = budget < LOG_EXCERPT_UNCOMPRESSED_MAX_BYTES;
+        let journal_gz = if attach_log {
+            journal_json
+                .map(|log| {
+                    let marker = serde_json::json!({
+                        "seq": 0,
+                        "elapsed_ms": 0,
+                        "entry": {
+                            "type": "ReportEdited",
+                            "journal_rows_deleted": edits.journal_rows_deleted,
+                            "app_log_rows_deleted": edits.app_log_rows_deleted,
+                            "send_attempt": edits.send_attempt,
+                            "shrunk": shrunk,
+                            "budget_bytes": budget,
+                        }
+                    })
+                    .to_string();
+                    gzip_base64(&with_edit_marker(
+                        &truncate_journal_json_tail(log, budget),
+                        &marker,
+                    ))
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let app_log_gz = if attach_log {
+            app_log
+                .map(|log| gzip_base64(&truncate_text_tail(log, budget)))
+                .transpose()?
+        } else {
+            None
+        };
+        let fits_field = journal_gz
+            .as_ref()
+            .into_iter()
+            .chain(app_log_gz.as_ref())
+            .all(|gz| gz.len() <= MAX_LOG_GZ_BASE64_CHARS);
+        object.insert("log_excerpt_gz".to_owned(), to_value(journal_gz));
+        object.insert("app_log_excerpt_gz".to_owned(), to_value(app_log_gz));
+        let json = serde_json::to_string(&object)?;
+        if (json.len() <= max_body_bytes && fits_field) || budget == 0 {
+            return Ok((json, shrunk));
+        }
+        halvings += 1;
+        budget = if halvings >= MAX_HALVINGS {
+            0
+        } else {
+            budget / 2
+        };
+    }
 }
 
 #[must_use]
@@ -391,10 +1302,13 @@ fn truncate_json_values_tail(values: &[serde_json::Value], max_bytes: usize) -> 
             continue;
         };
         let cost = item.len() + usize::from(!selected.is_empty());
-        if used + cost <= max_bytes {
-            used += cost;
-            selected.push(item);
+        if used + cost > max_bytes {
+            // 入らない行で止める。さらに古い小さな行を拾い続けると、途中が抜けた journal に
+            // なり、抜けたことが調査する側には分からない（Opus round3）。
+            break;
         }
+        used += cost;
+        selected.push(item);
     }
     selected.reverse();
     let mut json = String::from("[");
@@ -453,6 +1367,115 @@ pub fn unix_seconds_to_rfc3339(secs: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
+/// `awase.log` から報告に付ける時間窓（ADR-222 D10。journal の打鍵と同じ 10 分）。
+pub const APP_LOG_WINDOW_SECS: i64 = 10 * 60;
+
+/// `2026-10-04T02:24:02.110319Z` のような RFC3339（UTC）の先頭 19 文字
+/// （`YYYY-MM-DDTHH:MM:SS`）を UNIX 秒にする。tracing の出力形式に合わせた最小実装で、
+/// 小数秒とタイムゾーン表記は無視する（awase.log は常に UTC の `Z`）。
+#[must_use]
+pub fn rfc3339_utc_to_unix_seconds(text: &str) -> Option<i64> {
+    let b = text.as_bytes();
+    if b.len() < 19
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return None;
+    }
+    let num = |range: std::ops::Range<usize>| -> Option<i64> {
+        let part = text.get(range)?;
+        if part.bytes().all(|c| c.is_ascii_digit()) {
+            part.parse().ok()
+        } else {
+            None
+        }
+    };
+    let (year, month, day) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (hour, minute, second) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    // days_from_civil（civil_from_days の逆。Howard Hinnant のアルゴリズム）。
+    let y = year - i64::from(month <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+/// `awase.log` の本文を「行」の単位に分け、`now_unix` から `window_secs` 以内の行を返す。
+///
+/// 1 行 = 先頭が RFC3339 の時刻で始まる行 + それに続く時刻の無い継続行（panic の
+/// バックトレース等。直前の行に付ける）。最初の時刻行より前の継続行は捨てる。
+///
+/// 基準は**壁時計の `now_unix`**（呼び出し側が渡す。`awase.log` の時刻は UTC の壁時計で
+/// 設定アプリの `SystemTime::now()` と同じ時計）。ログ自身の最後の時刻を基準にすると、
+/// 既定の `info` レベルでは行がまばらで最後の行が数十分前のことがあり、journal と時間帯が
+/// ずれる（Opus round2 M-C1）。同じ理由で、窓内の行が `min_rows` 未満でもログの末尾
+/// `min_rows` 行は残す（info では 10 分に 1 行も無いことがある）。
+#[must_use]
+pub fn recent_app_log_rows(
+    text: &str,
+    window_secs: i64,
+    now_unix: i64,
+    min_rows: usize,
+) -> Vec<String> {
+    let mut rows: Vec<(i64, String)> = Vec::new();
+    for line in text.lines() {
+        if let Some(ts) = rfc3339_utc_to_unix_seconds(line) {
+            rows.push((ts, line.to_owned()));
+        } else if let Some((_, last)) = rows.last_mut() {
+            last.push('\n');
+            last.push_str(line);
+        }
+    }
+    let cutoff = now_unix - window_secs;
+    let first_in_window = rows
+        .iter()
+        .position(|(ts, _)| *ts >= cutoff)
+        .unwrap_or(rows.len());
+    let start = first_in_window.min(rows.len().saturating_sub(min_rows));
+    rows.into_iter()
+        .skip(start)
+        // `.old` と現行ファイルを連結すると、ファイル境界の空行が直前の行の末尾に
+        // 継続行として付く。行末の改行は取り除く。
+        .map(|(_, row)| row.trim_end_matches(['\n', '\r']).to_owned())
+        .collect()
+}
+
+/// journal の JSON 配列（`dump_to_file_for_report` の出力）を、1 entry = 1 行の文字列に分ける。
+/// 画面に表示して行単位で削除できるようにするため。
+pub fn journal_json_to_rows(json: &str) -> Result<Vec<String>, serde_json::Error> {
+    // `RawValue` は元の文字列をそのまま保つ（`Value` だと再シリアライズでキー順が変わる）。
+    let values: Vec<Box<serde_json::value::RawValue>> = serde_json::from_str(json)?;
+    Ok(values.iter().map(|v| v.get().to_owned()).collect())
+}
+
+/// `journal_json_to_rows` の逆。残っている行から journal の JSON 配列を作り直す。
+#[must_use]
+pub fn rows_to_journal_json(rows: &[String]) -> String {
+    let mut json = String::from("[");
+    for (index, row) in rows.iter().enumerate() {
+        if index > 0 {
+            json.push(',');
+        }
+        json.push_str(row);
+    }
+    json.push(']');
+    json
+}
+
 fn civil_from_days(days_since_epoch: u64) -> (i32, u32, u32) {
     let z = i64::try_from(days_since_epoch).unwrap_or(i64::MAX) + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -499,8 +1522,401 @@ mod tests {
             attach_config: true,
             layout_yab: Some("あ\tい"),
             attach_layout: true,
+            attach_retro_eval_stats: true,
+            retro_eval_stats: Some(BugReportRetroEvalStats {
+                three_key_total: 42,
+                ..BugReportRetroEvalStats::default()
+            }),
+            attach_ime_keymap: true,
+            gji_keymap: Some(test_gji_keymap_summary()),
+            msime_key_assignment: Some(test_msime_key_assignment_summary()),
+            legacy_msime_keymap: Some(test_legacy_msime_keymap_summary()),
+            keymap_learn: Some(test_keymap_learn_summary()),
+            attach_running_processes: true,
+            running_processes: Some(vec!["explorer.exe".to_owned(), "powertoys.exe".to_owned()]),
             reported_at: "2026-08-19T12:34:56Z",
         }
+    }
+
+    fn test_gji_keymap_summary() -> BugReportGjiKeymapSummary {
+        BugReportGjiKeymapSummary {
+            config1_db_status: "Ok".to_owned(),
+            session_keymap: Some(0),
+            has_henkan_muhenkan_overlay: false,
+            custom_keymap_table_present: true,
+            custom_keymap_table_is_effective: true,
+            // Opus敵対的コードレビューS-1: henkan/muhenkan_classified_kindが
+            // "On"/"Off"になるのは、実コードでは無変換/変換キー自身
+            // （VK_CONVERT/VK_NONCONVERT）がcustom_keymap_tableでIMEOn/Off
+            // に割り当てられている場合のみ（`classify_thumb_key_ime_actions`
+            // 参照）。VK_F21/F22だけではこの組み合わせは到達不能だったため、
+            // フィクスチャに含める。
+            ime_on_keys: Some(vec!["VK_F21".to_owned(), "VK_CONVERT".to_owned()]),
+            ime_off_keys: Some(vec!["VK_F22".to_owned(), "VK_NONCONVERT".to_owned()]),
+            ime_toggle_keys: Some(vec![]),
+            mode_set_keys: Some(vec![("VK_F6".to_owned(), "Hiragana".to_owned())]),
+            mode_toggle_alphanumeric_keys: Some(vec![]),
+            mode_toggle_kana_type_keys: Some(vec![]),
+            henkan_classified_kind: Some("On".to_owned()),
+            muhenkan_classified_kind: Some("Off".to_owned()),
+            muhenkan_dedicated_fn_key_configured: false,
+        }
+    }
+
+    fn test_msime_key_assignment_summary() -> BugReportMsImeKeyAssignmentSummary {
+        BugReportMsImeKeyAssignmentSummary {
+            is_key_assignment_enabled: Some(1),
+            key_assignment_muhenkan: Some(1),
+            key_assignment_henkan: Some(1),
+            key_assignment_ctrl_space: Some(0),
+            key_assignment_shift_space: Some(0),
+            adopted_ime_toggle_combos: None,
+            muhenkan_dedicated_fn_key_configured: false,
+        }
+    }
+
+    fn test_keymap_learn_summary() -> BugReportKeymapLearnSummary {
+        BugReportKeymapLearnSummary {
+            table_file: "loaded".to_owned(),
+            use_learned_keymap_table: true,
+            in_use: false,
+            cell_count: Some(3),
+            judgement: Some("NeedsConfirmation(SystematicMismatch:40%)".to_owned()),
+            fingerprint: None,
+            self_verification: None,
+            bundled_diff: None,
+            last_attempt_judgement: None,
+            toggle_contradictions: Vec::new(),
+        }
+    }
+
+    fn learn_pcell(key: u16) -> awase_keymap_learn::persist::PersistedCell {
+        use awase_keymap_learn::model::{Disposition, KeyId, Outcome, Status};
+        let status = Status {
+            open: true,
+            mode: 0x09,
+            composing: false,
+        };
+        awase_keymap_learn::persist::PersistedCell {
+            status,
+            key: KeyId(key),
+            prediction: Some(Outcome {
+                status,
+                disp: Disposition::Kept,
+            }),
+        }
+    }
+
+    /// ADR-199決定6-2: 閉状態で半角/全角（0xF3）を押して閉のままのセルは、学習表のトグル矛盾として
+    /// 固定語彙で報告される。矛盾が無い表では空。
+    #[test]
+    fn keymap_learn_summary_reports_toggle_contradictions() {
+        use awase_keymap_learn::model::{Disposition, KeyId, Outcome, Status};
+        use awase_keymap_learn::persist::{PersistedCell, PersistedTable};
+        let closed = Status {
+            open: false,
+            mode: 0x00,
+            composing: false,
+        };
+        let stays_closed = PersistedCell {
+            status: closed,
+            key: KeyId(0xF3),
+            prediction: Some(Outcome {
+                status: closed,
+                disp: Disposition::None,
+            }),
+        };
+        let with = BugReportKeymapLearnSummary::from_parts(
+            &Ok(PersistedTable::new(vec![stays_closed])),
+            &None,
+            true,
+            false,
+            None,
+        );
+        assert_eq!(
+            with.toggle_contradictions,
+            vec!["HankakuZenkaku:closed_stays_closed".to_owned()]
+        );
+        let without = BugReportKeymapLearnSummary::from_parts(
+            &Ok(PersistedTable::new(vec![learn_pcell(1)])),
+            &None,
+            true,
+            false,
+            None,
+        );
+        assert!(without.toggle_contradictions.is_empty());
+    }
+
+    /// 完了条件: 判定・自己検証・指紋・同梱表との突き合わせ（不一致セル一覧・表にのみ存在）・
+    /// 使用中か・退避ファイルの判定が**1つの項目にまとまる**こと。
+    #[test]
+    fn keymap_learn_summary_bundles_all_fields_into_one_item() {
+        use crate::state::key_effect_runtime::{BundledDiff, MismatchedCell};
+        use awase_keymap_learn::judgement::{
+            NeedsConfirmationReason, RejectedReason, ScoredVerification, TableJudgement,
+        };
+        use awase_keymap_learn::persist::{Fingerprint, PersistedTable};
+        use awase_keymap_learn::verify::ScoreReport;
+
+        let table = PersistedTable::new(vec![learn_pcell(1), learn_pcell(2)])
+            .with_fingerprint(Fingerprint(0xAB, 0xCD))
+            .with_verification(ScoredVerification {
+                score: ScoreReport {
+                    correct: 290,
+                    incorrect: 10,
+                    not_in_table: 5,
+                },
+                seed: 7,
+            })
+            .with_judgement(TableJudgement::NeedsConfirmation(
+                NeedsConfirmationReason::SystematicMismatch {
+                    mismatch_percent: 40,
+                },
+            ));
+        let last = PersistedTable::new(vec![])
+            .with_judgement(TableJudgement::Rejected(RejectedReason::LowAccuracy));
+        let diff = BundledDiff {
+            matched: 8,
+            mismatched: vec![MismatchedCell {
+                status: learn_pcell(1).status,
+                key: learn_pcell(1).key,
+            }],
+            only_in_one_table: 3,
+        };
+        let s = BugReportKeymapLearnSummary::from_parts(
+            &Ok(table),
+            &Some(Ok(last)),
+            true,
+            false,
+            Some(&diff),
+        );
+        assert_eq!(s.table_file, "loaded");
+        assert!(s.use_learned_keymap_table);
+        assert!(!s.in_use);
+        assert_eq!(s.cell_count, Some(2));
+        assert_eq!(
+            s.judgement.as_deref(),
+            Some("NeedsConfirmation(SystematicMismatch:40%)")
+        );
+        assert_eq!(
+            s.fingerprint.as_deref(),
+            Some("00000000000000ab00000000000000cd")
+        );
+        assert_eq!(
+            s.self_verification,
+            Some(BugReportKeymapLearnVerification {
+                correct: 290,
+                incorrect: 10,
+                not_in_table: 5,
+                seed: 7
+            })
+        );
+        let d = s.bundled_diff.expect("突き合わせ結果");
+        assert_eq!(
+            (d.matched, d.mismatched_count, d.only_in_one_table),
+            (8, 1, 3)
+        );
+        assert_eq!(
+            d.mismatched_cells,
+            vec!["open=true mode=9 composing=false key=1"]
+        );
+        assert_eq!(
+            s.last_attempt_judgement.as_deref(),
+            Some("Rejected(LowAccuracy)")
+        );
+    }
+
+    #[test]
+    fn keymap_learn_summary_reports_unreadable_file_state_without_table_fields() {
+        use crate::state::key_effect_runtime::RejectReason;
+        for (reason, label) in [
+            (RejectReason::NotFound, "not_learned"),
+            (RejectReason::Parse, "parse_error"),
+            (RejectReason::SchemaVersionMismatch, "schema_mismatch"),
+            (RejectReason::Io, "io_error"),
+        ] {
+            let s =
+                BugReportKeymapLearnSummary::from_parts(&Err(reason), &None, false, false, None);
+            assert_eq!(s.table_file, label);
+            assert!(!s.use_learned_keymap_table);
+            assert_eq!(s.judgement, None);
+            assert_eq!(s.cell_count, None);
+        }
+    }
+
+    #[test]
+    fn keymap_learn_summary_distinguishes_missing_and_broken_last_attempt() {
+        use crate::state::key_effect_runtime::RejectReason;
+        let label = |r: Option<Result<_, RejectReason>>| {
+            BugReportKeymapLearnSummary::from_parts(
+                &Err(RejectReason::NotFound),
+                &r,
+                true,
+                false,
+                None,
+            )
+            .last_attempt_judgement
+        };
+        assert_eq!(label(None), None);
+        assert_eq!(
+            label(Some(Err(RejectReason::NotFound))).as_deref(),
+            Some("not_found")
+        );
+        assert_eq!(
+            label(Some(Err(RejectReason::Parse))).as_deref(),
+            Some("parse_error")
+        );
+    }
+
+    /// 実ファイルを読む経路（`from_paths`）: 学習表・退避ファイルの有無・破損が
+    /// `table_file`/`last_attempt_judgement`に区別されて出ること。
+    #[test]
+    fn keymap_learn_summary_from_paths_reads_real_files() {
+        use awase_keymap_learn::judgement::{RejectedReason, TableJudgement};
+        use awase_keymap_learn::persist::PersistedTable;
+        let dir = std::env::temp_dir().join(format!("awase_from_paths_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let table_path = dir.join("keymap-learn-table.json");
+        let last_path = dir.join("keymap-learn-last-attempt.json");
+        let missing = dir.join("does-not-exist.json");
+
+        let table =
+            PersistedTable::new(vec![learn_pcell(1)]).with_judgement(TableJudgement::Accepted);
+        std::fs::write(&table_path, table.to_json().unwrap()).unwrap();
+        std::fs::write(&last_path, "{ not json").unwrap();
+
+        let s = BugReportKeymapLearnSummary::from_paths(
+            Some(&table_path),
+            Some(&last_path),
+            true,
+            false,
+            None,
+        );
+        assert_eq!(s.table_file, "loaded");
+        assert_eq!(s.judgement.as_deref(), Some("Accepted"));
+        assert_eq!(s.last_attempt_judgement.as_deref(), Some("parse_error"));
+        assert_eq!(
+            s.bundled_diff, None,
+            "validation_keyが無ければ突き合わせない"
+        );
+
+        let s = BugReportKeymapLearnSummary::from_paths(
+            Some(&missing),
+            Some(&missing),
+            true,
+            false,
+            None,
+        );
+        assert_eq!(s.table_file, "not_learned");
+        assert_eq!(s.last_attempt_judgement.as_deref(), Some("not_found"));
+
+        let last = PersistedTable::new(vec![])
+            .with_judgement(TableJudgement::Rejected(RejectedReason::LowAccuracy));
+        std::fs::write(&last_path, last.to_json().unwrap()).unwrap();
+        let s = BugReportKeymapLearnSummary::from_paths(None, Some(&last_path), true, false, None);
+        assert_eq!(s.table_file, "not_learned");
+        assert_eq!(
+            s.last_attempt_judgement.as_deref(),
+            Some("Rejected(LowAccuracy)")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keymap_learn_summary_caps_mismatched_cell_list_but_keeps_true_count() {
+        use crate::state::key_effect_runtime::{BundledDiff, MismatchedCell};
+        let n = KEYMAP_LEARN_MISMATCH_LIST_MAX + 10;
+        let diff = BundledDiff {
+            matched: 0,
+            mismatched: (0..n)
+                .map(|i| MismatchedCell {
+                    status: learn_pcell(0).status,
+                    key: awase_keymap_learn::model::KeyId(u16::try_from(i).unwrap()),
+                })
+                .collect(),
+            only_in_one_table: 0,
+        };
+        let s = BugReportKeymapLearnSummary::from_parts(
+            &Err(crate::state::key_effect_runtime::RejectReason::NotFound),
+            &None,
+            true,
+            false,
+            Some(&diff),
+        );
+        let d = s.bundled_diff.unwrap();
+        assert_eq!(d.mismatched_count as usize, n);
+        assert_eq!(d.mismatched_cells.len(), KEYMAP_LEARN_MISMATCH_LIST_MAX);
+    }
+
+    /// `#[serde(default)]`の回帰: `keymap_learn`を持たない旧診断JSONを読めること
+    /// （落ちると`load_diagnostics`の`.ok()`で既存診断も全部消える）。
+    #[test]
+    fn diagnostics_without_keymap_learn_field_still_deserializes() {
+        let mut v = serde_json::to_value(BugReportDiagnostics::default()).unwrap();
+        v.as_object_mut().unwrap().remove("keymap_learn");
+        let parsed: BugReportDiagnostics = serde_json::from_value(v).expect("旧形式を読めること");
+        assert_eq!(parsed.keymap_learn, None);
+    }
+
+    /// ADR-217の回帰: 削除した「採用系」フィールドを持つ旧診断JSONを読めること。
+    /// `deny_unknown_fields`を付けると、R2に溜まった過去の報告・旧ビルドが書いた
+    /// 診断JSONが読めなくなる（`load_diagnostics`の`.ok()`で既存診断も全部消える）。
+    #[test]
+    fn gji_keymap_summary_with_removed_adopted_keys_still_deserializes() {
+        let mut v = serde_json::to_value(test_gji_keymap_summary()).unwrap();
+        let o = v.as_object_mut().unwrap();
+        o.insert("henkan_adopted_kind".to_owned(), serde_json::json!("On"));
+        o.insert("muhenkan_adopted_kind".to_owned(), serde_json::json!("Off"));
+        o.insert("henkan_adopted_route".to_owned(), serde_json::json!(null));
+        o.insert("muhenkan_adopted_route".to_owned(), serde_json::json!(null));
+        o.insert("thumb_key_ime_warning".to_owned(), serde_json::json!(null));
+        let parsed: BugReportGjiKeymapSummary =
+            serde_json::from_value(v).expect("旧形式のJSONを読めること");
+        assert_eq!(parsed, test_gji_keymap_summary());
+
+        let mut v = serde_json::to_value(test_msime_key_assignment_summary()).unwrap();
+        let o = v.as_object_mut().unwrap();
+        o.insert(
+            "adopted_muhenkan_delegate".to_owned(),
+            serde_json::json!(null),
+        );
+        o.insert(
+            "adopted_henkan_delegate".to_owned(),
+            serde_json::json!("On"),
+        );
+        let parsed: BugReportMsImeKeyAssignmentSummary =
+            serde_json::from_value(v).expect("旧形式のJSONを読めること");
+        assert_eq!(parsed, test_msime_key_assignment_summary());
+    }
+
+    fn test_legacy_msime_keymap_summary() -> BugReportLegacyMsImeKeymapSummary {
+        BugReportLegacyMsImeKeymapSummary {
+            active_style: Some("Custom".to_owned()),
+            muhenkan_legacy_toggle_assigned: Some(true),
+            henkan_legacy_toggle_assigned: Some(false),
+            legacy_compat_mode_enabled: Some(true),
+        }
+    }
+
+    /// コードレビュー指摘: `legacy_compat_mode_enabled`はADR-197でこのPRが追加した
+    /// フィールドで、`SCHEMA_VERSION`は上げていない。旧ビルドが書いた診断JSONの
+    /// `legacy_msime_keymap`オブジェクトにはこのキー自体が無いため、`#[serde(default)]`
+    /// が無いと`serde_json::from_str`がその内側のフィールド不足だけで失敗し、
+    /// `load_diagnostics`側の`.ok()`で`state_snapshot`等**無関係な情報も含めて全部**
+    /// 静かに失われる（`crates/awase-settings/src/bug_report.rs`参照）。
+    #[test]
+    fn legacy_msime_keymap_summary_without_compat_mode_field_still_deserializes() {
+        let old_shape_json = r#"{
+            "active_style": "Custom",
+            "muhenkan_ime_on_toggle": true,
+            "henkan_ime_on_toggle": false
+        }"#;
+        let parsed: BugReportLegacyMsImeKeymapSummary =
+            serde_json::from_str(old_shape_json).expect("旧形式のJSONを読めること");
+        assert_eq!(parsed.active_style, Some("Custom".to_owned()));
+        assert_eq!(parsed.muhenkan_legacy_toggle_assigned, Some(true));
+        assert_eq!(parsed.henkan_legacy_toggle_assigned, Some(false));
+        assert_eq!(parsed.legacy_compat_mode_enabled, None);
     }
 
     fn test_state_snapshot() -> BugReportStateSnapshot {
@@ -516,11 +1932,18 @@ mod tests {
             send_health_consecutive_slow: 0,
             send_health_breaker_tripped: false,
             idle_conv_check_in_flight_ms: None,
+            idle_conv_check_abandoned_resync_count: 0,
+            idle_conv_check_abandoned_normal_count: 0,
+            idle_conv_check_spawned_resync_count: 0,
+            idle_conv_check_spawned_normal_count: 0,
             process_uptime_secs: 3_600,
             working_set_bytes: 42_000_000,
             handle_count: 321,
             gdi_object_count: 45,
             user_object_count: 67,
+            low_level_hooks_timeout_ms: Some(5000),
+            wake_post_failed_lifetime_count: 0,
+            hook_ring_max_occupancy: 3,
         }
     }
 
@@ -532,7 +1955,7 @@ mod tests {
             Some(r#"[{"seq":1}]"#),
         ))
         .unwrap();
-        assert_eq!(payload.schema_version, 3);
+        assert_eq!(payload.schema_version, 4);
         assert_eq!(payload.ime_kind, "Gji");
         assert_eq!(
             payload.ime_product_name.as_deref(),
@@ -548,10 +1971,16 @@ mod tests {
             payload.symptom_category,
             SymptomCategory::WrongCharacterOutput
         );
-        assert_eq!(payload.log_excerpt.as_deref(), Some(r#"[{"seq":1}]"#));
+        // ADR-222: 新クライアントは非圧縮フィールドを使わず gzip+base64 で送る。
+        assert_eq!(payload.log_excerpt, None);
+        assert_eq!(payload.app_log_excerpt, None);
         assert_eq!(
-            payload.app_log_excerpt.as_deref(),
-            Some("[2026-08-20T00:00:00Z INFO awase] started")
+            gunzip_base64(payload.log_excerpt_gz.as_deref().unwrap(), 1 << 20).unwrap(),
+            r#"[{"seq":1}]"#
+        );
+        assert_eq!(
+            gunzip_base64(payload.app_log_excerpt_gz.as_deref().unwrap(), 1 << 20).unwrap(),
+            "[2026-08-20T00:00:00Z INFO awase] started"
         );
     }
 
@@ -568,10 +1997,41 @@ mod tests {
         );
         assert!(payload.attach_layout);
         assert_eq!(payload.layout_yab.as_deref(), Some("あ\tい"));
+        assert!(payload.attach_retro_eval_stats);
+        assert_eq!(
+            payload.retro_eval_stats,
+            Some(BugReportRetroEvalStats {
+                three_key_total: 42,
+                ..BugReportRetroEvalStats::default()
+            })
+        );
+        assert!(payload.attach_ime_keymap);
+        assert_eq!(payload.gji_keymap, Some(test_gji_keymap_summary()));
+        assert_eq!(
+            payload.msime_key_assignment,
+            Some(test_msime_key_assignment_summary())
+        );
+        assert_eq!(
+            payload.legacy_msime_keymap,
+            Some(test_legacy_msime_keymap_summary())
+        );
+        assert_eq!(
+            payload.keymap_learn,
+            Some(test_keymap_learn_summary()),
+            "keymap_learnはattach_ime_keymapに相乗りして添付される"
+        );
+        assert!(payload.attach_running_processes);
+        assert_eq!(
+            payload.running_processes,
+            Some(vec!["explorer.exe".to_owned(), "powertoys.exe".to_owned()])
+        );
 
         input.attach_state_snapshot = false;
         input.attach_config = false;
         input.attach_layout = false;
+        input.attach_retro_eval_stats = false;
+        input.attach_ime_keymap = false;
+        input.attach_running_processes = false;
         let detached = build_payload(&input).unwrap();
         assert!(!detached.attach_state_snapshot);
         assert_eq!(detached.state_snapshot, None);
@@ -579,6 +2039,32 @@ mod tests {
         assert_eq!(detached.config_toml, None);
         assert!(!detached.attach_layout);
         assert_eq!(detached.layout_yab, None);
+        assert!(!detached.attach_retro_eval_stats);
+        assert_eq!(detached.retro_eval_stats, None);
+        assert!(!detached.attach_ime_keymap);
+        assert_eq!(detached.gji_keymap, None);
+        assert_eq!(detached.msime_key_assignment, None);
+        assert_eq!(detached.legacy_msime_keymap, None);
+        assert_eq!(detached.keymap_learn, None);
+        assert!(!detached.attach_running_processes);
+        assert_eq!(detached.running_processes, None);
+    }
+
+    /// opusコードレビュー指摘: `running_processes` は縮小ループの対象外なので、
+    /// 上限が無いと高負荷マシン(常駐プロセス多数)でペイロードが際限なく肥大化しうる。
+    /// `RUNNING_PROCESSES_MAX_ENTRIES` で常に有限件数に切り詰めることを確認する。
+    #[test]
+    fn running_processes_is_capped_at_max_entries() {
+        let mut input = input("説明", true, Some("[]"));
+        let many: Vec<String> = (0..RUNNING_PROCESSES_MAX_ENTRIES + 100)
+            .map(|i| format!("proc{i}.exe"))
+            .collect();
+        input.running_processes = Some(many);
+        let payload = build_payload(&input).unwrap();
+        assert_eq!(
+            payload.running_processes.map(|p| p.len()),
+            Some(RUNNING_PROCESSES_MAX_ENTRIES)
+        );
     }
 
     #[test]
@@ -608,32 +2094,35 @@ mod tests {
 
     #[test]
     fn log_is_attached_only_when_requested_and_truncated_by_utf8_boundary() {
-        let log =
-            serde_json::to_string(&vec!["あ".repeat((LOG_EXCERPT_MAX_BYTES / 3) + 10)]).unwrap();
-        let payload = build_payload(&input("説明", true, Some(&log))).unwrap();
-        let excerpt = payload.log_excerpt.unwrap();
-        assert!(excerpt.len() <= LOG_EXCERPT_MAX_BYTES);
+        let cap = 200 * 1024;
+        let log = serde_json::to_string(&vec!["あ".repeat((cap / 3) + 10)]).unwrap();
+        let payload = build_payload_with_log_budget(&input("説明", true, Some(&log)), cap).unwrap();
+        let excerpt = gunzip_base64(payload.log_excerpt_gz.as_deref().unwrap(), 1 << 22).unwrap();
+        assert!(excerpt.len() <= cap);
         assert!(excerpt.is_char_boundary(excerpt.len()));
 
-        let detached = build_payload(&input("説明", false, Some(&log))).unwrap();
-        assert_eq!(detached.log_excerpt, None);
+        let detached =
+            build_payload_with_log_budget(&input("説明", false, Some(&log)), cap).unwrap();
+        assert_eq!(detached.log_excerpt_gz, None);
     }
 
     #[test]
     fn app_log_is_attached_only_when_requested_and_truncated_by_utf8_boundary() {
-        let long_log = "あ".repeat((LOG_EXCERPT_MAX_BYTES / 3) + 10);
+        let cap = 200 * 1024;
+        let long_log = "あ".repeat((cap / 3) + 10);
         let mut base = input("説明", true, Some("[]"));
         base.app_log = Some(&long_log);
-        let payload = build_payload(&base).unwrap();
-        let excerpt = payload.app_log_excerpt.unwrap();
-        assert!(excerpt.len() <= LOG_EXCERPT_MAX_BYTES);
+        let payload = build_payload_with_log_budget(&base, cap).unwrap();
+        let excerpt =
+            gunzip_base64(payload.app_log_excerpt_gz.as_deref().unwrap(), 1 << 22).unwrap();
+        assert!(excerpt.len() <= cap);
         assert!(excerpt.is_char_boundary(excerpt.len()));
         // 末尾優先: 切り詰め後は元テキストの末尾がそのまま残っている。
         assert!(long_log.ends_with(&excerpt));
 
         base.attach_log = false;
-        let detached = build_payload(&base).unwrap();
-        assert_eq!(detached.app_log_excerpt, None);
+        let detached = build_payload_with_log_budget(&base, cap).unwrap();
+        assert_eq!(detached.app_log_excerpt_gz, None);
     }
 
     #[test]
@@ -682,15 +2171,18 @@ mod tests {
     #[test]
     fn payload_json_matches_schema_names() {
         let json = build_payload_json(&input("説明", true, Some("[]"))).unwrap();
-        assert!(json.contains("\"schema_version\": 3"));
+        assert!(json.contains("\"schema_version\": 4"));
         assert!(json.contains("\"ime_product_name\": \"Google 日本語入力\""));
         assert!(json.contains("\"keyboard_model\": \"Jis\""));
         assert!(json.contains("\"windows_keyboard_layout\": \"LANGID=0x0411 (Japanese=true)\""));
         assert!(json.contains("\"competing_software\": ["));
         assert!(json.contains("\"symptom_category\": \"WrongCharacterOutput\""));
         assert!(json.contains("\"attach_log\": true"));
-        assert!(json.contains("\"log_excerpt\": \"[]\""));
-        assert!(json.contains("\"app_log_excerpt\": \"[2026-08-20T00:00:00Z INFO awase] started\""));
+        // ADR-222: 非圧縮フィールドは常に null、本体は gzip(base64) の `_gz` に入る。
+        assert!(json.contains("\"log_excerpt\": null"));
+        assert!(json.contains("\"app_log_excerpt\": null"));
+        assert!(json.contains("\"log_excerpt_gz\": \"H4sI"));
+        assert!(json.contains("\"app_log_excerpt_gz\": \"H4sI"));
         assert!(json.contains("\"attach_state_snapshot\": true"));
         assert!(json.contains("\"state_snapshot\": {"));
         assert!(json.contains("\"send_health_last_elapsed_ms\": 12"));
@@ -701,10 +2193,26 @@ mod tests {
         assert!(json.contains("\"handle_count\": 321"));
         assert!(json.contains("\"gdi_object_count\": 45"));
         assert!(json.contains("\"user_object_count\": 67"));
+        assert!(json.contains("\"low_level_hooks_timeout_ms\": 5000"));
+        assert!(json.contains("\"wake_post_failed_lifetime_count\": 0"));
+        assert!(json.contains("\"hook_ring_max_occupancy\": 3"));
         assert!(json.contains("\"attach_config\": true"));
         assert!(json.contains("\"config_toml\": \"general.default_layout = \\\"nicola\\\"\""));
         assert!(json.contains("\"attach_layout\": true"));
         assert!(json.contains("\"layout_yab\": \"あ\\tい\""));
+        assert!(json.contains("\"attach_retro_eval_stats\": true"));
+        assert!(json.contains("\"retro_eval_stats\": {"));
+        assert!(json.contains("\"three_key_total\": 42"));
+        assert!(json.contains("\"attach_ime_keymap\": true"));
+        assert!(json.contains("\"gji_keymap\": {"));
+        assert!(json.contains("\"config1_db_status\": \"Ok\""));
+        assert!(json.contains("\"custom_keymap_table_is_effective\": true"));
+        assert!(json.contains("\"msime_key_assignment\": {"));
+        assert!(json.contains("\"key_assignment_muhenkan\": 1"));
+        assert!(json.contains("\"legacy_msime_keymap\": {"));
+        // ワイヤーJSONのキー名は`#[serde(rename)]`により旧名のまま
+        // （Rust側フィールド名のみ`muhenkan_legacy_toggle_assigned`へ訂正、上記struct定義参照）。
+        assert!(json.contains("\"muhenkan_ime_on_toggle\": true"));
         assert!(!json.contains("JournalEntry"));
     }
 
@@ -712,31 +2220,31 @@ mod tests {
     fn build_payload_json_fitting_keeps_full_budget_when_already_within_limit() {
         let (json, used_budget) =
             build_payload_json_fitting(&input("説明", true, Some("[]")), MAX_BODY_BYTES).unwrap();
-        assert_eq!(used_budget, LOG_EXCERPT_MAX_BYTES);
+        assert_eq!(used_budget, LOG_EXCERPT_UNCOMPRESSED_MAX_BYTES);
         assert!(json.len() <= MAX_BODY_BYTES);
+    }
+
+    /// 圧縮してもほとんど縮まないテキスト（実ログの代わりに、予算縮小ロジックを
+    /// 確実に発火させる）。決定的な疑似乱数（xorshift）で英数字を並べる。
+    fn noisy_text(len: usize) -> String {
+        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                ALPHABET[(x % ALPHABET.len() as u64) as usize] as char
+            })
+            .collect()
     }
 
     #[test]
     fn build_payload_json_fitting_shrinks_log_budget_to_stay_under_max_body_bytes() {
-        // journal と app_log を両方フルサイズ(LOG_EXCERPT_MAX_BYTES each)で
-        // 添付した場合でも、上限に対して十分小さい max_body_bytes を渡せば
-        // 縮小ロジックが機能することを確認する回帰テスト。journal は小さい
-        // 要素を大量に並べる（1要素が LOG_EXCERPT_MAX_BYTES を超えると
-        // truncate_journal_json_tail が丸ごと弾いて空配列になり、意図せず
-        // 予算を使い切らないため）。
-        //
-        // MAX_BODY_BYTES をそのまま使わない理由: LOG_EXCERPT_MAX_BYTES は
-        // 200KiB に調整済みで、journal+app_log の2本をフル添付しても
-        // 400KiB(< 512KiB=MAX_BODY_BYTES)に収まり、縮小自体が発生しなく
-        // なった（これは「送信のたびに必ず自動切り詰めが発生する」という
-        // 実機報告を受けた意図的な改善）。縮小ロジック自体の回帰を検知する
-        // ため、テストでは意図的に小さい上限を渡す。
-        let journal_items: Vec<_> = (0..4_000)
-            .map(|i| serde_json::json!({"seq": i, "payload": "x".repeat(80)}))
-            .collect();
-        let journal = serde_json::to_string(&journal_items).unwrap();
-        let app_log = "a".repeat(LOG_EXCERPT_MAX_BYTES);
-        let mut base = input("説明", true, Some(&journal));
+        // 圧縮しても大きいログを、上限に対して小さい max_body_bytes で送ると、
+        // 圧縮前の上限を半分ずつ縮めて収める（最終手段）ことの回帰テスト。
+        let app_log = noisy_text(1024 * 1024);
+        let mut base = input("説明", true, Some("[]"));
         base.app_log = Some(&app_log);
         let small_max_body_bytes = 200 * 1024;
         let (json, used_budget) = build_payload_json_fitting(&base, small_max_body_bytes).unwrap();
@@ -746,33 +2254,522 @@ mod tests {
             json.len()
         );
         assert!(
-            used_budget < LOG_EXCERPT_MAX_BYTES,
+            used_budget < LOG_EXCERPT_UNCOMPRESSED_MAX_BYTES,
             "予算が縮小されていない: {used_budget}"
         );
     }
 
+    /// 実際の awase.log（DEBUG）に近い行を `len` バイト以上並べる。タイムスタンプ・
+    /// ハンドル・経過時間が行ごとに変わるので、「同じ行の繰り返し」ほどは縮まない
+    /// （実ログは約 10 倍に圧縮された。このデータでそれより悪い側を確認する）。
+    fn realistic_log_text(len: usize) -> String {
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut out = String::with_capacity(len + 256);
+        let mut i: u64 = 0;
+        while out.len() < len {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            i += 1;
+            out.push_str(&format!(
+                "2026-10-04T02:24:{:02}.{:06}Z DEBUG awase_windows::imm: [ime-io] cross_process cmd=0x{:04x} kind=probe ime_wnd=HWND(0x{:x}) thread=ThreadId({}) issue_us={} elapsed_us={}\n",
+                (i / 1000) % 60,
+                (x >> 8) % 1_000_000,
+                x & 0xffff,
+                (x >> 20) & 0xfffff,
+                40_000 + (x >> 40) % 9_999,
+                56_000_000_000_u64 + i * 977 + (x >> 50),
+                x % 4_000,
+            ));
+        }
+        out
+    }
+
     #[test]
-    fn full_size_journal_and_app_log_fit_within_max_body_bytes_without_shrinking() {
-        // LOG_EXCERPT_MAX_BYTES を 256KiB から 200KiB に引き下げた理由そのもの
-        // の回帰テスト。旧値では journal(256KiB) + app_log(256KiB) だけで
-        // MAX_BODY_BYTES(512KiB) に達し、他のフィールドのぶんだけ確実に
-        // 超過して「送信のたびに必ず自動切り詰めが発生する」実機報告が
-        // あった。journal/app_log を両方フルサイズで添付しても、通常サイズの
-        // 他フィールドと合わせて MAX_BODY_BYTES に収まり、追加の予算縮小が
-        // 発生しないことを確認する。
-        let journal_items: Vec<_> = (0..4_000)
-            .map(|i| serde_json::json!({"seq": i, "payload": "x".repeat(80)}))
+    fn ten_minutes_of_heavy_typing_fits_within_max_body_bytes_without_shrinking() {
+        // ADR-222 の核心の回帰テスト: 10 分ぶんの打鍵（実測の最大頻度 1 分 475 件 ×
+        // 10 = 4,750 件、1 件約 420B → 約 2MB の非圧縮 JSON）と、awase.log の
+        // 10 分ぶん（DEBUG で約 2.2MB）を両方添付しても、縮小なしで本体上限に収まる。
+        // 旧仕様（非圧縮 200KiB ずつ）では打鍵が 165 秒・73 件しか残らなかった
+        // （report 01M42BME26GDQ3CJ4F5DMGT0MP）。
+        let journal_items: Vec<_> = (0..4_750)
+            .map(|i| {
+                serde_json::json!({
+                    "seq": i,
+                    "elapsed_ms": i * 126,
+                    "entry": {"type": "KeyInput", "event": {
+                        "vk_code": 65 + (i % 26), "scan_code": 30 + (i % 17), "is_down": i % 2 == 0,
+                        "injected": false,
+                        // 実データのように、間隔・状態に揺らぎを入れる（一定だと実際より極端に圧縮される）。
+                        "timestamp_us": 56_000_000_000_u64 + i * 126_000 + (i * 7919) % 90_000,
+                        "key_class": "Char", "alt": false, "ctrl": false, "shift": false},
+                        "state_before": format!("PendingChar(vk=0x{:02X})", 65 + ((i + 3) % 26)),
+                        "state_after": format!("PendingThumb(vk=0x{:02X},left={})", 65 + (i % 26), i % 3 == 0),
+                        "decision": {"kind": "Consume", "effect_count": 0},
+                        "physical": {"kind": "Allow"}, "repeat_count": 1,
+                        "last_timestamp_us": 0, "last_elapsed_ms": 0}
+                })
+            })
             .collect();
         let journal = serde_json::to_string(&journal_items).unwrap();
-        let app_log = "a".repeat(LOG_EXCERPT_MAX_BYTES);
+        assert!(
+            journal.len() > 1_500_000,
+            "テストデータが小さすぎる: {}",
+            journal.len()
+        );
+        // awase.log の 10 分ぶん（DEBUG で約 2.2MB。実測 3.7〜6.4KB/秒 × 600 秒）。
+        let app_log = realistic_log_text(2_200_000);
         let mut base = input("説明", true, Some(&journal));
         base.app_log = Some(&app_log);
         let (json, used_budget) = build_payload_json_fitting(&base, MAX_BODY_BYTES).unwrap();
         assert_eq!(
-            used_budget, LOG_EXCERPT_MAX_BYTES,
-            "journal/app_logフル添付だけで通常ケースの縮小が発生した: {used_budget}"
+            used_budget, LOG_EXCERPT_UNCOMPRESSED_MAX_BYTES,
+            "10 分ぶんのログを添付しただけで縮小が発生した: {used_budget}"
         );
-        assert!(json.len() <= MAX_BODY_BYTES);
+        assert!(
+            json.len() <= MAX_BODY_BYTES,
+            "{} > {MAX_BODY_BYTES}",
+            json.len()
+        );
+    }
+
+    #[test]
+    fn gzip_base64_round_trips_and_has_gzip_magic() {
+        let text = "日本語のログ\n".repeat(100);
+        let encoded = gzip_base64(&text).unwrap();
+        // gzip の先頭 1f 8b 08 は base64 で "H4sI"（Worker 側の検証にも使う）。
+        assert!(encoded.starts_with("H4sI"));
+        assert_eq!(gunzip_base64(&encoded, 1 << 20).unwrap(), text);
+    }
+
+    #[test]
+    fn gunzip_base64_rejects_oversized_expansion() {
+        // 受付は誰でも送れるので、調査側の解凍には展開後サイズの上限を設ける。
+        let bomb = gzip_base64(&"a".repeat(1 << 20)).unwrap();
+        assert!(bomb.len() < 4 * 1024);
+        assert!(gunzip_base64(&bomb, 1024).is_err());
+        assert!(gunzip_base64(&bomb, 2 << 20).is_ok());
+    }
+
+    #[test]
+    fn rfc3339_utc_to_unix_seconds_matches_unix_seconds_to_rfc3339() {
+        for secs in [
+            0_u64,
+            951_782_400,
+            1_760_000_000,
+            1_790_000_000,
+            4_102_444_799,
+        ] {
+            let text = unix_seconds_to_rfc3339(secs);
+            assert_eq!(
+                rfc3339_utc_to_unix_seconds(&format!("{text}.123456Z DEBUG x")),
+                Some(i64::try_from(secs).unwrap()),
+                "{text}"
+            );
+        }
+        assert_eq!(rfc3339_utc_to_unix_seconds("not a timestamp at all"), None);
+        assert_eq!(rfc3339_utc_to_unix_seconds("2026-13-04T02:24:02Z"), None);
+        assert_eq!(rfc3339_utc_to_unix_seconds("2026-10-04T02:24"), None);
+    }
+
+    const T_0224: i64 = 1_790_000_000; // 任意の基準時刻（秒）。行の時刻は下で相対的に作る。
+
+    fn log_line(offset_secs: i64, body: &str) -> String {
+        format!(
+            "{}.000000Z {body}",
+            unix_seconds_to_rfc3339((T_0224 + offset_secs) as u64).trim_end_matches('Z')
+        )
+    }
+
+    #[test]
+    fn recent_app_log_rows_keeps_window_from_now_and_joins_continuations() {
+        let text = [
+            log_line(-1440, "INFO old"),
+            log_line(-601, "INFO just outside"),
+            log_line(-600, "WARN boundary"),
+            "  stack frame 1".to_owned(),
+            "  stack frame 2".to_owned(),
+            log_line(0, "DEBUG newest"),
+        ]
+        .join("\n");
+        let rows = recent_app_log_rows(&text, APP_LOG_WINDOW_SECS, T_0224, 0);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].ends_with("stack frame 2"));
+        assert!(rows[0].contains("WARN boundary\n  stack frame 1\n"));
+        assert!(rows[1].ends_with("newest"));
+    }
+
+    #[test]
+    fn recent_app_log_rows_uses_now_not_the_last_log_line() {
+        // info レベルでは行がまばらで、最後の行が数十分前のことがある（Opus round2 M-C1）。
+        // 基準がログ自身の最後の時刻だと、journal（ダンプ時点まで）と時間帯がずれる。
+        let text = [log_line(-3600, "INFO a"), log_line(-1800, "INFO b")].join("\n");
+        assert!(recent_app_log_rows(&text, APP_LOG_WINDOW_SECS, T_0224, 0).is_empty());
+    }
+
+    #[test]
+    fn recent_app_log_rows_keeps_the_last_min_rows_even_outside_the_window() {
+        let text = [
+            log_line(-7200, "INFO 1"),
+            log_line(-3600, "INFO 2"),
+            log_line(-1800, "WARN 3"),
+        ]
+        .join("\n");
+        let rows = recent_app_log_rows(&text, APP_LOG_WINDOW_SECS, T_0224, 2);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].ends_with("INFO 2"));
+        assert!(rows[1].ends_with("WARN 3"));
+        // 窓内の行が min_rows より多ければ窓が優先される。
+        let text = [log_line(-10, "a"), log_line(-5, "b"), log_line(0, "c")].join("\n");
+        assert_eq!(
+            recent_app_log_rows(&text, APP_LOG_WINDOW_SECS, T_0224, 1).len(),
+            3
+        );
+    }
+
+    #[test]
+    fn recent_app_log_rows_strips_trailing_blank_lines_from_a_file_boundary() {
+        // `.old` の末尾の改行 + 連結用の改行 + 現行ファイルの先頭、で空行が挟まる。
+        let old = format!("{}\n", log_line(-120, "INFO in-old"));
+        let current = format!("{}\n", log_line(-5, "WARN in-current"));
+        let rows = recent_app_log_rows(&format!("{old}\n{current}"), 600, T_0224, 0);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].ends_with("in-old"), "{:?}", rows[0]);
+        assert!(rows[1].ends_with("in-current"), "{:?}", rows[1]);
+        // CRLF のファイルでも行末が残らない。
+        let crlf = format!(
+            "{}\r\n{}\r\n",
+            log_line(-9, "INFO a"),
+            log_line(-8, "INFO b")
+        );
+        let rows = recent_app_log_rows(&crlf, 600, T_0224, 0);
+        assert!(rows
+            .iter()
+            .all(|r| !r.ends_with('\r') && !r.ends_with('\n')));
+    }
+
+    #[test]
+    fn recent_app_log_rows_ignores_leading_continuations_and_empty_input() {
+        assert!(recent_app_log_rows("", 600, T_0224, 0).is_empty());
+        assert!(recent_app_log_rows("orphan line\nanother", 600, T_0224, 0).is_empty());
+        let line = log_line(-5, "INFO a");
+        let rows = recent_app_log_rows(&format!("orphan\n{line}"), 600, T_0224, 0);
+        assert_eq!(rows, vec![line]);
+    }
+
+    #[test]
+    fn journal_rows_round_trip_and_deleting_a_row_removes_it_from_the_array() {
+        let json = r#"[{"seq":1,"entry":{"type":"A"}},{"seq":2},{"seq":3}]"#;
+        let mut rows = journal_json_to_rows(json).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows_to_journal_json(&rows), json);
+        rows.remove(1);
+        assert_eq!(
+            rows_to_journal_json(&rows),
+            r#"[{"seq":1,"entry":{"type":"A"}},{"seq":3}]"#
+        );
+        assert_eq!(rows_to_journal_json(&[]), "[]");
+        assert!(journal_json_to_rows("not json").is_err());
+    }
+
+    fn sent_journal(json: &str) -> String {
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        gunzip_base64(value["log_excerpt_gz"].as_str().unwrap(), 1 << 22).unwrap()
+    }
+
+    #[test]
+    fn attach_logs_to_preview_json_embeds_current_log_rows_only() {
+        // プレビューで消した行は、送信内容（圧縮データ）に含まれない。
+        let (preview, _) =
+            build_payload_json_fitting(&input("説明", true, None), MAX_BODY_BYTES).unwrap();
+        let journal = r#"[{"seq":1},{"seq":3}]"#;
+        let (json, shrunk) = attach_logs_to_preview_json(
+            &preview,
+            true,
+            Some(journal),
+            Some("line-a\nline-c"),
+            LogEditSummary::default(),
+            MAX_BODY_BYTES,
+        )
+        .unwrap();
+        assert!(!shrunk);
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["schema_version"], SCHEMA_VERSION);
+        assert!(value["log_excerpt"].is_null());
+        assert!(value["app_log_excerpt"].is_null());
+        let sent: Vec<serde_json::Value> = serde_json::from_str(&sent_journal(&json)).unwrap();
+        // 先頭は編集の印、続いて残っている行（seq 2 は削除済みで含まれない）。
+        assert_eq!(sent[0]["entry"]["type"], "ReportEdited");
+        assert_eq!(sent[1]["seq"], 1);
+        assert_eq!(sent[2]["seq"], 3);
+        assert_eq!(sent.len(), 3);
+        let sent_log =
+            gunzip_base64(value["app_log_excerpt_gz"].as_str().unwrap(), 1 << 20).unwrap();
+        assert_eq!(sent_log, "line-a\nline-c");
+    }
+
+    #[test]
+    fn attach_logs_to_preview_json_marks_user_deletions_and_shrinking() {
+        // ユーザーが行を消した事実を送信内容に残す（調査側が「awase がキーを落とした」と
+        // 誤読しないため。Opus round2 M-A2）。
+        let (preview, _) =
+            build_payload_json_fitting(&input("説明", true, None), MAX_BODY_BYTES).unwrap();
+        let (json, _) = attach_logs_to_preview_json(
+            &preview,
+            true,
+            Some("[]"),
+            None,
+            LogEditSummary {
+                journal_rows_deleted: 7,
+                app_log_rows_deleted: 2,
+                send_attempt: 0,
+            },
+            MAX_BODY_BYTES,
+        )
+        .unwrap();
+        let sent: Vec<serde_json::Value> = serde_json::from_str(&sent_journal(&json)).unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["entry"]["journal_rows_deleted"], 7);
+        assert_eq!(sent[0]["entry"]["app_log_rows_deleted"], 2);
+        assert_eq!(sent[0]["entry"]["shrunk"], false);
+    }
+
+    #[test]
+    fn attach_logs_to_preview_json_omits_logs_when_attach_log_is_false_in_preview() {
+        let (preview, _) =
+            build_payload_json_fitting(&input("説明", false, None), MAX_BODY_BYTES).unwrap();
+        let (json, _) = attach_logs_to_preview_json(
+            &preview,
+            true,
+            Some("[]"),
+            Some("x"),
+            LogEditSummary::default(),
+            MAX_BODY_BYTES,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value["log_excerpt_gz"].is_null());
+        assert!(value["app_log_excerpt_gz"].is_null());
+    }
+
+    #[test]
+    fn attach_logs_to_preview_json_obeys_the_checkbox_even_when_the_preview_is_stale() {
+        // Opus round2 B-A1: プレビューを一度でも編集すると作り直されず、`attach_log: true` が
+        // 古いまま残る。そのとき「ログを添付する」を外しても、ログが送られてはならない。
+        let (stale_preview, _) =
+            build_payload_json_fitting(&input("説明", true, None), MAX_BODY_BYTES).unwrap();
+        assert!(stale_preview.contains("\"attach_log\": true"));
+        let (json, _) = attach_logs_to_preview_json(
+            &stale_preview,
+            false, // チェックボックスは外れている
+            Some(r#"[{"seq":1}]"#),
+            Some("secret keystrokes"),
+            LogEditSummary::default(),
+            MAX_BODY_BYTES,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["attach_log"], false);
+        assert!(value["log_excerpt_gz"].is_null());
+        assert!(value["app_log_excerpt_gz"].is_null());
+    }
+
+    #[test]
+    fn attach_logs_to_preview_json_shrinks_when_one_field_exceeds_the_per_field_limit() {
+        // 本体は収まっても、1 本が Worker の上限 `MAX_LOG_GZ_BASE64_CHARS` を超えると 400 に
+        // なる。クライアントも同じ上限を見て縮める。
+        let (preview, _) =
+            build_payload_json_fitting(&input("説明", true, None), MAX_BODY_BYTES).unwrap();
+        // ランダムな英数字は gzip + base64 後もほぼ元と同じ長さ（実測で約 0.99 倍）なので、
+        // 1 本の上限を確実に超えるよう、上限より大きく作る。
+        let big = noisy_text(MAX_LOG_GZ_BASE64_CHARS + 100_000);
+        let (json, shrunk) = attach_logs_to_preview_json(
+            &preview,
+            true,
+            None,
+            Some(&big),
+            LogEditSummary::default(),
+            // 本体の上限には余裕があるが、1 本の上限を超える。
+            MAX_BODY_BYTES * 4,
+        )
+        .unwrap();
+        assert!(shrunk);
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value["app_log_excerpt_gz"].as_str().unwrap().len() <= MAX_LOG_GZ_BASE64_CHARS);
+    }
+
+    fn http(status: u16, body: &str) -> SendFailure {
+        SendFailure::Http {
+            status,
+            body: body.to_owned(),
+        }
+    }
+
+    #[test]
+    fn plan_retry_shrinks_only_for_size_related_failures() {
+        // 本体が大きいことが原因の失敗は縮めて再送する。Workers Free の CPU 超過
+        // （Error 1102）は 5xx で、本文に 1102 が入る。
+        for f in [
+            http(503, "error code: 1102"),
+            http(
+                500,
+                "<title>Worker exceeded resource limits | Error 1102</title>",
+            ),
+            http(413, r#"{"error":"request_body_too_large"}"#),
+            http(400, r#"{"error":"log_excerpt_gz_too_large"}"#),
+        ] {
+            assert_eq!(plan_retry(&f, 1), RetryPlan::Shrink, "{f}");
+            assert_eq!(
+                plan_retry(&f, MAX_SEND_ATTEMPTS - 1),
+                RetryPlan::Shrink,
+                "{f}"
+            );
+            assert_eq!(plan_retry(&f, MAX_SEND_ATTEMPTS), RetryPlan::GiveUp, "{f}");
+        }
+    }
+
+    #[test]
+    fn plan_retry_waits_and_resends_the_same_size_for_transient_5xx() {
+        // R2 の一時障害・502/504 は、同じ大きさで通ったはずのログを捨てずに、待ってから再送する。
+        for f in [
+            http(500, r#"{"error":"internal_server_error"}"#),
+            http(502, "bad gateway"),
+            http(504, "gateway timeout"),
+        ] {
+            assert_eq!(
+                plan_retry(&f, 1),
+                RetryPlan::SameSize { delay_secs: 3 },
+                "{f}"
+            );
+            assert_eq!(
+                plan_retry(&f, 2),
+                RetryPlan::SameSize { delay_secs: 6 },
+                "{f}"
+            );
+            assert_eq!(
+                plan_retry(&f, MAX_SAME_SIZE_SEND_ATTEMPTS),
+                RetryPlan::GiveUp,
+                "{f}"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_retry_gives_up_when_shrinking_cannot_help() {
+        for f in [
+            http(429, r#"{"error":"rate_limit_exceeded"}"#),
+            http(400, r#"{"error":"unsupported_schema_version"}"#),
+            http(400, r#"{"error":"log_excerpt_gz_invalid"}"#),
+            http(404, "not found"),
+            http(418, "teapot"),
+        ] {
+            assert_eq!(plan_retry(&f, 1), RetryPlan::GiveUp, "{f}");
+        }
+    }
+
+    #[test]
+    fn plan_retry_resends_once_smaller_when_there_is_no_response() {
+        for f in [
+            SendFailure::Transport("WinHttpSendRequest: タイムアウト".to_owned()),
+            SendFailure::from("WinHttpConnect に失敗しました".to_owned()),
+        ] {
+            assert_eq!(plan_retry(&f, 1), RetryPlan::Shrink, "{f}");
+            assert_eq!(
+                plan_retry(&f, MAX_NETWORK_SEND_ATTEMPTS),
+                RetryPlan::GiveUp,
+                "{f}"
+            );
+        }
+    }
+
+    #[test]
+    fn send_failure_display_keeps_the_http_status_and_body() {
+        assert_eq!(http(503, "x").to_string(), "HTTP 503: x");
+        assert_eq!(
+            SendFailure::Transport("接続できません".to_owned()).to_string(),
+            "接続できません"
+        );
+    }
+
+    #[test]
+    fn retry_budget_bytes_halves_the_largest_log_each_time_with_a_floor() {
+        assert_eq!(retry_budget_bytes(2_000_000, 1), 1_000_000);
+        assert_eq!(retry_budget_bytes(2_000_000, 2), 500_000);
+        assert_eq!(retry_budget_bytes(2_000_000, 3), 250_000);
+        assert_eq!(retry_budget_bytes(100, 1), 1024);
+        assert_eq!(retry_budget_bytes(0, 3), 1024);
+    }
+
+    #[test]
+    fn attach_logs_with_budget_shrinks_the_largest_log_and_marks_the_attempt() {
+        let (preview, _) =
+            build_payload_json_fitting(&input("説明", true, None), MAX_BODY_BYTES).unwrap();
+        let app_log = realistic_log_text(400_000);
+        let journal = format!("[{}]", vec![r#"{"seq":1}"#; 5000].join(","));
+        let attach = |attempt: u32, budget: usize| {
+            attach_logs_with_budget(
+                &preview,
+                true,
+                Some(&journal),
+                Some(&app_log),
+                LogEditSummary {
+                    send_attempt: attempt,
+                    ..LogEditSummary::default()
+                },
+                MAX_BODY_BYTES,
+                budget,
+            )
+            .unwrap()
+        };
+        let largest = journal.len().max(app_log.len());
+        let (full, full_shrunk) = attach(0, LOG_EXCERPT_UNCOMPRESSED_MAX_BYTES);
+        assert!(!full_shrunk);
+        let mut previous = full.len();
+        for attempt in 1..=3_u32 {
+            let (json, shrunk) = attach(attempt, retry_budget_bytes(largest, attempt));
+            assert!(shrunk, "attempt {attempt}");
+            // 再送のたびに、送る本体が小さくなる。
+            assert!(
+                json.len() < previous,
+                "attempt {attempt}: {} !< {previous}",
+                json.len()
+            );
+            previous = json.len();
+            // 印に、再送で縮めたことが残る。
+            let sent: Vec<serde_json::Value> = serde_json::from_str(&sent_journal(&json)).unwrap();
+            assert_eq!(sent[0]["entry"]["send_attempt"], attempt);
+            assert_eq!(sent[0]["entry"]["shrunk"], true);
+        }
+        // 縮めても、残るのは新しい側（末尾）。
+        let (json, _) = attach(3, retry_budget_bytes(largest, 3));
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let sent_log =
+            gunzip_base64(value["app_log_excerpt_gz"].as_str().unwrap(), 1 << 22).unwrap();
+        assert!(app_log.ends_with(&sent_log));
+    }
+
+    #[test]
+    fn attach_logs_to_preview_json_rejects_broken_preview() {
+        let err = attach_logs_to_preview_json(
+            "{ not json",
+            true,
+            None,
+            None,
+            LogEditSummary::default(),
+            MAX_BODY_BYTES,
+        )
+        .unwrap_err();
+        assert!(matches!(err, BugReportPayloadError::InvalidPreview(_)));
+        let err = attach_logs_to_preview_json(
+            "[1,2]",
+            true,
+            None,
+            None,
+            LogEditSummary::default(),
+            MAX_BODY_BYTES,
+        )
+        .unwrap_err();
+        assert!(matches!(err, BugReportPayloadError::InvalidPreview(_)));
     }
 
     #[test]

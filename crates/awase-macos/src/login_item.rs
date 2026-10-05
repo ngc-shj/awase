@@ -53,7 +53,7 @@ mod imp {
         match result {
             Ok(()) => {
                 let new_state = state();
-                log::info!(
+                tracing::info!(
                     "Login item {}: {new_state:?}",
                     if enabled {
                         "unregistered"
@@ -65,7 +65,7 @@ mod imp {
             }
             Err(err) => {
                 // 裸バイナリ実行や署名不備では登録できない（.app が必要）
-                log::warn!("Login item toggle failed: {err}");
+                tracing::warn!("Login item toggle failed: {err}");
                 state()
             }
         }

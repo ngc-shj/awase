@@ -1,0 +1,1186 @@
+#![allow(unsafe_code)]
+
+use std::cell::Cell;
+use std::mem::size_of;
+use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use crate::phase_timing::{Phase, PhaseTimers};
+use crate::settle_tuning::SettleTuning;
+use awase::config::AppConfig;
+use awase::paths::resolve_relative_to_exe;
+use awase_keymap_learn::anomaly::ResetLevel;
+use awase_keymap_learn::exec::ImeDriver;
+use awase_keymap_learn::external_write::{
+    is_measurement_suspicious, InterferenceTracker, SessionMonitor,
+};
+use awase_keymap_learn::model::{Disposition, Outcome, Status};
+use awase_keymap_learn::sim::PressReport;
+use awase_windows::state::ime_kind::TipIdentity;
+use awase_windows::tsf::query_tip_identity_on_current_sta;
+
+use crate::hook_monitor::{HookMonitor, SELF_MARKER};
+use crate::ime_notify::{drain_queued_into, queue_notify, ImeNotifyMonitor, WM_IME_NOTIFY};
+use windows::core::{w, Interface, Result as WinResult};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+    COINIT_APARTMENTTHREADED,
+};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+use windows::Win32::UI::Input::Ime::{
+    ImmGetCandidateListCountW, ImmGetCompositionStringW, ImmGetContext, ImmGetConversionStatus,
+    ImmGetOpenStatus, ImmReleaseContext, IME_COMPOSITION_STRING, IME_CONVERSION_MODE,
+    IME_SENTENCE_MODE,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetFocus, SendInput, SetFocus, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+    KEYEVENTF_KEYUP, VIRTUAL_KEY,
+};
+use windows::Win32::UI::TextServices::{
+    CLSID_TF_ThreadMgr, ITfCompartmentMgr, ITfThreadMgr,
+    GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION, GUID_COMPARTMENT_KEYBOARD_OPENCLOSE,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    BringWindowToTop, CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyWindow,
+    DispatchMessageW, GetForegroundWindow, GetWindowThreadProcessId, PeekMessageW, RegisterClassW,
+    SetForegroundWindow, SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage,
+    GWLP_WNDPROC, MSG, PM_REMOVE, SW_SHOW, WINDOW_STYLE, WNDCLASSW, WNDPROC, WS_BORDER, WS_CHILD,
+    WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+};
+
+const GCS_COMPSTR: u32 = 0x0008;
+const SETUP_GAP_MS: u64 = 20;
+const QUIET_MS: u64 = 40;
+const SETTLE_TIMEOUT_MS: u64 = 150;
+const FOCUS_DEBOUNCE_FALLBACK_MS: u64 = 100;
+const FOCUS_MARGIN_MS: u64 = 25;
+/// フォーカス確保の再試行間隔・最大試行回数(ADR195-T10究明で判明: 素の`SetForegroundWindow`
+/// 単発呼び出しはCI(GitHub-hosted windows-latest)のフォアグラウンドロック環境下では
+/// 無言で失敗しうる。`tools/e2e/ime_key_matrix`の`compartment_notify_probe.rs::bring_to_front`
+/// が同じ環境で実績のある`AttachThreadInput`併用パターンを使っており、`RealImeDriver::new`の
+/// 起動時フォーカス確保にのみ移植する——`reset(Hard)`はround3 R1対応により意図的に
+/// このような強制前面化を行わない設計になっているため対象外)。
+const FOCUS_RETRY_ATTEMPTS: u32 = 5;
+const FOCUS_RETRY_GAP_MS: u64 = 200;
+/// ADR-196決定1b項目3: フォーカス移行・デバウンス待ち直後に、注入を一切しない
+/// 期間を置き、その間に外部からの書き込みが観測されないことをセッション開始
+/// 条件にする（quiet window）。暫定値——`.claude/rules/tuning-constants.md`の
+/// 実測義務に従い、実機プロトタイプでの計測後に更新すること。
+const QUIET_WINDOW_MS: u64 = 200;
+/// ADR-196決定1b項目5: セッション中に外部からの書き込みで試行が無効化された
+/// 回数の上限。超えたらセッション全体を失敗として終了する。暫定値、実測で
+/// 更新する。
+const SESSION_INVALIDATION_LIMIT: u32 = 3;
+/// 自分の注入によって`WM_IME_NOTIFY`が届くと期待してよい猶予（`settle()`の
+/// `SETTLE_TIMEOUT_MS`と揃える）。
+const NOTIFY_EXPECT_WINDOW_MS: u64 = SETTLE_TIMEOUT_MS;
+
+const WM_ACTIVATE: u32 = 0x0006;
+const WA_INACTIVE: u16 = 0;
+
+/// [ADR195-T7](../../../../docs/tasks/adr195-t7-safety-measures.md)項目2
+/// （opus-adversarial-consult round3 R2対応）: quiet window判定（外部からの
+/// 書き込み・物理入力・フォーカス喪失の検出）で失敗したときだけに使う専用
+/// HRESULT。`RealImeDriver::new()`の他の失敗（COM初期化・TSF起動・窓作成・
+/// フック登録等）と区別できるよう、[`is_quiet_window_error`]で判定に使う。
+const QUIET_WINDOW_HRESULT: windows::core::HRESULT =
+    windows::core::HRESULT(0x8000_4004u32.cast_signed());
+
+/// [ADR195-T7](../../../../docs/tasks/adr195-t7-safety-measures.md)項目2
+/// （opus-adversarial-consult round1 M3対応）: 学習窓（`self.window`）が
+/// 非アクティブ化された累計回数。`focus_intact()`の1点サンプリングでは
+/// 測定区間の途中でフォーカスが外れて戻ったケース（通知トーストの一瞬の
+/// 前面化等）を見逃すため、`WM_ACTIVATE(WA_INACTIVE)`を区間内で1回でも
+/// 受け取ったかを別途カウントする。`window_proc`は状態を持たない生の
+/// `extern "system" fn`なので、`hook_monitor.rs`の各staticと同じ
+/// 「プロセス内で`RealImeDriver`を複数作らない」前提のstaticに置く。
+static FOCUS_LOST_EVENTS: AtomicU32 = AtomicU32::new(0);
+
+extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if msg == WM_ACTIVATE && (wparam.0 & 0xFFFF) as u16 == WA_INACTIVE {
+        FOCUS_LOST_EVENTS.fetch_add(1, Ordering::SeqCst);
+    }
+    if msg == WM_IME_NOTIFY {
+        queue_notify(wparam.0);
+    }
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+/// EDITコントロールの元のウィンドウプロシージャ（サブクラス化前）。
+static ORIG_EDIT_PROC: AtomicIsize = AtomicIsize::new(0);
+
+/// B-1: IMEが`WM_IME_NOTIFY`を送る先はフォーカスを持つEDIT子窓で、親窓の
+/// `window_proc`にもメッセージポンプ(`PeekMessageW`)にも現れない。EDITを
+/// サブクラス化して通知をキューへ積み、元のプロシージャへ素通しする。
+extern "system" fn edit_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if msg == WM_IME_NOTIFY {
+        queue_notify(wparam.0);
+    }
+    let orig = ORIG_EDIT_PROC.load(Ordering::SeqCst);
+    // SAFETY: `orig`は`SetWindowLongPtrW(GWLP_WNDPROC)`が返した元のプロシージャ
+    // アドレス（0ならフォールバックのDefWindowProcW）。
+    unsafe {
+        if orig == 0 {
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        } else {
+            CallWindowProcW(
+                std::mem::transmute::<isize, WNDPROC>(orig),
+                hwnd,
+                msg,
+                wparam,
+                lparam,
+            )
+        }
+    }
+}
+
+/// [ADR195-T7](../../../../docs/tasks/adr195-t7-safety-measures.md)項目2
+/// （round1 M3対応）: 現在の`FOCUS_LOST_EVENTS`（学習窓が非アクティブ化された
+/// 累計回数）。`RealImeDriver`のインスタンスに依存しない値なのでフリー関数。
+fn focus_lost_events_total() -> u32 {
+    FOCUS_LOST_EVENTS.load(Ordering::SeqCst)
+}
+
+/// [ADR195-T7](../../../../docs/tasks/adr195-t7-safety-measures.md)項目2
+/// （round1 m3対応）: 汚染の原因（複数可）を診断ログへ出す。実機・CI調査
+/// （[ADR195-T10](../../../../docs/tasks/adr195-t10-realimedriver-ci-observation-failure.md)
+/// のような）では、3原因のどれが起きたかが分からないと原因を切り分けられない。
+fn log_contamination_cause(context: &str, external: bool, physical: bool, focus_lost: bool) {
+    let mut causes = Vec::new();
+    if external {
+        causes.push("外部からの書き込み");
+    }
+    if physical {
+        causes.push("物理入力");
+    }
+    if focus_lost {
+        causes.push("フォーカス喪失");
+    }
+    eprintln!(
+        "[awase-keymap-learn-win] {context}: 汚染を検出({})",
+        causes.join("・")
+    );
+}
+
+#[derive(Debug)]
+struct Observation {
+    status: Status,
+    text: String,
+}
+
+/// `CoInitializeEx`成功の対価としての`CoUninitialize`を担うガード。
+///
+/// `RealImeDriver::drop`本体で`CoUninitialize`を呼ぶと、その後に解放されるフィールド
+/// (`thread_mgr`/`thread_compartments`のCOMインターフェース)のReleaseがCOM終了後になり、
+/// アンロード済みCOMへのアクセス違反になりうる(コードレビューB-6)。Rustはフィールドを
+/// 宣言順に解放するので、このガードを**最後のフィールド**に置き、COMインターフェースが
+/// すべて解放された後に`CoUninitialize`が走るようにする。
+#[derive(Debug)]
+struct ComApartment;
+
+impl ComApartment {
+    /// STAで初期化する。成功時のみガードを返す(失敗時は`CoUninitialize`を呼んではならない)。
+    fn initialize_sta() -> WinResult<Self> {
+        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()? };
+        Ok(Self)
+    }
+}
+
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        unsafe { CoUninitialize() };
+    }
+}
+
+/// 専用EDIT窓、TSF thread manager、IMM観測と生SendInputを同一スレッドに保持する。
+#[derive(Debug)]
+pub struct RealImeDriver {
+    started: Instant,
+    window: HWND,
+    edit: HWND,
+    thread_mgr: ITfThreadMgr,
+    thread_compartments: ITfCompartmentMgr,
+    keys: Vec<u32>,
+    initial: Status,
+    /// 入力中でない押下の前に、EDITに残った確定文字を消す(既定で有効、`--no-clear-idle-edit`で無効)。
+    /// MS-IME本体は、EDITに文字があるとアイドル状態の変換キーが再変換に入る(隠れ変数、
+    /// windows-latest実測: 結果が割れるセル20→11、検証精度0.990/0.970→1.000/1.000)。
+    /// 学習中の文書を常に空にして、この分岐を測定から除く(ADR-210)。
+    clear_idle_edit: bool,
+    /// 直前の`reset`が最後に送ったキーの添字(リセット直後の観測の文脈として使う)。
+    last_reset_key: Cell<Option<usize>>,
+    /// 診断: 押下ごとに観測できる限りの特徴量を`[feat]`行で出す(`--trace-features`)。
+    /// 隠れ状態の候補を、学習の状態に加える前に実データで選ぶための観測(ADR-210)。挙動は変えない。
+    trace_features: bool,
+    feat_seq: Cell<u32>,
+    /// `observe_imm()`がIME観測を復号できず`self.initial`へフォールバックした回数
+    /// (ADR-195が前提とする「誤りに強い分類」が`awase-keymap-learn`に未実装のため、
+    /// この駆動部だけでは異常として`Executor`に伝える経路が無い。せめて可視化する
+    /// ——レビュー指摘対応)。`&self`のメソッドから増分するため`Cell`。
+    decode_errors: Cell<u32>,
+    /// ADR-196決定1b: 学習窓への「自分以外からの書き込み」を直接観測する基盤。
+    hook_monitor: HookMonitor,
+    notify_monitor: ImeNotifyMonitor,
+    /// 決定1b項目5（セッション中の監視）: 外部からの書き込みで試行が無効化
+    /// された回数を数え、上限超過でセッション全体を失敗にする。`&self`の
+    /// メソッドから更新するため`Cell`。
+    session_monitor: Cell<SessionMonitor>,
+    /// [ADR195-T7](../../../../docs/tasks/adr195-t7-safety-measures.md)項目2
+    /// （round1 m2対応）: 外部からの書き込み・物理入力・フォーカス喪失の
+    /// baseline管理を1箇所に集約したもの（`awase-keymap-learn::external_write`、
+    /// Linux上でユニットテスト済み）。quiet window判定と
+    /// `check_session_interference`が同じインスタンスを共有するため、両者の
+    /// baselineが食い違う（round1 m2の懸念）ことが構造的に起きない。`&self`の
+    /// メソッドから更新するため`Cell`。
+    interference: Cell<InterferenceTracker>,
+    /// [ADR195-T7](../../../../docs/tasks/adr195-t7-safety-measures.md)項目2
+    /// （round1 M1対応）: セッション監視の無効化上限を超えたら`true`に固定する。
+    /// `&self`のメソッドから更新するため`Cell`。
+    session_failed: Cell<bool>,
+    /// ADR196-T2「1e前半」(A-6): `new()`終了時点で同定した学習対象のTIP。
+    /// `judge_self_verification`の`is_ms_ime_native`引数と、決定1c(既知構成判定)の
+    /// 入力になる。TSFのアクティブプロファイルはスレッド単位で持つため、
+    /// awase-settings等の別スレッド/別プロセスでは同定できない(学習窓を持つこの
+    /// スレッドで同定するのが唯一正しい、opus-adversarial-consult 2026-09-23
+    /// A-1/A-2)。学習中にユーザーがIMEを切り替える可能性への対処として、呼び出し側は
+    /// 終了時に[`Self::query_tip_identity`]で再同定し、この値と比較すること。
+    tip_identity: TipIdentity,
+    /// 段階別の所要時間の内訳(観測専用、挙動は変えない)。
+    timers: PhaseTimers,
+    /// `settle()`/`clear_edit()`の待ち時間(既定は従来の固定40ms、診断フラグで上書き)。
+    tuning: SettleTuning,
+    /// **最後のフィールドでなければならない**(上記`ComApartment`の解放順の説明を参照)。
+    _com: ComApartment,
+}
+
+impl RealImeDriver {
+    pub fn new(keys: Vec<u32>) -> WinResult<Self> {
+        // round1 M3対応: 前回の(あれば)インスタンスが残したカウントを引き継がない。
+        FOCUS_LOST_EVENTS.store(0, Ordering::SeqCst);
+        // 以降の`?`による早期returnでも、`com`がローカル変数の解放順(宣言の逆順)で最後に
+        // 落ちるので、COMインターフェースの解放後に`CoUninitialize`される。
+        let com = ComApartment::initialize_sta()?;
+        let thread_mgr: ITfThreadMgr =
+            unsafe { CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER)? };
+        unsafe { thread_mgr.Activate()? };
+        let thread_compartments = thread_mgr.cast::<ITfCompartmentMgr>()?;
+        let (window, edit) = create_window()?;
+        unsafe {
+            let _ = ShowWindow(window, SW_SHOW);
+        }
+
+        // ADR-196決定1b: 学習窓への外部からの書き込みを直接観測する基盤を、
+        // フォーカス移行より前に立ち上げる（以降の待ちすべてを観測できるように、
+        // ADR195-T10のフォーカス確保リトライ待ちも含む）。
+        let hook_monitor = HookMonitor::install()?;
+        let notify_monitor = ImeNotifyMonitor::new();
+
+        // ADR195-T10: 起動直後の1回きりのSetForegroundWindow/SetFocusはCIの
+        // フォアグラウンドロックで無言失敗しうるため、AttachThreadInput併用で
+        // 確認しながら再試行する。
+        if !secure_focus_with_retries(window, edit, &notify_monitor) {
+            eprintln!(
+                "[awase-keymap-learn-win] 起動時のフォーカス確保に失敗した \
+                 (observe_imm()の結果が学習窓ではなく他の窓を指しうる)"
+            );
+        }
+
+        pump_for(
+            Duration::from_millis(focus_debounce_wait_ms()),
+            &notify_monitor,
+        );
+        unsafe { SetWindowTextW(edit, w!(""))? };
+        pump_for(Duration::from_millis(QUIET_MS), &notify_monitor);
+
+        let mut driver = Self {
+            started: Instant::now(),
+            window,
+            edit,
+            thread_mgr,
+            thread_compartments,
+            keys,
+            initial: Status {
+                open: false,
+                mode: 0x09,
+                composing: false,
+            },
+            decode_errors: Cell::new(0),
+            clear_idle_edit: true,
+            last_reset_key: Cell::new(None),
+            trace_features: false,
+            feat_seq: Cell::new(0),
+            hook_monitor,
+            notify_monitor,
+            session_monitor: Cell::new(SessionMonitor::new(SESSION_INVALIDATION_LIMIT)),
+            interference: Cell::new(InterferenceTracker::new()),
+            session_failed: Cell::new(false),
+            // 後段で`query_tip_identity_on_current_sta()`の結果に上書きする
+            // プレースホルダ(この値のまま使われることはない)。
+            tip_identity: TipIdentity::Other,
+            timers: PhaseTimers::default(),
+            tuning: SettleTuning::default(),
+            _com: com,
+        };
+
+        // 決定1b項目3・ADR195-T7項目2: 静かな観測窓（quiet window）——ここまでの
+        // 待ちの後、注入を一切しない期間T msを置き、その間に外部からの書き込み・
+        // ユーザーの物理入力・学習窓からのフォーカス喪失のいずれも観測されない
+        // ことをセッション開始条件にする。ここで失敗すれば`driver`はこのまま
+        // スコープを抜けてDropされ、窓・TSF・フックが片付く。
+        //
+        // ここまでの待ち（フォーカスデバウンス・入力欄クリア）で既に起きていた
+        // 分は対象外にするため、まず`tracker`のbaselineをその時点の値へ進めて
+        // おく（1回目の`observe`は戻り値を意図的に捨てる）。その後`pump`した
+        // 区間だけを2回目の`observe`で判定する——`InterferenceTracker::observe`は
+        // 判定に使った値でbaselineも同時に前進させるため（round1 m1対応）、
+        // ここで得た`tracker`は以降`check_session_interference`がそのまま
+        // 引き継げる（round1 m2対応、baselineの取り違えが構造的に起きない）。
+        let mut tracker = InterferenceTracker::new();
+        let _ = tracker.observe(
+            driver.external_total(),
+            driver.physical_total(),
+            focus_lost_events_total(),
+            driver.focus_intact(),
+        );
+        driver.pump(Duration::from_millis(QUIET_WINDOW_MS));
+        let verdict = tracker.observe(
+            driver.external_total(),
+            driver.physical_total(),
+            focus_lost_events_total(),
+            driver.focus_intact(),
+        );
+        driver.interference.set(tracker);
+        if verdict.contaminated() {
+            log_contamination_cause(
+                "quiet window",
+                verdict.external,
+                verdict.physical,
+                verdict.focus_lost,
+            );
+            return Err(windows::core::Error::new(
+                QUIET_WINDOW_HRESULT,
+                "quiet window中に外部からの書き込み・物理入力・フォーカス喪失のいずれかを検出した(A'が崩れている疑い)",
+            ));
+        }
+
+        driver.initial = driver.observe_imm()?.status;
+
+        // A-6: 学習対象のTIPを開始時点で同定する。取得できなければ、20分学習した後で
+        // 「何を測ったか分からない」と判明するより、開始直後に失敗させる方が安い
+        // (opus-adversarial-consult 2026-09-23 C-5)。
+        driver.tip_identity = query_tip_identity_on_current_sta().ok_or_else(|| {
+            windows::core::Error::new(
+                windows::core::HRESULT(0x8000_4006u32.cast_signed()),
+                "学習対象のIME(TIP)を同定できなかった",
+            )
+        })?;
+
+        Ok(driver)
+    }
+
+    /// 開始時点(`new()`)で同定した学習対象のTIP。
+    #[must_use]
+    pub const fn tip_identity(&self) -> TipIdentity {
+        self.tip_identity
+    }
+
+    /// A-6: 現在の学習対象TIPを再同定する。開始時の[`Self::tip_identity`]との比較は
+    /// 呼び出し側(`run_main`)が行う(セッション中のIME切り替え検出)。
+    #[must_use]
+    pub fn query_tip_identity(&self) -> Option<TipIdentity> {
+        query_tip_identity_on_current_sta()
+    }
+
+    /// ADR196-T2「1e前半」(C-1): フック経路の生存確認(決定1b項目4)。学習プロセス
+    /// 自身が送った自己注入の総数だけ、セッション開始からの累計でフックが観測できて
+    /// いれば`true`。`observation_alive`と違い直近1件ではなく累計を見るため、
+    /// いつ呼んでも意味のある粗粒度の健全性チェックになる。
+    #[must_use]
+    pub fn hook_alive(&self) -> bool {
+        self.hook_monitor.liveness().is_alive()
+    }
+
+    /// [ADR195-T7](../../../../docs/tasks/adr195-t7-safety-measures.md)項目2
+    /// （round3 R2対応）: `RealImeDriver::new()`が返す`Err`が、quiet window
+    /// 判定によるものかを判定する。それ以外（COM初期化・TSF起動・窓作成・
+    /// フック登録失敗等）の初期化失敗と区別するため、呼び出し側
+    /// （`awase-keymap-learn-win::main`）が result行の`reason`を出し分けるのに
+    /// 使う。
+    #[must_use]
+    pub fn is_quiet_window_error(err: &windows::core::Error) -> bool {
+        err.code() == QUIET_WINDOW_HRESULT
+    }
+
+    /// メッセージを回しながら待つ（`self.notify_monitor`に観測させる）。
+    fn pump(&self, duration: Duration) {
+        pump_for(duration, &self.notify_monitor);
+    }
+
+    /// 現在の「外部からの書き込み」累計件数（フック経由＋IME通知経由）。
+    fn external_total(&self) -> u32 {
+        self.hook_monitor.external_event_count() + self.notify_monitor.external_count()
+    }
+
+    /// [ADR195-T7](../../../../docs/tasks/adr195-t7-safety-measures.md)項目2:
+    /// 現在のユーザー物理入力（`LLKHF_INJECTED`無し）の累計件数。
+    fn physical_total(&self) -> u32 {
+        self.hook_monitor.physical_event_count()
+    }
+
+    /// [ADR195-T7](../../../../docs/tasks/adr195-t7-safety-measures.md)項目2
+    /// （round1 M3対応）: フォーカスが学習窓の専用EDITコントロールに留まって
+    /// いるか。`GetFocus()`だけでは「アクティブだがフォーカスキューが空」を
+    /// 前面窓と誤認しうるため、`GetForegroundWindow()`が学習窓自身であることも
+    /// 併せて確認する（`SendInput`の宛先を決めるのはフォアグラウンド）。学習
+    /// プロセスの窓を作成したのと同じスレッドから呼ぶ前提（`AttachThreadInput`
+    /// 無しで両APIが有効）。
+    fn focus_intact(&self) -> bool {
+        focus_on_edit(self.window, self.edit)
+    }
+
+    /// 決定1b項目5（セッション中の監視）・ADR195-T7項目2: 前回チェック以降に
+    /// 外部からの書き込み・ユーザーの物理入力が観測されたか、区間内で一度でも
+    /// フォーカスが学習窓から外れていたら（`FOCUS_LOST_EVENTS`の差分、round1
+    /// M3対応）、この試行を汚染とみなしセッション監視へ記録する。戻り値は
+    /// 「この試行が汚染されたか」（`PressReport::contaminated`用）。
+    /// セッション全体を失敗にすべきかは別途`session_failed()`で問い合わせる
+    /// （round1 M1対応——以前はここで判定した「上限超過」を誰も消費していな
+    /// かった）。
+    fn check_session_interference(&self) -> bool {
+        let mut tracker = self.interference.get();
+        let verdict = tracker.observe(
+            self.external_total(),
+            self.physical_total(),
+            focus_lost_events_total(),
+            self.focus_intact(),
+        );
+        self.interference.set(tracker);
+        if !verdict.contaminated() {
+            return false;
+        }
+        log_contamination_cause(
+            "press",
+            verdict.external,
+            verdict.physical,
+            verdict.focus_lost,
+        );
+        let mut monitor = self.session_monitor.get();
+        if monitor.record_invalidated_trial() {
+            self.session_failed.set(true);
+        }
+        self.session_monitor.set(monitor);
+        true
+    }
+
+    /// [ADR195-T7](../../../../docs/tasks/adr195-t7-safety-measures.md)項目2
+    /// （round1 M1対応）: セッション監視の無効化上限を超えたか。`true`なら
+    /// 呼び出し側（`main.rs`）は学習表を書き出さず失敗として終了すること。
+    #[must_use]
+    pub fn session_failed(&self) -> bool {
+        self.session_failed.get()
+    }
+
+    /// 決定1b項目4・項目2（生存確認）: フックとIME通知経路の両方が生きているか。
+    /// `status_changed`は直近の自己注入で実際に開閉・変換モードが変わったかを
+    /// 渡す（変わっていなければ通知が無くても判定できない）。
+    #[must_use]
+    pub fn observation_alive(&self, status_changed: bool) -> bool {
+        self.hook_monitor.liveness().is_alive()
+            && self
+                .notify_monitor
+                .is_alive_given_status_changed(status_changed)
+    }
+
+    /// 決定1b項目6（残余リスクの緩和）: 直近の自己注入1件に対して、
+    /// 開閉・変換モードの通知が2回以上届いていたら、その試行を無効とみなす
+    /// べきかを返す（向きの逆転の判定は未実装——`WM_IME_NOTIFY`はメッセージの
+    /// 種別しか運ばないため、件数のみで判定する）。
+    #[must_use]
+    pub fn measurement_suspicious(&self) -> bool {
+        is_measurement_suspicious(self.notify_monitor.notify_count_since_mark(), false)
+    }
+
+    /// これまでにセッション監視が記録した無効化件数。呼び出し側が上限超過を
+    /// 検知したらセッションを失敗として終了し、表を書き出さない。
+    #[must_use]
+    pub fn session_invalidated_trials(&self) -> u32 {
+        self.session_monitor.get().invalidated_trials()
+    }
+
+    /// フック・IME通知の生存確認用に、この後の自己注入で状態が変わったら
+    /// 通知が届くはずだと申告する。
+    fn mark_self_injection(&mut self, count: u32) {
+        for _ in 0..count {
+            self.hook_monitor.mark_self_injection_sent();
+        }
+        // 直前までに届いた通知を旧い猶予窓のうちに判定してから窓を付け替える。
+        drain_queued_into(&self.notify_monitor);
+        self.notify_monitor
+            .mark_expected_notify(Duration::from_millis(NOTIFY_EXPECT_WINDOW_MS));
+    }
+
+    pub const fn initial_status(&self) -> Status {
+        self.initial
+    }
+
+    /// `observe_imm()`が復号に失敗し`self.initial`へフォールバックした回数。
+    /// 0でなければ学習表に信頼できない観測が混じっている可能性がある
+    /// (呼び出し元は最終サマリで表示することを推奨)。
+    /// 測定前のEDIT消去を切り替える(`--no-clear-idle-edit`のA/B用)。
+    pub fn set_clear_idle_edit(&mut self, on: bool) {
+        self.clear_idle_edit = on;
+    }
+
+    /// 診断: 押下ごとの特徴量出力を有効にする(`--trace-features`)。
+    pub fn set_trace_features(&mut self, on: bool) {
+        self.trace_features = on;
+    }
+
+    /// 診断: IMM/TSF/EDITから観測できる特徴量を1行の`k=v`列にする。隠れ状態の候補
+    /// (入力中の文字数・カーソル・文節・属性・候補窓・変換モード生値の全ビット・
+    /// 文モード・EDITの文字数とキャレット・TSFとIMMの不一致)を、学習の状態に加える前に
+    /// 実データで選ぶための観測(挙動は変えない)。
+    fn observe_features(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        unsafe {
+            let himc = ImmGetContext(self.edit);
+            if himc.is_invalid() {
+                return "himc=invalid".to_string();
+            }
+            let open = ImmGetOpenStatus(himc).as_bool();
+            let mut raw = IME_CONVERSION_MODE::default();
+            let mut sentence = IME_SENTENCE_MODE::default();
+            let _ = ImmGetConversionStatus(himc, Some(&raw mut raw), Some(&raw mut sentence));
+            let len = |flag: u32| -> i32 {
+                ImmGetCompositionStringW(himc, IME_COMPOSITION_STRING(flag), None, 0)
+            };
+            let comp_len = len(GCS_COMPSTR) / 2;
+            let cursor = len(0x0080);
+            let clause_bytes = len(0x0020);
+            let attr_len = len(0x0010);
+            let result_len = len(0x0800) / 2;
+            let mut attrs = 0u32;
+            if attr_len > 0 {
+                let mut buf = vec![0u8; usize::try_from(attr_len).unwrap_or(0)];
+                let got = ImmGetCompositionStringW(
+                    himc,
+                    IME_COMPOSITION_STRING(0x0010),
+                    Some(buf.as_mut_ptr().cast()),
+                    u32::try_from(attr_len).unwrap_or(0),
+                );
+                if got > 0 {
+                    for b in &buf[..usize::try_from(got).unwrap_or(0).min(buf.len())] {
+                        attrs |= 1 << (*b & 0x1F);
+                    }
+                }
+            }
+            let mut cand = 0u32;
+            let _ = ImmGetCandidateListCountW(himc, &raw mut cand);
+            let _ = ImmReleaseContext(self.edit, himc);
+            let mut sel_start = 0u32;
+            let mut sel_end = 0u32;
+            let _ = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+                self.edit,
+                0x00B0,
+                Some(windows::Win32::Foundation::WPARAM(
+                    &raw mut sel_start as usize,
+                )),
+                Some(windows::Win32::Foundation::LPARAM(
+                    &raw mut sel_end as isize,
+                )),
+            );
+            let text_len = window_text(self.edit).chars().count();
+            let tsf_open = read_compartment(
+                &self.thread_compartments,
+                &GUID_COMPARTMENT_KEYBOARD_OPENCLOSE,
+            );
+            let tsf_conv = read_compartment(
+                &self.thread_compartments,
+                &GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION,
+            );
+            let _ = write!(
+                out,
+                "open={} conv=0x{:02X} sent=0x{:X} comp_len={comp_len} cursor={cursor} \
+                 clause_bytes={clause_bytes} attr_mask=0x{attrs:X} result_len={result_len} \
+                 cand={cand} text_len={text_len} sel={sel_start}-{sel_end} tsf_open={tsf_open:?} \
+                 tsf_conv={tsf_conv:?}",
+                u8::from(open),
+                raw.0,
+                sentence.0
+            );
+        }
+        out
+    }
+
+    pub fn decode_error_count(&self) -> u32 {
+        self.decode_errors.get()
+    }
+
+    fn note_decode_error(&self, reason: &str) {
+        self.decode_errors.set(self.decode_errors.get() + 1);
+        eprintln!(
+            "[awase-keymap-learn-win] observe_imm失敗({reason})、self.initialへフォールバック \
+             — この観測は信頼できない可能性がある(ADR-195: 誤りに強い分類は未実装)"
+        );
+    }
+
+    fn observe_imm(&self) -> WinResult<Observation> {
+        self.timers
+            .time(Phase::ObserveImm, || self.observe_imm_untimed())
+    }
+
+    fn observe_imm_untimed(&self) -> WinResult<Observation> {
+        unsafe {
+            let himc = ImmGetContext(self.edit);
+            if himc.is_invalid() {
+                self.note_decode_error("ImmGetContextが無効なハンドルを返した");
+                return Err(windows::core::Error::from_thread());
+            }
+            let open = ImmGetOpenStatus(himc).as_bool();
+            let mut raw = IME_CONVERSION_MODE::default();
+            let mut sentence = IME_SENTENCE_MODE::default();
+            let conv_ok =
+                ImmGetConversionStatus(himc, Some(&raw mut raw), Some(&raw mut sentence)).as_bool();
+            let comp_len =
+                ImmGetCompositionStringW(himc, IME_COMPOSITION_STRING(GCS_COMPSTR), None, 0);
+            let _ = ImmReleaseContext(self.edit, himc);
+            if !conv_ok {
+                self.note_decode_error("ImmGetConversionStatusが失敗した");
+                return Err(windows::core::Error::from_thread());
+            }
+            let mode = Status::mode_from_raw_conv(raw.0);
+            Ok(Observation {
+                status: Status {
+                    open,
+                    mode,
+                    composing: comp_len > 0,
+                },
+                text: window_text(self.edit),
+            })
+        }
+    }
+
+    /// 内部で`observe_imm()`も呼ぶので、`ObserveTsf`は`ObserveImm`を含む値になる。
+    fn observe_tsf(&self) -> Option<Status> {
+        self.timers
+            .time(Phase::ObserveTsf, || self.observe_tsf_untimed())
+    }
+
+    fn observe_tsf_untimed(&self) -> Option<Status> {
+        let open = read_compartment(
+            &self.thread_compartments,
+            &GUID_COMPARTMENT_KEYBOARD_OPENCLOSE,
+        )? != 0;
+        let raw = read_compartment(
+            &self.thread_compartments,
+            &GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION,
+        )?;
+        Some(Status {
+            open,
+            mode: Status::mode_from_raw_conv(u32::try_from(raw).ok()?),
+            composing: self.observe_imm().ok()?.status.composing,
+        })
+    }
+
+    /// [ADR195-T7](../../../../docs/tasks/adr195-t7-safety-measures.md)項目1
+    /// （round1 M2対応）: 送信前ゲート。フォーカスが学習窓（専用EDITコント
+    /// ロール）に無ければ送信しない——他アプリへ副作用を及ぼす前に止める
+    /// （事後の`check_session_interference()`は「止める」のではなく「今後の
+    /// 試行を無効化する」役割で、これとは別）。通ったら決定1b項目1・4のとおり
+    /// 送信直前に自分の注入として記録する（フック生存確認・IME通知の期待猶予の
+    /// 起点）。
+    fn send_gated(&mut self, vk: u32) -> bool {
+        if !self.focus_intact() {
+            eprintln!(
+                "[awase-keymap-learn-win] 送信前ゲート: フォーカスが学習窓に無いためVK 0x{vk:02X}の送信を中止した"
+            );
+            // round3 R1対応（N5が生んだ退行の修正）: フォーカスを失うと、以降の
+            // 送信はすべてこのゲートで拒否され続け、`delivered=false`のため
+            // `check_session_interference`は一度も呼ばれない（round2 N5対応）。
+            // 「送信前ゲートで拒否された」という事実そのものを、無効化件数
+            // カウンタ（`session_monitor`）を経由せず直接セッション失敗として
+            // 記録する——N5が再発しないよう、拒否のたびに加算するカウンタでは
+            // なく、一度立てたら戻らないフラグにする。
+            self.session_failed.set(true);
+            return false;
+        }
+        self.mark_self_injection(1);
+        send_key_press(vk)
+    }
+
+    /// キーを1件注入する（`send_gated`のフォーカスゲートを経由する）。
+    fn inject(&mut self, key: usize) -> bool {
+        self.keys
+            .get(key)
+            .copied()
+            .is_some_and(|vk| self.send_gated(vk))
+    }
+
+    fn settle(&self) -> Observation {
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(SETTLE_TIMEOUT_MS);
+        let mut last = self.observe_imm().unwrap_or_else(|_| Observation {
+            status: self.initial,
+            text: String::new(),
+        });
+        let mut quiet_since = Instant::now();
+        let mut first_change: Option<Duration> = None;
+        let mut settled = false;
+        while Instant::now() < deadline {
+            self.pump(Duration::from_millis(5));
+            if let Ok(now) = self.observe_imm() {
+                if now.status != last.status || now.text != last.text {
+                    if first_change.is_some() {
+                        self.timers.note_inter_change(quiet_since.elapsed());
+                    }
+                    last = now;
+                    quiet_since = Instant::now();
+                    first_change.get_or_insert_with(|| started.elapsed());
+                } else if quiet_since.elapsed()
+                    >= Duration::from_millis(if first_change.is_some() {
+                        self.tuning.quiet_after_change_ms
+                    } else {
+                        self.tuning.quiet_no_change_ms
+                    })
+                {
+                    settled = true;
+                    break;
+                }
+            }
+        }
+        self.timers.record(Phase::Settle, started.elapsed());
+        match first_change {
+            Some(d) => {
+                self.timers.record(Phase::SettleFirstChange, d);
+                self.timers.note_first_change(d);
+            }
+            None => self.timers.note_settle_no_change(),
+        }
+        if settled {
+            self.timers
+                .record(Phase::SettleQuietTail, quiet_since.elapsed());
+        } else {
+            self.timers.note_settle_timeout();
+        }
+        last
+    }
+
+    /// 診断用の待ち時間の上書き(`main`がコマンドラインから作る)。
+    pub fn set_settle_tuning(&mut self, tuning: SettleTuning) {
+        self.tuning = tuning;
+    }
+
+    /// 段階別の所要時間の内訳(`timing ...`行)。学習終了時に標準エラーへ出す。
+    #[must_use]
+    pub fn timing_summary_lines(&self) -> Vec<String> {
+        self.timers.summary_lines()
+    }
+
+    fn clear_edit(&self) {
+        self.timers.time(Phase::ClearEdit, || {
+            let before = self.observe_imm().ok().map(|o| o.status);
+            let _ = unsafe { SetWindowTextW(self.edit, w!("")) };
+            self.pump(Duration::from_millis(self.tuning.clear_edit_pump_ms));
+            // 案2の根拠: このpump中にIME状態が変わることがあるか(あれば短縮は危険)。
+            let after = self.observe_imm().ok().map(|o| o.status);
+            if before != after {
+                self.timers.note_clear_edit_status_changed();
+            }
+        });
+    }
+}
+
+impl Drop for RealImeDriver {
+    fn drop(&mut self) {
+        let _ = unsafe { self.thread_mgr.Deactivate() };
+        // `self.edit`は`self.window`の子窓なので、親を破棄すれば一緒に破棄される。
+        let _ = unsafe { DestroyWindow(self.window) };
+        // `CoUninitialize`は`_com`フィールド(最後に解放される)が担う。
+    }
+}
+
+impl RealImeDriver {
+    fn press_untimed(&mut self, key: usize) -> PressReport {
+        let mut before = self.observe_imm().unwrap_or_else(|_| Observation {
+            status: self.initial,
+            text: String::new(),
+        });
+        let mut cleared = false;
+        let mut clear_changed = false;
+        if self.clear_idle_edit && !before.status.composing && !before.text.is_empty() {
+            // 消去で起きうる通知を外部の書き込みと数えないよう猶予窓を張ってから消し、
+            // 消去の後に状態を読み直す(状態が変わっていれば読み直した値を押下前とする)。
+            self.notify_monitor
+                .mark_expected_notify(Duration::from_millis(NOTIFY_EXPECT_WINDOW_MS + 40));
+            let _ = unsafe { SetWindowTextW(self.edit, w!("")) };
+            self.pump(Duration::from_millis(QUIET_MS));
+            cleared = true;
+            match self.observe_imm() {
+                Ok(after_clear) => {
+                    clear_changed = after_clear.status != before.status;
+                    before = after_clear;
+                }
+                Err(_) => before.text.clear(),
+            }
+        }
+        let feat_before = self.trace_features.then(|| self.observe_features());
+        let delivered = self.inject(key);
+        let after = self.settle();
+        let disp = disposition(&before, &after);
+        let feat_after = self.trace_features.then(|| self.observe_features());
+        let seen_b = self.observe_tsf().unwrap_or(after.status);
+        // 決定1b項目5（セッション中の監視）・ADR195-T7項目2（round1 M1対応）:
+        // この測定の間に外部からの書き込み・ユーザーの物理入力・フォーカス
+        // 喪失のいずれかが観測されていたら、この観測を`contaminated=true`で
+        // 返す。`Executor::press`（`awase-keymap-learn::exec`）はこのフラグを
+        // 見て表への記録を見送る。セッション全体を失敗にすべきかは
+        // `session_failed()`で別途問い合わせる。
+        //
+        // round2 N5対応: `delivered=false`（`send_gated`のフォーカスゲートで
+        // 拒否された、または`SendInput`自体が失敗した）のときは判定しない。
+        // 何も送っていない試行にまで`check_session_interference`を呼ぶと、
+        // `Executor::press`の再試行ループ（`max_press_retries`回）のたびに同じ
+        // フォーカス喪失を重複して`session_monitor`へ計上してしまう
+        // （未送達自体は`Anomaly::KeyNotDelivered`として別途数えられている）。
+        let contaminated = delivered && self.check_session_interference();
+        if let (Some(fb), Some(fa)) = (feat_before, feat_after) {
+            let n = self.feat_seq.get();
+            self.feat_seq.set(n + 1);
+            eprintln!(
+                "[feat] n={n} key=0x{:02X} delivered={} contaminated={} cleared={} clear_changed={} \
+                 before_status={:?} after_status={:?} disp={:?} B[{fb}] A[{fa}]",
+                self.keys.get(key).copied().unwrap_or(0),
+                u8::from(delivered),
+                u8::from(contaminated),
+                u8::from(cleared),
+                u8::from(clear_changed),
+                before.status,
+                after.status,
+                disp,
+            );
+        }
+        PressReport {
+            delivered,
+            cost_ms: 0.0,
+            seen: Outcome {
+                status: after.status,
+                disp,
+            },
+            seen_b,
+            contaminated,
+        }
+    }
+
+    fn reset_untimed(&mut self, level: ResetLevel) -> bool {
+        self.timers.note_reset_level(level as usize);
+        // リセットが最後に送るキー(Mode以上はF2、SoftはEsc)を、直前キーとして記録させる。
+        let last_vk = if level >= ResetLevel::Mode {
+            0xF2
+        } else {
+            0x1B
+        };
+        self.last_reset_key
+            .set(self.keys.iter().position(|vk| *vk == last_vk));
+        self.clear_edit();
+        let esc = self.keys.iter().position(|vk| *vk == 0x1B);
+        if let Some(key) = esc {
+            let _ = self.inject(key);
+            let _ = self.inject(key);
+        }
+        if level >= ResetLevel::Mode {
+            for vk in [0x16, 0xF2] {
+                // round1 M2対応: 生の`send_key_press`直呼びは`send_gated`の
+                // フォーカスゲートを経由しないため、他アプリへの副作用の穴に
+                // なっていた。
+                let _ = self.send_gated(vk);
+                self.pump(Duration::from_millis(SETUP_GAP_MS));
+            }
+        }
+        if level == ResetLevel::Hard {
+            // round3 R1対応（項目3「他アプリへの副作用を作らない」）:
+            // `SetForegroundWindow(self.window)`は他プロセスが前面にいる
+            // ときにそのフォアグラウンドを奪い返してしまう
+            // （ユーザーが別アプリを操作中でも学習窓へ強制的にキーが
+            // 届くようになる）。自分の窓が既に前面のとき（フォーカスが
+            // `self.window`自身等、`self.edit`以外にずれているだけのとき）
+            // に限り`SetFocus(edit)`で戻す——他プロセスからの奪い返しは
+            // 行わない。奪い返せない場合、以降の送信は`send_gated`が拒否し
+            // 続け、`session_failed`が立ってセッションは終了する
+            // （round3 R1対応）。
+            //
+            // round4 I1（opus-adversarial-consult、非ブロッキング情報提供）:
+            // この分岐は実際にはほぼ到達しない——`reset()`はこの前に
+            // Esc×2・Mode段階を`send_gated`経由で送るため、フォーカスが
+            // 既に外れていれば`session_failed`はここへ来る前に確定している。
+            // 回復手段として機能させたい場合は`window_proc`が
+            // `WM_ACTIVATE(WA_ACTIVE)`で`SetFocus(edit)`する形にする必要が
+            // あるが、それでも離脱中の`WA_INACTIVE`は`FOCUS_LOST_EVENTS`に
+            // 計上され、その試行自体は汚染として無効化される（意図的に
+            // 対応していない——安全側の挙動で実害が無いため、round3 R1の
+            // 収束時点ではスコープ外とした）。
+            if (unsafe { GetForegroundWindow() }) == self.window {
+                let _ = unsafe { SetFocus(Some(self.edit)) };
+            }
+        }
+        self.settle().status == self.initial
+    }
+}
+
+impl ImeDriver for RealImeDriver {
+    fn last_reset_key(&self) -> Option<usize> {
+        self.last_reset_key.get()
+    }
+
+    fn press(&mut self, key: usize) -> PressReport {
+        let started = Instant::now();
+        let report = self.press_untimed(key);
+        self.timers.record(Phase::Press, started.elapsed());
+        report
+    }
+
+    fn press_setup(&mut self, key: usize) {
+        let started = Instant::now();
+        let _ = self.inject(key);
+        self.pump(Duration::from_millis(SETUP_GAP_MS));
+        self.timers.record(Phase::PressSetup, started.elapsed());
+    }
+
+    fn read_primary(&mut self) -> Status {
+        self.observe_imm().map_or(self.initial, |o| o.status)
+    }
+
+    fn read_secondary(&mut self) -> Status {
+        self.observe_tsf().unwrap_or(self.initial)
+    }
+
+    fn reread_status(&mut self) -> Status {
+        self.observe_imm().map_or(self.initial, |o| o.status)
+    }
+
+    fn settle_setup(&mut self) -> Status {
+        self.settle().status
+    }
+
+    fn reset(&mut self, level: ResetLevel) -> bool {
+        let started = Instant::now();
+        let ok = self.reset_untimed(level);
+        self.timers.record(Phase::Reset, started.elapsed());
+        ok
+    }
+
+    fn elapsed_ms(&self) -> f64 {
+        self.started.elapsed().as_secs_f64() * 1000.0
+    }
+
+    fn machine_initial_status(&self) -> Status {
+        self.initial
+    }
+
+    /// [ADR195-T7](../../../../docs/tasks/adr195-t7-safety-measures.md)項目2
+    /// （round2 N3対応）: セッション監視の無効化上限を超えたら、戦略側の
+    /// `over()`が予算を使い切る前に打ち切れるようにする。
+    fn should_abort(&self) -> bool {
+        self.session_failed()
+    }
+}
+
+fn disposition(before: &Observation, after: &Observation) -> Disposition {
+    if !before.status.composing {
+        Disposition::None
+    } else if after.status.composing {
+        Disposition::Kept
+    } else if before.text == after.text {
+        Disposition::Discarded
+    } else {
+        Disposition::Committed
+    }
+}
+
+fn read_compartment(manager: &ITfCompartmentMgr, guid: &windows::core::GUID) -> Option<i32> {
+    unsafe {
+        let compartment = manager.GetCompartment(guid).ok()?;
+        i32::try_from(&compartment.GetValue().ok()?).ok()
+    }
+}
+
+fn scan_for(vk: u32) -> u16 {
+    match vk {
+        0x1D => 0x7B,
+        0x1C => 0x79,
+        0xF2 | 0x15 | 0xF1 | 0xF5 | 0xF6 => 0x70,
+        0xF3 | 0xF4 | 0x19 => 0x29,
+        0xF0 => 0x3A,
+        0x41 => 0x1E,
+        0x0D => 0x1C,
+        0x20 => 0x39,
+        0x08 => 0x0E,
+        0x1B => 0x01,
+        _ => 0,
+    }
+}
+
+fn send_key_press(vk: u32) -> bool {
+    let make = |up| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(vk as u16),
+                wScan: scan_for(vk),
+                dwFlags: if up {
+                    KEYEVENTF_KEYUP
+                } else {
+                    KEYBD_EVENT_FLAGS(0)
+                },
+                time: 0,
+                // ADR-196決定1b項目1: 自分の注入だとADR196-T1の分類器が判定
+                // できるよう、専用の目印を付ける（`0`のままだと「目印の無い
+                // 注入」＝外部からの書き込みとして誤分類される）。
+                dwExtraInfo: SELF_MARKER,
+            },
+        },
+    };
+    let cb_size = i32::try_from(size_of::<INPUT>()).expect("size_of::<INPUT>() fits in i32");
+    unsafe { SendInput(&[make(false), make(true)], cb_size) == 2 }
+}
+
+/// ADR-195段階1 Major-1対応: 専用窓へフォーカスを移した後、最初の注入まで
+/// `config.general.focus_debounce_ms`(既定50ms)+`FOCUS_MARGIN_MS`だけ待つ。
+/// awase.exeの`config.toml`をexe隣・ワークスペースルートから探して読む
+/// (`resolve_relative_to_exe`、`find_config_path`と同じ解決順)。読めない・
+/// パースできない場合は保守的な既定値`FOCUS_DEBOUNCE_FALLBACK_MS`を使う
+/// (config読み取り統合前の暫定値、ADR-195段階0参照)。
+fn focus_debounce_wait_ms() -> u64 {
+    let path = resolve_relative_to_exe("config.toml");
+    let configured = AppConfig::load(&path)
+        .ok()
+        .map(|config| u64::from(config.general.focus_debounce_ms));
+    configured.unwrap_or(FOCUS_DEBOUNCE_FALLBACK_MS) + FOCUS_MARGIN_MS
+}
+
+/// 前面窓が`window`、かつ入力フォーカスが`edit`にあるか(`RealImeDriver::focus_intact`
+/// と共有、窓を作成したのと同じスレッドから呼ぶ前提)。
+fn focus_on_edit(window: HWND, edit: HWND) -> bool {
+    (unsafe { GetForegroundWindow() }) == window && (unsafe { GetFocus() }) == edit
+}
+
+/// `compartment_notify_probe.rs::bring_to_front`と同じ`AttachThreadInput`併用パターン。
+/// 素の`SetForegroundWindow`は、呼び出し元プロセスが既にフォアグラウンドでない限り
+/// Windowsのフォアグラウンドロックにより無言で失敗しうる(戻り値もエラーにならない)。
+/// 現在の前面窓のスレッドへ一時的に入力キューを結合すると、この制限が外れる。
+fn secure_foreground_focus(window: HWND, edit: HWND) -> bool {
+    unsafe {
+        let fg = GetForegroundWindow();
+        let fg_tid = if fg.0.is_null() {
+            0
+        } else {
+            GetWindowThreadProcessId(fg, None)
+        };
+        let my_tid = GetCurrentThreadId();
+        let attached =
+            fg_tid != 0 && fg_tid != my_tid && AttachThreadInput(my_tid, fg_tid, true).as_bool();
+        let _ = BringWindowToTop(window);
+        let ok = SetForegroundWindow(window).as_bool();
+        let _ = SetFocus(Some(edit));
+        if attached {
+            let _ = AttachThreadInput(my_tid, fg_tid, false);
+        }
+        ok || GetForegroundWindow() == window
+    }
+}
+
+/// `focus_on_edit`が成立するまで`secure_foreground_focus`を再試行する
+/// (ADR195-T10: CI環境では1回で成立しないことがある)。待ちは`pump_for`経由
+/// (ADR-196決定1b項目4: メッセージポンプを止めるとフックが黙って外れうる)。
+fn secure_focus_with_retries(window: HWND, edit: HWND, notify_monitor: &ImeNotifyMonitor) -> bool {
+    for _ in 0..FOCUS_RETRY_ATTEMPTS {
+        let fronted = secure_foreground_focus(window, edit);
+        pump_for(Duration::from_millis(FOCUS_RETRY_GAP_MS), notify_monitor);
+        if fronted && focus_on_edit(window, edit) {
+            return true;
+        }
+    }
+    focus_on_edit(window, edit)
+}
+
+/// メッセージを回しながら待つ（ADR-196決定1b項目4: フックが黙って外れるのを
+/// 防ぐため、待ちの間もメッセージポンプを回し続ける）。`notify_monitor`に
+/// `WM_IME_NOTIFY`を観測させる（決定1b項目2）。
+fn pump_for(duration: Duration, notify_monitor: &ImeNotifyMonitor) {
+    let deadline = Instant::now() + duration;
+    while Instant::now() < deadline {
+        unsafe {
+            let mut msg = MSG::default();
+            while PeekMessageW(&raw mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                notify_monitor.observe_message(&msg);
+                let _ = TranslateMessage(&raw const msg);
+                DispatchMessageW(&raw const msg);
+            }
+        }
+        // SendMessage配送の`WM_IME_NOTIFY`はウィンドウプロシージャが積んだキューから取る。
+        drain_queued_into(notify_monitor);
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn window_text(hwnd: HWND) -> String {
+    let mut buffer = [0u16; 512];
+    let len = unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(hwnd, &mut buffer) };
+    String::from_utf16_lossy(&buffer[..usize::try_from(len).unwrap_or(0)])
+}
+
+fn create_window() -> WinResult<(HWND, HWND)> {
+    unsafe {
+        let instance = GetModuleHandleW(None)?;
+        let class = w!("AwaseKeymapLearnWindow");
+        let window_class = WNDCLASSW {
+            lpfnWndProc: Some(window_proc),
+            hInstance: instance.into(),
+            lpszClassName: class,
+            ..Default::default()
+        };
+        RegisterClassW(&raw const window_class);
+        let window = CreateWindowExW(
+            windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
+            class,
+            w!("awase keymap learn"),
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            100,
+            100,
+            640,
+            120,
+            None,
+            None,
+            Some(instance.into()),
+            None,
+        )?;
+        let edit = CreateWindowExW(
+            windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE::default(),
+            w!("EDIT"),
+            w!(""),
+            WINDOW_STYLE((WS_CHILD | WS_VISIBLE).0 | WS_BORDER.0),
+            10,
+            10,
+            600,
+            28,
+            Some(window),
+            None,
+            Some(instance.into()),
+            None,
+        )?;
+        let orig = SetWindowLongPtrW(
+            edit,
+            GWLP_WNDPROC,
+            (edit_proc as *const () as usize).cast_signed(),
+        );
+        // 二重にサブクラス化した場合（`orig`が`edit_proc`自身）に自己再帰しないよう、
+        // 自分自身は元のプロシージャとして記録しない。
+        if orig != (edit_proc as *const () as usize).cast_signed() {
+            ORIG_EDIT_PROC.store(orig, Ordering::SeqCst);
+        }
+        Ok((window, edit))
+    }
+}

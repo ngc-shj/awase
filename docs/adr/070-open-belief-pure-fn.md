@@ -1,4 +1,18 @@
+---
+id: ADR-070
+title: |-
+  `reduce_open_belief` — 観測値を純粋関数で単一ビリーフに還元する
+status: |-
+  撤去済み(ADR-216 R1、fbe90204、2026-10-04 確認)。OpenBelief/OpenBeliefInputs/reduce_open_belief と ime_apply_planner は診断ログ専用だったため撤去され現行コードに無い。kanji_needs_context_override も同時に撤去。旧: 採用済み
+related_adr:
+  - "ADR-035"
+  - "ADR-044"
+  - "ADR-069"
+---
+
 # ADR-070: `reduce_open_belief` — 観測値を純粋関数で単一ビリーフに還元する
+
+> 状態更新(2026-10-04): 撤去済み(ADR-216 R1、fbe90204、2026-10-04 確認)。OpenBelief/OpenBeliefInputs/reduce_open_belief と ime_apply_planner は診断ログ専用だったため撤去され現行コードに無い。kanji_needs_context_override も同時に撤去
 
 ## ステータス
 

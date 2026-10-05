@@ -899,6 +899,236 @@ fn test_load_nicola_yab_file() {
 }
 
 #[test]
+fn test_nicola_keytop_yab_file_outputs_keytop_symbols_at_jis_extra_positions() {
+    // 2026-08-31: report 01M15R86FJW24278GGD3ETS9QX（docs/bug-reports-triage.md
+    // 参照）を機に、標準JISキーボードのキートップ印字通りの記号を出す版を
+    // layout/nicola_keytop.yab として追加した（新規インストールの既定）。
+    // layout/nicola.yab（Backspace/Escapeソフトウェア代用版）は既存ユーザーの
+    // 設定・ファイルを無言で変えないよう内容を変更していない
+    // （NeverOverwrite/Copy-IfAbsentで保護されるため、既定を変えても
+    // アップグレードでは配布されない。Opusレビュー指摘）。
+    let path = std::path::Path::new("layout/nicola_keytop.yab");
+    if !path.exists() {
+        return; // Skip in CI
+    }
+    let content = std::fs::read_to_string(path).unwrap();
+    let layout = YabLayout::parse(&content, KeyboardModel::Jis).unwrap();
+
+    let literal = |s: &str| Some(YabValue::Literal(s.to_string()));
+
+    // 数字段（row0）12-13列目 = physical ^ / ¥ キー。全面共通。
+    for face in [&layout.normal, &layout.left_thumb, &layout.right_thumb] {
+        assert_eq!(face.get(&PhysicalPos::new(0, 11)).cloned(), literal("＾"));
+        assert_eq!(face.get(&PhysicalPos::new(0, 12)).cloned(), literal("￥"));
+    }
+
+    // Q段（row1）11列目 = physical @ キー。シフト無し面は本家仕様の「、」を維持し、
+    // 親指シフト面のみ未定義スロットに「＠」を割り当てる。
+    assert_eq!(
+        layout.normal.get(&PhysicalPos::new(1, 10)).cloned(),
+        literal("、")
+    );
+    assert_eq!(
+        layout.left_thumb.get(&PhysicalPos::new(1, 10)).cloned(),
+        literal("＠")
+    );
+    assert_eq!(
+        layout.right_thumb.get(&PhysicalPos::new(1, 10)).cloned(),
+        literal("＠")
+    );
+
+    // Q段（row1）12列目 = physical [ キー。全面共通。
+    for face in [&layout.normal, &layout.left_thumb, &layout.right_thumb] {
+        assert_eq!(face.get(&PhysicalPos::new(1, 11)).cloned(), literal("［"));
+    }
+
+    // A段（row2）11-12列目 = physical : / ] キー。全面共通で、旧 Backspace/Escape
+    // 代用（後/逃）を置き換えている。
+    for face in [&layout.normal, &layout.left_thumb, &layout.right_thumb] {
+        assert_eq!(face.get(&PhysicalPos::new(2, 10)).cloned(), literal("："));
+        assert_eq!(face.get(&PhysicalPos::new(2, 11)).cloned(), literal("］"));
+    }
+}
+
+#[test]
+fn test_nicola_yab_still_uses_bs_esc_placeholders() {
+    // layout/nicola.yab は既存ユーザーへ無言で挙動を変えないため、
+    // Backspace/Escapeソフトウェア代用（後/逃）のまま維持している
+    // （layout/nicola_keytop.yab が新規インストールの既定）。
+    let path = std::path::Path::new("layout/nicola.yab");
+    if !path.exists() {
+        return; // Skip in CI
+    }
+    let content = std::fs::read_to_string(path).unwrap();
+    let layout = YabLayout::parse(&content, KeyboardModel::Jis).unwrap();
+
+    for face in [&layout.normal, &layout.left_thumb, &layout.right_thumb] {
+        assert_eq!(
+            face.get(&PhysicalPos::new(2, 10)),
+            Some(&YabValue::Special(SpecialKey::Backspace))
+        );
+        assert_eq!(
+            face.get(&PhysicalPos::new(2, 11)),
+            Some(&YabValue::Special(SpecialKey::Escape))
+        );
+    }
+}
+
+#[test]
+fn test_nicola_keytop_yab_does_not_reintroduce_bs_esc_placeholders() {
+    // layout/nicola_keytop.yab に「後」「逃」（Backspace/Escapeソフトウェア
+    // 代用）が将来の編集で再混入していないことを機械的に縛る。
+    let path = std::path::Path::new("layout/nicola_keytop.yab");
+    if !path.exists() {
+        return; // Skip in CI
+    }
+    let content = std::fs::read_to_string(path).unwrap();
+    assert!(
+        !content.contains('後'),
+        "nicola_keytop.yab should not contain the Backspace placeholder (後)"
+    );
+    assert!(
+        !content.contains('逃'),
+        "nicola_keytop.yab should not contain the Escape placeholder (逃)"
+    );
+}
+
+#[test]
+fn test_nicola_yab_and_nicola_keytop_yab_share_identical_kana_positions() {
+    // layout/nicola.yab と layout/nicola_keytop.yab はNICOLA本家仕様のかな
+    // 44キー配置を共有しているはず。記号の余りスロット（数字段12-13列目、
+    // Q段11-12列目、A段11-12列目）以外で内容が乖離していないことを機械的に
+    // 縛る（4ファイル体系での手作業コピーずれを検出するため、Opusレビュー指摘）。
+    let nicola_path = std::path::Path::new("layout/nicola.yab");
+    let keytop_path = std::path::Path::new("layout/nicola_keytop.yab");
+    if !nicola_path.exists() || !keytop_path.exists() {
+        return; // Skip in CI
+    }
+    let nicola = YabLayout::parse(
+        &std::fs::read_to_string(nicola_path).unwrap(),
+        KeyboardModel::Jis,
+    )
+    .unwrap();
+    let keytop = YabLayout::parse(
+        &std::fs::read_to_string(keytop_path).unwrap(),
+        KeyboardModel::Jis,
+    )
+    .unwrap();
+
+    // 記号スロットとして意図的に内容が異なる位置（row, col）。
+    let exceptions: &[(u8, u8)] = &[
+        (0, 11),
+        (0, 12), // 数字段: ＾／￥ vs 無／無
+        (1, 11), // Q段12列目: ［ vs 無
+        (2, 10),
+        (2, 11), // A段: ：／］ vs 後／逃
+    ];
+
+    for row in 0..4u8 {
+        for col in 0..13u8 {
+            if exceptions.contains(&(row, col)) {
+                continue;
+            }
+            let pos = PhysicalPos::new(row, col);
+            for (face_name, nicola_face, keytop_face) in [
+                ("normal", &nicola.normal, &keytop.normal),
+                ("left_thumb", &nicola.left_thumb, &keytop.left_thumb),
+                ("right_thumb", &nicola.right_thumb, &keytop.right_thumb),
+                ("shift", &nicola.shift, &keytop.shift),
+            ] {
+                // Q段11列目（物理@キー）は親指シフト面のみ意図的に異なる
+                // （、→＠、シフト無し面は本家仕様の、を両ファイルとも維持）。
+                if row == 1 && col == 10 && face_name != "normal" {
+                    continue;
+                }
+                assert_eq!(
+                    nicola_face.get(&pos),
+                    keytop_face.get(&pos),
+                    "{face_name} face differs at ({row}, {col})"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_nicola_kakutei_yab_matches_keytop_except_punctuation_cells() {
+    // layout/nicola_kakutei.yab は layout/nicola_keytop.yab の「。」(row1 col0)・
+    // 「、」(row1 col10) の normal 面2セルにのみ Ctrl+M 確定 (CV4D) を追加した
+    // ものであるはず。それ以外のセルが手作業コピーでずれていないことを機械的に
+    // 縛る（既存の nicola.yab/nicola_keytop.yab 比較テストと同じ手法）。
+    let keytop_path = std::path::Path::new("layout/nicola_keytop.yab");
+    let kakutei_path = std::path::Path::new("layout/nicola_kakutei.yab");
+    if !keytop_path.exists() || !kakutei_path.exists() {
+        return; // Skip in CI
+    }
+    let keytop = YabLayout::parse(
+        &std::fs::read_to_string(keytop_path).unwrap(),
+        KeyboardModel::Jis,
+    )
+    .unwrap();
+    let kakutei = YabLayout::parse(
+        &std::fs::read_to_string(kakutei_path).unwrap(),
+        KeyboardModel::Jis,
+    )
+    .unwrap();
+
+    let exceptions: &[(u8, u8)] = &[(1, 0), (1, 10)];
+
+    for row in 0..4u8 {
+        for col in 0..13u8 {
+            let pos = PhysicalPos::new(row, col);
+            for (face_name, keytop_face, kakutei_face) in [
+                ("normal", &keytop.normal, &kakutei.normal),
+                ("left_thumb", &keytop.left_thumb, &kakutei.left_thumb),
+                ("right_thumb", &keytop.right_thumb, &kakutei.right_thumb),
+                ("shift", &keytop.shift, &kakutei.shift),
+            ] {
+                if face_name == "normal" && exceptions.contains(&(row, col)) {
+                    continue;
+                }
+                assert_eq!(
+                    keytop_face.get(&pos),
+                    kakutei_face.get(&pos),
+                    "{face_name} face differs at ({row}, {col})"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_nicola_kakutei_yab_punctuation_cells_use_ctrl_chord_confirm() {
+    let path = std::path::Path::new("layout/nicola_kakutei.yab");
+    if !path.exists() {
+        return; // Skip in CI
+    }
+    let layout =
+        YabLayout::parse(&std::fs::read_to_string(path).unwrap(), KeyboardModel::Jis).unwrap();
+
+    for (pos, expected_literal) in [
+        (PhysicalPos::new(1, 0), "。"),
+        (PhysicalPos::new(1, 10), "、"),
+    ] {
+        match layout.normal.get(&pos) {
+            Some(YabValue::InlineSequence { items, .. }) => {
+                assert_eq!(
+                    items,
+                    &vec![
+                        YabValue::Literal(expected_literal.to_string()),
+                        YabValue::CtrlChord {
+                            vk: VkCode(0x4D),
+                            raw: "CV4D".to_string(),
+                        },
+                    ]
+                );
+            }
+            other => panic!("expected InlineSequence at {pos:?}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn test_load_nicola_us_yab_file() {
     let path = std::path::Path::new("layout/nicola_us.yab");
     if !path.exists() {
@@ -955,19 +1185,148 @@ fn test_load_nicola_f_yab_file() {
         Some(&YabValue::Literal("を".to_string()))
     );
 
-    // 未対応の特殊キーワード「濁」「半」は 無（None）に置き換え済み。
-    let unsupported_special_pos = PhysicalPos::new(1, 11);
+    let literal = |s: &str| Some(YabValue::Literal(s.to_string()));
+
+    // 2026-08-31追記: 数字段12-13列目・Q段11-12列目は、この機種でも通常の
+    // JIS記号キーが存在するため layout/nicola_keytop.yab と同じ記号を持つ
+    // （Opusレビュー指摘、README.mdがこの機種向けに本ファイルを勧めているのに
+    // 記号が欠落していた不具合の修正）。
+    for face in [&layout.normal, &layout.left_thumb, &layout.right_thumb] {
+        assert_eq!(face.get(&PhysicalPos::new(0, 11)).cloned(), literal("＾"));
+        assert_eq!(face.get(&PhysicalPos::new(0, 12)).cloned(), literal("￥"));
+        assert_eq!(face.get(&PhysicalPos::new(1, 11)).cloned(), literal("［"));
+    }
     assert_eq!(
-        layout.normal.get(&unsupported_special_pos),
+        layout.normal.get(&PhysicalPos::new(1, 10)).cloned(),
+        literal("、")
+    );
+    assert_eq!(
+        layout.left_thumb.get(&PhysicalPos::new(1, 10)).cloned(),
+        literal("＠")
+    );
+
+    // A段（row2）11-12列目は、この機種の「後退」「取消」専用キーが物理的に
+    // Backspace/Escapeのスキャンコードを出すため、ソフトウェア側では
+    // 到達不能＝無のまま（ファイル冒頭コメント参照）。
+    for face in [&layout.normal, &layout.left_thumb, &layout.right_thumb] {
+        assert_eq!(face.get(&PhysicalPos::new(2, 10)), Some(&YabValue::None));
+        assert_eq!(face.get(&PhysicalPos::new(2, 11)), Some(&YabValue::None));
+    }
+}
+
+#[test]
+fn test_load_nicola_kb232_yab_file() {
+    // report 01M15R86FJW24278GGD3ETS9QX（富士通純正キーボード「FMV-KB232」、
+    // docs/bug-reports-triage.md参照）で提供された、実機動作確認済みの配列。
+    let path = std::path::Path::new("layout/nicola_kb232.yab");
+    if !path.exists() {
+        return; // Skip in CI
+    }
+    let content = std::fs::read_to_string(path).unwrap();
+    let layout = YabLayout::parse(&content, KeyboardModel::Jis).unwrap();
+
+    // BUG-95のクォート崩れ検出(yab::lint)に引っかからないこと。
+    assert!(
+        lint(&content).is_empty(),
+        "nicola_kb232.yab should not trigger yab::lint warnings"
+    );
+
+    assert!(!layout.normal.is_empty());
+    assert!(!layout.left_thumb.is_empty());
+    assert!(!layout.right_thumb.is_empty());
+    assert!(!layout.shift.is_empty());
+
+    // nicola_f.yab と同じくローマ字ではなく仮名を直接リテラルで持つ形式。
+    let a_pos = PhysicalPos::new(2, 0);
+    assert_eq!(
+        layout.normal.get(&a_pos),
+        Some(&YabValue::Literal("う".to_string()))
+    );
+
+    let literal = |s: &str| Some(YabValue::Literal(s.to_string()));
+
+    // KB232固有の記号配置。nicola_keytop.yab/nicola_f.yabのどちらとも一致しない
+    // （NICOLA本家仕様で定義済みの「、」の位置自体がQ段11列目からA段11列目へ
+    // 動いている等、単純な「余っているスロットへの記号追加」ではない）。
+    assert_eq!(
+        layout.normal.get(&PhysicalPos::new(0, 12)).cloned(),
+        literal("￥")
+    );
+    assert_eq!(
+        layout.normal.get(&PhysicalPos::new(0, 11)),
         Some(&YabValue::None)
     );
     assert_eq!(
-        layout.left_thumb.get(&unsupported_special_pos),
-        Some(&YabValue::None)
+        layout.normal.get(&PhysicalPos::new(1, 10)).cloned(),
+        literal("＠")
     );
     assert_eq!(
-        layout.right_thumb.get(&unsupported_special_pos),
-        Some(&YabValue::None)
+        layout.normal.get(&PhysicalPos::new(1, 11)).cloned(),
+        literal("［")
+    );
+    assert_eq!(
+        layout.normal.get(&PhysicalPos::new(2, 10)).cloned(),
+        literal("、")
+    );
+    assert_eq!(
+        layout.normal.get(&PhysicalPos::new(2, 11)).cloned(),
+        literal("］")
+    );
+    assert_eq!(
+        layout.normal.get(&PhysicalPos::new(3, 10)).cloned(),
+        literal("￥")
+    );
+
+    // かな44キー配置は layout/nicola.yab と完全一致するはず（表記形式
+    // （リテラル vs ローマ字）が違うだけで物理位置ごとの意味は同じ）。
+    // /code-review指摘（PR #132）: 以前は normal 面の一部位置だけを手書き
+    // 列挙しており、left_thumb/right_thumb 面（濁音・半濁音等の残り約18キー）
+    // が未検証だった。nicola.yab で Romaji として定義されている全位置を
+    // 3面とも走査することで、44キー全体を機械的に網羅する。
+    let nicola = YabLayout::parse(
+        &std::fs::read_to_string("layout/nicola.yab").unwrap(),
+        KeyboardModel::Jis,
+    )
+    .unwrap();
+    let kana_table = KanaTable::build();
+    let mut checked = 0;
+    for (face_name, nicola_face, kb232_face) in [
+        ("normal", &nicola.normal, &layout.normal),
+        ("left_thumb", &nicola.left_thumb, &layout.left_thumb),
+        ("right_thumb", &nicola.right_thumb, &layout.right_thumb),
+    ] {
+        for row in 0..4u8 {
+            for col in 0..13u8 {
+                let pos = PhysicalPos::new(row, col);
+                let Some(YabValue::Romaji { romaji, .. }) = nicola_face.get(&pos) else {
+                    continue; // かな以外(記号/無/Special)は本テストの対象外
+                };
+                let expected_kana = kana_table
+                    .kana_for_romaji(romaji)
+                    .unwrap_or_else(|| panic!("no kana mapping for romaji {romaji:?}"));
+                match kb232_face.get(&pos) {
+                    Some(YabValue::Literal(lit)) => {
+                        assert_eq!(
+                            lit.chars().next(),
+                            Some(expected_kana),
+                            "{face_name} face kana mismatch at ({row},{col})"
+                        );
+                        checked += 1;
+                    }
+                    other => panic!(
+                        "{face_name} face: unexpected value at ({row},{col}) in \
+                         nicola_kb232.yab: {other:?}"
+                    ),
+                }
+            }
+        }
+    }
+    // NICOLA本家の物理44キーは面ごとに異なる仮名を割り当てるため、
+    // normal/left_thumb/right_thumb の合計は44より多くなる（実測81）。
+    // ここでは「ループが実際に仮名セルを走査した」ことのサニティチェックのみ行う。
+    assert_eq!(
+        checked, 81,
+        "kana cell count changed — verify nicola.yab wasn't edited unexpectedly"
     );
 }
 
@@ -1492,4 +1851,432 @@ fn yab_face_resolve_kana_populates_kana_field_for_romaji_values() {
         }
         other => panic!("expected Romaji, got {other:?}"),
     }
+}
+
+// ── ADR-115: 打鍵列機能 ──
+
+#[test]
+fn parse_ctrl_vk_recognizes_cv_prefix() {
+    assert_eq!(
+        YabValue::parse("CV4D"),
+        YabValue::CtrlChord {
+            vk: VkCode(0x4D),
+            raw: "CV4D".to_string()
+        }
+    );
+}
+
+#[test]
+fn parse_ctrl_vk_distinct_from_plain_vk() {
+    // "V4D"（Ctrl無し）は既存の Vk 経路のまま。
+    assert_eq!(YabValue::parse("V4D"), YabValue::Vk(VkCode(0x4D)));
+}
+
+#[test]
+fn parse_ctrl_vk_rejects_non_hex() {
+    // 認識できない場合は既存のフォールバックへ（Literal → 先頭1文字）。
+    assert_eq!(
+        YabValue::parse("CVXY"),
+        YabValue::Literal("CVXY".to_string())
+    );
+}
+
+#[test]
+fn macro_ref_recognizes_at_prefix() {
+    assert_eq!(
+        YabValue::parse("@bracket_paren"),
+        YabValue::MacroRef("bracket_paren".to_string())
+    );
+}
+
+#[test]
+fn macro_ref_allows_japanese_name() {
+    assert_eq!(
+        YabValue::parse("@括弧ペア"),
+        YabValue::MacroRef("括弧ペア".to_string())
+    );
+}
+
+#[test]
+fn macro_ref_empty_name_falls_back_to_literal() {
+    // "@" 単独は今日と同じ Literal フォールバック（レビュー指摘 M4）。
+    assert_eq!(YabValue::parse("@"), YabValue::Literal("@".to_string()));
+}
+
+#[test]
+fn split_unquoted_plus_splits_outside_quotes() {
+    assert_eq!(split_unquoted_plus("'．'+CV4D"), vec!["'．'", "CV4D"]);
+}
+
+#[test]
+fn split_unquoted_plus_ignores_plus_inside_quotes() {
+    assert_eq!(split_unquoted_plus("'a+b'"), vec!["'a+b'"]);
+}
+
+#[test]
+fn split_unquoted_plus_handles_escaped_quotes_in_layout_examples() {
+    // 実レイアウトの [小指拡張親指シフト1] に実在する3形。
+    assert_eq!(split_unquoted_plus(r#""\"""#), vec![r#""\"""#]);
+    assert_eq!(split_unquoted_plus(r#""\'""#), vec![r#""\'""#]);
+    assert_eq!(split_unquoted_plus(r"'\\'"), vec![r"'\\'"]);
+}
+
+#[test]
+fn cell_segments_none_when_no_plus() {
+    assert_eq!(cell_segments("'．'"), None);
+    assert_eq!(cell_segments("CV4D"), None);
+}
+
+#[test]
+fn cell_segments_none_for_degenerate_empty_segments() {
+    // 先頭/末尾/連続する `+` は分割しない（レビュー指摘 Major1/M2）。
+    assert_eq!(cell_segments("+CV4D"), None);
+    assert_eq!(cell_segments("'あ'+"), None);
+    assert_eq!(cell_segments("a++b"), None);
+}
+
+#[test]
+fn parse_cell_single_segment_matches_plain_parse() {
+    // + を含まないセルは今日と完全に同じ結果を返す。
+    for raw in ["'あ'", "ｋａ", "CV4D", "無", "後"] {
+        assert_eq!(parse_cell(raw), YabValue::parse(raw));
+    }
+}
+
+#[test]
+fn parse_cell_degenerate_plus_matches_plain_parse() {
+    // 空セグメントを生む "+" 単独等は分割せず今日と同じ結果。
+    for raw in ["+", "'あ'+", "+CV4D", "a++b"] {
+        assert_eq!(parse_cell(raw), YabValue::parse(raw));
+    }
+}
+
+#[test]
+fn parse_cell_builds_inline_sequence_for_kuten_confirm() {
+    let v = parse_cell("'．'+CV4D");
+    match v {
+        YabValue::InlineSequence { items, raw } => {
+            assert_eq!(raw, "'．'+CV4D");
+            assert_eq!(
+                items,
+                vec![
+                    YabValue::Literal("．".to_string()),
+                    YabValue::CtrlChord {
+                        vk: VkCode(0x4D),
+                        raw: "CV4D".to_string()
+                    },
+                ]
+            );
+        }
+        other => panic!("expected InlineSequence, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_cell_builds_inline_sequence_for_bracket_pair() {
+    // Issue #118 の実例（5要素）。
+    let v = parse_cell("'『'+CV4D+'』'+CV4D+左");
+    match v {
+        YabValue::InlineSequence { items, .. } => {
+            assert_eq!(
+                items,
+                vec![
+                    YabValue::Literal("『".to_string()),
+                    YabValue::CtrlChord {
+                        vk: VkCode(0x4D),
+                        raw: "CV4D".to_string()
+                    },
+                    YabValue::Literal("』".to_string()),
+                    YabValue::CtrlChord {
+                        vk: VkCode(0x4D),
+                        raw: "CV4D".to_string()
+                    },
+                    YabValue::Special(SpecialKey::Left),
+                ]
+            );
+        }
+        other => panic!("expected InlineSequence, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_cell_allows_macro_ref_segment() {
+    let v = parse_cell("'。'+@confirm");
+    match v {
+        YabValue::InlineSequence { items, .. } => {
+            assert_eq!(
+                items,
+                vec![
+                    YabValue::Literal("。".to_string()),
+                    YabValue::MacroRef("confirm".to_string()),
+                ]
+            );
+        }
+        other => panic!("expected InlineSequence, got {other:?}"),
+    }
+}
+
+#[test]
+fn serialize_ctrl_chord_and_inline_sequence_round_trip_via_raw() {
+    for raw in ["CV4D", "CV0D", "'．'+CV4D", "'『'+CV4D+'』'+CV4D+左"] {
+        let parsed = parse_cell(raw);
+        assert_eq!(
+            parsed.serialize(),
+            raw,
+            "raw round-trip must be byte-exact for {raw:?}"
+        );
+    }
+}
+
+#[test]
+fn serialize_macro_ref_reconstructs_at_name() {
+    assert_eq!(
+        YabValue::MacroRef("bracket_paren".to_string()).serialize(),
+        "@bracket_paren"
+    );
+}
+
+#[test]
+fn lint_raw_cell_regression_unaffected_by_new_syntax() {
+    // 既存のクォート不整合誤字検出（report 01M13EACMQ7D2VETW75N0BTZ9C）が
+    // 新構文追加後も変化しないこと。
+    assert!(YabValue::lint_raw_cell("ｂ'ｕ").is_some());
+    assert!(YabValue::lint_raw_cell("ｂｕ").is_none());
+    assert!(YabValue::lint_raw_cell("CV4D").is_none());
+}
+
+#[test]
+fn lint_detects_typo_inside_plus_joined_segment() {
+    // `+` 区切りのどのセグメントに誤字があっても検出される。
+    let warnings = lint("[ローマ字シフト無し]\nｂ'ｕ+CV4D,無,無,無,無,無,無,無,無,無,無,無,無\n無,無,無,無,無,無,無,無,無,無,無,無,無\n無,無,無,無,無,無,無,無,無,無,無,無,無\n無,無,無,無,無,無,無,無,無,無,無,無,無\n");
+    assert!(
+        !warnings.is_empty(),
+        "typo inside a + segment must still be detected"
+    );
+}
+
+#[test]
+fn resolve_kana_descends_into_inline_sequence() {
+    let table = KanaTable::build();
+    let mut face = YabFace::new();
+    let pos = PhysicalPos::new(0, 0);
+    face.insert(pos, parse_cell("ｋａ+CV4D"));
+    face.resolve_kana(&table);
+    match face.get(&pos) {
+        Some(YabValue::InlineSequence { items, .. }) => match &items[0] {
+            YabValue::Romaji { kana, .. } => assert_eq!(*kana, Some('か')),
+            other => panic!("expected Romaji, got {other:?}"),
+        },
+        other => panic!("expected InlineSequence, got {other:?}"),
+    }
+}
+
+// ── ADR-115: resolve_keystroke_syntax ──
+
+fn km(name: &str, steps: &[&str]) -> crate::config::KeystrokeMacro {
+    crate::config::KeystrokeMacro {
+        name: name.to_string(),
+        steps: steps.iter().map(|s| (*s).to_string()).collect(),
+    }
+}
+
+fn layout_with(pos: PhysicalPos, value: YabValue) -> YabLayout {
+    let mut face = YabFace::new();
+    face.insert(pos, value);
+    YabLayout {
+        name: "test".to_string(),
+        normal: face,
+        left_thumb: YabFace::new(),
+        right_thumb: YabFace::new(),
+        shift: YabFace::new(),
+        left_thumb_shift: YabFace::new(),
+        right_thumb_shift: YabFace::new(),
+    }
+}
+
+#[test]
+fn resolve_off_ctrl_chord_reverts_to_today_literal() {
+    let pos = PhysicalPos::new(0, 0);
+    let layout = layout_with(pos, parse_cell("CV41"));
+    let (resolved, warnings) =
+        resolve_keystroke_syntax(layout, &[], crate::config::KeystrokeSequencePolicy::Off);
+    assert!(warnings.is_empty());
+    assert_eq!(
+        resolved.normal.get(&pos),
+        Some(&YabValue::Literal("CV41".to_string()))
+    );
+}
+
+#[test]
+fn resolve_off_inline_sequence_reverts_to_today_parse_result() {
+    let pos = PhysicalPos::new(0, 0);
+    let layout = layout_with(pos, parse_cell("'．'+CV4D"));
+    let (resolved, _warnings) =
+        resolve_keystroke_syntax(layout, &[], crate::config::KeystrokeSequencePolicy::Off);
+    // 今日の YabValue::parse("'．'+CV4D") と完全に一致すること。
+    assert_eq!(
+        resolved.normal.get(&pos),
+        Some(&YabValue::parse("'．'+CV4D"))
+    );
+}
+
+#[test]
+fn resolve_off_inline_sequence_matches_today_quote_stripping_edge_case() {
+    // 実装タスクレビュー指摘 M2: raw 全体が同じクォート文字で始まり
+    // 終わるケースで、今日の strip_paired_quote 挙動と一致すること。
+    let pos = PhysicalPos::new(0, 0);
+    let raw = "'（'+'）'";
+    let layout = layout_with(pos, parse_cell(raw));
+    let (resolved, _warnings) =
+        resolve_keystroke_syntax(layout, &[], crate::config::KeystrokeSequencePolicy::Off);
+    assert_eq!(resolved.normal.get(&pos), Some(&YabValue::parse(raw)));
+}
+
+#[test]
+fn resolve_off_macro_ref_reverts_to_at_name_literal() {
+    let pos = PhysicalPos::new(0, 0);
+    let layout = layout_with(pos, parse_cell("@confirm"));
+    let (resolved, warnings) = resolve_keystroke_syntax(
+        layout,
+        &[km("confirm", &["CV4D"])],
+        crate::config::KeystrokeSequencePolicy::Off,
+    );
+    assert!(warnings.is_empty());
+    assert_eq!(
+        resolved.normal.get(&pos),
+        Some(&YabValue::Literal("@confirm".to_string()))
+    );
+}
+
+#[test]
+fn resolve_on_ctrl_chord_stays_ctrl_chord() {
+    let pos = PhysicalPos::new(0, 0);
+    let layout = layout_with(pos, parse_cell("CV4D"));
+    let (resolved, warnings) =
+        resolve_keystroke_syntax(layout, &[], crate::config::KeystrokeSequencePolicy::On);
+    assert!(warnings.is_empty());
+    assert_eq!(
+        resolved.normal.get(&pos),
+        Some(&YabValue::CtrlChord {
+            vk: VkCode(0x4D),
+            raw: "CV4D".to_string()
+        })
+    );
+}
+
+#[test]
+fn resolve_on_inline_sequence_becomes_flat_sequence() {
+    let pos = PhysicalPos::new(0, 0);
+    let layout = layout_with(pos, parse_cell("'．'+CV4D"));
+    let (resolved, warnings) =
+        resolve_keystroke_syntax(layout, &[], crate::config::KeystrokeSequencePolicy::On);
+    assert!(warnings.is_empty());
+    assert_eq!(
+        resolved.normal.get(&pos),
+        Some(&YabValue::Sequence(vec![
+            YabValue::Literal("．".to_string()),
+            YabValue::CtrlChord {
+                vk: VkCode(0x4D),
+                raw: "CV4D".to_string()
+            },
+        ]))
+    );
+}
+
+#[test]
+fn resolve_on_rejects_vk_inside_inline_sequence_with_warning() {
+    // 実装タスクレビュー/r5レビュー Critical C1 の回帰: Vk は InlineSequence
+    // 経由でも stuck key を招くため必ず拒否される。
+    let pos = PhysicalPos::new(0, 0);
+    let layout = layout_with(pos, parse_cell("'あ'+V1D"));
+    let (resolved, warnings) =
+        resolve_keystroke_syntax(layout, &[], crate::config::KeystrokeSequencePolicy::On);
+    assert!(!warnings.is_empty(), "Vk element must produce a warning");
+    // Vk が拒否されて Literal("あ") だけが残る → 1要素なので Sequence で
+    // 包まずそのまま返る。
+    assert_eq!(
+        resolved.normal.get(&pos),
+        Some(&YabValue::Literal("あ".to_string()))
+    );
+}
+
+#[test]
+fn resolve_on_macro_ref_inside_inline_sequence_flattens_without_nesting() {
+    // 実装タスクレビュー/r5レビュー Critical C2 の回帰: InlineSequence 内の
+    // MacroRef はマクロの steps を Sequence で包まず平坦に展開する。
+    let pos = PhysicalPos::new(0, 0);
+    let layout = layout_with(pos, parse_cell("'。'+@confirm"));
+    let (resolved, warnings) = resolve_keystroke_syntax(
+        layout,
+        &[km("confirm", &["CV4D"])],
+        crate::config::KeystrokeSequencePolicy::On,
+    );
+    assert!(warnings.is_empty());
+    match resolved.normal.get(&pos) {
+        Some(YabValue::Sequence(items)) => {
+            assert_eq!(items.len(), 2, "must be flat, not nested: {items:?}");
+            for it in items {
+                assert!(
+                    !matches!(it, YabValue::Sequence(_)),
+                    "found nested Sequence: {it:?}"
+                );
+            }
+        }
+        other => panic!("expected flat Sequence, got {other:?}"),
+    }
+}
+
+#[test]
+fn resolve_on_undefined_macro_ref_becomes_none_with_warning() {
+    let pos = PhysicalPos::new(0, 0);
+    let layout = layout_with(pos, parse_cell("@typo"));
+    let (resolved, warnings) =
+        resolve_keystroke_syntax(layout, &[], crate::config::KeystrokeSequencePolicy::On);
+    assert!(warnings.iter().any(|w| w.contains("@typo")));
+    assert_eq!(resolved.normal.get(&pos), Some(&YabValue::None));
+}
+
+#[test]
+fn resolve_on_all_elements_rejected_collapses_to_none() {
+    // V1D+V1C は全要素が Vk で拒否される → Sequence(vec![]) ではなく None。
+    let pos = PhysicalPos::new(0, 0);
+    let layout = layout_with(pos, parse_cell("V1D+V1C"));
+    let (resolved, warnings) =
+        resolve_keystroke_syntax(layout, &[], crate::config::KeystrokeSequencePolicy::On);
+    assert_eq!(warnings.len(), 2);
+    assert_eq!(resolved.normal.get(&pos), Some(&YabValue::None));
+}
+
+#[test]
+fn resolve_on_empty_macro_steps_collapses_to_none() {
+    let pos = PhysicalPos::new(0, 0);
+    let layout = layout_with(pos, parse_cell("@empty"));
+    let (resolved, _warnings) = resolve_keystroke_syntax(
+        layout,
+        &[km("empty", &[])],
+        crate::config::KeystrokeSequencePolicy::On,
+    );
+    assert_eq!(resolved.normal.get(&pos), Some(&YabValue::None));
+}
+
+#[test]
+fn resolve_on_macro_rejects_romaji_step_with_alternative_hint() {
+    let pos = PhysicalPos::new(0, 0);
+    let layout = layout_with(pos, parse_cell("@confirm"));
+    let (resolved, warnings) = resolve_keystroke_syntax(
+        layout,
+        &[km("confirm", &["ｋａ", "CV4D"])],
+        crate::config::KeystrokeSequencePolicy::On,
+    );
+    assert!(warnings
+        .iter()
+        .any(|w| w.contains("+") && w.contains("ローマ字")));
+    // "ｋａ" が拒否されて "CV4D" だけが残る → 1要素なのでそのまま返る。
+    assert_eq!(
+        resolved.normal.get(&pos),
+        Some(&YabValue::CtrlChord {
+            vk: VkCode(0x4D),
+            raw: "CV4D".to_string()
+        })
+    );
 }

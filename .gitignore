@@ -7,7 +7,6 @@
 .DS_Store
 # Wikipedia dump (large)
 jawiki-*.json.gz
-claude.md
 libscanmap.rlib
 rust_out
 librust_out.rlib
@@ -29,3 +28,9 @@ dist/
 
 # 個人設定（bundle には config.local.toml が優先して取り込まれる）
 config.local.toml
+
+__pycache__/
+*.pyc
+
+# lints/* は workspace exclude の独立クレート(dylint)。ビルドで生成される Cargo.lock は追跡しない
+/lints/*/Cargo.lock

@@ -27,13 +27,14 @@
 
 pub mod command;
 pub mod keymap;
+pub mod known_keymap;
+pub mod role;
 pub mod tsv;
 pub mod wire;
-pub mod write;
 
 pub use command::{GjiCompositionMode, GjiModeCommand};
 pub use keymap::{GjiImeKeys, GjiModeKeys};
-pub use write::ExistingBinding;
+pub use known_keymap::{classify_known_gji_keymap, KnownGjiKeymap};
 
 /// `config1.db` の生バイト列から、IME ON/OFF 検出用の VK 名集合を抽出する。
 ///
@@ -68,96 +69,77 @@ pub fn read_gji_mode_keys(bytes: &[u8]) -> GjiModeKeys {
     keymap::extract_mode_keys(&table)
 }
 
+/// Mozc `SessionKeymap` enum の `NONE` 値（`session_keymap`フィールド不在時の意味、BUG-115）。
+///
+/// protobufは既定値のフィールドを省略して直列化するため、`session_keymap`を一度も変更して
+/// いないユーザー（最多構成）は`config1.db`上でこのフィールド自体が**存在しない**
+/// （`wire::parse_top_level`は`None`を返す）。`config_handler.cc::GetDefaultKeyMap()`により、
+/// Windows版GJIではこれは`MSIME`と等価に扱われる（`key_effect_predictor.rs::from_config`が
+/// 既にこの前提で実装済み）。値`-1`自体が`config1.db`に直列化されて出現することは無いが、
+/// 「`None`と同じ意味」を呼び出し側に明示する目的で定数として置く。
+pub const SESSION_KEYMAP_NONE: i64 = -1;
+
 /// Mozc `SessionKeymap` enum の `CUSTOM` 値。
 ///
-/// `config.proto`（非公式知識だが `google/mozc` 本家ソースで確認済み:
-/// `NONE=-1, CUSTOM=0, ATOK=1, MSIME=2, KOTOERI=3, MOBILE=4, CHROMEOS=5, ...`）。
+/// `config.proto`（`google/mozc` 本家ソース `src/protocol/config.proto` で
+/// 実値を確認済み: `NONE=-1, CUSTOM=0, ATOK=1, MSIME=2, KOTOERI=3, MOBILE=4,
+/// CHROMEOS=5, OVERLAY_HENKAN_MUHENKAN_TO_IME_ON_OFF=100, ...`）。
 /// `session_keymap` がこの値でない（ATOK/MS-IME 等のプリセットが選択されている）
 /// 場合、GJI は `custom_keymap_table` を一切参照しない。
 pub const SESSION_KEYMAP_CUSTOM: i64 = 0;
 
-/// `write_dedicated_fn_key_binding` の失敗理由。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WriteDedicatedFnKeyError {
-    /// `bytes` が protobuf として解釈できない、または書き戻せない
-    /// （読み込み時は「読めた分だけ返す」ベストエフォートだが、書き込みは
-    /// 理解できないバイト列を破棄することになるため中止する）。
-    UnparsableConfig,
-    /// `vk_key` の既存バインドが既知の awase 残骸パターン（BUG-64）と一致しない
-    /// （他アプリ由来の設定、またはユーザー自身の意図的な設定の可能性がある）。
-    Conflict {
-        /// 衝突の原因になった既存の行（`status\tkey\tcommand`）。
-        rows: Vec<String>,
-    },
-    /// `session_keymap` が [`SESSION_KEYMAP_CUSTOM`] でない（ATOK/MS-IME 等の
-    /// プリセットが選択されている）。この状態で `custom_keymap_table` を
-    /// 書いても GJI はそれを一切参照しないため、書き込む意味が無く中止する。
-    /// ユーザーが GJI の「キー設定」を「カスタム」に切り替えてから再試行する
-    /// 必要がある（`session_keymap` 自体の書き換えは、他の既存カスタム
-    /// バインド全体の有効/無効を左右する影響範囲の大きい変更になるため、
-    /// このクレートは行わない）。
-    NotCustomKeymap,
-}
+/// Mozc `SessionKeymap` enum の `ATOK` 値（BUG-115）。
+///
+/// `google/mozc` の `src/data/keymap/atok.tsv`（2026-09-05取得）は
+/// `DirectInput`状態でHenkan/Muhenkan双方を`IMEOn`に、`Precomposition`
+/// 状態で双方を`CancelAndIMEOff`に割り当てている。他のプリセット
+/// （MSIME/MOBILE/KOTOERI/CHROMEOS）にはこの割当てが無い（MSIME/MOBILEの
+/// Henkanは`Reconvert`でIME開閉と無関係、Muhenkanは同状態への割当て自体が
+/// 無い。KOTOERI/CHROMEOSは該当行が無い）。
+pub const SESSION_KEYMAP_ATOK: i64 = 1;
 
-/// `config1.db` の生バイト列に、専用Fnキー変換（ADR-091 §D3.2）のエントリを
-/// 追加した新しいバイト列を返す。
+/// Mozc `SessionKeymap` enum の `MSIME` 値（BUG-115）。Windows版GJIの実質
+/// 既定（`session_keymap`不在/`NONE`時のフォールバック、
+/// `config_handler.cc::GetDefaultKeyMap()`で確認済み）。
 ///
-/// 手順: (1) `vk_key` の既存バインドを検査し、`IMEOn`/`IMEOff` 以外を含むなら
-/// [`WriteDedicatedFnKeyError::Conflict`] で中止する（BUG-64 の既知残骸のみ
-/// 安全に上書きする）。(2) `Composition`/`Conversion`/`Prediction`/
-/// `Suggestion` に `SwitchKanaType` を追加した新しい `custom_keymap_table` を
-/// 組み立てる（`Precomposition`/`DirectInput` には意図的にバインドしない）。
-/// (3) 元のバイト列の `custom_keymap_table` フィールドだけを差し替える
-/// （他のフィールドはバイト単位で温存、[`wire::replace_custom_keymap_table`]
-/// 参照）。
+/// `src/data/keymap/ms-ime.tsv`（2026-09-05取得）は`DirectInput`状態で
+/// Hiragana/Katakanaを`IMEOn`に割り当てている（Henkan/Muhenkanは
+/// `Reconvert`のみでIME開閉と無関係、`SESSION_KEYMAP_ATOK`のdoc参照）。
+pub const SESSION_KEYMAP_MSIME: i64 = 2;
+
+/// Mozc `SessionKeymap` enum の `MOBILE` 値（BUG-115）。
 ///
-/// **ファイル I/O・バックアップ・原子的置換・GJI プロセス再起動の要否の判断は
-/// 呼び出し側（プラットフォーム層）の責務。** このクレートはメモリ上のバイト列
-/// 変換のみを行う。
+/// `src/data/keymap/mobile.tsv`（2026-09-05取得）は`ms-ime.tsv`と同一の
+/// Henkan/Muhenkan/Hiragana/Katakana割当て。
+pub const SESSION_KEYMAP_MOBILE: i64 = 4;
+
+/// Mozc `SessionKeymap` enum の `KOTOERI` 値（ADR-199 決定4、プリセット定数表の判別に使う）。
+pub const SESSION_KEYMAP_KOTOERI: i64 = 3;
+
+/// Mozc `SessionKeymap` enum の `OVERLAY_HENKAN_MUHENKAN_TO_IME_ON_OFF` 値
+/// （BUG-115）。
 ///
-/// # Errors
-///
-/// `bytes` が protobuf として解釈できない場合、`session_keymap` が
-/// [`SESSION_KEYMAP_CUSTOM`] でない場合、または `vk_key` の既存バインドが
-/// 既知の残骸パターンと一致しない場合。
-pub fn write_dedicated_fn_key_binding(
-    bytes: &[u8],
-    vk_key: &str,
-) -> Result<Vec<u8>, WriteDedicatedFnKeyError> {
-    let raw = wire::parse_top_level(bytes).ok_or(WriteDedicatedFnKeyError::UnparsableConfig)?;
-    if raw.session_keymap != Some(SESSION_KEYMAP_CUSTOM) {
-        return Err(WriteDedicatedFnKeyError::NotCustomKeymap);
-    }
-    let existing_table = raw.custom_keymap_table.unwrap_or_default();
-    if let write::ExistingBinding::Conflict { rows } =
-        write::classify_existing_binding(&existing_table, vk_key)
-    {
-        return Err(WriteDedicatedFnKeyError::Conflict { rows });
-    }
-    let new_table = write::upsert_dedicated_fn_key_entries(&existing_table, vk_key);
-    wire::replace_custom_keymap_table(bytes, &new_table)
-        .ok_or(WriteDedicatedFnKeyError::UnparsableConfig)
-}
+/// `overlay_keymaps`（`config.proto` field 68、`session_keymap`/
+/// `custom_keymap_table` とは独立の repeated フィールド）にこの値が含まれると、
+/// GJI は `session_keymap` の値（CUSTOM かプリセットか）に関わらず、変換
+/// （Henkan）→IMEOn を Composition/Conversion/DirectInput/Precomposition の
+/// 全4状態に、無変換（Muhenkan）→IMEOff を Composition/Conversion/
+/// Precomposition の3状態（IMEが既にOFFの`DirectInput`除く）に無条件で
+/// 重ね掛けする（本家ソース
+/// `src/data/keymap/overlay_henkan_muhenkan_to_ime_on_off.tsv` で確認済み）。
+/// このクレートは現時点でこの値を検出する手段
+/// （[`crate::wire::GjiRawConfig::overlay_keymaps`]）を提供するのみで、
+/// `read_gji_ime_keys`/`read_gji_mode_keys` の戻り値には反映していない
+/// （overlay は `custom_keymap_table` の外にあるため、`custom_keymap_table`
+/// 経由の通常の抽出ロジックでは表現できない。呼び出し側でこの定数を直接
+/// チェックする必要がある）。
+pub const SESSION_KEYMAP_OVERLAY_HENKAN_MUHENKAN_TO_IME_ON_OFF: i64 = 100;
 
 #[cfg(test)]
 mod tests {
     use super::{
-        read_gji_ime_keys, write_dedicated_fn_key_binding, GjiImeKeys, WriteDedicatedFnKeyError,
+        read_gji_ime_keys, GjiImeKeys, SESSION_KEYMAP_OVERLAY_HENKAN_MUHENKAN_TO_IME_ON_OFF,
     };
-
-    /// `session_keymap = SESSION_KEYMAP_CUSTOM`（field 22）と
-    /// `custom_keymap_table = table`（field 42）を積んだ最小 protobuf バイト列を
-    /// 作る。`write_dedicated_fn_key_binding` は `session_keymap ==
-    /// Some(SESSION_KEYMAP_CUSTOM)` を前提とするため、このヘルパーはその前提を
-    /// 満たす「カスタムキーマップ選択中」のフィクスチャを表す。
-    fn encode_custom_keymap_table_only(table: &str) -> Vec<u8> {
-        let mut bytes = vec![176u8, 1, 0]; // field 22 (session_keymap) = CUSTOM(0)
-        bytes.push(0xD2u8);
-        bytes.push(0x02);
-        bytes.push(u8::try_from(table.len()).expect("fixture length fits in u8"));
-        bytes.extend_from_slice(table.as_bytes());
-        bytes
-    }
 
     #[test]
     fn empty_bytes_yields_empty_keys() {
@@ -188,123 +170,17 @@ mod tests {
         assert!(keys.toggle.is_empty());
     }
 
+    /// BUG-115: field 68 (`overlay_keymaps`) に
+    /// `OVERLAY_HENKAN_MUHENKAN_TO_IME_ON_OFF` (100) が含まれることを、
+    /// `wire::parse_top_level` 経由で検出できることを確認する。
     #[test]
-    fn write_dedicated_fn_key_binding_end_to_end_on_empty_config() {
-        let bytes = encode_custom_keymap_table_only("status\tkey\tcommand\n");
-        let written = write_dedicated_fn_key_binding(&bytes, "F21").expect("should write");
-        let keys = read_gji_ime_keys(&written); // 目的が違うので中身は見ないが壊れていないことの確認
-        assert!(keys.on.is_empty() && keys.off.is_empty() && keys.toggle.is_empty());
-        let mode_keys = super::read_gji_mode_keys(&written);
-        assert_eq!(
-            mode_keys.toggle_kana_type,
-            vec!["VK_F21".to_string()],
-            "書き込み後、config1.dbを再読み込みするとF21がSwitchKanaTypeとして検出できるはず"
-        );
-    }
-
-    /// BUG-64 の既知残骸（DirectInput→IMEOn 等）が残っていても、上書きして
-    /// 書き込める（衝突扱いにしない）。
-    #[test]
-    fn write_dedicated_fn_key_binding_overwrites_known_bug64_residual() {
-        let table = "status\tkey\tcommand
-DirectInput\tF21\tIMEOn
-Precomposition\tF21\tIMEOn
-Composition\tF21\tIMEOn
-Conversion\tF21\tIMEOn
-";
-        let bytes = encode_custom_keymap_table_only(table);
-        let written = write_dedicated_fn_key_binding(&bytes, "F21").expect("should write");
-        let mode_keys = super::read_gji_mode_keys(&written);
-        assert_eq!(mode_keys.toggle_kana_type, vec!["VK_F21".to_string()]);
-        let ime_keys = read_gji_ime_keys(&written);
-        assert!(
-            ime_keys.on.is_empty(),
-            "旧IMEOn残骸は上書きされ、もう検出されないはず"
-        );
-    }
-
-    /// 未知のバインド（他アプリ/ユーザー自身の設定の可能性）とは衝突として
-    /// 中止し、書き込まない。
-    #[test]
-    fn write_dedicated_fn_key_binding_refuses_on_conflict() {
-        let table = "status\tkey\tcommand\nComposition\tF21\tBackspace\n";
-        let bytes = encode_custom_keymap_table_only(table);
-        let err = write_dedicated_fn_key_binding(&bytes, "F21").expect_err("should conflict");
-        assert!(matches!(err, WriteDedicatedFnKeyError::Conflict { .. }));
-    }
-
-    /// `write_dedicated_fn_key_binding` は冪等: 一度書き込んだ結果に対して
-    /// 再度呼んでも衝突扱いにならず、同じ内容を返す（同一セッション内の
-    /// ポップアップ再試行、または複数セッションでの再検出のいずれでも
-    /// 失敗しないことの固定）。
-    #[test]
-    fn write_dedicated_fn_key_binding_is_idempotent() {
-        let bytes = encode_custom_keymap_table_only("status\tkey\tcommand\n");
-        let once = write_dedicated_fn_key_binding(&bytes, "F21").expect("should write");
-        let twice = write_dedicated_fn_key_binding(&once, "F21").expect("should write again");
-        assert_eq!(once, twice);
-    }
-
-    #[test]
-    fn write_dedicated_fn_key_binding_on_unparsable_bytes_is_error() {
-        // session_keymap = CUSTOM を先に置き、その後ろに group wire type (3、
-        // 未対応)を続ける。session_keymap チェックは通過させた上で、
-        // replace_custom_keymap_table 側の再走査が壊れたバイト列を検出することを
-        // 固定する（session_keymap チェックより先に UnparsableConfig を返す
-        // ケースの回帰）。
-        let mut bytes = vec![176u8, 1, 0]; // field 22 (session_keymap) = CUSTOM(0)
-        bytes.push((5 << 3) | 3); // field 5, group wire type (未対応)
-        let err = write_dedicated_fn_key_binding(&bytes, "F21").expect_err("should be unparsable");
-        assert_eq!(err, WriteDedicatedFnKeyError::UnparsableConfig);
-    }
-
-    /// `parse_top_level` 自体が空バイト列で `None` を返すケース
-    /// （session_keymap チェックに到達する前に中止する）。
-    #[test]
-    fn write_dedicated_fn_key_binding_on_empty_bytes_is_unparsable() {
-        let err = write_dedicated_fn_key_binding(&[], "F21").expect_err("should be unparsable");
-        assert_eq!(err, WriteDedicatedFnKeyError::UnparsableConfig);
-    }
-
-    /// `custom_keymap_table`（field 42）自体が元々存在しなくても、
-    /// `session_keymap = CUSTOM` でさえあれば新規追加できる
-    /// （カスタムキーマップを選択した直後、まだ何もカスタマイズしていない状態）。
-    #[test]
-    fn write_dedicated_fn_key_binding_creates_table_when_absent() {
-        // field 22 (session_keymap = CUSTOM) のみ、field 42 は無し。
-        let bytes: &[u8] = &[176, 1, 0];
-        let written = write_dedicated_fn_key_binding(bytes, "F21").expect("should write");
-        let mode_keys = super::read_gji_mode_keys(&written);
-        assert_eq!(mode_keys.toggle_kana_type, vec!["VK_F21".to_string()]);
-    }
-
-    /// `session_keymap` が `CUSTOM` でない（プリセット選択中、またはフィールド
-    /// 自体が無い）場合、`custom_keymap_table` に何が書かれていても GJI は
-    /// それを参照しないため、書き込みを中止する（Opus レビュー指摘）。
-    #[test]
-    fn write_dedicated_fn_key_binding_refuses_when_not_custom_keymap() {
-        // field 22 (session_keymap = ATOK = 1)。
-        let bytes: &[u8] = &[176, 1, 1];
-        let err = write_dedicated_fn_key_binding(bytes, "F21").expect_err("should refuse");
-        assert_eq!(err, WriteDedicatedFnKeyError::NotCustomKeymap);
-    }
-
-    /// `session_keymap` フィールド自体が無い場合も同様に中止する
-    /// （デフォルトが `CUSTOM` である保証がない、安全側に倒す）。
-    #[test]
-    fn write_dedicated_fn_key_binding_refuses_when_session_keymap_absent() {
-        let bytes =
-            encode_custom_keymap_table_only_without_session_keymap("status\tkey\tcommand\n");
-        let err = write_dedicated_fn_key_binding(&bytes, "F21").expect_err("should refuse");
-        assert_eq!(err, WriteDedicatedFnKeyError::NotCustomKeymap);
-    }
-
-    /// `session_keymap` を含めない `custom_keymap_table` のみのフィクスチャ
-    /// （`refuses_when_session_keymap_absent` 専用）。
-    fn encode_custom_keymap_table_only_without_session_keymap(table: &str) -> Vec<u8> {
-        let mut bytes = vec![0xD2u8, 0x02];
-        bytes.push(u8::try_from(table.len()).expect("fixture length fits in u8"));
-        bytes.extend_from_slice(table.as_bytes());
-        bytes
+    fn detects_henkan_muhenkan_overlay_via_wire_parse() {
+        // field 68, wire type 2 (length-delimited packed varint) に値 100 のみ。
+        // tag = (68 << 3) | 2 = 546 → varint [162, 4]。ペイロード長 1、値 100。
+        let bytes = [162, 4, 1, 100];
+        let raw = crate::wire::parse_top_level(&bytes).expect("should parse");
+        assert!(raw
+            .overlay_keymaps
+            .contains(&SESSION_KEYMAP_OVERLAY_HENKAN_MUHENKAN_TO_IME_ON_OFF));
     }
 }

@@ -1,14 +1,19 @@
 pub mod config;
+pub mod config_load_diag;
+pub mod config_save;
 pub mod diagnostics;
 pub mod engine;
 pub mod fs_atomic;
 pub mod gate;
 pub mod kana_table;
+pub mod key_text;
 pub mod ngram;
 pub mod paths;
 pub mod platform;
 pub mod scanmap;
 pub mod types;
+pub mod update_state;
+pub mod version;
 pub mod yab;
 
 // Re-export for ergonomic access from external crates and .yab integration.

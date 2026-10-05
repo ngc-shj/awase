@@ -39,6 +39,7 @@
 //! （`.claude/rules/experiment-logging.md`）の drift 源になる）。
 
 use awase::platform::ImeOpenOutcome;
+use awase::types::KeyAction;
 
 /// GJI 機構経由の IME 状態遷移が課す `GjiFsm` 同期義務のマーカー。
 ///
@@ -51,10 +52,61 @@ pub enum GjiFsmSync {
     OnImeOn,
     /// IME を閉じた（`gji_on_ime_off` 相当の同期が必要）。
     OnImeOff,
+    /// ADR-203 (i) level 突合: エンジンがローマ字を IME へ送ろうとしているのに `GjiFsm` が
+    /// `OffCold` のとき、`OnImeOn` と同じ遷移を **belief 起点**（awase は IME へ書いていない）で行う。
+    OnImeOnBelief,
+    /// ADR-203 (ii): 確かな ON 系イベント（物理キー予測 ON・shadow toggle ON〈`sync_direction` の on キーを含む〉）
+    /// で `GjiFsm` を開き直す（`GjiEvent::Reopen`。遷移表は `tsf/gji_fsm.rs` の `GjiEvent::Reopen` の doc）。
+    /// 発生元は journal の trigger に残す（[`ReopenSource`]）。
+    Reopen(ReopenSource),
+}
+
+/// [`GjiFsmSync::Reopen`] の発生元（journal の `GjiFsmTransition.trigger` に残し、e2e・bug report から
+/// どの入口で開き直したかを区別できるようにする。ADR-203 決定9）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReopenSource {
+    /// 物理キー予測（`KeyEffectPredicted{open: Some(true)}`）。
+    Predict,
+    /// shadow toggle の no-op 分岐（belief が既に ON の `TurnOn` キー。OFF を見逃した後の ON）。
+    ShadowNoop,
+    /// shadow toggle で OFF→ON に倒した瞬間。
+    ShadowToggle,
+}
+
+impl ReopenSource {
+    /// journal の trigger 文字列。
+    #[must_use]
+    pub const fn trigger(self) -> &'static str {
+        match self {
+            Self::Predict => "Reopen(BeliefSync:predict)",
+            Self::ShadowNoop => "Reopen(BeliefSync:shadow-noop)",
+            Self::ShadowToggle => "Reopen(BeliefSync:shadow-toggle)",
+        }
+    }
+}
+
+/// 同期の起点（ADR-203 決定3）。`BeliefSync` は awase が IME へ書いていない同期であり、
+/// long-cold の reinit（VK_IME_OFF→VK_IME_ON の awase 起点書き込み）を行ってはならない
+/// （ADR-191「awase は書かない」、ADR-090 A-2 の warrant を迂回しない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GjiSyncOrigin {
+    /// awase 自身の actuation の結果としての同期（従来の `OnImeOn`/`OnImeOff`）。
+    Actuation,
+    /// belief・観測・予測からの同期。
+    BeliefSync,
 }
 
 impl GjiFsmSync {
-    /// モジュール private。外から `GjiFsmSync` を作る唯一の経路は
+    /// この同期の起点。
+    #[must_use]
+    pub const fn origin(self) -> GjiSyncOrigin {
+        match self {
+            Self::OnImeOn | Self::OnImeOff => GjiSyncOrigin::Actuation,
+            Self::OnImeOnBelief | Self::Reopen(_) => GjiSyncOrigin::BeliefSync,
+        }
+    }
+
+    /// モジュール private。外から `GjiFsmSync::OnImeOn/OnImeOff` を作る唯一の経路は
     /// [`legacy_gji_sync_obligation`] であり、導出式が 1 箇所であることを
     /// 可視性で担保する（INV-42）。
     #[must_use]
@@ -201,9 +253,9 @@ impl Drop for ActuationReceipt {
 /// 純粋関数。**同期義務の導出式はここ 1 箇所である**（INV-42）。
 ///
 /// `WindowsPlatform::on_ime_applied`（`platform.rs`）の実装をそのまま反映する:
-/// `outcome == UnsafeToToggle` の場合のみ同期しない（送信していないため）。**それ以外は
+/// `outcome == UnsafeToToggle` / `NotOwned` の場合のみ同期しない（送信していないため）。**それ以外は
 /// `open` の値だけを見て無条件に同期する** — どの戦略（ImmCross / GjiDirect /
-/// MsImeDirect / KanjiToggle）で actuate したか、ひいてはどの `ImeProfileDriver` を
+/// MsImeDirect）で actuate したか、ひいてはどの `ImeProfileDriver` を
 /// 経由したかは一切問わない。
 ///
 /// # profile 軸 / K 軸でゲートしてはならない（ADR-089 §4.3、INV-42）
@@ -224,10 +276,75 @@ impl Drop for ActuationReceipt {
 /// 推測値でゲートして落とすリスクのほうが一方的に大きい（原則 P20）。
 #[must_use]
 pub fn legacy_gji_sync_obligation(open: bool, outcome: ImeOpenOutcome) -> Option<GjiFsmSync> {
-    if outcome == ImeOpenOutcome::UnsafeToToggle {
+    if matches!(
+        outcome,
+        ImeOpenOutcome::UnsafeToToggle | ImeOpenOutcome::NotOwned
+    ) {
         return None;
     }
     Some(GjiFsmSync::for_open(open))
+}
+
+/// ADR-203 (i) level 突合: `send_keys` の直前に `GjiFsm` を `OnImeOnBelief` で同期すべきか。
+///
+/// エンジンがローマ字を IME 経由で送るのは belief が ON のときだけなので、`GjiFsm` が `OffCold` の
+/// ままなのに送ろうとしている不一致はそれ自体が同期漏れの証拠になる（時刻反転・起動時既定値・観測の
+/// 揺れの影響を受けない、入口も問わない）。**種別（K 軸）ではなく戦略の実体（`needs_f2_probe`）で
+/// ゲートする**（INV-42）。
+///
+/// 対象外: Unicode 注入モード（`GjiFsm` に `KeyInput` を送らず composition も迂回するため per-VK/ESC
+/// の害が無い）、probe・raw recovery/reinit の実行中（probe_id の相関が崩れる。次の送信で拾う）。
+#[must_use]
+pub const fn needs_belief_sync_on(
+    send_has_romaji: bool,
+    injection_is_unicode: bool,
+    strategy_is_gji_fsm: bool,
+    gji_is_off_cold: bool,
+    probe_or_recovery_blocking: bool,
+) -> bool {
+    send_has_romaji
+        && !injection_is_unicode
+        && strategy_is_gji_fsm
+        && gji_is_off_cold
+        && !probe_or_recovery_blocking
+}
+
+/// `send_keys` の `actions` が、IME 経由のローマ字/文字の送信を含むか。
+///
+/// 対象は cold-start 保護（per-VK confirm）経路を通るもの。`Char`/`Romaji` に加え、`KeySequence`（`.yab` の全角記号 `，` `－` 等。VK モードでは
+/// `send_char` を1文字ずつ呼び `Char` と同じ経路に進む）と、`Sequence` の中身（再帰）を見る。
+/// ADR-203 決定1「Sequence 内含む」（PR #354 のコードレビュー M1）。`Key`/`KeyUp`/`CtrlChord` は含めない。
+#[must_use]
+pub fn send_carries_romaji(actions: &[KeyAction]) -> bool {
+    actions.iter().any(|a| match a {
+        KeyAction::Char(_) | KeyAction::Romaji(_) | KeyAction::KeySequence(_) => true,
+        KeyAction::Sequence(items) => send_carries_romaji(items),
+        _ => false,
+    })
+}
+
+/// ADR-203 (ii): 確かな ON 系イベントで `GjiFsm` を開き直す同期義務。
+///
+/// 候補窓が可視（=入力中）なら出さない。`GjiFsm` の `OnWarm` は `EndComposition` の取りこぼしで
+/// 候補窓が出ていても `OnWarm` に見えうるための二重防御（`GjiFsm` 側も `OnComposing`/`OnCold` では
+/// 何もしない）。入力の途中で cold に落とすと per-VK confirm → StaleConfirm → ESC で未確定文字が
+/// 消える（BUG-171、BUG-033 追補3・4 と同型）。
+///
+/// **Unicode 注入モードでも出す**（PR #354 のコードレビュー M2 で一度「Unicode では出さない」にしたが、
+/// e2e-ime-smoke の baseline/atok-passthrough-cold（Unicode モードで動く）で GjiFsm が OffCold に固着して
+/// I4 が FAIL したため取り下げた）。Reopen 後の long-idle で `needs_unicode_cold_warmup` が VK_IME_ON poke
+/// を出すのは Unicode long-cold の既存設計（同期が正常に届く Unicode ユーザーでは元から起きる挙動）で、
+/// OffCold に固着すると失われるのは「long-cold の defer」であり、それを取り戻すのが同期の目的である。
+#[must_use]
+pub const fn reopen_obligation(
+    candidate_visible: bool,
+    source: ReopenSource,
+) -> Option<GjiFsmSync> {
+    if candidate_visible {
+        None
+    } else {
+        Some(GjiFsmSync::Reopen(source))
+    }
 }
 
 #[cfg(test)]
@@ -236,10 +353,10 @@ mod tests {
 
     const ALL_OUTCOMES: [ImeOpenOutcome; 5] = [
         ImeOpenOutcome::Applied,
-        ImeOpenOutcome::FallbackSent,
         ImeOpenOutcome::AlreadyMatched,
         ImeOpenOutcome::Failed,
         ImeOpenOutcome::UnsafeToToggle,
+        ImeOpenOutcome::NotOwned,
     ];
 
     /// 同期呼び出しを記録するフェイク sink。
@@ -264,9 +381,16 @@ mod tests {
             legacy_gji_sync_obligation(false, ImeOpenOutcome::UnsafeToToggle),
             None
         );
+        assert_eq!(
+            legacy_gji_sync_obligation(true, ImeOpenOutcome::NotOwned),
+            None
+        );
+        assert_eq!(
+            legacy_gji_sync_obligation(false, ImeOpenOutcome::NotOwned),
+            None
+        );
         for outcome in [
             ImeOpenOutcome::Applied,
-            ImeOpenOutcome::FallbackSent,
             ImeOpenOutcome::AlreadyMatched,
             ImeOpenOutcome::Failed,
         ] {
@@ -322,5 +446,75 @@ mod tests {
         let mut receipt = receipt;
         let mut sink = RecordingSink::default();
         receipt.settle(&mut sink);
+    }
+
+    #[test]
+    fn belief_sync_on_decision_table_is_exhaustive() {
+        // 全 2^5 組: 真になるのは「ローマ字あり・非Unicode・GjiFsm戦略・OffCold・非blocking」の1通りだけ。
+        for bits in 0u8..32 {
+            let b = |i: u8| bits & (1 << i) != 0;
+            let (romaji, unicode, f2, off, blocking) = (b(0), b(1), b(2), b(3), b(4));
+            let want = romaji && !unicode && f2 && off && !blocking;
+            assert_eq!(
+                needs_belief_sync_on(romaji, unicode, f2, off, blocking),
+                want,
+                "bits={bits:05b}"
+            );
+        }
+    }
+
+    #[test]
+    fn reopen_is_suppressed_only_while_candidate_visible() {
+        use ReopenSource::*;
+        for src in [Predict, ShadowNoop, ShadowToggle] {
+            assert_eq!(reopen_obligation(false, src), Some(GjiFsmSync::Reopen(src)));
+            assert_eq!(reopen_obligation(true, src), None);
+        }
+    }
+
+    #[test]
+    fn reopen_triggers_distinguish_every_entry() {
+        use ReopenSource::*;
+        let t = [
+            Predict.trigger(),
+            ShadowNoop.trigger(),
+            ShadowToggle.trigger(),
+        ];
+        assert!(t.iter().all(|s| s.starts_with("Reopen(BeliefSync:")));
+        assert_eq!(t.iter().collect::<std::collections::HashSet<_>>().len(), 3);
+    }
+
+    #[test]
+    fn send_carries_romaji_sees_key_sequence_and_nested_sequence() {
+        use awase::types::VkCode;
+        assert!(send_carries_romaji(&[KeyAction::Char('あ')]));
+        assert!(send_carries_romaji(&[KeyAction::Romaji("ka".into())]));
+        // 全角記号（`.yab` のクォート無し記号）は KeySequence（M1）
+        assert!(send_carries_romaji(&[KeyAction::KeySequence("，".into())]));
+        assert!(send_carries_romaji(&[KeyAction::Sequence(vec![
+            KeyAction::Suppress,
+            KeyAction::Sequence(vec![KeyAction::Romaji("ka".into())]),
+        ])]));
+        assert!(!send_carries_romaji(&[]));
+        assert!(!send_carries_romaji(&[
+            KeyAction::Key(VkCode(0x41)),
+            KeyAction::KeyUp(VkCode(0x41)),
+            KeyAction::CtrlChord(VkCode(0x41)),
+            KeyAction::Suppress,
+        ]));
+    }
+
+    #[test]
+    fn belief_origin_syncs_never_claim_actuation_origin() {
+        assert_eq!(GjiFsmSync::OnImeOn.origin(), GjiSyncOrigin::Actuation);
+        assert_eq!(GjiFsmSync::OnImeOff.origin(), GjiSyncOrigin::Actuation);
+        assert_eq!(
+            GjiFsmSync::OnImeOnBelief.origin(),
+            GjiSyncOrigin::BeliefSync
+        );
+        assert_eq!(
+            GjiFsmSync::Reopen(ReopenSource::Predict).origin(),
+            GjiSyncOrigin::BeliefSync
+        );
     }
 }

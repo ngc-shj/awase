@@ -43,21 +43,41 @@ impl CurrentFocus {
     }
 
     /// フォーカス情報をアトミックに更新する。
-    /// `app_profile` は `class_name` から導出してキャッシュする。
-    pub fn update(&mut self, pid: u32, class_name: String, hwnd: usize) {
+    /// `app_profile` は `class_name` と `process_name` から導出してキャッシュする。
+    pub fn update(&mut self, pid: u32, class_name: String, hwnd: usize, relay_apps: &[String]) {
+        self.update_with_process_name(pid, class_name, hwnd, relay_apps, None);
+    }
+
+    /// 既に同一フォーカスプローブ内で取得済みの process_name があれば再利用して更新する。
+    // `process_name` は `self.process_name` へそのまま move するため所有権が要る
+    // （`unwrap_or_else` 経由で move、下記本体参照）。`&str` で受けて呼び出し元で
+    // clone させるのは無駄なアロケーションを増やすだけなので許容する
+    // （2026-09-03 pre-existing、PR #155のCI green化のため対処。ADR-123とは無関係）。
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn update_with_process_name(
+        &mut self,
+        pid: u32,
+        class_name: String,
+        hwnd: usize,
+        relay_apps: &[String],
+        process_name: Option<String>,
+    ) {
         self.hwnd = hwnd;
         #[cfg(windows)]
         {
-            self.process_name = super::classify::get_process_name(pid).to_lowercase();
+            self.process_name = process_name
+                .unwrap_or_else(|| super::classify::get_process_name(pid).to_lowercase());
             self.root_hwnd = super::classify::root_hwnd_of(hwnd);
         }
         #[cfg(not(windows))]
         {
             let _ = pid;
+            let _ = process_name;
             self.process_name.clear();
             self.root_hwnd = hwnd;
         }
-        self.app_profile = AppImeProfile::from_class_name(&class_name);
+        self.app_profile =
+            AppImeProfile::from_class_and_process(&class_name, &self.process_name, relay_apps);
         self.pid = pid;
         self.class_name = class_name;
     }

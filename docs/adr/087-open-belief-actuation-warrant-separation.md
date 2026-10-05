@@ -1,3 +1,27 @@
+---
+id: ADR-087
+title: |-
+  IME open/close belief における「内部信念」と「actuation の根拠」の分離（根拠軸の規律）
+summary: |-
+  IME open/close belief における「内部信念」と「actuation の根拠」の分離 — `effective_open()` の二重用途（engine 挙動決定 と 外部書き込みの授権）を `OpenWarrant`/`WarrantBasis` で型分離。ADR-086 の根拠軸、INV-20〜28
+status: |-
+  一部実装・配線済み(2026-10-04 コード確認)。Phase 0〜2' の純粋ロジック(`issue_open_warrant`、state/open_warrant.rs)は現存。Phase 3 の配線は ADR-090 §2.A の A-1(全 actuation 入口への shadow 配線、e3bf7af2)・A-2(`into_actuation` による強制、2026-09-19)で実施済みで、`warrant_pending_adr087()` は削除済み。実機ソークの記録は確認できず未実施扱い。
+  旧(2026-10-04 更新前):
+  Phase 0〜2' 純粋ロジック実装・テスト済み・Opus 最終確認 must-fix ゼロ（BUG-63）、Phase 3 配線・実機ソーク未着手
+related_adr:
+  - "ADR-077"
+  - "ADR-078"
+  - "ADR-080"
+  - "ADR-081"
+  - "ADR-082"
+  - "ADR-084"
+  - "ADR-086"
+  - "ADR-089"
+  - "ADR-090"
+  - "ADR-098"
+  - "ADR-153"
+---
+
 # ADR-087: IME open/close belief における「内部信念」と「actuation の根拠」の分離（根拠軸の規律）
 
 ## ステータス
@@ -989,6 +1013,7 @@ bit-identical 性は成立しない（round3 M1 参照）——実装レビュ�
     | 9 | `ime_refresh.rs:534` | `set_ime_open(false)` | focus change 強制 OFF（IMM32 のみ） | — | — |
     | 10 | `ime_refresh.rs:727` | `set_ime_open(desired)` | drift correction（ImmCross） | — | — |
     | 11 | `ime_refresh.rs:740` | `apply_ime_open_with_belief(desired, None, belief)` | drift correction（非 ImmCross = Blacklist/TsfNative） | 空 | — |
+    | 12 | ~~`key_pipeline.rs`（`kp_stage_shadow_ime_toggle`、ADR-153決定1ケース3）~~ **撤回済み（2026-09-08、同日中）** | ~~`apply_ime_open_with_belief(false, None, belief)`~~ | ~~user explicit config force-actuate~~（実機A/B実験で「@」再現の直接原因と確定、下記2026-09-08訂正参照） | — | — |
     | — | `platform.rs:728`（trait `apply_ime_open`）/ `src/platform.rs:210` | — | **呼び出し元ゼロ（死んだ入口）** | — | — |
 
     **訂正（2026-08-21、[ADR-098](098-tsfnative-applied-confirmed-laundering-and-force-on-removal.md)
@@ -1036,6 +1061,39 @@ bit-identical 性は成立しない（round3 M1 参照）——実装レビュ�
     `tests/architecture_guard.rs` の `actuation_target_capture_call_sites_are_accounted_for`
     / `ime_open_actuation_entry_points_are_accounted_for` /
     `async_imm_cross_actuation_goes_through_the_single_chain_entry` を更新済み。
+
+    **訂正（2026-09-08、[ADR-153](153-gji-keymap-aware-safe-vk-substitution-for-mode-keys.md)
+    決定1実装）**: 上表に #12（`key_pipeline.rs::kp_stage_shadow_ime_toggle`
+    のケース3、無変換/変換単独タップの明示config`"off"`×belief既にOFF）を
+    追加した。ケース1/2（belief ONまたはOFF→ON昇格）は既存の
+    `write_physical_key`書き込み→`Engine::check_active_transition`の自動
+    activationカスケードに乗るため新規actuation入口を増やさないが、
+    ケース3はbeliefが変化しない（既にOFF、目標もOFF）ためこのカスケードが
+    発火せず、`kp_stage_idle_conv_check`のDirectInput回復（上表#4）と同型の
+    `shadow_on: None`バイパスで独立に強制actuateする必要がある。分類は
+    force-write/observation-based correctionのどちらでもない**新しい第3の
+    分類（user explicit config force-actuate）**——ユーザーが明示的に
+    選んだ設定に基づく能動的なactuationであり、観測に基づく補正
+    （observation-based correction）でも自動救済機構（force-write）でもない。
+    warrant必須化の対象とすべきかは、他の`shadow_on: None`バイパス系
+    入口（#4/#6/#7/#11）と同じ扱いで良いと考えられる（ユーザー自身が
+    直接選んだ設定に基づく点で、force-write系より正当性が高い）が、本項目
+    全体の実装（`OpenWarrant`新設）が未着手のため確定はしていない。
+    `.apply_ime_open_with_belief(`の直接呼び出しは2件→3件（#4/#11/#12）に
+    増えた。`architecture_guard.rs`の`ENTRY_POINTS`もこれに合わせて2→3に
+    更新済み。
+
+    **訂正（2026-09-08、同日、ADR-153ケース3撤回）**: 上表 #12は撤回した。
+    実機A/B切り分け実験（`docs/known-bugs.md` BUG-113節・
+    `docs/experiments.md`エントリ25）で、この「shadow_on: Noneバイパスに
+    より beliefが変化しなくても毎回強制actuateする」設計そのものが
+    「単発のIME制御SendInputが1回飛ぶだけで『@』を誘発するのに十分」
+    という機序の十分条件を毎回満たしてしまうことが確定したため、
+    warrant分類の検討を待たずに実装ごと削除した——「user explicit
+    config force-actuate」という新分類の要否自体もこれにより解消して
+    いる。**実 actuation 入口は#12を除いた10経路+死んだ入口1つに戻る。**
+    `.apply_ime_open_with_belief(`の直接呼び出しは3件→2件（#4/#11）に
+    戻り、`architecture_guard.rs`の`ENTRY_POINTS`も3→2に更新済み。
 15. `is_eligible_for_ime_force_on()`（`state/platform_state.rs:478`、
     `belief.is_japanese_ime() && effective_open()`）の判定を `issue_open_warrant()`
     経由に差し替える（INV-25、P16）。呼び出し元は3箇所
@@ -1874,3 +1932,14 @@ S3（`extract_fn_body` のブレースカウントが文字列リテラル非対
 awase-windows -- -A clippy::doc_lazy_continuation -D warnings` 新規指摘
 ゼロを確認済み。**Phase 3 本体（item15 実差し替え・item16(b)）に進む前の
 must-fix は解消済み**（Opus 総評）。
+
+## 追記（2026-09-25）: ヒューリスティック guard の区別を撤去した
+
+`ForceOnReason::BrokenAppBootstrap`（唯一の「override 権限を持たない」reason）は、追加元の `try_force_on_bootstrap` が `621bf93c`（force-on 撤去、2026-09-18）で消え、variant 自体も #307 で削除した。これにより本 ADR が導入した次の区別は、到達する reason が無くなったので削除した（挙動は変わらない）。
+
+- `ForceOnReason::overrides_explicit_intent()`（全 reason が `true` になった）。
+- `ForceGuardSet::active_heuristic_reason()`（常に `None`）と、`issue_open_warrant` の Step 4b、`HeuristicGuessSource::Guard`。
+- `effective_open`/`resolve` の `has_explicit_intent` 引数（guard は明示意図があっても常に override する）。`active_override_reason()` は `active_reason()` に改名した。
+
+本文中の上記の名前は、当時の設計の記録として残す。
+

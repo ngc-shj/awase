@@ -1,8 +1,38 @@
+---
+id: ADR-110
+title: |-
+  物理キー単純リマップ機能（`key_remap`）
+summary: |-
+  秀Caps調査から着想した、物理キー1つを別の物理キーとして常時扱う単純リマップ機能（`[[key_remap]] from/to`）。PR #120で実装・PR #121（BUG-100）でstuck modifier修正まで済ませたが、後継ADR-111（Caps(英数)⇔Ctrl入れ替えプリセット）の設計レビューで、フックベースのキーリマップは日本語IME環境のCapsLock位置キーに対して構造的に危険と判明（`docs/experiments.md`エントリ07/08/09の先例、PowerToys Issue #3397/#32344と同型の問題）。「アプリごとに動的にキー割当てを変更する」将来機能で置き換える構想もあり、バックエンドごと撤回した
+status: |-
+  撤回済み(2026-08-30、ADR-111 r4 決定による)。2026-10-04 時点で `key_remap` 機構は現行コードに無い(awase-settings のコメントに残るのみ)。
+  旧(2026-10-04 更新前):
+  **撤回済み（2026-08-30、後継: ADR-111）**。ADR-111 r4決定によりrevert。実装・修正まで完了していたが後継検討で機能全体を取り下げ
+related_adr:
+  - "ADR-111"
+---
+
 # ADR-110: 物理キー単純リマップ機能（`key_remap`）
 
 ## ステータス
 
-**提案（未実装、2026-08-28）。改訂版（r3）。** 秀Caps（`hide.maruo.co.jp`）の
+**撤回（2026-08-30、ADR-111 r4 決定によりバックエンドごと revert）。**
+実装（PR #120）・stuck modifier修正（PR #121, BUG-100）まで完了し develop に
+merge されていたが、このADR-110の機能を「Caps(英数)⇔Ctrl入れ替え」用途に
+絞ろうとした後継ADR-111の設計レビュー（Opus 2体による敵対的レビュー、
+PowerToysの類似実装調査）で、フックベースのキーリマップは日本語IME環境の
+CapsLock位置キー（英数キー）に対して構造的に危険と判明した
+（`docs/experiments.md`エントリ07/08/09の先例の再発見、PowerToys
+[Issue #3397](https://github.com/microsoft/PowerToys/issues/3397)/
+[Issue #32344](https://github.com/microsoft/PowerToys/issues/32344)と同型の
+問題）。加えて「アプリケーションごとに動的にキー割当てを変更する」将来機能
+構想により本機能自体が置き換えられる見込みとなったため、汎用`key_remap`
+機構全体（本ADR）をバックエンドごと撤回した。詳細・経緯は ADR-111 参照。
+以下は撤回前の設計記録として保持する。
+
+---
+
+**（撤回前の内容、以下）提案（未実装、2026-08-28）。改訂版（r3）。** 秀Caps（`hide.maruo.co.jp`）の
 機能調査から着想。r1 を Opus に敵対的レビューさせ blocking 3件・should-fix
 7件（F1〜F10）を反映して r2 に改訂。r2 を同じレビュアーに再レビューさせた
 ところ、設計方針の転換は不要だが blocking 4件・should-fix 3件・

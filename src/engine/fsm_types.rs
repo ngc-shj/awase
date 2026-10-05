@@ -39,6 +39,10 @@ impl KeyClass {
 }
 
 /// classify() の結果。キー分類と物理位置を一度に計算する。
+///
+/// `injected`/`is_ime_control`の2個のboolは、それぞれ独立した
+/// プラットフォーム層の分類結果（互いに排他でも状態遷移でもない）。`RawKeyEvent`（この型の
+/// 変換元）からそのまま引き継ぐ。
 #[derive(Debug, Clone, Copy)]
 pub struct ClassifiedEvent {
     pub key_class: KeyClass,
@@ -48,6 +52,10 @@ pub struct ClassifiedEvent {
     pub scan_code: ScanCode,
     pub vk_code: VkCode,
     pub timestamp: Timestamp,
+    /// プラットフォーム層が注入イベントとして分類したか。
+    /// 生の OS フラグではなく、delegate-to-open-axis の BUG-14 ガード等に使う
+    /// プラットフォーム非依存の事前分類結果。
+    pub injected: bool,
     /// IME 制御キーか（保留フラッシュ判定用、プラットフォーム層が事前分類）
     pub is_ime_control: bool,
     /// この VK が OS 修飾キー（Ctrl/Shift/Alt/Meta）であるかの事前分類。
@@ -58,6 +66,9 @@ pub struct ClassifiedEvent {
     /// 素通しして良いか（無変換/変換等）／してはいけないか（Alt 等、
     /// 単独タップで OS 側の副作用があるキー）を判定するために使う。
     pub modifier_key: Option<ModifierKey>,
+    /// 元の `RawKeyEvent::press_id`（非リピート KeyDown だけ Some）。Engine は中身を見ず、単独タップの確定
+    /// （`PendingThumbData::press_id` 経由）まで運んで `ImeEffect::SetOpen.press` に載せる（ADR-208 決定2 D1）。
+    pub press_id: Option<crate::types::PressId>,
 }
 
 impl ClassifiedEvent {
@@ -70,8 +81,10 @@ impl ClassifiedEvent {
             scan_code: ScanCode(0),
             vk_code: VkCode(0),
             timestamp: 0,
+            injected: false,
             is_ime_control: false,
             modifier_key: None,
+            press_id: None,
         }
     }
 }
@@ -267,18 +280,35 @@ pub enum IdleIntent {
     ConfirmMode,
 }
 
-/// `flush_pending` に渡す composing 値の信頼性。
+/// `flush_pending` で保留中の親指キーを単独確定する際、生の機能VK
+/// （`VK_SPACE`/無変換/変換等、US配列 Space 親指キー対応・`e3041be6`）を
+/// OS へ送出してよいかの許可。
+///
+/// **かな出力の可否とは無関係**——`EngineState::PendingChar`/`PendingCharThumb`
+/// の腕はこの値を一切参照しない。両腕とも `lookup_face` の結果（かなの
+/// `KeyAction`）だけを出力し、生VKを送出しないため、「別ウィンドウへの生VK
+/// 誤注入」というこの型が守ろうとしているリスクが構造的に存在しない（詳細は
+/// `EngineState::PendingThumb` の flush 実装と `docs/known-bugs.md` BUG-129
+/// 参照。旧名 `ComposingHint`——「composing の信頼性」という名前が実態
+/// 〈生VK送出許可〉より広い意味に読めたことが BUG-129 調査で見つかった
+/// 非対称性を「見落としでは」と誤読させる一因だったため、2026-09-11 に
+/// 改名した）。
 ///
 /// `NicolaFsm::flush_pending` の doc 参照。呼び出し元が `composing` を「保留キーが
-/// 入力された時点と同一のコンテキスト」のものだと保証できる場合のみ `Trusted` を渡す。
-/// フォーカス変更等でコンテキスト境界を跨ぐ場合は `Unknown` を渡し、
-/// Space フォールバック例外も含め無条件 suppress する（安全側）。
+/// 入力された時点と同一のウィンドウ/コンテキストである」と保証できる場合のみ
+/// `Allowed(composing)` を渡す。フォーカス変更等でコンテキスト境界を跨ぐ場合は
+/// `Denied` を渡す——`ContextChange` の variant からは自動導出しないこと
+/// （`ImeOff` という reason でも実体はフォーカス変更でありうるため、境界情報は
+/// 呼び出し元が明示的に渡し続ける設計）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ComposingHint {
-    /// `composing` は保留キーと同一コンテキストのものと信頼できる。
-    Trusted(bool),
-    /// コンテキスト境界を跨ぐため `composing` を信頼できない。無条件 suppress する。
-    Unknown,
+pub enum ThumbRawVkEmission {
+    /// 同一ウィンドウ・同一コンテキスト内の flush。`composing` は保留キーと
+    /// 同一コンテキストのものと信頼できるため、その値どおりに生VK送出可否を判定する。
+    Allowed(bool),
+    /// フォーカス変更等、出力先ウィンドウが保留キー入力時と異なりうる flush。
+    /// 別ウィンドウへ `VK_SPACE` 等を誤注入しないため生VK送出を禁止する
+    /// （`e3041be6` の除外条項）。
+    Denied,
 }
 
 /// 出力履歴の更新指示。
@@ -305,6 +335,22 @@ impl OutputUpdate {
             kana,
             action: action.clone(),
         })
+    }
+
+    /// ADR-120 決定0a: `Record`/`RetractAndRecord` いずれでも、内包する
+    /// `OutputEntry` への参照を返す（`None` なら `Self::None`）。
+    #[must_use]
+    pub const fn entry_ref(&self) -> Option<&crate::engine::output_history::OutputEntry> {
+        match self {
+            Self::Record(entry) | Self::RetractAndRecord(entry) => Some(entry),
+            Self::None => None,
+        }
+    }
+
+    /// ADR-120 決定0a 項目7: 投機出力の差し替え（`RetractAndRecord`）かどうか。
+    #[must_use]
+    pub const fn is_retract_and_record(&self) -> bool {
+        matches!(self, Self::RetractAndRecord(_))
     }
 }
 
@@ -468,6 +514,10 @@ impl PendingKey {
 }
 
 /// 保留中の親指キーデータ
+///
+/// `is_left`/`after_char_flush`は独立した分類結果で
+/// あり（互いに排他でも状態遷移でもない）、状態機械やenumへの統合は不自然。
+/// `ClassifiedEvent`の値をそのまま引き継ぐ。
 #[derive(Debug, Clone, Copy)]
 pub struct PendingThumbData {
     pub scan_code: ScanCode,
@@ -477,6 +527,17 @@ pub struct PendingThumbData {
     /// この親指キーが OS 修飾キー（Ctrl/Shift/Alt/Meta）に割り当てられているか。
     /// `NicolaFsm::timeout_pending_thumb` 参照。
     pub modifier_key: Option<ModifierKey>,
+    /// ADR-182 決定1: この親指は、文字キー保留中に到着し、その文字が時間超過で単独確定された
+    /// 結果として`PendingThumb`になった（`step_pending_char_thumb`の時間超過分岐）。
+    /// 文字が既に単独確定済みで、親指を生のIME操作キーとしても出すと、
+    /// チョードのつもりの打鍵が意図しない単独タップ（半角英数化等）になるため、
+    /// `resolve_pending_thumb_as_single`は`ModeKeyConfig`のPassthrough（優先順位3）を抑止する
+    /// （`suppresses_solo_output`）。Idle起点の親指ではfalse。
+    pub after_char_flush: bool,
+    /// この親指の保留開始 KeyDown の押下 ID（`ClassifiedEvent::press_id`）。KeyUp/タイムアウトで単独タップが
+    /// 確定して IME 開閉を要求するとき、`ImeEffect::SetOpen.press` へ運ぶ（確定点は KeyDown ではないので、ここで保持する。
+    /// ADR-208 決定2 D1）。自動リピートの Down は `None`。
+    pub press_id: Option<crate::types::PressId>,
 }
 
 impl PendingThumbData {
@@ -488,7 +549,17 @@ impl PendingThumbData {
             is_left: ev.key_class.is_left_thumb(),
             timestamp: ev.timestamp,
             modifier_key: ev.modifier_key,
+            after_char_flush: false,
+            press_id: ev.press_id,
         }
+    }
+
+    /// `resolve_pending_thumb_as_single`の抑止引数に渡す値。`after_char_flush`（ADR-182決定1）のとき、
+    /// `ModeKeyConfig`のPassthrough（優先順位3）を抑止する。優先順位1（専用Fnキー）・2（ユーザー
+    /// 明示config）には影響しない。
+    #[must_use]
+    pub const fn suppresses_solo_output(self) -> bool {
+        self.after_char_flush
     }
 
     /// この親指キーに対応する `Face` を返す。
@@ -586,15 +657,9 @@ impl ModeKeyConfig {
 
     /// 非 composing（idle）時に単独タップが素通し（`GuardAction::Passthrough`）か。
     ///
-    /// `gji_charset_popup.rs` の設定支援ポップアップ（無変換単独タップが
-    /// 「素のパススルー」設定のまま=GJI 既定のかな切替に横取りされうる状態か）
-    /// の判定に使う、`!always_suppress` の新表現（ADR-092 実装時の Opus
-    /// コードレビュー指摘: 同じ事実を legacy bool から独立に導出していた
-    /// `Runtime::muhenkan_solo_tap_is_passthrough` を、この単一の判定へ
-    /// 一本化した）。専用Fnキー（`DedicatedFnKey`）が有効かどうかはこの
-    /// メソッドの関知するところではない——呼び出し元が別途チェックする
-    /// （`gji_charset_popup.rs::maybe_show_setup_popup` は
-    /// `muhenkan_dedicated_fn_key_active()` を本メソッドより先に見ている）。
+    /// `!always_suppress` の表現。専用Fnキー（`DedicatedFnKey`）が有効かどうかは
+    /// このメソッドの関知するところではない——`DedicatedFnKey`は`ModeKeyConfig`を
+    /// 経由せず独立に優先される（下記 doc 参照）。
     #[must_use]
     pub const fn is_passthrough(self) -> bool {
         matches!(self.idle, GuardAction::Passthrough)
@@ -605,15 +670,12 @@ impl ModeKeyConfig {
 /// `resolve_pending_thumb_as_single` の戻り値の中間表現。`DedicatedFnKey`
 /// は `ModeKeyConfig` を経由せず独立に優先される（上記 doc 参照）。
 ///
-/// ADR-092 決定Bが4つ目の variant として定義していた `DelegateToOpenAxis
-/// (ShadowImeAction)`（MS-IME/GJI 宣言に基づく IME open 軸への肩代わり、
-/// 決定D Step4b）は、この enum には**追加しない**（Step4b 実装時の設計判断）。
-/// `DedicatedFnKey` と同様「`ModeKeyConfig` を経由せず独立に優先される」
-/// 自動検出由来の上書きであり、`NicolaFsm` の独立フィールド
-/// （`muhenkan_delegate_to_open_axis`/`henkan_delegate_to_open_axis`）として
-/// 保持し、`resolve_pending_thumb_as_single` が `SoloTapAction` を構築する
-/// **前**に判定する（`dedicated_fn_key` と同じ理由: config reload で
-/// `ModeKeyConfig` が丸ごと再設定されても自動検出値を消さないため）。
+/// 開閉の役割（bare `keys.ime_*`／IME 設定由来のトグル、ADR-192 決定3b・ADR-199 決定16・ADR-206）による
+/// IME open 軸への副作用（旧ADR-092 決定Bの `DelegateToOpenAxis` 相当）は、この enum には**追加しない**。
+/// `DedicatedFnKey` と同様「`ModeKeyConfig` を経由せず独立に優先される」上書きであり、
+/// `NicolaFsm` の独立フィールド（`forced_open_action`）として保持し、`resolve_pending_thumb_as_single` が
+/// `SoloTapAction` を構築する**前**に判定する。旧 `*_solo_tap_ime_action`（ADR-153）は ADR-206 で撤去し、
+/// GJI/MS-IME の設定からの旧自動採用（`*_delegate_to_open_axis`）は ADR-191 で撤去した。
 /// IME open 軸への副作用要求は `ResolvedAction` を経由せず、
 /// `NicolaFsm::ime_open_requested`（`take_engine_off_requested` と同型の
 /// ワンショットチャネル）で `Engine` 層へ伝える。
@@ -634,6 +696,16 @@ impl From<GuardAction> for SoloTapAction {
             GuardAction::Passthrough => Self::Passthrough,
         }
     }
+}
+
+/// `NicolaFsm::ime_open_requested` のワンショット要求（無変換/変換の単独タップが要求する IME open 軸操作）。
+///
+/// `press` は単独タップの保留開始 KeyDown の押下 ID（`PendingThumbData::press_id`）。確定点（KeyUp/タイムアウト/次のキー）
+/// は KeyDown と別のイベントなので、`Engine` が `ImeEffect::SetOpen.press` に載せられるようここで運ぶ（ADR-208 決定2 D1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImeOpenRequest {
+    pub action: crate::types::ShadowImeAction,
+    pub press: Option<crate::types::PressId>,
 }
 
 /// Space/Enter 親指キー（IME の正規機能を持つキー）の設定（ADR-092 決定B）。
@@ -710,8 +782,7 @@ mod tests {
     }
 
     /// `is_passthrough()` は idle が `Passthrough` の場合のみ true
-    /// （`gji_charset_popup.rs` が「無変換単独タップが素のパススルー設定の
-    /// まま」を判定するのに使う、旧`!always_suppress`の新表現）。
+    /// （`!always_suppress`の表現）。
     #[test]
     fn mode_key_config_is_passthrough_matches_idle_state() {
         assert!(!ModeKeyConfig::from_legacy_bools(false, true).is_passthrough()); // always_suppress
@@ -730,6 +801,8 @@ mod tests {
         modifier_key: Option<ModifierKey>,
     ) -> RawKeyEvent {
         RawKeyEvent {
+            was_down: false,
+            press_id: None,
             vk_code: VkCode(0x41),
             scan_code: ScanCode(0x1E),
             event_type,
@@ -740,6 +813,8 @@ mod tests {
             ime_relevance: crate::types::ImeRelevance::default(),
             modifier_key,
             modifier_snapshot: Default::default(),
+            left_thumb_down_snapshot: None,
+            right_thumb_down_snapshot: None,
             injected: false,
         }
     }
@@ -1024,6 +1099,8 @@ mod tests {
             is_left,
             timestamp: 2000,
             modifier_key: None,
+            press_id: None,
+            after_char_flush: false,
         }
     }
 
@@ -1300,8 +1377,10 @@ mod tests {
             scan_code: ScanCode(0x20),
             vk_code: VkCode(0x48),
             timestamp: 3000,
+            injected: false,
             is_ime_control: false,
             modifier_key: None,
+            press_id: None,
         };
         assert_eq!(ev.key_class, KeyClass::Char);
         assert!(ev.pos.is_some());
@@ -1316,8 +1395,10 @@ mod tests {
             scan_code: ScanCode(0x39),
             vk_code: VkCode(0x20),
             timestamp: 4000,
+            injected: false,
             is_ime_control: false,
             modifier_key: None,
+            press_id: None,
         };
         assert!(ev.key_class.is_thumb());
         assert!(ev.pos.is_none());
@@ -1331,8 +1412,10 @@ mod tests {
             scan_code: ScanCode(0x70),
             vk_code: VkCode(0xF3),
             timestamp: 5000,
+            injected: false,
             is_ime_control: true,
             modifier_key: None,
+            press_id: None,
         };
         assert!(ev.is_ime_control);
     }
@@ -1426,8 +1509,10 @@ mod tests {
             scan_code: ScanCode(1),
             vk_code: VkCode(1),
             timestamp: 0,
+            injected: false,
             is_ime_control: false,
             modifier_key: None,
+            press_id: None,
         };
         let pa = ParseAction::ReduceAndContinue {
             actions: smallvec::smallvec![KeyAction::Suppress],
@@ -1459,6 +1544,8 @@ mod debug_label_tests {
             is_left: true,
             timestamp: 0,
             modifier_key: None,
+            after_char_flush: false,
+            press_id: None,
         }
     }
 

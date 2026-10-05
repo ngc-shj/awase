@@ -1,3 +1,34 @@
+---
+id: ADR-090
+title: |-
+  ADR-089 の型保護を実効化し、隣接 ADR の後始末を確定する — warrant 実配線 / 読み戻し API / 裏口の可視性 / 非同期 caps / dylint 方針 / ADR-081 Phase 1d 凍結
+summary: |-
+  ADR-089 の型保護を実効化し、隣接 ADR の後始末を確定する — `issue_open_warrant()` の実配線（`ActuationOrder` による warrant の運搬、shadow→enforce の二段階）、`ConvergedReceipt` の制御フロー配線と `most_recent_trusted_after` の private 化、観測ストアの裏口の可視性縮小と「閉じられない witness」の理由確定、非同期チェーンの `caps` 再抽選化、dylint 2 crate を恒久的に実行時 lint とする決定、**ADR-081 Phase 1d/1e の凍結決定**、golden の stale な関数名。INV-47〜52、P22
+status: |-
+  一部実装(2026-10-04 本文の実施記録で確認)。項A(A-1 shadow 配線 e3bf7af2・A-2 `into_actuation` による強制、2026-09-19)・項B(ConvergedReceipt 配線 a33a94e2)・項C(観測ストアの裏口)・項E(dylint 残置)・項F(ADR-081 Phase 1d/1e 凍結 146934ec)・項G(golden 名)は実施済み。項D(非同期チェーンの caps 化)は実施記録なく未着手。実機ソーク未実施。
+  旧(2026-10-04 更新前):
+  **項A: A-1（shadow配線）実施済み（2026-08-12）。A-2（強制）も実装済み・
+  push待ち（2026-09-19、ユーザー指示によりリスクを受容し実機ソーク前に
+  着手する方針へ転換——通常の「A-1ログ収集→入口ごと段階的に倒す」計画を
+  前倒しし、`ImeController::apply`/`run_open_chain_async`/
+  `set_ime_open_ordered`の3箇所を一括で`into_actuation()`（強制）へ
+  切替。3箇所目`set_ime_open_ordered`はA-2着手当初に見落としていた
+  合流点——warrantを計算してログするが`drop(order)`で捨てて無条件書き込み
+  していた欠陥として発見・修正）。他項（B/C/D/E/F/G）はドラフトのまま
+  未着手。詳細はA.7実施記録参照。**
+related_adr:
+  - "ADR-065"
+  - "ADR-078"
+  - "ADR-080"
+  - "ADR-081"
+  - "ADR-082"
+  - "ADR-084"
+  - "ADR-086"
+  - "ADR-087"
+  - "ADR-088"
+  - "ADR-089"
+---
+
 # ADR-090: ADR-089 の型保護を実効化し、隣接 ADR の後始末を確定する — warrant 実配線 / 読み戻し API / 裏口の可視性 / 非同期 caps / dylint 方針 / ADR-081 Phase 1d 凍結
 
 ## ステータス
@@ -645,6 +676,33 @@ $ grep -rn 'issue_actuation_order(\|issue_actuation_order_with_origin(\|issue_or
 - ADR-089 §6 Phase C 実施記録が「`cargo xwin check --target x86_64-pc-windows-msvc
   --all-targets` がグリーン」と書いているのは `--target` 明示ありなので、
   そちらは有効な検証である。**`--target` を省いた呼び方が無効**という話。
+
+#### A.7 A-2 実施記録（2026-09-19）— **実施済み**（実機ソーク未実施）
+
+**通常の段階的計画（A-1のshadowログで`would_have_blocked`実発火頻度を測り、
+入口ごとに1つずつ強制へ倒す）を経ず、ユーザー指示により3箇所を一括で
+強制へ切り替えた。** 理由: [ADR-179（旧178）](179-mode-key-actuation-follow-only-vs-toggle-ownership.md)
+領域A撤去（`f83084b3`/`621bf93c`、`apply_force_on_for_imm_broken`/
+`try_force_on_bootstrap`の削除）により、差分オラクルが指摘していた
+9件の不一致のうち最大リスクの2件（old-1: bootstrap force-ON、old-2:
+`BrokenAppBootstrap`guard）の生産コード上の発火源が既に消えていたため、
+残る差分（old-3: BUG-63パターンで新の方が安全、new-1: TsfNative Blind
+プロファイルの意図されたOwnSsotフォールバック1件のみ）を受容できると
+判断し、リスクを受容して実機検証で確認する方針へ転換した。
+
+| 変更 | 内容 |
+|---|---|
+| `ImeOpenOutcome::Unwarranted`新設（`src/platform.rs`） | `NotOwned`（InputRelay、プロファイル所有権軸）とは別の理由の「送っていない」を表す新variant。`ApplyError::Unwarranted`も対で新設 |
+| `ImeController::apply`（同期） | `order.into_actuation_shadow()` → `order.into_actuation()`。`None`なら`Unwarranted`を返しchainを試行しない |
+| `run_open_chain_async`（非同期） | 同上 |
+| `WindowsPlatform::set_ime_open_ordered` | **A-2着手当初に見落としていた3つ目の合流点として発見**（`ime_refresh.rs`のfocus change強制OFFとdrift correction ImmCross分岐が経由）。warrantを`log_shadow_warrant`でログするだけで`drop(order)`し無条件書き込みしていた欠陥を修正——`order.into_actuation().is_none()`なら`false`を返し書き込まない |
+| `ime_refresh.rs`の2呼び出し元 | 戻り値を無視していた（`let _ = ...`）のを、実際に書けたときだけ`record_optimistic`/診断ログの`sent`を反映する形に修正（無条件`record_optimistic`は「送っていないのに送った体でbeliefに記録する」ADR-098型の欠陥だった） |
+
+**未解決**: 実機（dragonflyg4）ソーク未実施。特にnew-1（TsfNative Blind
+プロファイルのOwnSsotフォールバック）が実際に安全に発火するか、
+`set_ime_open_ordered`経由の書き込み拒否がfocus change強制OFF/drift
+correctionの実挙動を壊さないかは実機A/Bで確認すること。Linux側の
+コンパイル・全862+1021テスト・fmt・clippyは確認済み（2026-09-19）。
 
 ---
 

@@ -1,3 +1,19 @@
+---
+id: ADR-095
+title: |-
+  タスクトレイからの不具合報告機能 — Cloudflare Workers + R2 による非公開受付
+summary: |-
+  タスクトレイから不具合報告(症状発生時の内部状態を自動添付)を送信する機能。受け口にGitHub Issuesは使わず、`report.awase.cc`をCloudflare Workers+R2の非公開受付として新設(`awase.cc`は既にCloudflare権威DNS配下のためゾーン移管不要)。GCPは無料枠超過時のfail-closed特性でCloudflareに劣ると判断し不採用。Opus round1レビュー(must-fix 8件)を受けユーザー判断でround2化: journalの生打鍵列はマスキングせず送信前プレビュー必須化で対応、ログ添付は既定ON、Turnstileはネイティブアプリ非対応のため不採用しレート制限+サイズ上限のみ。送信主体分離・R2書き込み専用トークン・ペイロードallowlist型化はエンジニアリング判断として決定。codex CLIで`services/report-worker/`(Worker)と`crates/awase-{windows,settings}/src/bug_report.rs`(トレイUI)を実装、Claudeが検証・修正(clippy borrow_as_ptr 4件・TS型エラー1件)しdevelop起点のADRブランチへマージ。Cloudflare実デプロイも完了(R2 `awase-report-bucket`+90日lifecycle・KV `RATE_LIMIT_KV`作成、`report.awase.cc`は手動CNAME(proxied)+Worker routeで疎通、有効ペイロードでのエンドツーエンド疎通確認(201+R2書き込み)済み。R2有効化にカード登録は不要と実地確認)。**決定7・8(2026-08-19追加)**: クラッシュレポーターと異なりawaseのバグはサイレントに違う動作をするため自由記述の価値は残しつつ、症状カテゴリ(10択)を選ぶだけの最小操作送信を可能にした(自由記述は任意化、「その他」選択時のみ必須)。あわせてIME製品名(既存TSFプロファイル列挙のキャッシュ、新規COM呼び出しなし)・keyboard_model設定・Windowsキーボードレイアウト・競合ソフトウェア検出(ADR-060再利用)を追加。schema_versionを2に上げ再デプロイ、エンドツーエンド疎通確認済み
+status: |-
+  実装済み(コード確認のみ、2026-10-04)。`bug_report.rs` が現存し、ADR-222(PR #451、v2.0.0)で 10 分ログの gzip 化など拡張済み。トレイ操作の実機確認の記録は本確認では見つからず未確認。
+  旧(2026-10-04 更新前):
+  **実装済み・Cloudflare実デプロイ済み(schema v2)**(2026-08-19。Windows実機でのタスクトレイ操作確認のみ未実施)
+related_adr:
+  - "ADR-060"
+  - "ADR-120"
+  - "ADR-148"
+---
+
 # ADR-095: タスクトレイからの不具合報告機能 — Cloudflare Workers + R2 による非公開受付
 
 ## ステータス
@@ -371,6 +387,34 @@ journal ログと同じ設計（**マスキングしない生データ、既定 
   と結合して読み込む。`config.general.default_layout`（保存済みの値）
   ではなく実行時の現在値を使うことで、「設定を保存せずレイアウトだけ
   切り替えた状態で発生したバグ」も正しく再現できるようにする。
+
+- **`retro_eval_stats`**（`attach_retro_eval_stats: bool`、ADR-120 決定0a-report、
+  2026-09-02追記）: NICOLA 3キー仲裁の判定過程・訂正発生を観測する累積カウンタ
+  （`BugReportRetroEvalStats`、`Engine::retro_eval_stats()` 由来）。打鍵内容・
+  かな1文字も含まない。`schema_version` は据え置き、フィールド自体が無い
+  旧クライアントの報告も引き続き受理する（`services/report-worker` の
+  `optionalBoolean`/`optionalNullableRecord`）。他の `attach_*` と同様、既定は
+  ON で送信前プレビューから個別に外せる。
+
+- **`gji_keymap`/`msime_key_assignment`**（`attach_ime_keymap: bool`、
+  [ADR-148](148-bug-report-ime-keymap-attachment.md)、2026-09-07追記）:
+  使用中のIME（GJIまたはMS-IME）の無変換/変換キー等へのIME ON/OFF割当て
+  設定。GJIは`config1.db`、MS-IMEはレジストリ（`キーとタッチの
+  カスタマイズ`）から読み取る。生バイナリ・生TSVは送らず、構造化された
+  要約型（`BugReportGjiKeymapSummary`/`BugReportMsImeKeyAssignmentSummary`）
+  のみを送る。`schema_version`は据え置き、`retro_eval_stats`と同じ
+  `optionalBoolean`/`optionalNullableRecord`パターンで旧クライアントの
+  報告も引き続き受理する。既定はONで送信前プレビューから個別に外せる。
+
+- **`legacy_msime_keymap`**（同じく`attach_ime_keymap: bool`、
+  [ADR-148 Phase 2](148-bug-report-ime-keymap-attachment.md#phase-2-実装2026-09-07追記2)、
+  2026-09-07追記）: 上記`msime_key_assignment`（新UI・シンプルキー割当て）
+  とは別系統の、旧UI（互換モードでのみ到達できる詳細キーカスタマイズ）
+  での無変換/変換キーへの「IMEオン/オフ」割当て検出結果
+  （`BugReportLegacyMsImeKeymapSummary`）。`msime_legacy_keymap.rs`の
+  実機確認済みの範囲のみ（無変換/変換の直接入力→ON方向のみ）を構造化して
+  送る。他の2フィールドと同じ`optionalNullableRecord`パターン・同じ
+  `attach_ime_keymap`フラグに相乗り。
 
 **プライバシー注記**: `layouts_dir`/`default_layout` にユーザーが絶対
 パスを入力していた場合、Windows のユーザー名が含まれる可能性がある。

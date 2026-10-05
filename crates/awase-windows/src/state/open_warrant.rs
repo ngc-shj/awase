@@ -16,7 +16,7 @@
 //! ## Step 0〜4 の評価順序（§2.3 P15、round3 で確定）
 //!
 //! ```text
-//! Step 0: override 権限を持つ真の安全弁（PanicReset/ProfilePolicy）が active
+//! Step 0: 真の安全弁（PanicReset/ProfilePolicy。active な guard は全て該当）が active
 //!         → SafetyValve（意図より先に評価する。ForceGuardSet::effective_open()
 //!           の意味論そのもの。§7 round3 M2）
 //! Step 1: IntentStore に対象への有効な明示意図がある
@@ -24,8 +24,6 @@
 //! Step 3: authority()==Actuating な観測が derive_any() 相当の判定を満たす
 //!         → DirectRead / Corroborated
 //! Step 4a: HeuristicDefault 観測が実在する → HeuristicGuess(Observation)
-//! Step 4b: override 権限を持たないヒューリスティック guard が active
-//!          （BrokenAppBootstrap 等）→ HeuristicGuess(Guard)
 //! Step 4c: policy.default_feedback == Blind（実 IME の open 状態を直接観測する
 //!          手段が構造的に無いプロファイル）→ OwnSsot（desired_open を採用）
 //! ```
@@ -89,6 +87,11 @@ pub enum WarrantBasis {
     /// `CASCADIA_HOSTING_WINDOW_CLASS` のような「Imm32Unavailable にも
     /// is_tsf_native にも該当するクラス」を誤判定し、BUG-16 を再発させる）。
     OwnSsot,
+    /// 明示キー押下（`ActuationOrder.press.is_some()`、ADR-208 決定2 D2・D3）の order が、**この押下の意図**
+    /// （`requested`）そのものを根拠に授権される。ユーザーの明示操作であり、ADR-090 の warrant が防ぎたい
+    /// 「推測による書き込み」ではない。Step 0（真の安全弁）の後で Step 1〜4 の代わりに使い、`is_japanese_ime`
+    /// （probe・HKL の誤答で偽になりうる）と `current_focus`（`None` だと IntentStore の Step 1 が外れる）を問わない。
+    ExplicitPress,
 }
 
 /// `WarrantBasis::HeuristicGuess` の内訳。
@@ -97,9 +100,6 @@ pub enum HeuristicGuessSource {
     /// `HeuristicDefault` 観測（`reset_stale_ime_on_for_imm_broken()` が
     /// Imm32Unavailable 入場時に記録するもの）に基づく。
     Observation(ObservationSource),
-    /// override 権限を持たないヒューリスティック guard（`BrokenAppBootstrap` 等）
-    /// に基づく。
-    Guard(ForceOnReason),
 }
 
 /// `issue_open_warrant()` が参照する状態一式。1回の呼び出しの間は不変
@@ -138,13 +138,43 @@ pub fn issue_open_warrant(
     target: HwndId,
     ctx: &WarrantContext<'_>,
 ) -> Option<OpenWarrant> {
-    if !ctx.is_japanese_ime {
+    issue_open_warrant_inner(requested, target, ctx, false)
+}
+
+/// 明示キー押下（`ActuationOrder.press.is_some()`）の order の授権（ADR-208 決定2 D2・D3）。
+///
+/// `issue_open_warrant` との違いは、`ctx.is_japanese_ime` による棄却（D2、S-2）と、`current_focus==None` で
+/// IntentStore の Step 1 が外れたときの棄却（D3、S-4）をしないこと。Step 0（真の安全弁）だけは押下でも先に効く。
+/// それ以外は押下の意図（`requested`）を [`WarrantBasis::ExplicitPress`] として授権する。
+#[must_use]
+pub fn issue_press_warrant(
+    requested: bool,
+    target: HwndId,
+    ctx: &WarrantContext<'_>,
+) -> Option<OpenWarrant> {
+    issue_open_warrant_inner(requested, target, ctx, true)
+}
+
+fn issue_open_warrant_inner(
+    requested: bool,
+    target: HwndId,
+    ctx: &WarrantContext<'_>,
+    explicit_press: bool,
+) -> Option<OpenWarrant> {
+    // 押下の order は `is_japanese_ime` を問わない（ADR-208 D2。0x16/0x1A・Engine のコンボが全窓で通る）。
+    if !explicit_press && !ctx.is_japanese_ime {
         return None;
     }
 
-    // Step 0: 真の安全弁。明示意図より先に評価する（§7 round3 M2）。
-    if let Some(reason) = ctx.guards.active_override_reason() {
+    // Step 0: 真の安全弁（active な guard は全て安全弁）。明示意図より先に評価する（§7 round3 M2）。
+    if let Some(reason) = ctx.guards.active_reason() {
         return finalize(requested, true, WarrantBasis::SafetyValve(reason));
+    }
+
+    // 押下（ADR-208 D3）: この押下の意図で授権する。Step 1 は `current_focus==None`（target が NULL）だと
+    // 必ず外れ、Step 3/4 の観測や `desired_open` は押下の向きと食い違いうる（S-4）ため、押下では使わない。
+    if explicit_press {
+        return finalize(requested, requested, WarrantBasis::ExplicitPress);
     }
 
     // Step 1: 明示意図（IntentStore、対象一致・TTL は lookup 内部で判定済み）。
@@ -186,15 +216,6 @@ pub fn issue_open_warrant(
             WarrantBasis::HeuristicGuess(HeuristicGuessSource::Observation(
                 ObservationSource::HeuristicDefault,
             )),
-        );
-    }
-
-    // Step 4b: override 権限を持たないヒューリスティック guard。
-    if let Some(reason) = ctx.guards.active_heuristic_reason() {
-        return finalize(
-            requested,
-            true,
-            WarrantBasis::HeuristicGuess(HeuristicGuessSource::Guard(reason)),
         );
     }
 
@@ -292,6 +313,79 @@ mod tests {
         );
     }
 
+    /// ADR-208 D2（S-2）: 明示キー押下の order は `is_japanese_ime` が偽でも授権される。リピート等（`issue_open_warrant`）は従来どおり。
+    #[test]
+    fn press_warrant_ignores_is_japanese_ime_but_plain_warrant_does_not() {
+        let store = IntentStore::default();
+        let obs = ObservationStore::default();
+        let guards = ForceGuardSet::default();
+        // 観測の無い Win32（Blind でない）: 通常の授権は Step 1/3/4 のどれも成立せず、`is_japanese_ime` が真でも None。
+        let policy = AppImePolicy::from_profile(ImePolicyProfile::Plain);
+        let now = Instant::now();
+        for jp in [false, true] {
+            let c = ctx(&store, &obs, &guards, &policy, false, jp, now, TickMs(0));
+            for open in [false, true] {
+                assert_eq!(
+                    issue_press_warrant(open, TARGET, &c),
+                    Some(OpenWarrant {
+                        target: open,
+                        basis: WarrantBasis::ExplicitPress
+                    }),
+                    "jp={jp} open={open}"
+                );
+            }
+            assert_eq!(issue_open_warrant(true, TARGET, &c), None, "jp={jp}");
+        }
+    }
+
+    /// ADR-208 D3（S-4）: `current_focus==None`（target が NULL で IntentStore の Step 1 が外れる）でも、鮮度内の観測が
+    /// 押下の向きと食い違っていても、押下の order は押下の意図で授権される。
+    #[test]
+    fn press_warrant_does_not_depend_on_focus_target_or_conflicting_observation() {
+        let store = IntentStore::default();
+        let mut obs = ObservationStore::default();
+        let now = Instant::now();
+        rec(
+            &mut obs,
+            obs_at(
+                true,
+                ObservationSource::ImmGetOpenStatus,
+                ObservationConfidence::High,
+                now,
+            ),
+        );
+        let guards = ForceGuardSet::default();
+        let policy = AppImePolicy::from_profile(ImePolicyProfile::ImmCross);
+        let c = ctx(&store, &obs, &guards, &policy, true, true, now, TickMs(0));
+        // 通常の授権: 観測 ON と食い違う OFF は None（INV-20）。押下の OFF は授権される。
+        assert_eq!(issue_open_warrant(false, HwndId::NULL, &c), None);
+        assert_eq!(
+            issue_press_warrant(false, HwndId::NULL, &c).map(|w| w.basis),
+            Some(WarrantBasis::ExplicitPress)
+        );
+    }
+
+    /// 押下でも Step 0（真の安全弁）は先に効く（ON を要求する PanicReset の間は OFF を授権しない）。ON は SafetyValve として授権される。
+    #[test]
+    fn press_warrant_still_honors_the_safety_valve() {
+        let store = IntentStore::default();
+        let obs = ObservationStore::default();
+        let mut guards = ForceGuardSet::default();
+        guards.add(ForceGuard {
+            reason: ForceOnReason::PanicReset,
+            expires_at: None,
+            generation: 1,
+        });
+        let policy = AppImePolicy::from_profile(ImePolicyProfile::TsfNative);
+        let now = Instant::now();
+        let c = ctx(&store, &obs, &guards, &policy, false, false, now, TickMs(0));
+        assert_eq!(issue_press_warrant(false, TARGET, &c), None);
+        assert!(matches!(
+            issue_press_warrant(true, TARGET, &c).map(|w| w.basis),
+            Some(WarrantBasis::SafetyValve(_))
+        ));
+    }
+
     #[test]
     fn step0_safety_valve_wins_even_over_explicit_off_intent() {
         // ADR-087 §7 round3 M2: PanicReset は明示 OFF 意図があっても override する。
@@ -322,36 +416,6 @@ mod tests {
                 target: true,
                 basis: WarrantBasis::SafetyValve(ForceOnReason::PanicReset),
             })
-        );
-    }
-
-    #[test]
-    fn step0_broken_app_bootstrap_does_not_override_explicit_off_intent() {
-        // BrokenAppBootstrap は override 権限を持たないため、Step 0 では発行されない。
-        let mut store = IntentStore::default();
-        store.record(
-            TARGET,
-            false,
-            crate::state::ime_event::UserIntentSource::PhysicalImeKey,
-            TickMs(0),
-        );
-        let obs = ObservationStore::default();
-        let mut guards = ForceGuardSet::default();
-        guards.add(ForceGuard {
-            reason: ForceOnReason::BrokenAppBootstrap,
-            expires_at: None,
-            generation: 1,
-        });
-        let policy = AppImePolicy::from_profile(ImePolicyProfile::Imm32Unavailable);
-        let now = Instant::now();
-        let warrant = issue_open_warrant(
-            true,
-            TARGET,
-            &ctx(&store, &obs, &guards, &policy, true, true, now, TickMs(0)),
-        );
-        assert_eq!(
-            warrant, None,
-            "Step1 の明示 OFF 意図が勝ち、requested=true とは一致しないため None"
         );
     }
 
@@ -598,35 +662,6 @@ mod tests {
     }
 
     #[test]
-    fn step4b_broken_app_bootstrap_fires_without_explicit_intent() {
-        let store = IntentStore::default();
-        let obs = ObservationStore::default();
-        let mut guards = ForceGuardSet::default();
-        guards.add(ForceGuard {
-            reason: ForceOnReason::BrokenAppBootstrap,
-            expires_at: None,
-            generation: 1,
-        });
-        let policy = AppImePolicy::from_profile(ImePolicyProfile::Imm32Unavailable);
-        let now = Instant::now();
-        let warrant = issue_open_warrant(
-            true,
-            TARGET,
-            &ctx(&store, &obs, &guards, &policy, false, true, now, TickMs(0)),
-        );
-        assert_eq!(
-            warrant,
-            Some(OpenWarrant {
-                target: true,
-                basis: WarrantBasis::HeuristicGuess(HeuristicGuessSource::Guard(
-                    ForceOnReason::BrokenAppBootstrap
-                )),
-            }),
-            "明示意図が無ければ BrokenAppBootstrap も既定推測として発火する"
-        );
-    }
-
-    #[test]
     fn requested_mismatch_returns_none() {
         // INV-20: basis が示す値と requested が食い違えば None。
         let store = IntentStore::default();
@@ -825,7 +860,6 @@ mod tests {
     #[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
     fn oracle(
         override_guard: bool,
-        heuristic_guard: bool,
         intent: Option<bool>,
         step3: Step3Case,
         heuristic_default_obs: Option<bool>,
@@ -887,14 +921,6 @@ mod tests {
                 None
             };
         }
-        // Step 4b: override 権限を持たないヒューリスティック guard（常に ON 側）。
-        if heuristic_guard {
-            return if requested {
-                Some((true, "HeuristicGuess"))
-            } else {
-                None
-            };
-        }
         // Step 4c: OwnSsot（Blind のときのみ、desired_open を採用）。
         if feedback_blind {
             return if requested == desired_open {
@@ -916,6 +942,7 @@ mod tests {
             WarrantBasis::Corroborated { .. } => "Corroborated",
             WarrantBasis::HeuristicGuess(_) => "HeuristicGuess",
             WarrantBasis::OwnSsot => "OwnSsot",
+            WarrantBasis::ExplicitPress => "ExplicitPress",
         }
     }
 
@@ -927,57 +954,59 @@ mod tests {
         let mut mismatches = Vec::new();
 
         for &override_guard in &[false, true] {
-            for &heuristic_guard in &[false, true] {
-                for &intent in &[None, Some(true), Some(false)] {
-                    for &step3 in &ALL_STEP3_CASES {
-                        for &heuristic_default_obs in &[None, Some(true), Some(false)] {
-                            for &feedback_blind in &[false, true] {
-                                for &desired_open in &[false, true] {
-                                    for &is_japanese_ime in &[false, true] {
-                                        for &requested in &[false, true] {
-                                            checked += 1;
+            for &intent in &[None, Some(true), Some(false)] {
+                for &step3 in &ALL_STEP3_CASES {
+                    for &heuristic_default_obs in &[None, Some(true), Some(false)] {
+                        for &feedback_blind in &[false, true] {
+                            for &desired_open in &[false, true] {
+                                for &is_japanese_ime in &[false, true] {
+                                    for &requested in &[false, true] {
+                                        checked += 1;
 
-                                            // ── 実際の状態を組み立てる ──
-                                            let mut guards = ForceGuardSet::default();
-                                            if override_guard {
-                                                guards.add(ForceGuard {
-                                                    reason: ForceOnReason::PanicReset,
-                                                    expires_at: None,
-                                                    generation: 1,
-                                                });
-                                            }
-                                            if heuristic_guard {
-                                                guards.add(ForceGuard {
-                                                    reason: ForceOnReason::BrokenAppBootstrap,
-                                                    expires_at: None,
-                                                    generation: 1,
-                                                });
-                                            }
+                                        // ── 実際の状態を組み立てる ──
+                                        let mut guards = ForceGuardSet::default();
+                                        if override_guard {
+                                            guards.add(ForceGuard {
+                                                reason: ForceOnReason::PanicReset,
+                                                expires_at: None,
+                                                generation: 1,
+                                            });
+                                        }
 
-                                            let mut store = IntentStore::default();
-                                            if let Some(v) = intent {
-                                                store.record(
-                                                    TARGET,
+                                        let mut store = IntentStore::default();
+                                        if let Some(v) = intent {
+                                            store.record(
+                                                TARGET,
+                                                v,
+                                                UserIntentSource::PhysicalImeKey,
+                                                TickMs(0),
+                                            );
+                                        }
+
+                                        let now = Instant::now();
+                                        let mut obs = ObservationStore::default();
+                                        match step3 {
+                                            Step3Case::None => {}
+                                            Step3Case::High(v) => rec(
+                                                &mut obs,
+                                                obs_at(
                                                     v,
-                                                    UserIntentSource::PhysicalImeKey,
-                                                    TickMs(0),
-                                                );
-                                            }
-
-                                            let now = Instant::now();
-                                            let mut obs = ObservationStore::default();
-                                            match step3 {
-                                                Step3Case::None => {}
-                                                Step3Case::High(v) => rec(
-                                                    &mut obs,
-                                                    obs_at(
-                                                        v,
-                                                        ObservationSource::ImmGetOpenStatus,
-                                                        ObservationConfidence::High,
-                                                        now,
-                                                    ),
+                                                    ObservationSource::ImmGetOpenStatus,
+                                                    ObservationConfidence::High,
+                                                    now,
                                                 ),
-                                                Step3Case::MediumSingle(v) => rec(
+                                            ),
+                                            Step3Case::MediumSingle(v) => rec(
+                                                &mut obs,
+                                                obs_at(
+                                                    v,
+                                                    ObservationSource::ObserverPoll,
+                                                    ObservationConfidence::Medium,
+                                                    now,
+                                                ),
+                                            ),
+                                            Step3Case::MediumAgree(v) => {
+                                                rec(
                                                     &mut obs,
                                                     obs_at(
                                                         v,
@@ -985,107 +1014,95 @@ mod tests {
                                                         ObservationConfidence::Medium,
                                                         now,
                                                     ),
-                                                ),
-                                                Step3Case::MediumAgree(v) => {
-                                                    rec(
-                                                        &mut obs,
-                                                        obs_at(
-                                                            v,
-                                                            ObservationSource::ObserverPoll,
-                                                            ObservationConfidence::Medium,
-                                                            now,
-                                                        ),
-                                                    );
-                                                    rec(
-                                                        &mut obs,
-                                                        obs_at(
-                                                            v,
-                                                            ObservationSource::Gji,
-                                                            ObservationConfidence::Medium,
-                                                            now,
-                                                        ),
-                                                    );
-                                                }
-                                                Step3Case::MediumConflict => {
-                                                    rec(
-                                                        &mut obs,
-                                                        obs_at(
-                                                            true,
-                                                            ObservationSource::ObserverPoll,
-                                                            ObservationConfidence::Medium,
-                                                            now,
-                                                        ),
-                                                    );
-                                                    rec(
-                                                        &mut obs,
-                                                        obs_at(
-                                                            false,
-                                                            ObservationSource::Gji,
-                                                            ObservationConfidence::Medium,
-                                                            now,
-                                                        ),
-                                                    );
-                                                }
-                                            }
-                                            if let Some(v) = heuristic_default_obs {
+                                                );
                                                 rec(
                                                     &mut obs,
                                                     obs_at(
                                                         v,
-                                                        ObservationSource::HeuristicDefault,
-                                                        ObservationConfidence::Low,
+                                                        ObservationSource::Gji,
+                                                        ObservationConfidence::Medium,
                                                         now,
                                                     ),
                                                 );
                                             }
-
-                                            let policy =
-                                                AppImePolicy::from_profile(if feedback_blind {
-                                                    ImePolicyProfile::TsfNative
-                                                } else {
-                                                    ImePolicyProfile::ImmCross
-                                                });
-
-                                            let warrant = issue_open_warrant(
-                                                requested,
-                                                TARGET,
-                                                &ctx(
-                                                    &store,
-                                                    &obs,
-                                                    &guards,
-                                                    &policy,
-                                                    desired_open,
-                                                    is_japanese_ime,
+                                            Step3Case::MediumConflict => {
+                                                rec(
+                                                    &mut obs,
+                                                    obs_at(
+                                                        true,
+                                                        ObservationSource::ObserverPoll,
+                                                        ObservationConfidence::Medium,
+                                                        now,
+                                                    ),
+                                                );
+                                                rec(
+                                                    &mut obs,
+                                                    obs_at(
+                                                        false,
+                                                        ObservationSource::Gji,
+                                                        ObservationConfidence::Medium,
+                                                        now,
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                        if let Some(v) = heuristic_default_obs {
+                                            rec(
+                                                &mut obs,
+                                                obs_at(
+                                                    v,
+                                                    ObservationSource::HeuristicDefault,
+                                                    ObservationConfidence::Low,
                                                     now,
-                                                    TickMs(0),
                                                 ),
                                             );
+                                        }
 
-                                            let expected = oracle(
-                                                override_guard,
-                                                heuristic_guard,
-                                                intent,
-                                                step3,
-                                                heuristic_default_obs,
-                                                feedback_blind,
+                                        let policy =
+                                            AppImePolicy::from_profile(if feedback_blind {
+                                                ImePolicyProfile::TsfNative
+                                            } else {
+                                                ImePolicyProfile::ImmCross
+                                            });
+
+                                        let warrant = issue_open_warrant(
+                                            requested,
+                                            TARGET,
+                                            &ctx(
+                                                &store,
+                                                &obs,
+                                                &guards,
+                                                &policy,
                                                 desired_open,
                                                 is_japanese_ime,
-                                                requested,
-                                            );
+                                                now,
+                                                TickMs(0),
+                                            ),
+                                        );
 
-                                            let actual = warrant
-                                                .as_ref()
-                                                .map(|w| (w.target, category(&w.basis)));
+                                        let expected = oracle(
+                                            override_guard,
+                                            intent,
+                                            step3,
+                                            heuristic_default_obs,
+                                            feedback_blind,
+                                            desired_open,
+                                            is_japanese_ime,
+                                            requested,
+                                        );
 
-                                            if actual != expected {
-                                                mismatches.push(format!(
-                                                "override_guard={override_guard} heuristic_guard={heuristic_guard} \
+                                        let actual = warrant
+                                            .as_ref()
+                                            .map(|w| (w.target, category(&w.basis)));
+
+                                        if actual != expected {
+                                            mismatches.push(format!(
+                                                "override_guard={override_guard} \
                                                  intent={intent:?} step3={step3:?} heuristic_default_obs={heuristic_default_obs:?} \
                                                  feedback_blind={feedback_blind} desired_open={desired_open} \
                                                  is_japanese_ime={is_japanese_ime} requested={requested} \
                                                  → actual={actual:?} expected={expected:?}"
                                             ));
-                                            }
                                         }
                                     }
                                 }
@@ -1154,7 +1171,6 @@ mod tests {
     enum GuardDim {
         Inactive,
         Override,
-        HeuristicOnly,
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -1163,8 +1179,8 @@ mod tests {
         TsfNative,
         // default_feedback = Read。Step4c は発火しない
         // （`step4c_does_not_fire_for_read_profile` 参照）。旧ゲートの
-        // `try_force_on_bootstrap` 呼び出し元はこちら側のプロファイルで
-        // 到達する（`ir_poll_and_learn`／`OsPoll` 経由）。
+        // 撤去済みの `try_force_on_bootstrap` 呼び出し元はこちら側のプロファイルで
+        // 到達していた（`ir_poll_and_learn`／`OsPoll` 経由）。
         ImmCross,
     }
 
@@ -1182,21 +1198,16 @@ mod tests {
         // - new_only（old=false, new=true）: new の方が緩い = Phase 3 実配線で
         //   新たに force-ON し始める可能性があるため要注意。
         //
-        // old_only の内訳（本テストで実測、計8件）:
+        // old_only の内訳（本テストで実測、計4件。ヒューリスティック guard〈旧 BrokenAppBootstrap、
+        // 撤去済み〉の次元を落とした分の4件は消えた）:
         // 1. `policy=ImmCross`・観測/意図/guard 一切無し・`desired_open=true`
-        //    （`try_force_on_bootstrap` 相当、1件）: 旧は observation 皆無時に
+        //    （撤去済み `try_force_on_bootstrap` 相当、1件）: 旧は observation 皆無時に
         //    `most_recent_trusted` も外れて `desired_open` にフォールバックし
         //    true になるが、新は Read プロファイルのため Step4c(OwnSsot) が
         //    発火せず None——**Phase 3 実配線で ImmCross の bootstrap force-ON
         //    経路が丸ごと無効化される、今回判明した中で最大の挙動変化**
         //    （2026-08-10 Opus レビュー M2）。
-        // 2. `guard=HeuristicOnly`（BrokenAppBootstrap）が実際の Actuating 観測
-        //    （ImmGetOpenStatus=false）を無視して force-ON する（旧のみ、
-        //    policy={TsfNative,ImmCross}×desired_open={false,true} の4件、
-        //    guard の効果はどちらの policy でも変わらないため両方に出現）。
-        //    新は Step3 の実観測が Step4b のヒューリスティック推測より優先
-        //    されるため force-ON しない——安全側の差分。
-        // 3. `observation=BeliefOnlyMedium(true)`（ConvOpenInference）が単独で
+        // 2. `observation=BeliefOnlyMedium(true)`（ConvOpenInference）が単独で
         //    force-ON eligibility を作る（旧のみ、3件: policy=TsfNative×
         //    desired_open=false、policy=ImmCross×desired_open={false,true}。
         //    TsfNative×desired_open=true は Step4c(OwnSsot) が同じ true を
@@ -1205,7 +1216,7 @@ mod tests {
         //    フィルタでこの観測源を actuation の根拠から除外するため発火しない。
         //
         // new_only の内訳（本テストで実測、計1件）:
-        // 4. `observation=BeliefOnlyMedium(false)`・intent/guard 無し・
+        // 3. `observation=BeliefOnlyMedium(false)`・intent/guard 無し・
         //    `policy=TsfNative`・`desired_open=true`: 旧は observation
         //    （ConvOpenInference=false）を採用し false になるが、新は Step3 で
         //    この観測源を除外した結果何も残らず Step4c(OwnSsot) が
@@ -1216,7 +1227,7 @@ mod tests {
         //
         // Phase 3 実配線前にこの件数が増減したら、この変更が意図したものか
         // （新しい分岐を足した／既存の不一致を解消した）を確認した上で更新すること。
-        const EXPECTED_OLD_ONLY_COUNT: usize = 8;
+        const EXPECTED_OLD_ONLY_COUNT: usize = 4;
         const EXPECTED_NEW_ONLY_COUNT: usize = 1;
 
         const EXPLICIT_INTENTS: [ExplicitIntentDim; 3] = [
@@ -1231,11 +1242,7 @@ mod tests {
             ObservationDim::BeliefOnlyMedium(true),
             ObservationDim::BeliefOnlyMedium(false),
         ];
-        const GUARDS: [GuardDim; 3] = [
-            GuardDim::Inactive,
-            GuardDim::Override,
-            GuardDim::HeuristicOnly,
-        ];
+        const GUARDS: [GuardDim; 2] = [GuardDim::Inactive, GuardDim::Override];
         const POLICIES: [PolicyDim; 2] = [PolicyDim::TsfNative, PolicyDim::ImmCross];
 
         let now = Instant::now();
@@ -1341,18 +1348,6 @@ mod tests {
                                         });
                                         guards_new.add(ForceGuard {
                                             reason: ForceOnReason::PanicReset,
-                                            expires_at: None,
-                                            generation: 1,
-                                        });
-                                    }
-                                    GuardDim::HeuristicOnly => {
-                                        model.force_guards.add(ForceGuard {
-                                            reason: ForceOnReason::BrokenAppBootstrap,
-                                            expires_at: None,
-                                            generation: 1,
-                                        });
-                                        guards_new.add(ForceGuard {
-                                            reason: ForceOnReason::BrokenAppBootstrap,
                                             expires_at: None,
                                             generation: 1,
                                         });
