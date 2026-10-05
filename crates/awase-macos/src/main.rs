@@ -874,6 +874,12 @@ mod app {
                                 }
                                 continue;
                             }
+                            // 注入してから期待を立てる。`expect_ime_from_key` の
+                            // RefreshState で engine が非活性化すると、押下中の
+                            // 切替キーの KeyUp が即座に出る。先に期待を立てると
+                            // その KeyUp が切替キーの KeyDown より先に OS へ届き、
+                            // ATOK が切替を取りこぼす（BUG-193）
+                            self.output.send_keys(actions);
                             for action in actions {
                                 if let awase::types::KeyAction::Key(vk) = action {
                                     self.expect_ime_from_key(vk.0);
@@ -881,7 +887,6 @@ mod app {
                                     self.spend_thumb_on_switch(vk.0);
                                 }
                             }
-                            self.output.send_keys(actions);
                             continue;
                         }
                         // IME 切替中は旧入力ソースで解釈されてしまうため保留する
@@ -915,11 +920,12 @@ mod app {
                         }
                     }
                     Effect::Input(InputEffect::ReinjectKey(ev)) => {
+                        // 注入が先（SendKeys の切替キーと同じ理由、BUG-193）
+                        self.output.reinject(ev.vk_code, ev.event_type);
                         if matches!(ev.event_type, KeyEventType::KeyDown) {
                             self.expect_ime_from_key(ev.vk_code.0);
                             self.spend_thumb_on_switch(ev.vk_code.0);
                         }
-                        self.output.reinject(ev.vk_code, ev.event_type);
                     }
                     Effect::Timer(TimerEffect::Set { id, duration }) => {
                         self.timers.set(*id, *duration);
