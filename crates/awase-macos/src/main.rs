@@ -324,8 +324,11 @@ fn load_layout(config: &awase::config::ValidatedConfig) -> Result<YabLayout> {
 
 /// ms 精度: IME 切替の settle 窓（数十 ms）と打鍵の前後関係を読むには
 /// 秒精度では足りない（BUG-187 の調査で判明）。tracing_subscriber の既定の
-/// タイマーは µs 精度なのでそのまま使う。出力先は従来どおり stderr
+/// タイマーは µs 精度なのでそのまま使う。出力先は従来どおり stderr。
+/// 色付けは端末のときだけ: LaunchAgent 等でファイルへ流すと制御コードが混ざり、
+/// `grep ' WARN '` 等が効かなくなる（env_logger は自動で切っていた）
 fn init_logging() {
+    use std::io::IsTerminal as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -333,6 +336,7 @@ fn init_logging() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
         .finish()
         .init();
 }
