@@ -323,7 +323,7 @@ fn load_layout(config: &awase::config::ValidatedConfig) -> Result<YabLayout> {
 }
 
 /// ms 精度: IME 切替の settle 窓（数十 ms）と打鍵の前後関係を読むには
-/// 秒精度では足りない（BUG-187 の調査で判明）。tracing_subscriber の既定の
+/// 秒精度では足りない（BUG-228 の調査で判明）。tracing_subscriber の既定の
 /// タイマーは µs 精度なのでそのまま使う。出力先は従来どおり stderr。
 /// 色付けは端末のときだけ: LaunchAgent 等でファイルへ流すと制御コードが混ざり、
 /// `grep ' WARN '` 等が効かなくなる（env_logger は自動で切っていた）
@@ -399,7 +399,7 @@ fn main() -> Result<()> {
     );
     // 親指キーが 英数/かな（kVK_JIS_Eisu / kVK_JIS_Kana）そのものなら、非活性化
     // フラッシュで捨てずに送出させる。macOS では親指キーが IME 切替キーを兼ねる
-    // ため、捨てるとユーザーの切替操作が消える（BUG-189）。Space 等の文字キーを
+    // ため、捨てるとユーザーの切替操作が消える（BUG-230）。Space 等の文字キーを
     // 割り当てた構成では false のままにする — 生キー送出の誤注入を防ぐ抑制が
     // 本来の目的どおり効くべきなので（`thumb_keys_are_ime_switch` の doc 参照）
     let is_switch_key = |kc: u16| matches!(kc, KEYCODE_EISU | KEYCODE_KANA);
@@ -529,7 +529,7 @@ mod app {
     ///
     /// 実測では張り直しは毎回 ~20ms で成功しているので 1 回で足りるが、
     /// `EXPECTATION_GRACE` を実測最大 +59ms まで詰めた分、期限の空振りが
-    /// キュー破棄（＝入力消失）に直結しないよう 2 回まで許す（BUG-187）。
+    /// キュー破棄（＝入力消失）に直結しないよう 2 回まで許す（BUG-228）。
     const MAX_SWITCH_REASSERTS: u8 = 2;
 
     /// 親指キー 1 本の押下状態。
@@ -537,7 +537,7 @@ mod app {
     /// macOS では親指キーが IME 切替キー（英数/かな）を兼ねるため、「切替として
     /// 消費された押下」と「親指シフトとしての押下」を区別する必要がある。前者を
     /// 押下として数えると、切替直後の文字が意図せず親指シフト面で解決される
-    /// （BUG-191: 英数 → かな と押して「きょう」を打つと、かな 押下中の 2 文字が
+    /// （BUG-232: 英数 → かな と押して「きょう」を打つと、かな 押下中の 2 文字が
     /// シフト面になり `ゔ` `い` が出た）。その押下は既に「IME を切り替える」役割を
     /// 果たして OS へ渡っており、同じ押下をシフトにも数えるのは二重計上。
     ///
@@ -673,13 +673,13 @@ mod app {
         deferred_focus_pid: Option<i32>,
         /// 保留を始めた時点で待っていた IME 状態。`is_switch_pending` は
         /// 「切替が完了した」と「猶予切れで諦めた」を区別しないため、
-        /// フラッシュ直前に観測がこれと一致するかを確かめる（BUG-187）。
+        /// フラッシュ直前に観測がこれと一致するかを確かめる（BUG-228）。
         deferred_expect_on: Option<bool>,
         /// 保留を始めた時刻（フラッシュまでの実待ち時間をログに残す）
         deferred_since: Option<Instant>,
         /// 観測されない切替を `TISSelectInputSource` で張り直した回数
         deferred_switch_reasserts: u8,
-        /// 保留キューが空のまま失敗した切替を張り直した回数（BUG-188）。
+        /// 保留キューが空のまま失敗した切替を張り直した回数（BUG-229）。
         /// 切替キーを新たに観測するたびに 0 に戻す
         switch_recoveries: u8,
     }
@@ -761,7 +761,7 @@ mod app {
                 );
                 return;
             }
-            // settle 定数の実測用（BUG-187）。保留開始から実際に送出するまでの
+            // settle 定数の実測用（BUG-228）。保留開始から実際に送出するまでの
             // 実待ち時間を残す
             tracing::debug!(
                 "Flushing {} deferred key action(s) {}ms after the switch was expected",
@@ -772,7 +772,7 @@ mod app {
         }
 
         /// この切替アクションが、より後に押された反対側の親指キーに
-        /// 追い越されているか（BUG-189 追補）。
+        /// 追い越されているか（BUG-230 追補）。
         ///
         /// 両親指が押されている間だけ判定する。押下時刻の新しい方がユーザーの
         /// 最終意図なので、古い方の切替キーを送ると結果が逆になる。
@@ -792,7 +792,7 @@ mod app {
             })
         }
 
-        /// 観測されないまま猶予切れした切替を張り直す（BUG-188）。
+        /// 観測されないまま猶予切れした切替を張り直す（BUG-229）。
         ///
         /// 保留キューがあるときは `maybe_flush_deferred` が回数制限付きで面倒を
         /// 見るので、ここは「切替キーが効かなかったが、まだ何も打鍵していない」
@@ -857,7 +857,7 @@ mod app {
                         // 打鍵がリテラルで漏れる事例を実測）
                         if actions.iter().any(is_ime_switch_action) {
                             // 保留から遅れて出てきた切替キーは、その間に押された
-                            // 反対側の親指に追い越される（BUG-189 追補: 英数 →
+                            // 反対側の親指に追い越される（BUG-230 追補: 英数 →
                             // 42ms 後に かな と打つと、flush された 英数 が かな の
                             // 後に着地して IME が意図と逆の OFF に落ちた）。
                             // 後から押された方をユーザーの最終意図とみなして捨てる
@@ -878,7 +878,7 @@ mod app {
                             // RefreshState で engine が非活性化すると、押下中の
                             // 切替キーの KeyUp が即座に出る。先に期待を立てると
                             // その KeyUp が切替キーの KeyDown より先に OS へ届き、
-                            // ATOK が切替を取りこぼす（BUG-193）
+                            // ATOK が切替を取りこぼす（BUG-234）
                             self.output.send_keys(actions);
                             for action in actions {
                                 if let awase::types::KeyAction::Key(vk) = action {
@@ -920,7 +920,7 @@ mod app {
                         }
                     }
                     Effect::Input(InputEffect::ReinjectKey(ev)) => {
-                        // 注入が先（SendKeys の切替キーと同じ理由、BUG-193）
+                        // 注入が先（SendKeys の切替キーと同じ理由、BUG-234）
                         self.output.reinject(ev.vk_code, ev.event_type);
                         if matches!(ev.event_type, KeyEventType::KeyDown) {
                             self.expect_ime_from_key(ev.vk_code.0);
@@ -1120,6 +1120,9 @@ mod app {
                 right_thumb_down_snapshot: None,
                 // CGEventTap では他プロセス注入の確実な識別手段がないため false 固定
                 injected: false,
+                // ADR-249/255: 他アプリ注入 Ctrl の記録も Alt なりすましも Windows のフックだけが行う
+                foreign_ctrl: false,
+                impersonated: false,
             };
 
             self.modifiers.update(&raw);
@@ -1221,7 +1224,7 @@ mod app {
     mod tests {
         use super::{passthrough_moves_focus, KeyEventType, ModifierState, TapAction, ThumbHold};
 
-        /// BUG-191: IME 切替として使い切った親指打鍵は、離すまで親指シフトとして
+        /// BUG-232: IME 切替として使い切った親指打鍵は、離すまで親指シフトとして
         /// 数えない。数えると切替直後の文字がシフト面で解決される
         /// （英数 → かな と押して「きょう」を打つと `ゔ` `い` になった）。
         #[test]

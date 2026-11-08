@@ -104,7 +104,7 @@ ADR-191 実測5の「Bで仕様から外れた31件」は、撤去後は**仕様
 
 回避は「内部状態に依るキーを、依らないキーに置き換える」こと。
 
-- 親指キーの単独打鍵の挙動を awase 側で決める（既存の `muhenkan_solo_tap_ime_action` / `henkan_solo_tap_ime_action`、`keys.ime_on/off/toggle`。ADR-153・ADR-192 決定3）。
+- 親指キーの単独打鍵の挙動を awase 側で決める（`keys.ime_on/off/toggle` に無変換・変換を単独で書く。旧 `muhenkan_solo_tap_ime_action` / `henkan_solo_tap_ime_action` は撤去済み。ADR-153・ADR-192 決定3）。
   awase が物理キーを消費し、冪等な `VK_IME_ON`/`VK_IME_OFF`（トグルは belief 基づき）で書くので、IME 側の状態依存の割り当ては届かない。
 - IME 側のキーマップを冪等なキー（変換=IME ON、無変換=IME OFF など）へ変更する。awase は `config1.db`・レジストリを書き換えない（ADR-192 決定4）。
 
@@ -158,6 +158,8 @@ ADR-191 実測5の「Bで仕様から外れた31件」は、撤去後は**仕様
 - 現状 `pass` の構成（`atok-passthrough*`）を `observe` へ緩めるのは、撤去した機構が担っていた追随が実際に失われた場合に限る。先に緩めない（撤去の副作用を見逃すため）。
 
 ## 5. 期待結果の例（IMEの状態 × キー）
+
+> 注（2026-10-06）: 本書の `[shadow-send]` は `shadow_send_trace` が出していたログ。同モジュールは撤去した（判定器は未実装・使用実績0件・lparam を残さない判断）。INV-3/4/5 の判定器は未定で、ImeControl の lparam が必要なら再導入する。
 
 「実IME」は IME 単体の仕様（Mozc の公開キーマップ、`atok.tsv`/`ms-ime.tsv` と実測）、「書き込み」は awase.log の
 `[shadow-send]` の件数（INV-3）。Engine は INV-2 から決まる（かな=ON、それ以外=OFF）。
@@ -226,4 +228,4 @@ ADR-191 実測5の「Bで仕様から外れた31件」は、撤去後は**仕様
 
 - [ADR-191](adr/191-ime-is-source-of-truth-observe-not-write.md)（決定1〜6・実測・TsfNative 節）、ADR-186/187/189/192/193
 - `tools/e2e/ime_key_matrix/check_consistency.py`・`check_toggle.py`・`check.py`（判定器）、`effect_learning.py`（`ci/e2e-adr191`、未マージ）
-- `crates/awase-windows/src/shadow_send_trace.rs`（`[shadow-send]`、書き込みの数え方の基礎）
+- ~~`crates/awase-windows/src/shadow_send_trace.rs`（`[shadow-send]`）~~（2026-10-06 撤去。判定器は未実装で、ImeControl の lparam が必要なら再導入する）

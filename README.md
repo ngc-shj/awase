@@ -76,7 +76,7 @@ v1 の最終版（1.21.2）には次の問題が残り、v1 では直りませ�
 - **`keys.ime_toggle` の既定値が空になりました。** 以前の既定は `VK_KANJI`（半角/全角）でした。`config.toml` に `VK_KANJI` を明示している場合は、その設定を尊重します（消しません）。ただし v1 の設定画面が書き出した旧既定と同じ値（`["VK_KANJI"]`）は空として扱われ、保存すると消えます。
 - **`keys.ime_detect.on` / `off` の既定値が空になりました**（以前は `IMEオン` / `IMEオフ`）。IMEオン／IMEオフキーへの追随は指定しなくても自動で行われます。書いてある値はそのまま使われます。
 - **`keys.engine_on_ime_key` / `engine_off_ime_key` を撤去しました。** 2026-08-15 より前に設定画面で保存した人は、旧既定値が `config.toml` に残っていて、エンジンの ON/OFF に合わせて全角/半角モードキーを送る機能が有効だった場合があります。v2 ではその機能が止まります（`config.toml` に残っていても無視され、起動時に通知が出ます。設定画面で保存するとその行は消えます）。代わりの設定はありません。IME の開閉は `keys.ime_on` / `ime_off` で設定できます。
-- **`muhenkan_solo_tap_ime_action` / `henkan_solo_tap_ime_action` を撤去しました。** 読み込み時に `keys.ime_*` 相当へ移行し、警告が出ます（同じキーの設定が既にあれば移行しません）。無変換／変換の単独タップは、Suppress／Passthrough の設定に従います。
+- **`muhenkan_solo_tap_ime_action` / `henkan_solo_tap_ime_action` を撤去しました。** `config.toml` に残っていても値は**無視され**、起動時に通知が出ます（設定画面で保存するとその行は消えます）。無変換／変換の単独タップで IME を開閉するには、`keys.ime_on` / `keys.ime_off` に「無変換」「変換」を単独で書いてください（例: `ime_on = ["変換"]`、`ime_off = ["無変換"]`）。それ以外の単独タップは、Suppress／Passthrough の設定に従います。（v2.2.0 までは読み込み時に `keys.ime_*` 相当へ移していましたが、この移行は終了しました。）
 - **確定モード `confirm_mode` は `wait` と `ngram_predictive` の 2 択になりました。** 旧い値は読込時に `wait` として扱われ、保存時に `wait` へ書き換わります。
 - **`config.toml` のキー名の解釈が統一されました。** これまで黙って無視されていた書き方（`VK_` 無し、小文字、日本語名など）が有効になります。心当たりのある再割り当てが、更新しただけで効き始めることがあります。旧表記 `[[keymap]]`（正しくは `[[keymaps]]`）も効き始めます。
 
@@ -158,7 +158,7 @@ data/
 | ローマ字入力にする | **Ctrl+Shift+無変換** |
 | IME ON | **Ctrl+変換**（IME が既に ON の場合はひらがな・ローマ字・CapsLock OFF へリセット） |
 | IME OFF | **Ctrl+無変換** |
-| IME-ON 半角英数トグル（MS-IME のみ） | **左Shift 単独タップ**（他キーを介さず押して離す。もう一度タップで解除） |
+| IME-ON 半角英数トグル（既定で MS-IME・Google 日本語入力の両方で有効。設定画面の「上級者向け設定」タブで無効にできます） | **左Shift 単独タップ**（他キーを介さず押して離す。もう一度タップで解除） |
 | アプリ別動作を手動切替 | **Ctrl+Shift+F11** |
 
 > トレイアイコンを右クリック → 「設定」から GUI で変更できます。
@@ -242,14 +242,12 @@ force_text = [
 force_bypass = [
     { process = "launcher.exe", class = "LauncherClass" },
 ]
-# TSF ネイティブモード（WezTerm 等）
-force_tsf = [
-    { process = "wezterm-gui.exe", class = "org.wezfurlong.wezterm" },
-]
 ```
 <!-- example-end -->
 
 プロセス名とクラス名は `RUST_LOG=debug awase.exe` のログで確認できます。
+
+文字はすべてのアプリに VK キーストローク（IME 経由）で送ります（表に無い文字と、`.yab` で `\u` などを使って直接指定した文字だけは Unicode で直接送ります）。以前の `force_vk`・`force_tsf`（送り方の指定）は不要になったため廃止しました（書いてあっても無視されます）。
 
 ---
 
@@ -306,11 +304,26 @@ awase はフォーカス中のアプリを自動識別し、出力方式を切�
 
 | アプリ種別 | 例 | 出力方式 |
 |-----------|-----|---------|
-| Win32 / WinForms | メモ帳、Word、Excel | Unicode 直接注入 |
+| Win32 / WinForms | メモ帳、Word、Excel | VK キーストローク |
 | TSF ネイティブ | Chrome, Edge, VS Code, WezTerm, Electron 系 | VK キーストローク |
-| UWP / XAML | Windows ストアアプリ | Unicode 直接注入 |
+| UWP / XAML | Windows ストアアプリ | VK キーストローク |
 
 識別結果はアプリのクラス名ごとに学習・キャッシュされ（`cache.toml`）、再起動後も維持されます。自動識別が合わない場合は `[app_overrides]` で手動指定できます。
+
+---
+
+## mozc-readable(任意・実験的)
+
+[mozc-readable](https://github.com/cuzic/mozc-readable) は、Google 日本語入力のオープンソース版 [Mozc](https://github.com/google/mozc) に「IME の開閉・入力モードを他のプロセスから読める」変更を加えた非公式のビルドです。awase が読めない窓の IME の状態を推測ではなく IME 自身の値で知るために作っています。
+
+mozc-readable は IME の開閉と入力モードを IME 自身が出す値で awase に伝えるため、『awase の想定と実際の IME の状態がずれる』問題を根本から解決できる見込みです。まだ実験的な機能で、実機での検証を続けています。
+
+- awase は mozc-readable が共有メモリに出す値を読んで IME の開閉を知り、親指シフト(NICOLA)入力の ON/OFF をそれに合わせます(設定は不要です。mozc-readable を使っていない窓では何もしません。[ADR-268](docs/adr/268-mozc-shm-belief-connection.md))。
+- 窓の切り替えやひらがなキーの直後の最初のローマ字が、入力中の文字にならず英字のまま残ったときは、awase がそれを検出して消し、打ち直します([ADR-270](docs/adr/270-mozc-first-send-composition-check.md)、[BUG-209](docs/known-bugs/BUG-209.md))。
+- 配布は mozc-readable の [GitHub Releases](https://github.com/cuzic/mozc-readable/releases) です([awase.cc のインストール欄](https://awase.cc/#mozc-readable)からも入手できます)。署名はありません。
+- インストール後、Windows の言語設定で入力方式に「Mozc Readable」を追加して使います(入力方式の表示名は「Mozc Readable」です)。以前の版の上に入れた場合、新しい表示名が言語設定の一覧に反映されるのにサインアウトが要ることがあります。
+- Mozc(公式版・mozc-readable)は Google 日本語入力と同じ系統として扱います(IME のキー設定の自動読み取りは Google 日本語入力のみ)。
+- **自作キーボード(QMK など)を作る人へ**: 共有メモリの仕様と、読み取りの最小例があります。OLED やレイヤーを IME の状態に連動させる用途を想定しています。→ [共有メモリ仕様](https://github.com/cuzic/mozc-readable/blob/readable/readable/docs/shared-memory.md)
 
 ---
 
@@ -336,3 +349,5 @@ awase はフォーカス中のアプリを自動識別し、出力方式を切�
 ## ライセンス
 
 [Apache License, Version 2.0](LICENSE-APACHE) または [MIT License](LICENSE-MIT) のいずれかを選択できます。
+
+同梱する n-gram などの統計データの元（Wikipedia・Tatoeba など）の出典と帰属は [docs/third-party-data.md](docs/third-party-data.md) にあります。

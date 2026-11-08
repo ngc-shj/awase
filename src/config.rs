@@ -10,8 +10,9 @@ use crate::types::VkCode;
 // #[serde(default)] + 未知フィールド無視により残っていても無害）:
 // - HookMode (hook_mode): Relay に一本化。Filter はリレー系機能（relay-defer/
 //   INPUT_DEFER 対称性/NonText パススルー等）の登場以降テストされておらず撤去。
-// - OutputMode (output_mode): per-window の InjectionMode（injection_hint + AppKind
-//   から自動決定）に完全置換済みで、フィールドは書き込みのみの死に設定だった。
+// - OutputMode (output_mode): per-window の注入モード（当時の injection_hint + AppKind
+//   から自動決定。注入モード自体も 2026-10-22 に VK だけになった）に置換済みで、
+//   フィールドは書き込みのみの死に設定だった。
 // - ConvModePolicy (conv_mode_policy): 2026-08-17、ADR-094 で charset 軸
 //   （ひらがな/カタカナ×全角/半角の追跡）自体を撤去したのに伴い削除。
 //   `Observe`/`Force` という2値のうち `Force`（conv モードの能動的な強制
@@ -47,7 +48,7 @@ pub enum KeystrokeSequencePolicy {
 
 /// 左Shift単独タップによる「IME-ON 半角英数」持続トグルをどの IME で許可するか。
 ///
-/// 既定値 `MsImeOnly` は従来動作そのもの。設定GUIからは `Off`/`All` の
+/// 既定値は `All`（MS-IME / GJI の両方で有効）。設定GUIからは `Off`/`All` の
 /// 二択チェックボックスとして操作する（`MsImeOnly` はGUIからは選べない、
 /// config.toml に残っている場合のみ有効な中間値）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -55,10 +56,10 @@ pub enum KeystrokeSequencePolicy {
 pub enum HalfWidthAlnumTogglePolicy {
     /// MS-IME / GJI ともに機能全体を止める。
     Off,
-    /// 従来どおり MS-IME のみ許可する。
-    #[default]
+    /// MS-IME のみ許可する（旧既定。config.toml に明示した場合のみ有効）。
     MsImeOnly,
     /// MS-IME と Google 日本語入力の両方で許可する。
+    #[default]
     All,
 }
 
@@ -146,8 +147,6 @@ pub struct GeneralConfig {
     pub update_check: bool,
     /// 状態依存のIMEモードキーを検出したときに警告する（ADR-192）。
     pub warn_state_dependent_mode_keys: bool,
-    /// Linux 入力バックエンド ("evdev", "x11", "libinput")
-    pub linux_input_backend: String,
     /// macOS の出力方式（"romaji" または "kana"）。
     ///
     /// - "romaji"（既定）: ローマ字キーストロークを注入し IME に変換させる。
@@ -156,8 +155,6 @@ pub struct GeneralConfig {
     ///   モードに設定して使う）。1 かな 1 打（濁点は追い打ち）でイベント数が
     ///   少なく、高速打鍵時の注入取りこぼしに強い（Lacaille と同方式）
     pub macos_output_style: String,
-    /// evdev バックエンド: キーボードデバイスパス（None = 自動検出）
-    pub linux_evdev_device: Option<String>,
     /// キーボードの物理レイアウトモデル（"jis" または "us"）。
     ///
     /// .yab のパース時の列数上限チェックと、プラットフォーム層の
@@ -305,7 +302,7 @@ pub struct GeneralConfig {
     pub muhenkan_solo_tap_dedicated_fn_key: Option<String>,
     /// 左Shift単独タップによる「IME-ON 半角英数」持続トグルの許可範囲。
     ///
-    /// 既定 `ms_ime_only` は従来動作を維持する。設定GUI（上級者向け設定）
+    /// 既定は `all`（MS-IME / GJI の両方で有効）。設定GUI（上級者向け設定）
     /// からは `off`/`all` の二択チェックボックスとして操作できる（実機ソーク
     /// 完了、2026-08-27）——`ms_ime_only` はGUIからは選べない中間値で、
     /// 既存ユーザーの config.toml に残っている場合のみ意味を持つ
@@ -368,21 +365,6 @@ pub struct GeneralConfig {
     /// 使いたい場合（= awase の Engine を OFF にして使う想定）のみ `false` にする。
     pub swallow_alt_kana_input_method_switch: bool,
 
-    /// **非推奨（ADR-206、読み込み専用）**: 無変換単独タップ確定時の IME ON/OFF/Toggle（旧 ADR-153 決定1、隠し設定）。
-    ///
-    /// 値は読み込むが、エンジンには直接渡さない。そのキーが親指キー（`left_thumb_key`/`right_thumb_key`）に
-    /// 割り当てられているときだけ、読込時にメモリ上で `keys.ime_on/off/toggle` に bare で書いたのと同じ扱いへ
-    /// 移し（`GeneralConfig::legacy_thumb_solo_tap_actions`）、`validate` が非推奨の警告を出す。親指キーでなければ
-    /// 効かない（IME が自分で処理する）。config.toml は書き換えない。
-    ///
-    /// 単独タップの扱いは ADR-206 の規則に従う: 開閉の役割（bare `keys.ime_*`、または GJI の CUSTOM 表で無変換/変換が
-    /// トグル）があれば生キーを抑止して awase が絶対指定の ON/OFF を1回書き、なければ `ModeKeyConfig` の
-    /// Suppress/Passthrough に従う。
-    #[serde(default)]
-    pub muhenkan_solo_tap_ime_action: Option<ShadowImeActionConfig>,
-    /// `muhenkan_solo_tap_ime_action` と対称（変換キー用、非推奨）。
-    #[serde(default)]
-    pub henkan_solo_tap_ime_action: Option<ShadowImeActionConfig>,
     /// ADR-195段階4: `<config dir>/keymap-learn-table.json`（段階3永続化）が存在し
     /// 検証を通れば、それを`key_effect_predictor`が引く表として同梱表の代わりに使う。
     /// `false`にすると学習済み表があっても常に同梱表を使う（opt-out、M-b）。
@@ -394,9 +376,19 @@ pub struct GeneralConfig {
     /// 予測して Engine を追随させる。`false`で止める（偽 ON が出たとき、ビルドし直さずに戻すため）。
     #[serde(default = "default_predict_henkan_open_in_unreadable_windows")]
     pub predict_henkan_open_in_unreadable_windows: bool,
+    /// ADR-282 V2(隠し設定、既定 `true`、V2-3): Engine の入力(IME の開閉・入力モード)を、IME の保持単位ごとに最後に受け入れた
+    /// 主張をラッチする belief(候補 Z、`state::scope_belief`)から読む。IME への書き込み・drift correction・授権はどちらでも
+    /// 従来の belief のまま。**旧に戻すには** `config.toml` の `[general]` に `belief_v2 = false` を書く(設定の再読み込みで効く)。
+    #[serde(default = "default_belief_v2")]
+    pub belief_v2: bool,
 }
 
 const fn default_predict_henkan_open_in_unreadable_windows() -> bool {
+    true
+}
+
+/// ADR-282 V2-3: 所有者の決定(O8、オラクルで旧より悪い設定が無いことを確かめて既定にする)。
+const fn default_belief_v2() -> bool {
     true
 }
 
@@ -426,80 +418,23 @@ impl Default for GeneralConfig {
             auto_start: "enabled".to_string(),
             update_check: true,
             warn_state_dependent_mode_keys: true,
-            linux_input_backend: "evdev".to_string(),
             macos_output_style: "romaji".to_string(),
-            linux_evdev_device: None,
             keyboard_model: KeyboardModel::Jis,
             space_thumb_ignore_composing_guard: true,
             space_thumb_shift_literal: true,
             muhenkan_solo_tap_ignore_composing_guard: false,
             muhenkan_solo_tap_always_suppress: true,
             muhenkan_solo_tap_dedicated_fn_key: None,
-            half_width_alnum_toggle: HalfWidthAlnumTogglePolicy::MsImeOnly,
+            half_width_alnum_toggle: HalfWidthAlnumTogglePolicy::All,
             keystroke_sequence: KeystrokeSequencePolicy::On,
             henkan_solo_tap_ignore_composing_guard: false,
             henkan_solo_tap_always_suppress: true,
             enter_thumb_ignore_composing_guard: true,
             enter_thumb_shift_literal: true,
             swallow_alt_kana_input_method_switch: true,
-            muhenkan_solo_tap_ime_action: None,
-            henkan_solo_tap_ime_action: None,
             use_learned_keymap_table: true,
             predict_henkan_open_in_unreadable_windows: true,
-        }
-    }
-}
-
-impl GeneralConfig {
-    /// ADR-206 決定4: 非推奨の `*_solo_tap_ime_action` のうち、そのキーが親指キー
-    /// （`left_thumb_key`/`right_thumb_key`）に割り当てられているものだけを `(無変換, 変換)` で返す。
-    /// 呼び出し側（Platform 層）が、該当キーの bare コンボを `keys.ime_on/off/toggle` に相当する形で
-    /// メモリ上でだけ追加する。親指キーでないキーの旧設定は返さない（読み捨てて警告する）。
-    #[must_use]
-    pub fn legacy_thumb_solo_tap_actions(
-        &self,
-    ) -> (
-        Option<crate::types::ShadowImeAction>,
-        Option<crate::types::ShadowImeAction>,
-    ) {
-        let is_thumb = |canonical: &str| {
-            [self.left_thumb_key.as_str(), self.right_thumb_key.as_str()]
-                .into_iter()
-                .any(|k| key_identity(k) == canonical)
-        };
-        (
-            self.muhenkan_solo_tap_ime_action
-                .filter(|_| is_thumb("NONCONVERT"))
-                .map(ShadowImeActionConfig::to_core),
-            self.henkan_solo_tap_ime_action
-                .filter(|_| is_thumb("CONVERT"))
-                .map(ShadowImeActionConfig::to_core),
-        )
-    }
-}
-
-/// `muhenkan_solo_tap_ime_action`/`henkan_solo_tap_ime_action` のTOML表現
-/// （`"on"`/`"off"`/`"toggle"`、ADR-153 決定1）。
-///
-/// `awase::types::ShadowImeAction` という**プラットフォーム非依存コア型**への
-/// 変換は、ここ（config 側の薄い層）に置く——`ADR-019` の層境界を守るため、
-/// core 型に serde を直接付けない（`deserialize_keymap_to` と同じ様式）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ShadowImeActionConfig {
-    On,
-    Off,
-    Toggle,
-}
-
-impl ShadowImeActionConfig {
-    /// `awase::types::ShadowImeAction`（core 型）へ変換する。
-    #[must_use]
-    pub const fn to_core(self) -> crate::types::ShadowImeAction {
-        match self {
-            Self::On => crate::types::ShadowImeAction::TurnOn,
-            Self::Off => crate::types::ShadowImeAction::TurnOff,
-            Self::Toggle => crate::types::ShadowImeAction::Toggle,
+            belief_v2: true,
         }
     }
 }
@@ -520,14 +455,182 @@ pub struct DiagnosticsConfig {
     /// `false`にすることでビルド無しで無効化できる（自己修復以前の診断ログ出力自体は
     /// この設定に関係なく継続する）。
     pub hook_self_heal: bool,
+    /// mozc-readable（共有メモリへ IME の開閉・入力モードを書き出す Mozc の fork）の共有メモリを、フォーカスを持つ窓の
+    /// スレッドについて読んで journal に残す（ADR-265 段階 1。**belief には入れず、IME へは何も書かない**観測）。
+    ///
+    /// 既定は**無効**（オプトイン）。有効にすると、IME リフレッシュの tick（約 500ms）で共有メモリを 1 回読み、フォーカスが
+    /// 変わったときと結論が変わったときだけ記録する。mozc-readable を入力方式にしていない窓では「読めない」と記録するだけ。
+    /// **反映は awase の再起動後**（起動時に 1 度だけ渡す）。
+    pub mozc_shm_shadow: bool,
 }
 
 impl Default for DiagnosticsConfig {
     fn default() -> Self {
         Self {
             hook_self_heal: true,
+            mozc_shm_shadow: false,
         }
     }
+}
+
+/// 『日本語でない』（英数入力）の判定に使うモデル（ADR-280 の後続）。日本語の確定（親指の重なり・仮名 n-gram の尤度比）は変わらない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoDetectDecider {
+    /// 追加式ロジスティック回帰（`tools/lang-detect-model/`）。独立した実文で、同じ誤確定率での非日本語の検出率が
+    /// 仮名 n-gram より 20〜35 ポイント高い。閾値は `lr_en_threshold`（`ime_on`）・`lr_eisu_threshold`（`ime_on_eisu`）
+    #[default]
+    Lr,
+    /// 仮名 n-gram と英語のラテン文字 2 連の対数尤度比（ADR-280 まで）。閾値は `en_threshold`・`eisu_threshold`
+    KanaNgram,
+}
+
+/// 窓切替直後・長い無操作のあとの最初の打鍵から日本語/英数を判定する機能の動作（ADR-263）。
+///
+/// 設定画面では、`mode` と `scope` の意味のある組み合わせを 5 択にまとめて出す（`awase-settings` の上級者向け設定）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoDetectMode {
+    /// 何もしない
+    Off,
+    /// 打鍵は今までどおり流し、判定器を影として走らせて結果をログ（journal）に残すだけ（挙動を変えない）
+    #[default]
+    Observe,
+    /// 観測の無い窓（実測学習で降格された窓）で、belief が ON のとき、エピソード先頭の打鍵を短時間保持し、
+    /// 日本語入力と判定できたときだけ、ひらがなキーを 1 回送ってから流す（ADR-263 PR 2b）。
+    /// 英数と判定した・決まらなかった場合は、保持した打鍵を今までと同じ流れに戻す。
+    ImeOn,
+    /// `ime_on` に加えて、英数入力と判定できたとき、左Shift単独タップと同じ**半角英数トグル**に入る（IME は ON のまま。
+    /// Engine は非活性になり、保持した打鍵をそのまま流す）。半角英数トグルが有効な設定のときだけ働く。**利用者の責任**:
+    /// 日本語を英数と誤判定しても、Shift のタップなどで戻れる（誤判定の率は `eisu_threshold` で決まる）。
+    ImeOnEisu,
+}
+
+/// `ime_on` の対象にする窓の範囲（ADR-263）。**既定より広い範囲は利用者の責任**で選ぶ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoDetectScope {
+    /// 窓内の IME 状態が読めないと実測学習された窓（一太郎など）だけ。既定。
+    #[default]
+    Unobserved,
+    /// 読める窓（Chrome 等）も対象にする。読める窓では awase の belief が観測で実状態に追随するので、判定の書き込みの
+    /// 結果が次の観測で揃うまで食い違うことがある。実質 TSF ネイティブの窓（Windows Terminal 等）も含む（既定の
+    /// `unobserved` では含めない）。入力中継ツールの窓だけは常に対象外。
+    All,
+}
+
+/// 窓切替直後・長い無操作のあとの最初の打鍵から日本語/英数を判定する機能の設定（ADR-263）。
+///
+/// `observe` は影の判定とログだけ（挙動を変えない）。`ime_on` は打鍵の保持と、日本語と判定したときのひらがなキー 1 回の送信まで行う。
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct AutoDetectConfig {
+    pub mode: AutoDetectMode,
+    /// `ime_on` の対象にする窓の範囲。既定は観測の無い窓だけ。`all` は利用者の責任で選ぶ。
+    pub scope: AutoDetectScope,
+    /// 空なら観測の無い窓に限らずすべての窓で影の判定を行う。指定した場合はそのプロセス名の窓だけ（将来の `ime_on` 用。`observe` では無視）。
+    pub include_apps: Vec<String>,
+    /// 対象外にするプロセス名（将来の `ime_on` 用。`observe` では無視）。
+    pub exclude_apps: Vec<String>,
+    /// 判定に使う打鍵（Down）の最大数
+    pub max_keys: u32,
+    /// エピソードの最大の長さ（ミリ秒）
+    pub max_ms: u32,
+    /// この長さ以上の無操作のあとの最初の打鍵でエピソードを始める（ミリ秒）。窓切替でも始まる
+    pub idle_ms: u32,
+    /// 日本語と確定する対数尤度比（nats）
+    pub ja_threshold: f64,
+    /// 日本語でないとする対数尤度比の大きさ（nats）
+    pub en_threshold: f64,
+    /// `ime_on_eisu` で半角英数に入るために必要な「日本語でない」確信度（nats。`en_threshold` 以上にする）。
+    /// 大きいほど誤って半角英数に入る率が下がるが、英数の判定が遅くなる（保持が長くなる）。
+    pub eisu_threshold: f64,
+    /// 『日本語でない』の判定に使うモデル（既定 `lr`）。`kana_ngram` で従来に戻せる
+    pub decider: AutoDetectDecider,
+    /// `decider = "lr"` の `ime_on` 側の閾値（累積 log-odds が `-値` 以下で英数）。既定 1.5
+    pub lr_en_threshold: f64,
+    /// `decider = "lr"` の `ime_on_eisu` の入りの閾値。既定 4.0
+    pub lr_eisu_threshold: f64,
+}
+
+impl Default for AutoDetectConfig {
+    /// 閾値は人工データのオフライン評価による（`lang_detect::DetectParams::default` の doc 参照）。
+    ///
+    /// **尺度の注意（ADR-280）**: 判定の背景を一様分布からラテン文字の 2 連に替えたので、対数尤度比の尺度が変わった。
+    /// 同じ「日本語→英数の誤判定率」になる閾値の対応（旧 = 従来の構成 `ja_threshold = 4`、新 = 今の構成）:
+    /// 旧 8 → 新 8.0（誤判定 7.0%）、旧 10 → 9.5（3.5%）、旧 12 → 11.5（1.6%）、旧 14 → 13.0（0.95%）、旧 16 → 14.5（0.43%）、
+    /// 旧 18 → 16.0（0.22%）、旧 20 → 16.5（0.15%）。`config.toml` に旧尺度の値を書いている場合は、この表で読み替える。
+    /// `ja_threshold` は旧 4 → 新 14（非日本語を日本語と誤確定する率を従来以下にするため。旧尺度の 4 のままだとコードの 5.8% を誤確定する）。
+    /// `idle_ms` は影の観測で再校正するため、短め（3 秒）にして多めに記録する。
+    ///
+    /// **LR の閾値（`decider = "lr"`）**: `tools/lang-detect-model/` の test 分割（135,302 エピソード、独立した実文）で、日本語を英数と
+    /// 誤確定する率（FPR）が `lr_en_threshold = 1.5` で 6.4%（従来の `en_threshold = 8` は 6.8%）、`lr_eisu_threshold = 4.0` で 0.47%
+    /// （従来の `eisu_threshold = 13` は 0.71%）。同じ FPR で英語の検出は 63% → 86%（`ime_on_eisu` 側）。非日本語は書き言葉で、
+    /// 実機の分布は未測定（`docs/tasks/lang-detect-lr-shadow.md`）。
+    fn default() -> Self {
+        Self {
+            mode: AutoDetectMode::default(),
+            scope: AutoDetectScope::default(),
+            include_apps: Vec::new(),
+            exclude_apps: Vec::new(),
+            max_keys: 7,
+            max_ms: 2500,
+            idle_ms: 3000,
+            ja_threshold: 14.0,
+            en_threshold: 8.0,
+            eisu_threshold: 13.0,
+            decider: AutoDetectDecider::default(),
+            lr_en_threshold: 1.5,
+            lr_eisu_threshold: 4.0,
+        }
+    }
+}
+
+/// 入力インジケーターを読む証拠源（字形）の使い方の段階（ADR-271）。段階は累積する（`Ord` は強さの順）。
+///
+/// どの段階でも IME へは何も書かない。`Unobserved`/`All` の belief への配線は別 ADR で決める
+/// ので、`awase-ime-core` の `ui_max_level()` を超える段階は実効値で丸める（保存は書き換えない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceLevel {
+    /// 読まない。既定（ウイルス対策ソフトの行動検出に当たりうるためオプトイン。ADR-261）。
+    #[default]
+    Off,
+    /// すべてのウィンドウで読み、journal・不具合報告に残す。belief の証拠にはしない。
+    Observe,
+    /// `Observe` に加え、IME 状態が読めないウィンドウでだけ belief の証拠にする。
+    Unobserved,
+    /// 読めるウィンドウでも belief の証拠にする。**利用者の責任**。
+    All,
+}
+
+impl EvidenceLevel {
+    /// 設定ファイルと不具合報告での表記（`serde(rename_all = "snake_case")` と同じ）。
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Observe => "observe",
+            Self::Unobserved => "unobserved",
+            Self::All => "all",
+        }
+    }
+}
+
+/// 入力インジケーターを読む証拠源ごとの段階（ADR-271）。
+///
+/// 右クリックメニュー（ADR-264）の `menu` は 2026-10-22 に撤去した。旧 `config.toml` に残っていても無警告で無視する（`config_load_diag::REMOVED_KEYS`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct IndicatorEvidenceConfig {
+    /// タスクバーのインジケーターの字形（ADR-261）。
+    pub glyph: EvidenceLevel,
+    /// `glyph` が `observe` 以上のときに限り、T2〜T4(欄の移動・モード系の打鍵・途切れ)共通のトリガーとして
+    /// UIA push 通知(インジケーター要素自身の `Name` の変化)も使うか（ADR-283 §10）。既定は `false`
+    /// （T1〔前面窓の変化〕だけになる。MS-IME 本体での push 発火は未測定・既知の限界が残るため、`glyph` の
+    /// 有効化とは別にオプトインできるようにした）。`glyph` が `off` のままならこの値は意味を持たない
+    /// （取り込みワーカー自体が起動しない）。
+    pub glyph_push_trigger: bool,
 }
 
 // 既定はすべて空（`#[derive(Default)]`）。経緯:
@@ -679,7 +782,8 @@ pub struct AppOverrideEntry {
 /// `from`/`to` に指定できない vk がある（ADR-114 決定5、`KeymapTable::new` が
 /// `tracing::warn!` して該当ルールを skip する）: 親指キー・IME 制御系 VK・Alt 系
 /// VK（`from` の修飾子としての Alt を含む）・Win 系 VK・`VK_CAPITAL`・
-/// Shift を `from` の主キーにすること。
+/// Shift を `from` の主キーにすること。例外: `ime = "off"` のルールは `from` に
+/// 無修飾の無変換/変換（親指キー）だけを指定できる（ADR-255 決定5）。
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct KeymapRule {
     /// プロセス名（省略=全アプリ）。大文字小文字を無視し、末尾の `.exe` の
@@ -696,6 +800,12 @@ pub struct KeymapRule {
     /// 常に配列形式へ正規化される。
     #[serde(default, deserialize_with = "deserialize_keymap_to")]
     pub to: Vec<String>,
+    /// IME の状態による条件（ADR-255 決定1）。`"off"` のみ。省略=従来どおり
+    /// （IME の状態を問わず、エンジンの前に照合）。`"off"` のルール（遅いルール）は
+    /// エンジンが素通しにした打鍵に対してだけ照合し、`from` は無修飾の
+    /// 無変換/変換に限る。`"off"` 以外の値は `KeymapTable::new` が警告して skip する。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ime: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -740,18 +850,17 @@ pub struct KeystrokeMacro {
 ///
 /// - `force_text`: 常にテキスト入力として扱う (process, class) の組
 /// - `force_bypass`: 常に非テキストとしてバイパスする組
-/// - `force_vk`: ローマ字出力を VK キーストローク Batched モードで送る組（Chrome/Edge/Electron 等）
-/// - `force_tsf`: ローマ字出力を VK キーストローク Sequential モードで送る組（WezTerm 等 TSF 直結アプリ）
+///
+/// 旧 `force_vk`（VK Batched で送る組）は、ADR-276 で既定が全部 VK Batched になったため
+/// 2026-10-22 に退役させた。旧 `force_tsf`（VK Sequential〈Tsf 注入〉で送る組）も、Tsf 注入経路の
+/// 撤去（2026-10-22、ADR-0004 追記）で削除した。どちらも旧 `config.toml` に残っていても
+/// 読み込みエラーにせず無視し、空でなければ通知する（`config_load_diag::REMOVED_WITH_VALUE_NOTICE`）。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppOverrides {
     #[serde(default)]
     pub force_text: Vec<AppOverrideEntry>,
     #[serde(default)]
     pub force_bypass: Vec<AppOverrideEntry>,
-    #[serde(default)]
-    pub force_vk: Vec<AppOverrideEntry>,
-    #[serde(default)]
-    pub force_tsf: Vec<AppOverrideEntry>,
     /// フォーカス中このプロセス名（大文字小文字無視、`.exe` 有無どちらでも一致）
     /// にマッチしたら awase を丸ごと無効化する（force_bypass と異なり class 指定不要、
     /// フックレベルで生キーをそのまま OS に通す）。
@@ -774,8 +883,6 @@ impl Default for AppOverrides {
         Self {
             force_text: Vec::new(),
             force_bypass: Vec::new(),
-            force_vk: Vec::new(),
-            force_tsf: Vec::new(),
             disable_apps: default_disable_apps(),
             input_relay_apps: default_input_relay_apps(),
         }
@@ -834,6 +941,12 @@ pub struct AppConfig {
     /// 診断・自己修復系のキルスイッチ（issue #165）。
     #[serde(default)]
     pub diagnostics: DiagnosticsConfig,
+    /// 窓切替直後・長い無操作のあとの日本語/英数の判定（ADR-263）。
+    #[serde(default)]
+    pub auto_detect: AutoDetectConfig,
+    /// 入力インジケーターを読む証拠源の段階（ADR-271）。
+    #[serde(default)]
+    pub indicator_evidence: IndicatorEvidenceConfig,
     #[serde(default)]
     pub keymaps: Vec<KeymapRule>,
     /// Ctrl+key バイパス後に次キーを NICOLA スキップするルール一覧
@@ -1113,6 +1226,10 @@ pub struct ValidatedConfig {
     pub app_overrides: AppOverrides,
     /// 診断・自己修復系のキルスイッチ（issue #165）。検証は行わない（bool のみ）。
     pub diagnostics: DiagnosticsConfig,
+    /// 窓切替直後・長い無操作のあとの日本語/英数の判定（ADR-263）。検証は行わない。
+    pub auto_detect: AutoDetectConfig,
+    /// 入力インジケーターを読む証拠源の段階（ADR-271）。**検証で丸めない**（実効値は使う時点で決める）。
+    pub indicator_evidence: IndicatorEvidenceConfig,
     /// キーマップインターセプトルール
     pub keymaps: Vec<KeymapRule>,
     /// Ctrl+key バイパス後に次キーを NICOLA スキップするルール
@@ -1139,6 +1256,8 @@ impl From<ValidatedConfig> for AppConfig {
             keys: v.keys,
             app_overrides: v.app_overrides,
             diagnostics: v.diagnostics,
+            auto_detect: v.auto_detect,
+            indicator_evidence: v.indicator_evidence,
             keymaps: v.keymaps,
             post_bypass: v.post_bypass,
             keystroke_macro: v.keystroke_macro,
@@ -1333,56 +1452,6 @@ impl AppConfig {
         }
     }
 
-    /// 非推奨の `*_solo_tap_ime_action` が残っているときの警告（ADR-206 決定4）。
-    fn validate_legacy_solo_tap_action(g: &GeneralConfig, keys: &KeysConfig, w: &mut Vec<String>) {
-        // 同じキーの bare が `keys.ime_*` に既にあれば、旧設定は移行されず bare が優先される（ADR-206 決定4）。
-        let has_bare = |canonical: &str| {
-            [&keys.ime_on, &keys.ime_off, &keys.ime_toggle]
-                .into_iter()
-                .flatten()
-                .any(|combo| {
-                    let (mods, main) = split_combo(combo);
-                    mods.is_empty() && key_identity(main) == canonical
-                })
-        };
-        let (muhenkan_migrated, henkan_migrated) = g.legacy_thumb_solo_tap_actions();
-        for (field, set, migrated, key_name, bare_present) in [
-            (
-                "muhenkan_solo_tap_ime_action",
-                g.muhenkan_solo_tap_ime_action.is_some(),
-                muhenkan_migrated.is_some(),
-                "無変換",
-                has_bare("NONCONVERT"),
-            ),
-            (
-                "henkan_solo_tap_ime_action",
-                g.henkan_solo_tap_ime_action.is_some(),
-                henkan_migrated.is_some(),
-                "変換",
-                has_bare("CONVERT"),
-            ),
-        ] {
-            if !set {
-                continue;
-            }
-            if migrated && bare_present {
-                w.push(format!(
-                    "general.{field} は非推奨で、`keys.ime_on`/`ime_off`/`ime_toggle` に「{key_name}」が既にあるため無視されます（そちらが優先されます）。削除してください。"
-                ));
-            } else if migrated {
-                w.push(format!(
-                    "general.{field} は非推奨です。`keys.ime_on`/`ime_off`/`ime_toggle` に「{key_name}」を単独で書くか、削除してください。\
-                     現在は、そこに単独で書いたのと同じ扱いで動いています。GJI の CUSTOM 表で{key_name}がトグルなら、設定なしで動きます。"
-                ));
-            } else {
-                w.push(format!(
-                    "general.{field} は非推奨で、{key_name}が親指キーに割り当てられていないため今後は効きません（IME が自分で処理します）。\
-                     半角状態で「@」が出る場合は、{key_name}を親指キーに割り当ててください。"
-                ));
-            }
-        }
-    }
-
     /// `keyboard_model = "us"` のとき、無変換/変換キー前提のデフォルト値が
     /// 残っていないか確認する。US キーボードにはこれらの物理キーが存在しない。
     fn validate_keyboard_model(g: &GeneralConfig, keys: &KeysConfig, w: &mut Vec<String>) {
@@ -1451,7 +1520,7 @@ impl AppConfig {
         }
     }
 
-    fn validate_linux_backend(g: &mut GeneralConfig, w: &mut Vec<String>) {
+    fn validate_macos_output_style(g: &mut GeneralConfig, w: &mut Vec<String>) {
         if !["romaji", "kana"].contains(&g.macos_output_style.as_str()) {
             w.push(format!(
                 "macos_output_style \"{}\" は不正です。romaji/kana のいずれかを指定してください。romaji にリセットします",
@@ -1459,28 +1528,11 @@ impl AppConfig {
             ));
             g.macos_output_style = "romaji".to_string();
         }
-        if !["evdev", "x11", "libinput"].contains(&g.linux_input_backend.as_str()) {
-            w.push(format!(
-                "linux_input_backend \"{}\" は不正です。evdev/x11/libinput のいずれかを指定してください。evdev にリセットします",
-                g.linux_input_backend
-            ));
-            g.linux_input_backend = "evdev".to_string();
-        }
-        if let Some(ref dev) = g.linux_evdev_device {
-            if !dev.starts_with("/dev/") {
-                w.push(format!(
-                    "linux_evdev_device \"{dev}\" は /dev/ で始まる必要があります。自動検出にリセットします"
-                ));
-                g.linux_evdev_device = None;
-            }
-        }
     }
 
     fn validate_app_override_entries(overrides: &AppOverrides, w: &mut Vec<String>) {
         Self::check_override_list(&overrides.force_text, "force_text", w);
         Self::check_override_list(&overrides.force_bypass, "force_bypass", w);
-        Self::check_override_list(&overrides.force_vk, "force_vk", w);
-        Self::check_override_list(&overrides.force_tsf, "force_tsf", w);
         Self::check_disable_apps_list(&overrides.disable_apps, w);
         Self::check_input_relay_apps_list(&overrides.input_relay_apps, w);
     }
@@ -1524,14 +1576,13 @@ impl AppConfig {
         let mut general = self.general;
         let app_overrides = self.app_overrides;
 
+        Self::validate_macos_output_style(&mut general, &mut warnings);
         Self::validate_thresholds(&mut general, &mut warnings);
         Self::validate_layouts(&mut general, &mut warnings);
         Self::validate_thumb_keys(&general, &mut warnings);
         Self::validate_dedicated_fn_key(&general, &mut warnings);
         Self::validate_thumb_key_in_ime_combos(&general, &self.keys, &mut warnings);
-        Self::validate_legacy_solo_tap_action(&general, &self.keys, &mut warnings);
         Self::validate_keyboard_model(&general, &self.keys, &mut warnings);
-        Self::validate_linux_backend(&mut general, &mut warnings);
         Self::validate_app_override_entries(&app_overrides, &mut warnings);
 
         (
@@ -1540,6 +1591,8 @@ impl AppConfig {
                 keys: self.keys,
                 app_overrides,
                 diagnostics: self.diagnostics,
+                auto_detect: self.auto_detect,
+                indicator_evidence: self.indicator_evidence,
                 keymaps: self.keymaps,
                 post_bypass: self.post_bypass,
                 keystroke_macro: self.keystroke_macro,
@@ -2060,7 +2113,6 @@ engine_off_solo_triple = "VK_NONCONVERT"
         let config: AppConfig = toml::from_str(toml_str).unwrap();
         assert!(config.app_overrides.force_text.is_empty());
         assert!(config.app_overrides.force_bypass.is_empty());
-        assert!(config.app_overrides.force_vk.is_empty());
     }
 
     #[test]
@@ -2081,6 +2133,61 @@ engine_off_solo_triple = "VK_NONCONVERT"
 [general]
 "#;
         let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.diagnostics.hook_self_heal);
+    }
+
+    #[test]
+    fn test_indicator_evidence_defaults_to_off() {
+        // 既定は off(オプトイン。ADR-271 D4)。セクションが無くても。
+        let config: AppConfig = toml::from_str("[general]\n").unwrap();
+        assert_eq!(config.indicator_evidence.glyph, EvidenceLevel::Off);
+    }
+
+    #[test]
+    fn test_indicator_evidence_levels_parse_and_order() {
+        let config: AppConfig =
+            toml::from_str("[indicator_evidence]\nglyph = \"unobserved\"\n").unwrap();
+        assert_eq!(config.indicator_evidence.glyph, EvidenceLevel::Unobserved);
+        assert!(
+            EvidenceLevel::Off < EvidenceLevel::Observe
+                && EvidenceLevel::Observe < EvidenceLevel::Unobserved
+                && EvidenceLevel::Unobserved < EvidenceLevel::All
+        );
+    }
+
+    #[test]
+    fn test_indicator_evidence_is_not_rounded_by_validate() {
+        // ADR-271 D3: 設定画面の保存が利用者の `all` を恒久的に書き換えないよう、validate は段階を丸めない。
+        let config: AppConfig = toml::from_str("[indicator_evidence]\nglyph = \"all\"\n").unwrap();
+        let (validated, warnings) = config.validate();
+        assert_eq!(validated.indicator_evidence.glyph, EvidenceLevel::All);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let back: AppConfig = validated.into();
+        assert_eq!(back.indicator_evidence.glyph, EvidenceLevel::All);
+    }
+
+    #[test]
+    fn test_removed_indicator_menu_keys_are_ignored_without_warning() {
+        // ADR-264 のメニュー読み取りの撤去(2026-10-22): 旧キー・新キーとも、読み込みエラーにも警告にもならない。
+        let config = AppConfig::from_toml_str(
+            "[diagnostics]\nindicator_menu_shadow = true\n\n[indicator_evidence]\nglyph = \"observe\"\nmenu = \"observe\"\n",
+        )
+        .expect("撤去した menu が残っていても読める");
+        assert_eq!(config.indicator_evidence.glyph, EvidenceLevel::Observe);
+        let (_, w) = config.validate();
+        assert!(w.is_empty(), "{w:?}");
+    }
+
+    #[test]
+    fn test_mozc_shm_shadow_defaults_to_disabled() {
+        let config: AppConfig = toml::from_str("[general]\n").unwrap();
+        assert!(!config.diagnostics.mozc_shm_shadow);
+    }
+
+    #[test]
+    fn test_mozc_shm_shadow_can_be_enabled_without_touching_the_other_diagnostics() {
+        let config: AppConfig = toml::from_str("[diagnostics]\nmozc_shm_shadow = true\n").unwrap();
+        assert!(config.diagnostics.mozc_shm_shadow);
         assert!(config.diagnostics.hook_self_heal);
     }
 
@@ -2196,22 +2303,42 @@ disable_apps = ["mstsc.exe", ""]
         );
     }
 
+    /// `app_overrides.force_vk`・`force_tsf` は 2026-10-22 に退役させた（ADR-276 で既定が全部 VK になり、
+    /// Tsf 注入経路も撤去したため。ADR-0004 追記）。旧 `config.toml` に残っていても読み込みエラーに
+    /// ならず、他の設定は読める。空でなければ「不要になった」旨をそれぞれ 1 回だけ通知し、空
+    /// （`force_vk = []`・`force_tsf = []`）なら黙って無視する。
     #[test]
-    fn test_app_overrides_force_vk_parse() {
-        let toml_str = r#"
-[general]
-
+    fn test_retired_force_vk_and_force_tsf_are_ignored_with_notice() {
+        let text = r#"
 [app_overrides]
 force_vk = [
     { process = "wezterm-gui.exe", class = "org.wezfurlong.wezterm" },
 ]
+force_tsf = [
+    { process = "a.exe", class = "A" },
+]
+force_text = [
+    { process = "b.exe", class = "B" },
+]
 "#;
-        let config: AppConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.app_overrides.force_vk.len(), 1);
-        assert_eq!(config.app_overrides.force_vk[0].process, "wezterm-gui.exe");
-        assert_eq!(
-            config.app_overrides.force_vk[0].class,
-            "org.wezfurlong.wezterm"
+        let config =
+            AppConfig::from_toml_str(text).expect("旧 force_vk・force_tsf が残っていても読める");
+        assert_eq!(config.app_overrides.force_text.len(), 1, "他の設定は読める");
+        let (_, warnings) = config.validate();
+        for key in ["force_vk", "force_tsf"] {
+            let hits: Vec<&String> = warnings.iter().filter(|w| w.contains(key)).collect();
+            assert_eq!(hits.len(), 1, "{key}: {warnings:?}");
+            assert!(hits[0].contains("不要"), "{hits:?}");
+        }
+
+        let config = AppConfig::from_toml_str("[app_overrides]\nforce_vk = []\nforce_tsf = []\n")
+            .expect("空の旧 force_vk・force_tsf も読める");
+        let (_, warnings) = config.validate();
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.contains("force_vk") || w.contains("force_tsf")),
+            "{warnings:?}"
         );
     }
 
@@ -2611,59 +2738,34 @@ ime_toggle = []
         );
     }
 
+    /// ADR-206 決定4・SF-09: 旧 `*_solo_tap_ime_action` は撤去済み。残っていても読み込みエラーにならず、
+    /// 値は無視され、`keys.ime_on`/`keys.ime_off` を案内する通知が1件ずつ出る（未知キーの提案文にはならない）。
     #[test]
-    fn test_legacy_solo_tap_action_migrates_only_for_thumb_keys_and_warns() {
+    fn test_removed_solo_tap_ime_action_is_ignored_with_notice() {
         let toml_str = r#"
 [general]
 left_thumb_key = "無変換"
-right_thumb_key = "Space"
 muhenkan_solo_tap_ime_action = "off"
 henkan_solo_tap_ime_action = "on"
 "#;
-        let config: AppConfig = toml::from_str(toml_str).unwrap();
-        // 無変換だけが親指キー。変換は親指に割り当てられていないので移行しない。
-        assert_eq!(
-            config.general.legacy_thumb_solo_tap_actions(),
-            (Some(crate::types::ShadowImeAction::TurnOff), None)
+        let config = AppConfig::from_toml_str(toml_str).expect("旧キーが残っていても読める");
+        assert_eq!(config.general.left_thumb_key, "無変換");
+        assert!(
+            config.keys.ime_off.iter().all(|k| k != "無変換"),
+            "旧設定は keys.ime_off へ移行しない（無視する）"
         );
         let (_validated, warnings) = config.validate();
-        assert!(
-            warnings
+        for field in ["muhenkan_solo_tap_ime_action", "henkan_solo_tap_ime_action"] {
+            let hits: Vec<_> = warnings
                 .iter()
-                .any(|w| w.contains("general.muhenkan_solo_tap_ime_action")
-                    && w.contains("非推奨です")
-                    && w.contains("同じ扱いで動いています")),
-            "親指キーの旧設定は移行の警告、got: {warnings:?}"
-        );
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("general.henkan_solo_tap_ime_action")
-                    && w.contains("今後は効きません")),
-            "親指でないキーの旧設定は読み捨ての警告、got: {warnings:?}"
-        );
-    }
-
-    #[test]
-    fn test_legacy_solo_tap_action_is_ignored_when_bare_combo_exists() {
-        let toml_str = r#"
-[general]
-left_thumb_key = "無変換"
-muhenkan_solo_tap_ime_action = "toggle"
-
-[keys]
-ime_off = ["無変換"]
-"#;
-        let config: AppConfig = toml::from_str(toml_str).unwrap();
-        let (_validated, warnings) = config.validate();
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("general.muhenkan_solo_tap_ime_action")
-                    && w.contains("無視されます")
-                    && w.contains("優先されます")),
-            "bare が既にあれば旧設定は無視される旨を警告する、got: {warnings:?}"
-        );
+                .filter(|w| w.contains(&format!("general.{field}")))
+                .collect();
+            assert_eq!(hits.len(), 1, "{field} の通知は1件、got: {warnings:?}");
+            assert!(
+                hits[0].contains("無視されます") && hits[0].contains("keys.ime_on"),
+                "無視される旨と keys.ime_on/ime_off の案内、got: {hits:?}"
+            );
+        }
     }
 
     #[test]
@@ -2767,67 +2869,22 @@ engine_on = ["Ctrl+VK_F10"]
         assert_eq!(config.keys.engine_on, vec!["Ctrl+VK_F10"]);
     }
 
-    // ── Linux 設定テスト ──
-
+    /// Linux スタブ crate（`awase-linux`）の撤去（2026-10-22、SF-06）で
+    /// `linux_input_backend`/`linux_evdev_device` を削除した。既存の`config.toml`に
+    /// 残っていても読み込みエラーにならず、無視されて他の設定が読める
+    /// （`deny_unknown_fields`を付けていない）。
     #[test]
-    fn test_linux_defaults() {
-        let toml_str = r#"
-[general]
-"#;
-        let config: AppConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.general.linux_input_backend, "evdev");
-        assert_eq!(config.general.linux_evdev_device, None);
-    }
-
-    #[test]
-    fn test_linux_custom_values() {
+    fn test_removed_linux_backend_keys_are_ignored_on_load() {
         let toml_str = r#"
 [general]
 linux_input_backend = "x11"
 linux_evdev_device = "/dev/input/event3"
+left_thumb_key = "無変換"
 "#;
-        let config: AppConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.general.linux_input_backend, "x11");
-        assert_eq!(
-            config.general.linux_evdev_device,
-            Some("/dev/input/event3".to_string())
-        );
-    }
-
-    #[test]
-    fn test_linux_libinput_backend() {
-        let toml_str = r#"
-[general]
-linux_input_backend = "libinput"
-"#;
-        let config: AppConfig = toml::from_str(toml_str).unwrap();
-        let (validated, warnings) = config.validate();
-        assert!(warnings.iter().all(|w| !w.contains("linux_input_backend")));
-        assert_eq!(validated.general.linux_input_backend, "libinput");
-    }
-
-    #[test]
-    fn test_linux_invalid_backend_produces_warning() {
-        let toml_str = r#"
-[general]
-linux_input_backend = "wayland"
-"#;
-        let config: AppConfig = toml::from_str(toml_str).unwrap();
-        let (validated, warnings) = config.validate();
-        assert!(warnings.iter().any(|w| w.contains("linux_input_backend")));
-        assert_eq!(validated.general.linux_input_backend, "evdev");
-    }
-
-    #[test]
-    fn test_linux_invalid_evdev_device_produces_warning() {
-        let toml_str = r#"
-[general]
-linux_evdev_device = "not/a/dev/path"
-"#;
-        let config: AppConfig = toml::from_str(toml_str).unwrap();
-        let (validated, warnings) = config.validate();
-        assert!(warnings.iter().any(|w| w.contains("linux_evdev_device")));
-        assert_eq!(validated.general.linux_evdev_device, None);
+        let config: AppConfig = toml::from_str(toml_str).expect("旧キーが残っていても読める");
+        assert_eq!(config.general.left_thumb_key, "無変換");
+        let (_validated, warnings) = config.validate();
+        assert!(warnings.iter().all(|w| !w.contains("linux_")));
     }
 
     #[test]
@@ -3254,5 +3311,38 @@ steps = ["'（'", "CV4D", "'）'", "CV4D", "左"]
             "{:?}",
             bundled.load_warnings()
         );
+    }
+    #[test]
+    fn test_auto_detect_defaults_to_observe_with_measured_thresholds() {
+        // [auto_detect] が無くても既定で影の判定（observe。挙動を変えない）が有効。ADR-263 PR 2a。
+        let config: AppConfig = toml::from_str("[general]\n").unwrap();
+        assert_eq!(config.auto_detect.mode, AutoDetectMode::Observe);
+        assert_eq!(config.auto_detect.decider, AutoDetectDecider::Lr);
+        assert!((config.auto_detect.lr_en_threshold - 1.5).abs() < f64::EPSILON);
+        assert!((config.auto_detect.lr_eisu_threshold - 4.0).abs() < f64::EPSILON);
+        assert_eq!(config.auto_detect.scope, AutoDetectScope::Unobserved);
+        assert_eq!(config.auto_detect.max_keys, 7);
+        assert_eq!(config.auto_detect.max_ms, 2500);
+        assert!((config.auto_detect.ja_threshold - 14.0).abs() < f64::EPSILON);
+        assert!((config.auto_detect.en_threshold - 8.0).abs() < f64::EPSILON);
+        assert!((config.auto_detect.eisu_threshold - 13.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_auto_detect_can_be_turned_off_and_tuned() {
+        let toml_str = r#"
+[auto_detect]
+mode = "off"
+scope = "all"
+idle_ms = 5000
+en_threshold = 6.0
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.auto_detect.mode, AutoDetectMode::Off);
+        assert_eq!(config.auto_detect.scope, AutoDetectScope::All);
+        assert_eq!(config.auto_detect.idle_ms, 5000);
+        assert!((config.auto_detect.en_threshold - 6.0).abs() < f64::EPSILON);
+        // 指定しなかった項目は既定のまま
+        assert_eq!(config.auto_detect.max_keys, 7);
     }
 }

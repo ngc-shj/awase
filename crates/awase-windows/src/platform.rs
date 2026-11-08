@@ -11,7 +11,7 @@ use awase::platform::{PlatformRuntime, TsfComposition};
 use awase::types::{KeyAction, RawKeyEvent};
 
 use crate::focus::class_names::AppImeProfile;
-use crate::focus::classifier::{ImmCapability, InjectionHint};
+use crate::focus::classifier::ImmCapability;
 use crate::focus::tracker::FocusTracker;
 use crate::output::Output;
 use crate::timer::Win32Timer;
@@ -37,6 +37,8 @@ pub struct WindowsPlatform {
     /// ADR-227: give-up の証拠の判定(純粋)と、runtime が取り出すまでの 1 件。
     giveup_tracker: crate::tsf::literal_facts::GiveUpTracker,
     pending_giveup: Option<crate::tsf::literal_facts::GiveUpEvidence>,
+    /// ADR-258 段階0: 1回目の literal 疑いの証拠(runtime が journal に記録するだけ。arm しない)。
+    pending_first_literal: Option<crate::tsf::literal_facts::FirstLiteralEvidence>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -88,6 +90,7 @@ impl WindowsPlatform {
             pending_literal_vk: None,
             giveup_tracker: crate::tsf::literal_facts::GiveUpTracker::default(),
             pending_giveup: None,
+            pending_first_literal: None,
         }
     }
 
@@ -274,6 +277,10 @@ impl WindowsPlatform {
                         record.consecutive_before,
                         self.giveup_tracker
                     );
+                    // ADR-258 段階0: 1回目の literal 疑い(`note_record` が数える前に判定する。tracker は変えない)。
+                    if let Some(first) = self.giveup_tracker.first_literal_evidence(&record) {
+                        self.pending_first_literal = Some(first);
+                    }
                     if let Some(evidence) = self.giveup_tracker.note_record(&record) {
                         tracing::debug!(
                             "[giveup-follow] give-up の証拠を保持 cold={} focus_gen={}",
@@ -292,6 +299,13 @@ impl WindowsPlatform {
         if terminal_timer {
             self.flush_pending_literal_vk_as_aborted();
         }
+    }
+
+    /// ADR-258 段階0: 1回目の literal 疑いの証拠を 1 件取り出す(runtime の `TIMER_TSF_PROBE` が give-up の証拠の後に呼ぶ)。
+    pub(crate) fn take_first_literal_evidence(
+        &mut self,
+    ) -> Option<crate::tsf::literal_facts::FirstLiteralEvidence> {
+        self.pending_first_literal.take()
     }
 
     /// ADR-227: give-up の証拠を 1 件取り出す(runtime の `TIMER_TSF_PROBE` が `advance_tsf_probe` の直後に呼ぶ)。
@@ -346,42 +360,9 @@ impl WindowsPlatform {
         self.gji_on_composition_reset();
     }
 
-    /// フォーカス変更時に injection_mode を更新する（runtime 用）。
-    pub(crate) const fn update_injection_mode(
-        &mut self,
-        mode: crate::output::types::InjectionMode,
-    ) {
-        self.output.update_injection_mode(mode);
-    }
-
     /// フォーカス変更を Output に通知し、warm epoch をリセットする（runtime 用）。
     pub(crate) fn notify_focus_changed(&self) {
         self.output.on_focus_changed();
-    }
-
-    /// TSF モード確定時に TsfGate を Probing に遷移させ、保留キーを返す（runtime 用）。
-    pub(crate) fn confirm_tsf(&mut self) -> Vec<RawKeyEvent> {
-        self.output.confirm_tsf()
-    }
-
-    /// 非 TSF モード確定時に TsfGate を Bypass に遷移させ、保留キーを返す（runtime 用）。
-    pub(crate) fn bypass_tsf(&mut self) -> Vec<RawKeyEvent> {
-        self.output.bypass_tsf()
-    }
-
-    /// フォーカス変更時に TsfGate を PendingWarmup に遷移させる（bootstrap 用）。
-    pub(crate) fn on_focus_change_tsf(&mut self) {
-        self.output.on_focus_change_tsf();
-    }
-
-    /// TIMER_TSF_GATE タイムアウト時に TsfGate を Bypass にフォールバックし、保留キーを返す。
-    pub(crate) fn on_tsf_warmup_timeout(&mut self) -> Vec<RawKeyEvent> {
-        self.output.on_tsf_warmup_timeout()
-    }
-
-    /// キーを TsfGate で処理する。`true` = 保留（呼び出し元は Consumed を返すこと）。
-    pub(crate) fn try_hold_key(&mut self, event: RawKeyEvent) -> bool {
-        self.output.try_hold_key(event)
     }
 
     /// `send_keys()` が開始した TSF/GJI probe がまだ完了していないか。
@@ -413,7 +394,6 @@ impl WindowsPlatform {
             state_changed: state_before_step != state_after_step,
             needs_composition_reset: result.needs_gji_composition_reset,
             has_gji_response: result.gji_response.is_some(),
-            learned_tsf: result.learned_tsf,
             completed: result.completed_cold_seq.is_some(),
             terminal_timer,
             is_first_tick: self.probe_tick_index == 1,
@@ -441,25 +421,8 @@ impl WindowsPlatform {
         if let Some(gji_resp) = result.gji_response {
             self.dispatch_gji_response(&gji_resp);
         }
-        if result.learned_tsf {
-            // UnicodeLiteralObserverFsm が GJI write なしと判断 → フォーカス中クラスを Tsf に昇格。
-            let class_name = self.focus.class_name().to_string();
-            tracing::info!("[injection-mode] {class_name:?} → Tsf 事後昇格（GJI write 未観測）");
-            self.focus.learn_injection_mode_tsf(class_name);
-            // 現セッション（現在のフォーカスウィンドウ）にも即時 Tsf モードを適用する。
-            self.output
-                .update_injection_mode(crate::output::InjectionMode::Tsf);
-            // 次の文字送信が cold-start TSF probe を正しく踏むよう composition を cold にリセット。
-            self.output
-                .mark_composition_cold(crate::output::ColdReason::FocusChange);
-        }
-        if result.completed_cold_seq.is_some() || result.learned_tsf {
-            let outcome = if result.learned_tsf {
-                "LearnedTsf"
-            } else {
-                "Done"
-            };
-            self.note_tsf_probe_completed(outcome, result.completed_cold_seq, None);
+        if result.completed_cold_seq.is_some() {
+            self.note_tsf_probe_completed("Done", result.completed_cold_seq, None);
         }
         self.apply_timer_command(result.timer_cmd);
     }
@@ -481,11 +444,10 @@ impl WindowsPlatform {
     }
 
     /// [`Self::dispatch_gji_response`] の起点付き版（ADR-203 決定3）。起点で分けていた Unicode long-cold の
-    /// reinit は ADR-212 P3/P5 で撤去したので、`origin` は今は再帰でしか使わない（同期の呼び出し側が起点を渡す形は残す）。
-    #[expect(clippy::only_used_in_recursion)]
+    /// reinit は ADR-212 P3/P5 で撤去したので、`_origin` は今は使わない（同期の呼び出し側が起点を渡す形は残す）。
     pub(crate) fn dispatch_gji_response_from(
         &mut self,
-        origin: crate::state::gji_direct_mechanism::GjiSyncOrigin,
+        _origin: crate::state::gji_direct_mechanism::GjiSyncOrigin,
         response: &timed_fsm::Response<
             crate::tsf::gji_fsm::GjiAction,
             crate::tsf::gji_fsm::GjiTimer,
@@ -516,8 +478,7 @@ impl WindowsPlatform {
             match action {
                 GjiAction::StartProbe { probe_id, params } => {
                     tracing::debug!(
-                        "[gji-fsm] StartProbe probe_id={probe_id:?} forces_f2={} long={}",
-                        params.forces_prepend_f2,
+                        "[gji-fsm] StartProbe probe_id={probe_id:?} long={}",
                         params.is_long_cold
                     );
                     self.output.gji_store_probe_id(*probe_id);
@@ -525,27 +486,6 @@ impl WindowsPlatform {
                     self.active_tsf_probe_started_ms = Some((now_ms, u64::from(probe_id.0)));
                     self.reset_probe_tick_counters();
                     self.note_tsf_probe_started_from_gji_action(*probe_id);
-                    // Unicode injection mode では KEYEVENTF_UNICODE が GJI TSF context を迂回するため
-                    // GjiWarmupFsm も ChromeProbe も作成されず GjiFsm が OnCold(Authorized) に留まり続ける。
-                    // 即 WarmupComplete を dispatch して OnWarm に遷移させる。
-                    // long-cold（≥10s idle）でも何も送らない（VK_IME_ON poke・warmup FSM・reinit は ADR-212 P3/P5 で撤去）。
-                    if self.output.injection_mode == crate::output::InjectionMode::Unicode {
-                        use crate::tsf::gji_fsm::GjiEvent;
-                        let state_before = self.gji_state_label();
-                        let warmup_resp = self.output.gji_on_event(GjiEvent::WarmupComplete {
-                            probe_id: *probe_id,
-                        });
-                        self.note_gji_transition("WarmupComplete(unicode)", state_before);
-                        // ADR-123 `/code-review` 指摘: このハンドラ内で直前に push した
-                        // TsfProbeStarted と Start/Complete を probe_id で突合できるよう、
-                        // cold_seq には（別の採番空間である）probe_id を入れない。
-                        self.note_tsf_probe_completed(
-                            "UnicodeImmediate",
-                            None,
-                            Some(u64::from(probe_id.0)),
-                        );
-                        self.dispatch_gji_response_from(origin, &warmup_resp);
-                    }
                 }
                 GjiAction::CancelProbe { probe_id } => {
                     if self.output.gji_current_probe_id() == Some(*probe_id) {
@@ -584,17 +524,27 @@ impl WindowsPlatform {
     /// SendInput 2連送になり、ADR-149/BUG-113 の「@」の必要条件を作る）。`eager_warmup_sent_ms` の latch もしない
     /// （唯一の読み手 `compute_focus_probe_grace` はフォーカス変更で 0 に戻された値をフォーカス直後の最初の打鍵で読むため、
     /// F2 の latch は読まれない。BUG-06 の「新F2から500ms待機」自体も 2026-07-18 に撤去済み。Opus round2 R2-6）。
-    /// - TSF mode: `GjiNativeF2Consumed` を使うことで GjiFsm が Medium/Long cold 状態を維持できる
-    ///   （`GjiCompositionReset` だと Short に降格して Long cold の forces_prepend_f2/is_long_cold が失われる）。
-    /// - 非 TSF・非 warm: cold mark と GjiFsm reset のみ（Chrome/Win32 向け）。
-    /// - 非 TSF・warm: 何もしない（BUG-31: warm 中の無関係な物理 IME キーで cold 化すると、直後の無関係な
+    /// cold にするかは `tsf::cold_reason::physical_f2_marks_cold` が決める:
+    /// - 非 warm: cold mark と GjiFsm reset のみ。
+    /// - warm の GJI 系: 何もしない（BUG-31: warm 中の無関係な物理 IME キーで cold 化すると、直後の無関係な
     ///   タイピングが cold-start 経路に落ちて GJI 候補ウィンドウ可視性のレースで文字が消える）。
+    /// - warm の Mozc 系で、ADR-270 の確認を張る窓（`mozc_compose_check_applies`、Windows Terminal・WezTerm）:
+    ///   cold にする（BUG-209。確認は cold の送信でしか張られない）。他の窓では確認が張られないので cold にしない
+    ///   （無益な保持を入れない。PR #809 再レビュー N1）。
+    ///
+    /// 旧 Tsf 注入モード（`force_tsf`）では warm でも `NativeF2Consumed` で cold にしていたが、
+    /// Tsf 注入経路の撤去（2026-10-22、ADR-0004 追記）で分岐ごと削除した（Mozc 系の分だけ上で残す）。
     pub(crate) fn composition_native_f2_down(&mut self) {
-        if self.output.is_tsf_mode() {
-            self.output
-                .mark_composition_cold(crate::output::ColdReason::NativeF2Consumed);
-            self.gji_on_native_f2_consumed();
-        } else if !self.output.is_composition_warm() {
+        let warm = self.output.is_composition_warm();
+        let mozc_check = warm && {
+            // SAFETY: Win32 GetForegroundWindow + GetClassName; returns empty string on failure.
+            let fg_class = unsafe { crate::ime::get_foreground_window_class() };
+            crate::focus::class_names::mozc_compose_check_applies(
+                crate::tsf::observer::gji_evidence_absent(),
+                &fg_class,
+            )
+        };
+        if crate::tsf::cold_reason::physical_f2_marks_cold(warm, mozc_check) {
             self.output
                 .mark_composition_cold(crate::output::ColdReason::F2NonTsf);
             self.gji_on_composition_reset();
@@ -604,10 +554,7 @@ impl WindowsPlatform {
     // ── GjiFsm イベント通知 ──────────────────────────────────────────────────
 
     /// フォーカス変更を GjiFsm に通知する（`ir_post_focus_change_snapshot` から呼ぶ）。
-    pub(crate) fn gji_on_focus_change(
-        &mut self,
-        injection_mode: crate::output::types::InjectionMode,
-    ) {
+    pub(crate) fn gji_on_focus_change(&mut self) {
         if crate::tsf::observer::discard_pending_composition_events() {
             tracing::debug!(
                 "[gji-fsm] FocusChange: 前セッションの保留 composition イベント(SHOW/HIDE)を破棄"
@@ -617,10 +564,7 @@ impl WindowsPlatform {
         let state_before = self.gji_state_label();
         let resp = self
             .output
-            .gji_on_event(crate::tsf::gji_fsm::GjiEvent::FocusChange {
-                injection_mode,
-                gji_idle_ms,
-            });
+            .gji_on_event(crate::tsf::gji_fsm::GjiEvent::FocusChange { gji_idle_ms });
         self.note_gji_transition(
             format!("FocusChange(gji_idle_ms={gji_idle_ms})"),
             state_before,
@@ -694,15 +638,12 @@ impl WindowsPlatform {
     }
 
     /// IME ON を GjiFsm に通知する（`on_ime_applied(open=true)` から呼ぶ）。
-    pub(crate) fn gji_on_ime_on(&mut self, injection_mode: crate::output::types::InjectionMode) {
+    pub(crate) fn gji_on_ime_on(&mut self) {
         let gji_idle_ms = crate::tsf::observer::gji_idle_ms();
         let state_before = self.gji_state_label();
         let resp = self
             .output
-            .gji_on_event(crate::tsf::gji_fsm::GjiEvent::ImeOn {
-                injection_mode,
-                gji_idle_ms,
-            });
+            .gji_on_event(crate::tsf::gji_fsm::GjiEvent::ImeOn { gji_idle_ms });
         self.note_gji_transition(format!("ImeOn(gji_idle_ms={gji_idle_ms})"), state_before);
         self.dispatch_gji_response(&resp);
     }
@@ -782,19 +723,6 @@ impl WindowsPlatform {
         );
     }
 
-    /// TSF mode で物理 F2 が消費されたことを GjiFsm に通知する（`on_reinject_key` の NativeF2Consumed パス）。
-    ///
-    /// Medium/Long cold 中は probe が継続（saw_native_f2=true）。Short cold / OnWarm / OnComposing は
-    /// CompositionReset 相当として処理される（GjiFsm 側で分岐、`gji_idle_ms` による
-    /// 再検証込み）。
-    pub(crate) fn gji_on_native_f2_consumed(&mut self) {
-        let gji_idle_ms = crate::tsf::observer::gji_idle_ms();
-        self.dispatch_gji_event(
-            format!("NativeF2Consumed(gji_idle_ms={gji_idle_ms})"),
-            crate::tsf::gji_fsm::GjiEvent::NativeF2Consumed { gji_idle_ms },
-        );
-    }
-
     /// GJI candidate SHOW → GjiFsm::StartComposition を dispatch する。
     ///
     /// `observation_event_proc` が `pending_start_composition` を set した後、
@@ -811,13 +739,13 @@ impl WindowsPlatform {
     ///
     /// `observation_event_proc` が `pending_end_composition` を set した後、
     /// `advance_tsf_probe` / `send_keys` で `take_pending_end_composition()` が true を返したときに呼ぶ。
-    /// `OnComposing` 以外の状態では epoch が取れないためスキップする（GjiFsm 側でも無視される）。
+    /// `OnComposing` 以外の状態ではスキップする（GjiFsm 側でも無視される）。
     pub(crate) fn gji_on_end_composition(&mut self) {
-        if let Some(epoch) = self.output.gji_current_composition_epoch() {
-            tracing::debug!("[gji-fsm] EndComposition (candidate HIDE) epoch={epoch:?}");
+        if self.output.gji_is_composing() {
+            tracing::debug!("[gji-fsm] EndComposition (candidate HIDE)");
             self.dispatch_gji_event(
-                format!("EndComposition(candidate HIDE, epoch={epoch:?})"),
-                crate::tsf::gji_fsm::GjiEvent::EndComposition { epoch },
+                "EndComposition(candidate HIDE)",
+                crate::tsf::gji_fsm::GjiEvent::EndComposition,
             );
             // BUG-24 追補: 候補ウィンドウ HIDE = IME セッションの終了。次のセッションの
             // 最初の1文字は改めて literal-detect の確認を受けるようリセットする。
@@ -840,7 +768,7 @@ impl WindowsPlatform {
 
     /// WM_DRAIN_OUTPUT_QUEUE ハンドラ用: raw TSF literal 回収 + probe タイマーをセット。
     ///
-    /// `output.flush_raw_tsf_literal_recovery()` は内部で `send_romaji_as_tsf` /
+    /// `output.flush_raw_tsf_literal_recovery()` は内部で
     /// `send_romaji_batched` を呼ぶため、`send_keys()` と同様に `GjiFsm::KeyInput` の
     /// `Response`（`pending_gji_key_responses`）や `composition_reset` フラグが
     /// 発生しうる。`platform.send_keys` を経由しないため、`drain_output_post_send_effects`
@@ -850,9 +778,24 @@ impl WindowsPlatform {
     pub fn flush_raw_tsf_literal_recovery(&mut self) {
         let outcome = self.output.flush_raw_tsf_literal_recovery();
         let outcome = match outcome {
-            crate::output::RawRecoveryOutcome::Flushed { vk_count } => {
-                crate::journal::DeferredRecoveryOutcomeSummary::Flushed { vk_count }
-            }
+            crate::output::RawRecoveryOutcome::Flushed {
+                vk_count,
+                focus_hwnd_changed,
+            } => crate::journal::DeferredRecoveryOutcomeSummary::Flushed {
+                vk_count,
+                focus_hwnd_changed,
+            },
+            crate::output::RawRecoveryOutcome::DiscardedStale {
+                backs,
+                romaji_present,
+                deferred_vk_count,
+                focus_hwnd_changed,
+            } => crate::journal::DeferredRecoveryOutcomeSummary::DiscardedStale {
+                backs,
+                romaji_present,
+                deferred_vk_count,
+                focus_hwnd_changed,
+            },
         };
         let facts = match outcome {
             crate::journal::DeferredRecoveryOutcomeSummary::DiscardedStale { .. } => {
@@ -861,9 +804,13 @@ impl WindowsPlatform {
             crate::journal::DeferredRecoveryOutcomeSummary::SkippedWhilePolling => {
                 crate::journal_policy::DeferredRecoveryFlushFacts::SkippedWhilePolling
             }
-            crate::journal::DeferredRecoveryOutcomeSummary::Flushed { vk_count } => {
-                crate::journal_policy::DeferredRecoveryFlushFacts::Flushed { vk_count }
-            }
+            crate::journal::DeferredRecoveryOutcomeSummary::Flushed {
+                vk_count,
+                focus_hwnd_changed,
+            } => crate::journal_policy::DeferredRecoveryFlushFacts::Flushed {
+                vk_count,
+                focus_hwnd_changed,
+            },
         };
         if crate::journal_policy::deferred_recovery_flush_is_notable(facts) {
             self.push_journal_entry(crate::journal::JournalEntry::DeferredRecoveryFlush {
@@ -887,7 +834,7 @@ impl WindowsPlatform {
         // 件数を journal 化する。`JournalStamper::stamp` は push 時に
         // seq/elapsed_ms を採番するため、ここ（全送信直後、`drain_journal_entries`
         // より前）で変換しないと「flush が resend より前に発火した」ことを
-        // journal 上で示せず、`GjiReinitRetryCompleted` 等の後続entryより
+        // journal 上で示せず、後続entryより
         // 後ろの seq になってしまう（round: 実装後コードレビュー指摘）。
         //
         // `deferred_recovery_flush_is_notable` の判定はこの呼び出し元
@@ -898,11 +845,17 @@ impl WindowsPlatform {
         // 追随し忘れる退行を招く（/code-review 指摘・検討のうえ据え置き）。
         let vk_count = self.output.take_pending_drain_before_send_flush();
         if vk_count > 0 {
-            let facts = crate::journal_policy::DeferredRecoveryFlushFacts::Flushed { vk_count };
+            let facts = crate::journal_policy::DeferredRecoveryFlushFacts::Flushed {
+                vk_count,
+                focus_hwnd_changed: None,
+            };
             if crate::journal_policy::deferred_recovery_flush_is_notable(facts) {
                 self.push_journal_entry(crate::journal::JournalEntry::DeferredRecoveryFlush {
                     trigger: "drain_before_send",
-                    outcome: crate::journal::DeferredRecoveryOutcomeSummary::Flushed { vk_count },
+                    outcome: crate::journal::DeferredRecoveryOutcomeSummary::Flushed {
+                        vk_count,
+                        focus_hwnd_changed: None,
+                    },
                 });
             }
         }
@@ -931,8 +884,6 @@ impl WindowsPlatform {
             crate::output::TimerCommand::Kill { id } => self.timer.kill(id),
         }
     }
-
-    // ── Unicode cold-start warmup ヘルパー ────────────────────────────────
 }
 
 impl PlatformRuntime for WindowsPlatform {
@@ -949,7 +900,6 @@ impl PlatformRuntime for WindowsPlatform {
         // lock しない。フックの応答時間に効く経路）。
         if crate::state::gji_direct_mechanism::needs_belief_sync_on(
             crate::state::gji_direct_mechanism::send_carries_romaji(actions),
-            self.output.injection_mode == crate::output::InjectionMode::Unicode,
             self.output.f2_warmup_owned(),
             self.output.gji_is_off_cold(),
             false,
@@ -960,15 +910,6 @@ impl PlatformRuntime for WindowsPlatform {
                 crate::state::gji_direct_mechanism::GjiFsmSync::OnImeOnBelief,
             );
         }
-        // Unicode モード + 未学習クラスなら、Romaji 送信後に GJI write 観測をリクエストする（事後昇格）。
-        if self.output.injection_mode == crate::output::InjectionMode::Unicode
-            && !self
-                .focus
-                .has_learned_injection_mode_tsf(self.focus.class_name())
-        {
-            self.output.request_unicode_observation();
-        }
-        // Unicode long-cold warmup(VK_IME_ON+VK_A+BS と文字の保留)は ADR-212 P5 で撤去した。
         self.output.send_keys(actions);
         self.drain_output_post_send_effects();
     }
@@ -1042,29 +983,16 @@ impl crate::state::gji_direct_mechanism::GjiSyncSink for WindowsPlatform {
     fn sync_gji(&mut self, sync: crate::state::gji_direct_mechanism::GjiFsmSync) {
         use crate::state::gji_direct_mechanism::GjiFsmSync;
         match sync {
-            GjiFsmSync::OnImeOn => {
-                // settle 時点の値を読む（receipt 生成時に積むと、actuation 中に
-                // mode が変わった場合に古い値で同期する。ADR-089 §2.4 細目2）。
-                let mode = self.output.injection_mode;
-                self.gji_on_ime_on(mode);
-            }
+            GjiFsmSync::OnImeOn => self.gji_on_ime_on(),
             GjiFsmSync::OnImeOff => self.gji_on_ime_off(),
             GjiFsmSync::OnImeOnBelief => {
-                let injection_mode = self.output.injection_mode;
                 self.gji_sync_from_belief(sync, "ImeOn(BeliefSync:level)", |gji_idle_ms| {
-                    crate::tsf::gji_fsm::GjiEvent::ImeOn {
-                        injection_mode,
-                        gji_idle_ms,
-                    }
+                    crate::tsf::gji_fsm::GjiEvent::ImeOn { gji_idle_ms }
                 });
             }
             GjiFsmSync::Reopen(source) => {
-                let injection_mode = self.output.injection_mode;
                 self.gji_sync_from_belief(sync, source.trigger(), |gji_idle_ms| {
-                    crate::tsf::gji_fsm::GjiEvent::Reopen {
-                        injection_mode,
-                        gji_idle_ms,
-                    }
+                    crate::tsf::gji_fsm::GjiEvent::Reopen { gji_idle_ms }
                 });
             }
         }
@@ -1072,20 +1000,12 @@ impl crate::state::gji_direct_mechanism::GjiSyncSink for WindowsPlatform {
 }
 
 impl TsfComposition for WindowsPlatform {
-    fn composition_output(&self) -> Option<&dyn awase::platform::CompositionOutput> {
-        Some(&self.output)
-    }
-
     fn output_in_flight_ms(&self) -> u64 {
         self.output.ms_since_last_send()
     }
 
     fn is_composition_warm(&self) -> bool {
         self.output.is_composition_warm()
-    }
-
-    fn is_tsf_mode(&self) -> bool {
-        self.output.is_tsf_mode()
     }
 
     fn on_ime_applied(&mut self, open: bool, outcome: awase::platform::ImeOpenOutcome) {
@@ -1180,8 +1100,6 @@ impl WindowsPlatform {
             self.output
                 .mark_composition_cold(crate::output::ColdReason::SetOpenFalse);
         }
-        // `injection_mode` は receipt にも settle の引数にも積まない。
-        // `sync_gji` の実装内で settle 時点の値を読む（ADR-089 §2.4 細目2）。
         receipt.settle(self);
     }
 
@@ -1265,7 +1183,7 @@ impl WindowsPlatform {
         &mut self,
         order: crate::state::actuation_chain::ActuationOrder,
     ) -> bool {
-        crate::ime_controller::log_shadow_warrant("set_ime_open", &order);
+        crate::state::sync_actuation::log_shadow_warrant("set_ime_open", &order);
         let open = order.open();
         // `order` は**値で**受け取り、ここで消費する。1 つの `ActuationOrder`
         // = 高々 1 回の write という `Actuation` のアフィン性（ADR-089 INV-41）を、
@@ -1295,23 +1213,6 @@ impl WindowsPlatform {
     #[must_use]
     pub const fn current_app_profile(&self) -> AppImeProfile {
         self.focus.current_profile()
-    }
-
-    /// 現在のフォーカス先に対する注入ヒントを返す。
-    #[must_use]
-    pub fn injection_hint(&self) -> InjectionHint {
-        self.focus.injection_hint()
-    }
-
-    /// 指定した pid/class に対する injection_hint を返す（フォーカス変更直後の stale 回避用）。
-    #[must_use]
-    pub(crate) fn injection_hint_for(&self, pid: u32, class_name: &str) -> InjectionHint {
-        self.focus.injection_hint_for(pid, class_name)
-    }
-
-    /// フォーカス情報と `AppImeProfile` キャッシュをアトミックに更新する。
-    pub fn update_focus_info(&mut self, process_id: u32, class_name: String, hwnd: usize) {
-        self.focus.update(process_id, class_name, hwnd);
     }
 
     /// 同一フォーカスプローブ内で取得済みの process_name を再利用して更新する。
@@ -1351,13 +1252,5 @@ impl WindowsPlatform {
     pub fn clear_imm_pending_unavailable(&mut self, process_name: &str, class_name: &str) {
         self.focus
             .clear_imm_pending_unavailable(process_name, class_name);
-    }
-
-    /// UIA ワーカーへの送信チャネルを設定する。
-    pub fn set_uia_sender(
-        &mut self,
-        sender: std::sync::mpsc::Sender<crate::focus::uia::SendableHwnd>,
-    ) {
-        self.focus.set_uia_sender(sender);
     }
 }

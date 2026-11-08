@@ -59,7 +59,7 @@ API が状態を偽ることもあるため、実際にキーを打って結果�
 | `check_resync.py` | リセット操作の後に実IMEとEngineが揃うか |
 | `--charthumb=CHAR,THUMB` / `check_charthumb.py` | 文字→親指の順に押して文字を先に離し、親指を押し続ける(重なり不足、`min_overlap_margin_percent`>0)。親指の KEY 行の実IMEで、保持中(+400ms)は開いたまま・離した後(+1500ms)に閉じるか(ADR-199 T10 決定A、構成 `sc-charthumb-gji-atok`)。文字キーにはスキャンコードの対応(`scan_for`)が要る |
 | `check_toggle.py` | 開閉トグルキーが押すたびに反転し、Engineが追随するか |
-| `ablations/a*.sh` | 撤去実験(ミューテーター)。`a7-no-follow.sh`はfollow(ADR-187)を無効化してずれを起こす |
+| `ablations/a*.sh` | 撤去実験(ミューテーター)。現存は a4〜a6・a8(a3・a7 は対象コードが変わり差分を作れなくなったため撤去、ADR-240) |
 
 ## ADR-191/193: 学習ラウンド(格子)・検証ラウンド(walk)・通知の計測ツール(ワークフローの `cal-*` 構成 = `check: collect`)
 `cal-*` 構成は判定せずログを回収し、`[GRID-ABORT]` による打ち切り(rc=3=INVALID)だけを検出する(解析は下のツールでローカルに行う)。
@@ -74,7 +74,7 @@ API が状態を偽ることもあるため、実際にキーを打って結果�
 | `cycle.py` | 3段階ラウンド(設定の読み取り・学習・検証)のオフライン計測。`all <学習ログ> -- <検証ログ>` で、設定由来の表 S・学習した表 L・合成 M を、学習に使っていない walk の開ループ連鎖で採点する |
 | `conv_exp.py` | 隠れ状態「変換中(Conversion)」を打鍵履歴から追跡すると、入力中の Esc・無変換の非決定セルが決定的になるかの検証実験(研究用。製品コードは使わない) |
 | `score_walk.py` | 格子から作った予測表(JSON)を、独立した walk(キーで到達した状態)で一段予測として採点し、不一致セルを列挙する |
-| `gen_key_effect_table.py` | `grid-tables/{atok,msime,msime-native}.json` から、打鍵時予測の表 `crates/awase-windows/src/state/key_effect_table.rs` を生成する(ADR-191 決定3・4)。`--check` は何も書かずコミット済みの生成物との一致だけを検査する(`architecture_guard` の `key_effect_table_matches_generator` が呼ぶ)。予測器本体は `state/key_effect_predictor.rs` |
+| `gen_key_effect_table.py` | `grid-tables/{atok,msime,msime-native}.json` から、打鍵時予測の表 `crates/awase-key-effect/src/state/key_effect_table.rs` を生成する(ADR-191 決定3・4)。`--check` は何も書かずコミット済みの生成物との一致だけを検査する(`architecture_guard` の `key_effect_table_matches_generator` が呼ぶ)。予測器本体は `state/key_effect_predictor.rs` |
 | `gen_grid_nondet.py` | 前回の格子の表(`grid-tables/*.json`)から、結果が割れたセルの一覧(`grid-tables/nondet-*.txt`)を作る。`--grid-adaptive` の2パス目(`--grid-retry-file`)が再試行する対象になる |
 | `notify_latency.py` | `compartment_notify_probe`(ADR-193)のログから、キー→TSF compartment 変更通知の遅延(P50/P95/最大)、通知が来なかったキーの割合、通知の順序、周期読み取りとの比較を集計する |
 | `grid-tables/` | 格子(`--grid`)の学習結果の参照データ(`atok.json`/`msime.json`/`msime-native.json`: セル→結果の分布)と、`--grid-adaptive` の再試行対象(`nondet-*.txt`)。予測表(`key_effect_table.rs`)の生成元でもある(`gen_key_effect_table.py`) |
@@ -150,3 +150,47 @@ API が状態を偽ることもあるため、実際にキーを打って結果�
 **CI で作れない項目**: B3(a)(GJI の設定ダイアログで利用者が保存した CUSTOM 表に Hankaku/Zenkaku 行が残るか。ダイアログ操作は自動化できない。表の解釈自体は `sc-t1b-*` が見ている)、
 B4(MS-IME 本体の値2。設定アプリの「キーの割り当て」が出ず作れない、PR #378)、D3 の物理 Ctrl 操作そのもの(SendInput は PHYSICAL_KEY_STATE を作れないため、CI は実 IME の直接 close でずれだけを代替)。
 単体テスト: `python3 -m unittest discover -s tools/e2e/ime_key_matrix -p 'test_*.py'`。
+
+## 結果の信頼性と observe 構成の運用(2026-10-05)
+
+- **run の汚れ**(`check_run_validity.py`、`cpu_sampler.ps1`): 物理キー(`[engine-input]` の extra=0x0)の混入と CPU 負荷(p95)を run ごとに記録し、summary に「run の汚れ」表を出す。
+  既定は情報のみ。リポジトリ変数 `E2E_VALIDITY_ENFORCE=1` で、汚れた run を INVALID(rc=3)にして期待表の判定から外す(強制する前に、extra=0 のままの注入が無いか件数を見ること)。
+- **入力先の profile と経路の件数**(ADR-235 D1、`check_run_validity.py`): 同じ `validity.json` に、observed・drift・unicode・external_change の 4 つの経路の件数と、打鍵前の最後の `focus transition` の profile(入力先)・bootstrap の profile(awase 起動時の前面窓。入力先とは限らない)を記録し、summary に 4 件数がすべて 0 の回だけ表で出す。合否は変えない。0 件の回は「経路に乗っていない」ので、「起きなかった」と読まないこと。正規表現は判定器と共通(`e2e_common.py`)。
+- **Wilson 区間**(`stats_util.py`): 試行数が小さいので、typing 表に FAIL率の 95% 区間を併記する(0/10 でも上限は約 28%)。
+- **observe の期限**(`observe_audit.py`、`test_e2e_plan.py`): 新しい `expect=observe` には `until='YYYY-MM-DD'` が必須で、期限までに pass / fail(再現固定)/ 削除を決める。
+  既存分は `observe_grandfathered.txt` に載せ、縮める方向にだけ動かす。summary は有効回 2 回以上で全PASS/全FAIL の observe に昇格候補の目印を付ける。
+
+## 未確定文字(preedit)の読み取り(`typing_stress --mode=preedit`、`check_preedit.py`)
+
+最終テキストとは別に「今、未確定文字があるか」を読む部品。結論が出たため `sc-preedit-*`(observe、`e2e-ime.yml`)と可否表の report 生成は撤去済み(撤去コミット: 77d0a2c01、`git show 77d0a2c01^:.github/workflows/e2e-ime.yml` で戻せる。旧 `preedit-verify.yml` は先に撤去済み、`git show e2784f20^:.github/workflows/preedit-verify.yml`)。
+読み取り可否(run 37276470334、各 6 試行、GJI/MS-IME、終端=Enter。真値は「打鍵前 なし/かな打鍵中 あり/Enter 後 なし」):
+
+| 入力先 | uia(`GetActiveComposition`) | imm(`ImmGetCompositionString`) |
+|---|---|---|
+| 自前 `tsf`・`rich`(TSF) | 読める(GJI・MS-IME とも全 phase 正解) | 読める(同左) |
+| 自前 `edit`(IMM32) | 不可(`nopattern`) | 読める(GJI・MS-IME とも全 phase 正解) |
+| 実 Chrome(`chromepage`) | 打鍵前=none・打鍵中=composing は正解。**Enter 確定後も範囲を返し続ける**(1.5 秒後も同じ)ので「確定済み」と区別できない。ESC で取り消した後は none(GJI) | 不可(別プロセス) |
+
+注意: TSF 窓では `text`(`WM_GETTEXT`)にも未確定文字が出る(`text_leak`)ので、本文の読み戻しでは未確定と確定を区別できない。
+実 Chrome は未確定が無いとき空や U+FFFC でなく本文と無関係な文字列(`st` 等)を返すので、範囲が本文に含まれないときだけ composing とする。
+使いどころ: 「未確定が消えた」判定(BUG-184/171/168)は、本来あるはずの未確定に対して読み値が none かつ本文も空、で見る(Chrome の確定直後の誤 composing とは別の状況)。
+MS-IME は ESC 1 回で未確定を取り消さなかった(自前 edit/tsf・実 Chrome とも)ので、esc の後は真値を決めず観測のみ。TSF の `ITfContext` 直接読みは `ITfThreadMgr` がスレッド単位のため未実装。
+
+## 打鍵の揺らぎ比較(`tsj-*`、`examples/typing_stress/jitter.rs`、#486)
+
+固定間隔(base)と、間隔・親指ずれ・文字先押しに分布を持たせた版(jit、分布は `docs/adr/182` の実機実測に合わせた仮置き)を
+同じ入力先・IME・seed で比較し、揺らぎで loss/reorder/literal が増えるかを見る部品。結論が出たため `tsj-*`(observe、`e2e-ime.yml`)は
+撤去済み(撤去コミット: 77d0a2c01、`git show 77d0a2c01^:.github/workflows/e2e-ime.yml` で戻せる)。
+
+結果(run 37275609943、tsj-* 8 構成 × 4 run、GJI・tsf/edit × 10/20ms、各 64 試行): **差は検出できなかった**(全構成 0/64 FAIL、Wilson 95%
+上限 約6%)。jit は親指ずれの分だけ枠を伸ばすので総時間が約3倍になり(base 397〜793ms → jit 1189〜1590ms)、base より「遅い」打鍵になる。
+速度を揃えた比較は未実施。詳細は PR #486 のコメント参照。
+
+## 時間窓のずらし(`tsx-susp-*`、`examples/typing_stress/suspend.rs`、BUG-171)
+
+GJI の変換サーバ(GoogleIMEJaConverter)・候補窓の描画(GoogleIMEJaRenderer)を打鍵の途中で一時停止して応答を遅らせ、BUG-171(途中の語の
+StaleConfirm→ESC)を実機で当てにいく調査。結論が出たため `tsx-susp-*`(observe、`e2e-ime.yml`)は撤去済み(撤去コミット: 77d0a2c01、
+`git show 77d0a2c01^:.github/workflows/e2e-ime.yml` で戻せる)。
+
+変換サーバ・描画サーバのどちらを止めても、per-VK confirm の StaleConfirm 発火条件・文字の消失/リテラル化に差は出なかった(全試行 0件)。
+途中の語の StaleConfirm→ESC は最終的に再現できないまま。詳細な経緯・各ラウンドの数値は [docs/known-bugs/BUG-171.md](../../../docs/known-bugs/BUG-171.md) 参照。

@@ -13,6 +13,7 @@
 //! - `tsf`   : `RICHEDIT50W` を `Chrome_RenderWidgetHostHWND` へスーパークラス化(ADR-193)。awase から
 //!   `AppKind::TsfNative` 相当に見える決定的な入力先(親窓も `Chrome_WidgetWin_1`)。
 //! - `chromebar` / `chromepage` : 本物の Chrome(専用プロファイル。アドレスバー / ページ内 textarea)。UI Automation で読む。
+//! - `ext` : 宣言表(tools/e2e/input_forms/forms.toml)の項目。`--ext=<名前>` `--ext-manifest=PATH` `--ext-repo=DIR`。Java・Office・wx・Qt など。
 //! - `bugreport` : 本物の `awase-settings.exe --bug-report` の「説明」欄。UI Automation で読む。
 //!
 //! 入力先ごとの差は `target.rs` の `InputTarget` に閉じ込めてある(読む・空にする・前面へ戻す・フォーカス確認・終了)。
@@ -24,13 +25,15 @@
 //! 連続打鍵では作れない実利用に近い状況を試行に差し込む: `--cold` / `--pause-after=N --pause-ms=MS` / `--idle=MS` /
 //! `--switch-focus` / `--start-delay=MS` / `--interrupt=off_on|off|f2` / `--settle-read`。意味は `perturb.rs` の表を参照。
 //! 指定した摂動は `config` レコードの `perturb` に記録される。
+//! 相手(GJI の変換サーバ等)を遅くする摂動は `suspend.rs`(`--suspend-proc=NAME --suspend-at-ms=T --suspend-ms=D`)。
 //!
 //! ## フラグ
 //! `--form=edit|multi|rich|tsf|chromebar|chromepage|bugreport`(`--chrome-path=PATH` で Chrome を指定) / `--mode=nicola|raw|drift|drift-on|keymatrix|reopen` / `--interval=MS`(1文字あたりの間隔。既定20) /
 //! `--trials=N`(種別ごとの試行数。既定4。`--mode=drift` では試行回数として使う) / `--len=N`(1試行の文字数。既定40) / `--seed=S` /
 //! `--kinds=single,thumb,mixed` / `--layout=PATH`(.yab。既定 layout/nicola_keytop.yab) /
-//! `--activate-gji`(GJI/MS-IME のプロファイルを有効化。CI 用) / `--msime`(有効化する IME を Microsoft IME に) /
+//! `--activate-gji`(GJI/MS-IME/Mozc Readable のプロファイルを有効化。CI 用) / `--msime`(有効化する IME を Microsoft IME に) / `--mozc`(有効化する IME を Mozc Readable に。GJI も入っている環境で Mozc をアクティブにする。BUG-207) / `--switch-mozc-ms=N`(起動から N ms 後に Mozc Readable へ切り替える) /
 //! `--no-awase`(awase を待たない。`--mode=raw` の対照実験用) / `--log=PATH`。
+//! 打鍵の揺らぎ(`jitter.rs`、既定オフ): `--jit-iv=SIGMA` / `--jit-thumb=MIN_MS:MAX_MS` / `--jit-char-first=PCT`。
 //! `--mode=raw` は awase なしで、期待文字列と同じ内容をローマ字の生キーで同じ速度で注入する対照実験
 //! (入力先+IME 単体がその速度を受けられるかを、awase と切り離して見る)。
 //!
@@ -60,6 +63,8 @@
 //! `--drift-off-ctrl-muhenkan` では直接 close の代わりに、マーカー付き SendInput で
 //! Ctrl↓→無変換↓→無変換↑→Ctrl↑を送る。debug awase はこの注入を物理キーとして扱う。
 //!
+//! `--mode=focus-restore`(観測専用): 半角英数の持続トグル(左 Shift 単独タップ)中にフォーカスが別窓へ移ったとき、強制復元が実 IME のどこに効くか。詳細は `focusrestore.rs` 冒頭。判定はせず check_focusrestore.py が表にする。
+//!
 //! `--mode=keymatrix`(ADR-208 L3b): 「ずれの作り方 × 明示キー」行列。詳細は `keymatrix.rs` 冒頭。判定は check_keymatrix.py。
 //!
 //! `--mode=reopen`(ADR-203 e2e (c)、BUG-170 の実機確認): 「OFF 前に1語確定 → 物理 OFF(`VK_IME_OFF`)→ `--reopen-gap`(既定600ms、1秒以内)後に
@@ -81,8 +86,16 @@
 #![windows_subsystem = "windows"]
 #![allow(unsafe_code)]
 
+mod focusrestore;
+mod immread;
+mod jitter;
 mod keymatrix;
+mod langdetect;
+mod lateorder;
 mod perturb;
+mod preedit;
+mod suspend;
+mod switchime;
 mod target;
 mod uia;
 
@@ -248,6 +261,7 @@ enum Form {
     ChromeBar,
     ChromePage,
     BugReport,
+    Ext,
 }
 
 impl Form {
@@ -260,6 +274,7 @@ impl Form {
             "chromebar" => Some(Self::ChromeBar),
             "chromepage" => Some(Self::ChromePage),
             "bugreport" => Some(Self::BugReport),
+            "ext" => Some(Self::Ext),
             _ => None,
         }
     }
@@ -272,6 +287,7 @@ impl Form {
             Self::ChromeBar => "chromebar",
             Self::ChromePage => "chromepage",
             Self::BugReport => "bugreport",
+            Self::Ext => "ext",
         }
     }
 }
@@ -365,7 +381,7 @@ fn create_own_window(form: Form) {
                 700,
                 240,
             ),
-            Form::ChromeBar | Form::ChromePage | Form::BugReport => {
+            Form::ChromeBar | Form::ChromePage | Form::BugReport | Form::Ext => {
                 unreachable!("別プロセスの入力先は target::launch が扱う")
             }
             Form::Rich => ("RICHEDIT50W".into(), WS_BORDER.0 | ES_AUTOHSCROLL, 700, 240),
@@ -666,12 +682,18 @@ fn front_distractor() -> bool {
 
 // ---------------------------------------------------------------- IME プロファイル
 
-/// GJI(既定)または Microsoft IME(`--msime`)の TSF プロファイルをセッション内で有効化する(spike と同じ手順)。
+/// GJI(既定)、Microsoft IME(`--msime`)、Mozc Readable(`--mozc`)の TSF プロファイルをセッション内で有効化する(spike と同じ手順)。
 fn activate_profile() {
     let (clsid, profile) = if has_flag("--msime") {
         (
             windows::core::GUID::from_u128(0x03B5835F_F03C_411B_9CE2_AA23E1171E36),
             windows::core::GUID::from_u128(0xA76C93D9_5523_4E90_AAFA_4DB112F9AC76),
+        )
+    } else if has_flag("--mozc") {
+        // Mozc Readable(cuzic/mozc-readable)。GJI と別の CLSID/プロファイル(`tools/mozc_shm_ci/run_scenario.ps1`)。
+        (
+            windows::core::GUID::from_u128(0xAFC94560_63DA_488E_9227_B04F3EF34B5B),
+            windows::core::GUID::from_u128(0x7D7B9A38_A0A4_4390_9706_509E98A8C791),
         )
     } else {
         (
@@ -679,6 +701,18 @@ fn activate_profile() {
             windows::core::GUID::from_u128(0x773EB24E_CA1D_4B1B_B420_FA985BB0B80D),
         )
     };
+    activate_profile_ids(&clsid, &profile);
+}
+
+/// Mozc Readable の TSF プロファイルをセッション内で有効化する(`--switch-mozc-ms` が、途中で GJI から切り替えるために使う)。
+fn activate_mozc_profile() {
+    activate_profile_ids(
+        &windows::core::GUID::from_u128(0xAFC94560_63DA_488E_9227_B04F3EF34B5B),
+        &windows::core::GUID::from_u128(0x7D7B9A38_A0A4_4390_9706_509E98A8C791),
+    );
+}
+
+fn activate_profile_ids(clsid: &windows::core::GUID, profile: &windows::core::GUID) {
     const TF_PROFILETYPE_INPUTPROCESSOR: u32 = 1;
     const TF_IPPMF_ENABLEPROFILE: u32 = 0x1;
     const TF_IPPMF_FORSESSION: u32 = 0x2000_0000;
@@ -690,8 +724,8 @@ fn activate_profile() {
                 let r = m.ActivateProfile(
                     TF_PROFILETYPE_INPUTPROCESSOR,
                     0x0411,
-                    &clsid,
-                    &profile,
+                    clsid,
+                    profile,
                     windows::Win32::UI::Input::KeyboardAndMouse::HKL(std::ptr::null_mut()),
                     TF_IPPMF_ENABLEPROFILE | TF_IPPMF_FORSESSION,
                 );
@@ -712,7 +746,103 @@ struct Ev {
     down: bool,
 }
 
+/// ADR-255: `--inject-driver`(キーボードフィルタドライバ awasekbf 経由、`tools/kbd-inject-driver/`)。ドライバが kbdclass のコールバックへ
+/// スキャンコードを流すので、フックには物理キーと同じ形(LLKHF_INJECTED なし・dwExtraInfo 0)で届く。スキャンコードの無い仮想キー
+/// (`VK_IME_ON` など)は従来どおり SendInput(目印付き)にする。
+mod driver_inject {
+    use std::sync::OnceLock;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateFileW(
+            name: *const u16,
+            access: u32,
+            share: u32,
+            sa: *const core::ffi::c_void,
+            disp: u32,
+            flags: u32,
+            tmpl: isize,
+        ) -> isize;
+        fn DeviceIoControl(
+            h: isize,
+            code: u32,
+            inb: *const core::ffi::c_void,
+            inl: u32,
+            outb: *mut core::ffi::c_void,
+            outl: u32,
+            ret: *mut u32,
+            ov: *mut core::ffi::c_void,
+        ) -> i32;
+    }
+    #[link(name = "user32")]
+    extern "system" {
+        fn MapVirtualKeyW(code: u32, map_type: u32) -> u32;
+    }
+
+    const IOCTL_INJECT: u32 = 0x000B_2000;
+    /// ドライバへ送った回数(`done` の記録で、ドライバ経路が実際に使われたことを示す)。
+    pub static SENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn handle() -> Option<isize> {
+        static H: OnceLock<Option<isize>> = OnceLock::new();
+        *H.get_or_init(|| {
+            if !crate::has_flag("--inject-driver") {
+                return None;
+            }
+            let name: Vec<u16> = "\\\\.\\AwaseKbInject\0".encode_utf16().collect();
+            // SAFETY: NUL 終端の UTF-16 の名前。失敗は -1 で返る。
+            let h =
+                unsafe { CreateFileW(name.as_ptr(), 0xC000_0000, 3, core::ptr::null(), 3, 0, 0) };
+            if h == -1 || h == 0 {
+                crate::log(
+                    "[TS] --inject-driver: \\\\.\\AwaseKbInject を開けない(SendInput に戻す)",
+                );
+                None
+            } else {
+                crate::log("[TS] --inject-driver: ドライバ(awasekbf)経由でキーを送る(スキャンコードの無いキーだけ SendInput)");
+                Some(h)
+            }
+        })
+    }
+
+    /// ドライバで送れたら true。送れない(`--inject-driver` なし・ドライバなし・スキャンコードの無いキー)なら false。
+    pub fn send(vk: u32, down: bool) -> bool {
+        let Some(h) = handle() else { return false };
+        // MAPVK_VK_TO_VSC_EX(4): 拡張キーは上位バイトが 0xE0。
+        // SAFETY: 引数は値のみ。
+        let sc = unsafe { MapVirtualKeyW(vk, 4) };
+        if sc == 0 {
+            return false;
+        }
+        let make = (sc & 0xFF) as u16;
+        let mut flags: u16 = if down { 0 } else { 1 };
+        if (sc >> 8) == 0xE0 {
+            flags |= 2;
+        }
+        let cmd: [u16; 2] = [make, flags];
+        let mut ret = 0u32;
+        // SAFETY: 4 バイトの入力バッファ。出力なし。
+        SENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let ok = unsafe {
+            DeviceIoControl(
+                h,
+                IOCTL_INJECT,
+                cmd.as_ptr().cast(),
+                4,
+                core::ptr::null_mut(),
+                0,
+                &raw mut ret,
+                core::ptr::null_mut(),
+            )
+        };
+        ok != 0
+    }
+}
+
 fn send_key(vk: u32, scan: u16, down: bool) -> bool {
+    if driver_inject::send(vk, down) {
+        return true;
+    }
     let input = INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
@@ -1524,12 +1654,21 @@ fn reopen_scenario(child: HWND, cells: &[Vec<Cell>; 3]) {
 fn worker(form: Form) {
     let child = hwnd_of(&CHILD);
     let perturb = perturb::Perturbation::from_args();
+    let suspend = suspend::Suspend::from_args();
+    let jit = jitter::Jitter::from_args();
     let mode_arg = arg_value("--mode=");
     let raw = mode_arg.as_deref() == Some("raw");
     let drift = mode_arg.as_deref() == Some("drift");
     let drift_on = mode_arg.as_deref() == Some("drift-on");
     let reopen = mode_arg.as_deref() == Some("reopen");
+    let preedit = mode_arg.as_deref() == Some("preedit");
+    let lateorder = mode_arg.as_deref() == Some("lateorder");
+    let immread = mode_arg.as_deref() == Some("immread");
+    let immtime = mode_arg.as_deref() == Some("immtime");
+    let immswitch = mode_arg.as_deref() == Some("immswitch");
+    let langdetect = mode_arg.as_deref() == Some("langdetect");
     let keymatrix = mode_arg.as_deref() == Some("keymatrix");
+    let focus_restore = mode_arg.as_deref() == Some("focus-restore");
     let startup = mode_arg.as_deref() == Some("startup");
     let startup_on = arg_value("--startup-ime=").as_deref() == Some("on");
     let iv_ms: f64 = arg_value("--interval=")
@@ -1551,7 +1690,13 @@ fn worker(form: Form) {
         .map(str::to_string)
         .collect();
     let layout_path = arg_value("--layout=").unwrap_or_else(|| "layout/nicola_keytop.yab".into());
-    let ime = if has_flag("--msime") { "msime" } else { "gji" };
+    let ime = if has_flag("--msime") {
+        "msime"
+    } else if has_flag("--mozc") {
+        "mozc"
+    } else {
+        "gji"
+    };
 
     // 期待文字列の元になるセル(.yab の各面 × かな表)。
     let table = KanaTable::build();
@@ -1574,12 +1719,15 @@ fn worker(form: Form) {
         collect_cells(&layout.right_thumb, Face::Right, &table),
     ];
     rec(
-        &json!({"type":"config","form":form.name(),"ime":ime,"mode":if startup {"startup"} else if drift {"drift"} else if drift_on {"drift-on"} else if keymatrix {"keymatrix"} else if reopen {"reopen"} else if raw {"raw"} else {"nicola"},
+        &json!({"type":"config","form":form.name(),"ime":ime,"mode":if startup {"startup"} else if drift {"drift"} else if drift_on {"drift-on"} else if keymatrix {"keymatrix"} else if focus_restore {"focus-restore"} else if reopen {"reopen"} else if preedit {"preedit"} else if lateorder {"lateorder"} else if immread {"immread"} else if immtime {"immtime"} else if immswitch {"immswitch"} else if langdetect {"langdetect"} else if raw {"raw"} else {"nicola"},
         "interval_ms":iv_ms,"len":len,"trials":trials,"seed":seed,"kinds":kinds,
         "no_awase":has_flag("--no-awase"),"startup_skip_refocus2":has_flag("--startup-skip-refocus2"),
         "layout":layout_path,"cells":[cells[0].len(),cells[1].len(),cells[2].len()],
-        "child_class":class_of(child),"perturb":perturb.describe()}),
+        "child_class":class_of(child),"perturb":perturb.describe(),"jitter":jit.describe(),"suspend":suspend.as_ref().map(suspend::Suspend::describe)}),
     );
+    if let Some(sp) = &suspend {
+        sp.log_candidates();
+    }
     if cells.iter().any(Vec::is_empty) {
         rec(&json!({"type":"abort","reason":"候補セルが空(layout の読み取り失敗?)"}));
         finish();
@@ -1633,7 +1781,7 @@ fn worker(form: Form) {
     // 確定入力になり、「起動直後にユーザーが最初に打つ文字」を素通りさせてしまうため。
     if perturb.cold {
         rec(&json!({"type":"ready","attempt":0,"skipped":true,"reason":"--cold"}));
-    } else if !ime_ready(raw, &cells, child) {
+    } else if !ime_ready(raw || immread || immtime || immswitch, &cells, child) {
         rec(&json!({"type":"abort","reason":"IME/awase の準備確認に失敗(ready の text を参照)"}));
         finish();
         return;
@@ -1654,8 +1802,43 @@ fn worker(form: Form) {
         finish();
         return;
     }
+    if focus_restore {
+        focusrestore::focus_restore_scenario(child, &cells);
+        finish();
+        return;
+    }
     if reopen {
         reopen_scenario(child, &cells);
+        finish();
+        return;
+    }
+    if preedit {
+        preedit::preedit_scenario(child, &cells);
+        finish();
+        return;
+    }
+    if lateorder {
+        lateorder::lateorder_scenario(child);
+        finish();
+        return;
+    }
+    if immread {
+        immread::immread_scenario(child);
+        finish();
+        return;
+    }
+    if immtime {
+        immread::immtime_scenario(child);
+        finish();
+        return;
+    }
+    if immswitch {
+        focusrestore::immswitch_scenario(child);
+        finish();
+        return;
+    }
+    if langdetect {
+        langdetect::langdetect_scenario(child);
         finish();
         return;
     }
@@ -1679,20 +1862,39 @@ fn worker(form: Form) {
                 .wrapping_add(n_total * 7919)
                 .wrapping_add(kind.len() as u64);
             let seq = gen_sequence(kind, len, trial_seed, &cells);
-            let expect = expect_string(&seq);
+            let expect = if switchime::expects_raw() {
+                switchime::raw_expect(&seq)
+            } else {
+                expect_string(&seq)
+            };
             let mut evs = if raw {
                 raw_events(&seq, iv_us)
+            } else if jit.is_active() {
+                jitter::events(&seq, iv_us, &jit, trial_seed)
             } else {
                 nicola_events(&seq, iv_us)
             };
             perturb.apply_pause(&mut evs, iv_us);
-            perturb.before_trial(target());
-            clear_text(child);
-            sleep_ms(perturb.start_delay_ms);
+            // 検証専用(ci/ ブランチ): --sw-mode= のときは窓切替・ひらがなキーの直後に打つ(switchime.rs)。
+            let sw = switchime::before_trial(child, n_total - 1);
+            if sw.is_none() {
+                perturb.before_trial(target());
+                clear_text(child);
+                sleep_ms(perturb.start_delay_ms);
+            }
             if let Ok(mut g) = HOOK_EVENTS.lock() {
                 g.clear();
             }
+            let suspender = suspend.as_ref().map(|sp| sp.arm(kind, t));
             let stats = run_schedule(&evs);
+            if let Some(h) = suspender {
+                let _ = h.join();
+            }
+            if let Some(mut v) = sw {
+                v["kind"] = json!(kind);
+                v["n"] = json!(t);
+                rec(&v);
+            }
             perturb.after_inject(kind, t);
             // 最後の同時打鍵判定・出力の落ち着きを待ってから確定(Enter)。
             sleep_ms(300);
@@ -1757,7 +1959,8 @@ fn worker(form: Form) {
 }
 
 fn finish() {
-    rec(&json!({"type":"done"}));
+    switchime::kill_b();
+    rec(&json!({"type":"done","driver_sends":driver_inject::SENT.load(Ordering::Relaxed)}));
     log("=== 完了 ===");
     target().shutdown();
     if !target().owns_himc() {
@@ -1767,6 +1970,16 @@ fn finish() {
 }
 
 fn main() {
+    // focus-restore の窓 B 用の別プロセス(ログも入力先も作らない)。
+    if has_flag("--fr-helper") {
+        focusrestore::helper_main();
+        return;
+    }
+    // immread の別プロセスの読み手(窓もログも作らない)。
+    if let Some(path) = arg_value("--immread-reader=") {
+        immread::reader_main(&path);
+        return;
+    }
     let log_path = arg_value("--log=").unwrap_or_else(|| "typing_stress.log".into());
     let _ = LOG_PATH.set(log_path.clone());
     let _ = std::fs::remove_file(&log_path);
@@ -1783,10 +1996,10 @@ fn main() {
     // 入力先(Chrome など)を起動する前に弾く。
     if matches!(
         arg_value("--mode=").as_deref(),
-        Some("drift" | "drift-on" | "keymatrix")
+        Some("drift" | "drift-on" | "keymatrix" | "focus-restore")
     ) && !matches!(form, Form::Edit | Form::Multi | Form::Rich | Form::Tsf)
     {
-        log("[FATAL] 引数エラー: --mode=drift|drift-on|keymatrix は --form=edit|multi|rich|tsf でのみ使える");
+        log("[FATAL] 引数エラー: --mode=drift|drift-on|keymatrix|focus-restore は --form=edit|multi|rich|tsf でのみ使える");
         std::process::exit(2);
     }
     unsafe {
@@ -1805,10 +2018,25 @@ fn main() {
     if perturbation.needs_distractor() {
         create_distractor();
     }
-    if has_flag("--activate-gji") || has_flag("--msime") {
+    if has_flag("--activate-gji") || has_flag("--msime") || has_flag("--mozc") {
         activate_profile();
     }
     std::thread::spawn(move || worker(form));
+    // `--switch-mozc-ms=N`: 起動から N ミリ秒後に、セッション内の入力方式を Mozc Readable へ切り替える(GJI から途中で切り替える
+    // 経路の確認。awase が GJI の監視を外す経路を動かす。BUG-207、ADR-269)。
+    if let Some(ms) = arg_value("--switch-mozc-ms=").and_then(|v| v.parse::<u64>().ok()) {
+        std::thread::spawn(move || {
+            sleep_ms(ms);
+            unsafe {
+                let _ = windows::Win32::System::Com::CoInitializeEx(
+                    None,
+                    windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+                );
+            }
+            log("[switch] Mozc Readable へ切り替える");
+            activate_mozc_profile();
+        });
+    }
     unsafe {
         let mut msg = MSG::default();
         while GetMessageW(&raw mut msg, None, 0, 0).as_bool() {

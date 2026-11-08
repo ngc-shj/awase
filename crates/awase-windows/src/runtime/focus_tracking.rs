@@ -86,22 +86,8 @@ impl Runtime {
         let (process_changed, prev_pid) = self.advance_focus_tracking(&classified, false);
         let next = self.focus_identity_snapshot();
         self.record_focus_transition_if_changed(&prev, &next, prev_started_ms);
-        // injection_mode を push — advance_focus_tracking() で last_focus_info が更新された後に
-        // 呼ぶことで injection_hint() が新ウィンドウ (WezTerm 等) を正しく参照できる。
-        {
-            let hint = self.platform.injection_hint();
-            let new_mode = crate::output::types::InjectionMode::from((
-                hint,
-                self.platform_state.focus.app_kind,
-            ));
-            self.platform.update_injection_mode(new_mode);
-        }
         if process_changed {
             self.on_focus_process_changed(&classified, prev_pid, &prev);
-        } else if classified.kind == FocusKind::Undetermined {
-            self.platform
-                .focus
-                .try_send_uia(crate::focus::uia::SendableHwnd(classified.hwnd));
         }
         process_changed
     }
@@ -125,32 +111,18 @@ impl Runtime {
         self.record_focus_transition_if_changed(&prev, &next, prev_started_ms);
 
         let tick_ms = self.enter_focus_scope(&classified);
-        // BUG-102: `enter_focus_scope` の直後（epoch インクリメント済み・
-        // `update_focus_info` 済み）に、live 側フェンスを `ObservationStore` 側へ
-        // 同期する。この 1 行が無いと、起動時にフォーカスされていたアプリの
-        // `ImmCrossProbe`（High）観測が次のプロセス変更まで `derive_*` から
-        // 外れ続ける。
+        // ADR-232 D1: 起動時のフォーカス確立（旧 `sync_initial_focus_fence`・
+        // `sync_initial_app_policy`・`sync_initial_focus_hwnd` の 3 つ）。
+        // `enter_focus_scope`（epoch インクリメント済み）と `advance_focus_tracking`
+        // （`current_app_profile()` 確定済み）の**後**に呼ぶこと。
         //
-        // 上の early return（`classify_focus_probe` が `None`、= probe タイム
-        // アウトや pid 取得失敗）を通った場合はここまで来ないため同期も走らないが、
-        // その場合は `enter_focus_scope` も走っておらず live 側 epoch も 0 のまま
-        // なので、両側は既定値で一致したままになる（BUG-102 の desync は起きない）。
-        self.sync_initial_focus_fence(tick_ms);
-        // BUG-114 根本原因1（ADR-134 D1c）: `advance_focus_tracking` 済み
-        // （`self.platform.focus.current.app_profile` 確定済み）の**後**に
-        // 呼ぶこと。これより前だと `current_app_profile()` がまだ正しい
-        // 値を返さない。
-        self.sync_initial_app_policy(tick_ms);
-        // BUG-148/ADR-186: `current_focus` も起動時の前面 hwnd で初期化する
-        // （最初のプロセス切替まで `None` のままだと明示意図が記録されない）。
-        self.sync_initial_focus_hwnd(&classified, tick_ms);
-
-        // injection_mode の再計算は呼び出し元に残す（指摘9: `on_focus_process_changed`
-        // とは呼び出し順序が異なるため `enter_focus_scope` には含めない）。
-        let hint = self.platform.injection_hint();
-        let new_mode =
-            crate::output::types::InjectionMode::from((hint, self.platform_state.focus.app_kind));
-        self.platform.update_injection_mode(new_mode);
+        // 上の early return（`classify_focus_probe` が `None`、= probe タイムアウトや
+        // pid 取得失敗）を通った場合はここまで来ないため同期も走らないが、その場合は
+        // `enter_focus_scope` も走っておらず live 側 epoch も 0 のままなので、両側は
+        // 既定値で一致したままになる（BUG-102 の desync は起きない）。
+        self.sync_initial_focus_scope(&classified, tick_ms);
+        // ADR-282 V1: 起動時のフォーカスを Z の shadow へ渡す(観測のみ。belief は書かない)。
+        self.scope_shadow_focus_now(crate::state::ime_event::HwndId(classified.hwnd.0 as usize));
     }
 
     /// フォーカス確定処理の共通シーケンス（`last_focus_change_ms`/`focus_epoch`
@@ -160,11 +132,6 @@ impl Runtime {
     /// `establish_initial_focus_scope`（bootstrap、まだ一度も IME を観測していない）
     /// と `on_focus_process_changed`（定常経路）が、この処理列を独立に手動コピー
     /// していた。
-    ///
-    /// **`injection_mode` の再計算はここに含めない**（各呼び出し元に残す）。
-    /// 2箇所で呼び出し順序が異なる（`establish_initial_focus_scope` はこの直後、
-    /// `on_focus_process_changed` は IME belief dispatch・cache restore の後）ため、
-    /// 統合すると挙動が変わるリスクがある。
     ///
     /// 戻り値の `TickMs` は、呼び出し元がこの後の処理（`dispatch_event` 等）で
     /// 同じ時刻を使い回すために返す。
@@ -189,113 +156,78 @@ impl Runtime {
         tick_ms
     }
 
-    /// 非 TsfNative で、IME が ON である belief を `applied` へ先同期し、GJI なら GjiFsm へも ImeOn を通知する。
+    /// 非 TsfNative で、実測学習で降格された窓でもなく、IME が ON である belief を `applied` へ先同期する
+    /// （GjiFsm への ImeOn 通知は ADR-276 で撤去した。呼び出し側が `state::applied_mirror_plan::may_mirror_applied_on_focus` で絞る。
+    /// TsfNative と学習降格の窓は `applied` を Unknown のまま維持する。ADR-098 決定 1-a・ADR-262 段階 A）。
     ///
     /// フォーカス直後の OS 観測値を applied に先同期して、直後の Engine ON が古い applied を根拠に不要な再送へ進む
-    /// ことを防ぐ（KanjiToggle 機構は撤去済みだが、applied_snapshot を未更新のままにすると focus-resync / force-on の
-    /// 判断が古い状態を参照するため、この pre-sync は Standard でも必要）。
+    /// ことを防ぐ。（旧: focus-resync / force-on の判断が古い状態を参照するため必要、としていたが、force-on は
+    /// `621bf93c` で撤去、focus-resync は `applied` を読まない〔ADR-262 round 3 で確認〕。この「再送の防止」も、
+    /// ActivationSync の撤去〔ADR-213〕と押下の書き込みの view 未知化〔ADR-208 D1〕で実質は残っていない。実際に残る目的は
+    /// `press=None` の ON の already-matched の材料である。）
     ///
-    /// BUG-18: HwndCacheRestored / mirror_applied_open は belief 層（ImeModel）だけを ON に戻し、GjiFsm には一切通知
-    /// しない。無操作中の AppKind 往復（TsfNative⇔Uwp）で本経路を繰り返し通ると、直前の実 IME-OFF で
-    /// `GjiFsm::OffCold` に入ったまま belief だけが ON に戻り、再開後の StartComposition が OffCold で握りつぶされて
-    /// 最初の数文字が欠落する。`sync_ime_kind_from_observation`（runtime/message_handlers.rs）と同じ
-    /// 「belief=ON なら GjiFsm へも ImeOn を通知する」パターンを揃える。GjiFsm が既に ON なら ImeOn ハンドラ側で
-    /// no-op になる（gji_fsm.rs 558-565）。
+    /// BUG-18（無操作中の AppKind 往復で `GjiFsm` が `OffCold` に取り残され、最初の数文字が欠落する）は、かつてここで
+    /// GjiFsm へ ImeOn を通知して防いでいた。ADR-276 で撤去し、最初のローマ字の送信時の level 突合
+    /// （ADR-203 (i)、`needs_belief_sync_on`）に一本化した（VK 注入だけの世界では二重で、モデル検証
+    /// `tsf/gji_sync_model.rs` で同じ害の集合になることを確かめた）。
     pub(crate) fn presync_applied_open_on(&mut self, tick_ms: crate::state::TickMs) {
         self.platform_state.ime.record_confirmed(true, tick_ms.0);
         tracing::debug!(
             "[focus] Imm32Unavailable hard pre-sync applied=true \
              (prevent spurious VK_KANJI on first character key)"
         );
-        if matches!(
-            crate::tsf::observer::tsf_obs().active_ime_kind(),
-            crate::tsf::observer::ActiveImeKind::GoogleJapaneseInput
-        ) {
-            let mode = self.platform.output.injection_mode;
-            self.platform.gji_on_ime_on(mode);
-            for entry in self.platform.drain_journal_entries() {
-                self.platform_state.ime.journal.absorb(entry);
-            }
-        }
     }
 
-    /// bootstrap で確立した最初のフォーカススコープの同一性（epoch + hwnd）を
-    /// `ObservationStore::current_fence` へ同期する（BUG-102）。
+    /// bootstrap で確立した最初のフォーカススコープの同一性（`app_policy`・`current_focus`・
+    /// 観測の fence）を `ImeModel` へ入れる（ADR-232 D1。BUG-102・114・148 の 3 つの
+    /// `sync_initial_*` を 1 つにした）。
     ///
     /// **必ず `enter_focus_scope`（epoch インクリメント）と `advance_focus_tracking`
-    /// （`update_focus_info` による hwnd 更新）の後に呼ぶこと** ——
-    /// `focus_fence()` が live 側の確定値を返している必要がある。
+    /// （`current_app_profile()` の確定）の後に呼ぶこと**。値は定常の
+    /// `on_focus_process_changed` が `FocusChanged` に載せるものと同じ式（`classified.hwnd`・
+    /// `current_app_profile()`・`focus_epoch`）で取る。
     ///
-    /// `notify_focus_hwnd_updated_if_needed` と同じ理由で独立した関数として切り出して
-    /// いる: `dispatch_event(` を直接テキストとして含む関数は
-    /// `establish_initial_focus_scope_does_not_write_ime_belief`
-    /// （`architecture_guard.rs`）の対象リストに直接載っているため、
-    /// `establish_initial_focus_scope` の本体に置くと静的テキスト検査で機械的に落ちる。
+    /// `dispatch_event(` を直接テキストとして含む関数は
+    /// `establish_initial_focus_scope_does_not_write_ime_belief`（`architecture_guard.rs`）の
+    /// 対象リストに直接載っているため、`establish_initial_focus_scope` の本体に置くと
+    /// 静的テキスト検査で機械的に落ちる。独立した関数として切り出している。
     ///
-    /// **このイベントが belief を書かないこと**（ADR-102 決定3-b の不変条件）は、
-    /// 運ぶ値が「観測の新鮮さを判定するための識別子」だけであることと、reducer 側の
-    /// アームが `ObservationStore::establish_initial_fence()` しか呼ばないことの
-    /// 2点で担保する。後者は `initial_focus_fence_event_only_touches_the_fence`
-    /// （`architecture_guard.rs`）と
-    /// `state::ime_model::tests::initial_focus_fence_established_touches_only_the_fence`
-    /// が固定する。
+    /// **このイベントが belief を書かないこと**（ADR-102 決定3-b の不変条件）は、運ぶ値が
+    /// スコープの同一性だけであることと、reducer の腕が `app_policy`・`current_focus`・
+    /// `ObservationStore::establish_initial_fence()` しか書かないことで担保する。後者は
+    /// `state::ime_model::tests::initial_focus_scope_established_touches_only_the_scope_identity`
+    /// が固定し、`FocusChanged` との食い違いは
+    /// `initial_focus_scope_matches_focus_changed_except_input_barrier` が捕まえる。
     ///
-    /// **bootstrap で1度しか呼ばれない**（唯一の呼び出し元
-    /// `establish_initial_focus_scope` 自体が `app/bootstrap.rs::run_all` から
-    /// 1度だけ呼ばれる）ことは、静的には
-    /// `initial_focus_fence_event_only_touches_the_fence` が、実行時には
-    /// `ObservationStore::establish_initial_fence()` 側の `debug_assert!` が
-    /// 固定する。2度目以降の呼び出しは「initial」ではなく、観測プールを持った
-    /// まま fence だけ差し替える危険な操作になる（その用途は
-    /// `clear_on_focus_change()` が担当する）。
-    fn sync_initial_focus_fence(&mut self, tick_ms: crate::state::TickMs) {
-        let fence = self.focus_fence();
-        tracing::debug!("[focus-fence] bootstrap initial fence: {fence:?}");
-        self.platform_state.ime.dispatch_event(
-            crate::state::ime_event::ImeEvent::InitialFocusFenceEstablished { fence },
-            tick_ms,
-        );
-    }
-
-    /// BUG-114 根本原因1（ADR-134 D1c）: 起動直後の初回フォーカス確立時に
-    /// `app_policy` を live 側の profile 分類で初期化する。
-    ///
-    /// これが無いと `app_policy`（`ImeModel::app_policy`）は既定値
-    /// `AppImePolicy::standard()`（`ImmCross` 固定、`default_feedback=Read`）
-    /// のまま、最初のプロセス切替（`FocusChanged`）まで固定される。ユーザーが
-    /// 起動後 1 つのアプリ（Windows Terminal 等）に留まり続けるだけの
-    /// 自然な使い方でこの窓に入り、TsfNative/Imm32Unavailable では読み戻し
-    /// 不能なため `Read` が無条件に再送し続ける（実機確認済み、
-    /// `docs/known-bugs.md` BUG-114）。
-    fn sync_initial_app_policy(&mut self, tick_ms: crate::state::TickMs) {
-        let profile: crate::state::ime_event::ImePolicyProfile =
-            self.platform.current_app_profile().into();
-        tracing::debug!("[app-policy] bootstrap initial app_policy: profile={profile:?}");
-        self.platform_state.ime.dispatch_event(
-            crate::state::ime_event::ImeEvent::InitialAppPolicyEstablished { profile },
-            tick_ms,
-        );
-    }
-
-    /// BUG-148/ADR-186: 起動直後の初回フォーカス確立時に `current_focus` を前面 hwnd で
-    /// 初期化する。`on_focus_process_changed` の `FocusChanged` と同じ `HwndId` の導出
-    /// （`classified.hwnd`）を使う。belief は書かない（`current_focus` のみ）。
-    fn sync_initial_focus_hwnd(
+    /// **bootstrap で1度しか呼ばれない**（唯一の呼び出し元 `establish_initial_focus_scope` 自体が
+    /// `app/bootstrap.rs::run_all` から1度だけ呼ばれる）ことは、静的には
+    /// `initial_focus_scope_event_is_dispatched_from_one_place` が、実行時には
+    /// `ObservationStore::establish_initial_fence()` 側の `debug_assert!` が固定する。
+    fn sync_initial_focus_scope(
         &mut self,
         classified: &ClassifiedFocus,
         tick_ms: crate::state::TickMs,
     ) {
-        let hwnd = crate::state::ime_event::HwndId(classified.hwnd.0 as usize);
-        tracing::debug!("[focus] bootstrap initial current_focus: {hwnd:?}");
+        let to = crate::state::ime_event::HwndId(classified.hwnd.0 as usize);
+        let profile: crate::state::ime_event::ImePolicyProfile =
+            self.platform.current_app_profile().into();
+        let focus_epoch = self.platform_state.focus.focus_epoch;
+        tracing::debug!(
+            "[focus-scope] bootstrap initial scope: to={to:?} profile={profile:?} \
+             focus_epoch={focus_epoch:?}"
+        );
         self.platform_state.ime.dispatch_event(
-            crate::state::ime_event::ImeEvent::InitialFocusHwndEstablished { hwnd },
+            crate::state::ime_event::ImeEvent::InitialFocusScopeEstablished {
+                to,
+                profile,
+                focus_epoch,
+            },
             tick_ms,
         );
     }
 
     /// プローブ結果を検証・分類し、platform_state (app_kind / focus_kind) を更新する。
     ///
-    /// injection_mode の更新は `apply_focus_probe_result` が `advance_focus_tracking` 後に行う。
     /// None を返した場合は呼び出し元が early return すること。
     fn classify_focus_probe(
         &mut self,
@@ -406,7 +338,7 @@ impl Runtime {
         let process_changed = last_pid.is_some_and(|last| last != classified.process_id);
         // `focus_hwnd()` は `self.platform.focus.current.hwnd` を都度読む薄いラッパー
         // （`Runtime::focus_fence().hwnd`、ADR-106 決定3）。`prev_hwnd`/`new_hwnd` を
-        // 同一の生成元（このメソッド）から取ることで、`update_focus_info` 呼び出しの
+        // 同一の生成元（このメソッド）から取ることで、`update_focus_info_with_process_name` 呼び出しの
         // 前後で同じ式を2通りに書く重複を無くす（PR 109 コードレビュー指摘6）。
         // この時点ではまだ epoch は進んでいない（`on_focus_process_changed` は
         // 後続の `apply_focus_probe_result` 内で呼ばれる）ため、両軸を同時に運ぶ
@@ -446,6 +378,7 @@ impl Runtime {
                     ime_on,
                     self.platform_state.ime.input_mode(),
                     from_explicit_off_intent,
+                    crate::state::TickMs(now_ms),
                 );
             } else {
                 tracing::debug!(
@@ -462,7 +395,7 @@ impl Runtime {
             classified.process_name.clone(),
         );
 
-        // `update_focus_info` 直後のため `self.focus_hwnd()` は `classified.hwnd` と
+        // `update_focus_info_with_process_name` 直後のため `self.focus_hwnd()` は `classified.hwnd` と
         // 構築上必ず一致する（同じ値を2通りの式で書く重複を無くす、PR 109
         // コードレビュー指摘6）。hwnd 追従の詳細は
         // `notify_focus_hwnd_updated_if_needed` のドキュメントを参照。
@@ -477,6 +410,13 @@ impl Runtime {
         self.apply_app_disable_transition(classified.process_id, is_bootstrap);
 
         self.platform_state.ime.set_prev_conversion_mode(None);
+        // ADR-238: 英数モードの候補は、実際にフォーカス(プロセス/ウィンドウ)が変わったときだけ捨てる。
+        // この関数はフォーカスが変わらなくても読み取りのたびに走る(上の `prev_conversion_mode` のリセットも毎回走る)ので、
+        // ここで無条件に捨てると、候補が確認の読みの前に毎回消えて一度も確定しない(sc-dbe-msime-native の MS-IME の英数キーが
+        // 追随できなかった、run 37483627619)。
+        if process_changed || prev_hwnd != new_hwnd {
+            self.platform_state.ime.clear_eisu_candidate();
+        }
 
         (
             process_changed,
@@ -496,7 +436,7 @@ impl Runtime {
     /// なく「最初のスコープ確立」であり、扱うべきは hwnd 片側ではなく epoch を
     /// 含む両軸である（bootstrap では `enter_focus_scope` が epoch も 0→1 に
     /// 進める）。この同期は `establish_initial_focus_scope` が
-    /// `sync_initial_focus_fence`（`ImeEvent::InitialFocusFenceEstablished`）で
+    /// `sync_initial_focus_scope`（`ImeEvent::InitialFocusScopeEstablished`）で
     /// 行う——ここから hwnd だけ先に dispatch すると、epoch が食い違ったままの
     /// 中途半端な fence を1度作ることになる（BUG-102）。この関数を
     /// `advance_focus_tracking` の
@@ -515,21 +455,35 @@ impl Runtime {
         prev_hwnd: crate::state::ime_event::HwndId,
         new_hwnd: crate::state::ime_event::HwndId,
     ) {
-        if is_bootstrap || process_changed || new_hwnd == prev_hwnd {
+        if is_bootstrap || process_changed {
             return;
         }
         let tick_ms = crate::state::TickMs(crate::hook::current_tick_ms());
-        self.platform_state.ime.dispatch_event(
-            crate::state::ime_event::ImeEvent::FocusHwndUpdated { hwnd: new_hwnd },
-            tick_ms,
-        );
+        if new_hwnd != prev_hwnd {
+            self.platform_state.ime.dispatch_event(
+                crate::state::ime_event::ImeEvent::FocusHwndUpdated { hwnd: new_hwnd },
+                tick_ms,
+            );
+            self.scope_shadow_focus_now(new_hwnd);
+        }
+        // ECRS DD3-01: 同じプロセスの中でクラスが変わった・学習で降格された、など `FocusChanged` が送られない
+        // 経路でも、核の `app_policy` を殻の live の profile に追随させる（ずれると drift の上限が効かない）。
+        // 判断は核の `app_profile_follow_event`（閉ループのハーネスも同じ関数を呼ぶ、ADR-277 段階 2）。
+        let live =
+            crate::state::ime_event::ImePolicyProfile::from(self.platform.current_app_profile());
+        if let Some(event) = crate::state::app_ime_policy::app_profile_follow_event(
+            &self.platform_state.ime.model().app_policy,
+            live,
+        ) {
+            self.platform_state.ime.dispatch_event(event, tick_ms);
+        }
     }
 
     /// `config.app_overrides.disable_apps` への出入りを検出し、フックへ伝達する
     /// （BUG-78: リモートデスクトップ接続中にローカル側の awase が Ctrl キーの
     /// 押しっぱなし状態を起こす問題への対策）。
     ///
-    /// `advance_focus_tracking` の `update_focus_info` 直後、フォーカス変更のたびに
+    /// `advance_focus_tracking` の `update_focus_info_with_process_name` 直後、フォーカス変更のたびに
     /// 呼ぶ想定。`process_changed` を流用せず自前でエッジ判定する — `process_changed`
     /// は初回フォーカス（`last_pid == None`）で `false` になるため、無効化対象アプリが
     /// フォーカスを持ったまま awase が起動したケースを取りこぼす。
@@ -644,9 +598,35 @@ impl Runtime {
             },
             tick_ms,
         );
+        // ADR-282 V1: 候補 Z の shadow へ窓切替を渡す(観測のみ)。新しいスレッドの事前(O9)は、今の
+        // `assume_closed_for_new_thread` と同じ条件(測定済みの入力設定の共有と IME の種類)のときだけ。
+        {
+            let new_thread = thread_probe.is_some_and(|probe| {
+                matches!(
+                    probe.scope,
+                    crate::focus::thread_scope::ThreadScope::NewSinceStart
+                ) && crate::focus::thread_scope::closed_assumption(
+                    crate::focus::thread_scope::read_thread_local_input_settings(),
+                    crate::tsf::observer::tsf_obs().table_ime_kind(),
+                )
+                .applied()
+            });
+            let scope = crate::state::scope_belief::scope_key(
+                thread_probe.map_or(classified.process_id, |probe| probe.pid),
+                thread_probe.map(|probe| probe.tid),
+                classified.hwnd.0 as usize,
+            );
+            let facts = self.scope_shadow_window_facts(new_thread);
+            self.platform_state
+                .ime
+                .scope_shadow_focus(scope, facts, tick_ms);
+        }
 
         {
-            let cache_hit = self.platform.focus.restore_ime_state();
+            let cache_hit = self
+                .platform
+                .focus
+                .restore_ime_state(crate::state::TickMs(crate::hook::current_tick_ms()));
             let profile = self.platform.current_app_profile();
             let is_imm_broken = matches!(
                 profile,
@@ -681,7 +661,16 @@ impl Runtime {
                 let desired_open = self.platform_state.ime.model().desired_open();
                 let new_hwnd = classified.hwnd.0 as usize;
                 let cache_hwnd = cache_hit.as_ref().map(|snap| snap.hwnd);
-                if should_restore_tsf_cache_on(cache_hit.as_ref(), desired_open, new_hwnd) {
+                // BUG-218: 明示 OFF が、入場先と同じプロセスで、キャッシュより新しく押されていたら復元しない
+                // （フォーカス検出が遅れている間に、すでに入場先の窓の中で押された OFF を古い ON で上書きしない）。
+                let decision = crate::focus::tsf_cache_restore::plan_tsf_cache_restore(
+                    cache_hit.as_ref(),
+                    desired_open,
+                    new_hwnd,
+                    classified.process_id,
+                    self.platform_state.ime.persistent_explicit_off(),
+                );
+                if decision.restores() {
                     // Imm32Unavailable コンテキストで desired_open が false に汚染された可能性。
                     // キャッシュの true を復元して TsfNative 窓の状態を回復する。
                     self.platform_state
@@ -693,6 +682,18 @@ impl Runtime {
                          new_hwnd={new_hwnd} — 汚染を修正)"
                     );
                 } else {
+                    if decision
+                        == crate::focus::tsf_cache_restore::TsfCacheDecision::SkipOffNewerInSameProcess
+                    {
+                        tracing::info!(
+                            "[focus] TsfNative: cache restore を見送り — 明示 OFF がキャッシュより新しく、\
+                             入場先と同じプロセスで押されている (BUG-218) \
+                             explicit_off={:?} cache_recorded_ms={:?} new_pid={}",
+                            self.platform_state.ime.persistent_explicit_off(),
+                            cache_hit.as_ref().map(|snap| snap.recorded_ms),
+                            classified.process_id,
+                        );
+                    }
                     // SSOT: desired_open を前窓の値のまま維持。
                     // FocusChanged が applied=Unknown を設定済みのため、最初のキー入力で
                     // dispatch_ime が desired_open を窓へ apply する。
@@ -801,8 +802,14 @@ impl Runtime {
         // `VK_IME_OFF→VK_IME_ON` reinit）を行うと、IME を閉じて起動したとき awase が IME を開けてしまう。
         // 初期値のままの間は行わず、最初の成功観測が「開」だったときに `ir_align_placeholder_desired` が同じ処理を行う
         // （観測が「閉」なら行わない。GjiFsm は閉の IME と整合した OffCold のまま）。
-        if !is_effectively_tsf_native_now
-            && !self.platform_state.ime.desired_is_placeholder()
+        // ADR-262 段階 A: 窓内の IMM が読めないと学習された窓（`ImmCapability::Unavailable` で `Standard` から降格）
+        // では先同期しない。読めない窓の `applied=Confirmed(true)` は何も書いていない偽の確定で（ADR-098 が TsfNative で
+        // 止めた型と同じ）、GJI の already-matched が後続の ON の書き込みを省く（#623）。GjiFsm の ImeOn は、最初の
+        // ローマ字の送信時に ADR-203 (i) の level 突合（`OnImeOnBelief`）が代わりに行う。
+        if crate::state::applied_mirror_plan::may_mirror_applied_on_focus(
+            is_effectively_tsf_native_now,
+            self.platform.focus.is_demoted_by_learning(),
+        ) && !self.platform_state.ime.desired_is_placeholder()
             && self.platform_state.ime.effective_open()
         {
             self.presync_applied_open_on(tick_ms);
@@ -830,7 +837,17 @@ impl Runtime {
                 let snap = crate::ime::read_ime_state_full_async().await;
                 if let Some(open) = snap.ime_on {
                     let _ = crate::with_app(|app| {
-                        crate::state::probe_admission::admit_epoch_in_app(
+                        // ADR-245 追補 2 R1: 復元の書き込みの前に始まった読みは棄却する(floor が無ければ従来どおり)。
+                        if crate::state::resume_observation::read_predates_restore_write(
+                            read_started,
+                            app.platform.output.resume_restore_floor.get(),
+                        ) {
+                            tracing::debug!(
+                                "[ImmCrossProbe/focus] 復元の書き込みより前に始まった読みを棄却 (R1 floor)"
+                            );
+                            return;
+                        }
+                        crate::probe_rejection_stats::admit_epoch_in_app(
                             app,
                             ticket,
                             "[ImmCrossProbe/focus] epoch rejected \
@@ -862,12 +879,6 @@ impl Runtime {
             self.platform_state.ime.reset_detect_state();
         }
 
-        if classified.kind == FocusKind::Undetermined {
-            self.platform
-                .focus
-                .try_send_uia(crate::focus::uia::SendableHwnd(classified.hwnd));
-        }
-
         // フォーカス復帰後 resync（report `01M0VGJ2M5KQHD1D9V7HAMBHNT`）: TsfNative は
         // ImmCross と違い上記の focus-time probe が無く、周期ポーリングも
         // `reschedule_ime_refresh` が早期 return するため構造的に走らない
@@ -887,6 +898,57 @@ impl Runtime {
         ) {
             crate::focus_resync::FOCUS_RESYNC.arm(tick_ms.0);
         }
+        // ADR-282 V1: 窓切替の後処理が終わった時点の旧と Z を比べる(観測のみ)。
+        self.platform_state.ime.scope_shadow_end_focus(tick_ms);
+    }
+
+    /// ADR-282 V1: 候補 Z の shadow に渡す、今のフォーカス先の窓の事実(観測のみ)。窓切替を Z へ渡す前に呼ぶ
+    /// (O5 の「直前の窓が読める Win32 の窓か」に、Z がまだ持っている直前の窓の事実を使う)。
+    fn scope_shadow_window_facts(
+        &self,
+        new_thread: bool,
+    ) -> crate::state::scope_belief::WindowFacts {
+        use crate::tsf::observer::{tsf_obs, ActiveImeKind};
+        let profile = self.platform.current_app_profile();
+        let imm_trusted =
+            profile.can_use_imm32_cross_process() && !self.platform.focus.is_demoted_by_learning();
+        // U3: InputRelay の窓は O2 の ON 寄りに入れない。
+        let on_lean = profile != crate::focus::class_names::AppImeProfile::InputRelay;
+        let obs = tsf_obs();
+        let inherit_open_on_entry = matches!(obs.active_ime_kind(), ActiveImeKind::MicrosoftIme)
+            && obs.ms_ime_native_identified()
+            && crate::focus::class_names::is_windows_terminal_window(
+                self.platform.focus.class_name(),
+            )
+            && self
+                .platform_state
+                .ime
+                .scope_shadow_facts()
+                .is_some_and(|f| f.imm_trusted);
+        crate::state::scope_belief::WindowFacts {
+            imm_trusted,
+            inherit_open_on_entry,
+            new_thread,
+            on_lean,
+        }
+    }
+
+    /// ADR-282 V1: 同じプロセスの中の窓切替・起動時のフォーカス確立を Z の shadow へ渡し、すぐ比べる(観測のみ)。
+    /// スレッドを「見た」ことは記録しない(`focus_thread_of`)ので、新しいスレッドの事前(O9)は使わない。
+    fn scope_shadow_focus_now(&mut self, hwnd: crate::state::ime_event::HwndId) {
+        let tick_ms = crate::state::TickMs(crate::hook::current_tick_ms());
+        let ids =
+            crate::focus::thread_scope::focus_thread_of(HWND(hwnd.0 as *mut core::ffi::c_void));
+        let scope = crate::state::scope_belief::scope_key(
+            ids.map_or_else(|| self.platform.focus.pid(), |(pid, _)| pid),
+            ids.map(|(_, tid)| tid),
+            hwnd.0,
+        );
+        let facts = self.scope_shadow_window_facts(false);
+        self.platform_state
+            .ime
+            .scope_shadow_focus(scope, facts, tick_ms);
+        self.platform_state.ime.scope_shadow_end_focus(tick_ms);
     }
 
     /// 現在のフォーカス先を検出し、focus_kind / app_kind を更新する。
@@ -915,23 +977,6 @@ impl From<&FocusIdentity> for crate::journal::FocusEndpoint {
             focus_kind: format!("{:?}", identity.focus_kind),
         }
     }
-}
-
-/// TsfNative 窓入場時に、`(pid, class_name)` キャッシュの `ime_on=true` を
-/// 復元してよいか判定する（BUG-128、ADR-165）。
-///
-/// `snap.hwnd == new_hwnd` を要求することで、`(pid, class_name)` キーが
-/// 同一クラス名を共有する複数の無関係なウィンドウ（例:
-/// `Windows.UI.Input.InputSite.WindowClass` を共有する explorer.exe 内の
-/// 複数の UWP 入力面）を取り違えないようにする。時間条件は設けない
-/// （`docs/adr/165-tsf-cache-restore-recency-guard.md` 参照、実機検証済み）。
-fn should_restore_tsf_cache_on(
-    snap: Option<&crate::focus::hwnd_cache::HwndImeSnapshot>,
-    desired_open: bool,
-    new_hwnd: usize,
-) -> bool {
-    let Some(snap) = snap else { return false };
-    snap.ime_on && !desired_open && snap.hwnd == new_hwnd
 }
 
 fn should_discard_imm_broken_cache(
@@ -1003,51 +1048,5 @@ mod tests {
             20_000,
             19_000,
         ));
-    }
-
-    // ── should_restore_tsf_cache_on（BUG-128、ADR-165）──────────────────────
-
-    #[test]
-    fn tsf_cache_restore_fires_when_hwnd_matches() {
-        // 35230fd の救済シナリオ: 同じウィンドウ（同じ hwnd）へ戻ってきた場合は復元する。
-        assert!(should_restore_tsf_cache_on(
-            Some(&snap(true, false, 42)),
-            false,
-            42,
-        ));
-    }
-
-    #[test]
-    fn tsf_cache_restore_is_suppressed_when_hwnd_differs() {
-        // report_id 01M27VXD4SPAD4STQ9TG1PZSCD の再現: 同じ (pid, class_name) でも
-        // 別のウィンドウインスタンス（別 hwnd）への入場では復元しない。
-        assert!(!should_restore_tsf_cache_on(
-            Some(&snap(true, false, 42)),
-            false,
-            999,
-        ));
-    }
-
-    #[test]
-    fn tsf_cache_restore_skips_when_desired_open_already_true() {
-        assert!(!should_restore_tsf_cache_on(
-            Some(&snap(true, false, 42)),
-            true,
-            42,
-        ));
-    }
-
-    #[test]
-    fn tsf_cache_restore_skips_when_cache_says_off() {
-        assert!(!should_restore_tsf_cache_on(
-            Some(&snap(false, false, 42)),
-            false,
-            42,
-        ));
-    }
-
-    #[test]
-    fn tsf_cache_restore_skips_when_no_cache_entry() {
-        assert!(!should_restore_tsf_cache_on(None, false, 42));
     }
 }

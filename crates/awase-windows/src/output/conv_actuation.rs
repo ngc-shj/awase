@@ -16,7 +16,7 @@
 //! **INV-14: 全 7 経路が移行完了（2026-08-08）。** 旧
 //! `set_ime_romaji_mode_with_target`/`_async`（宛先をライブクエリで自己決定する
 //! target 非対応の低レベル API）は `ime.rs` から削除済み。移行済み経路:
-//! `actuate_conv_mode`（本モジュール）、`cold_warmup.rs::run_start`、
+//! `actuate_conv_mode`（本モジュール）、`cold_warmup.rs::run_start`（2026-10-22 撤去）、
 //! `executor.rs::dispatch_ime_set_open`（`set_ime_open_then_conv_for_target`、
 //! open と conv を同一 hwnd に対して行う特殊版）、`key_pipeline.rs` の
 //! `kp_stage_idle_conv_check`（BUG-08 ローマ字復元）・
@@ -48,8 +48,8 @@
 //! hwnd 再クエリ（`async`）まで必須と読んだ場合にのみ正しい。**捕獲自体は
 //! `get_focused_hwnd()` 1 回**であり、旧 `set_ime_romaji_mode()` が内部で
 //! やっていたライブクエリと同一なので、「捕獲を write の外へ出す」だけなら
-//! 同期のままできる。再検証は focus 世代の照合のみで行う
-//! （`ActuationTarget::verify_gen_only` の doc 参照）。
+//! 同期のままできる。同期版は完全同期(await 点なし)なので再検証をしない
+//! （旧 `verify_gen_only` は恒真の比較だったので撤去、ECRS DD2-03）。
 //!
 //! 到達可能性（ADR-089 §6 Phase C 実施記録 C-7 と §9-21 の訂正）:
 //! `executor.rs`/`key_pipeline.rs` は `imm_cross_is_first_applicable` で async
@@ -175,7 +175,7 @@ impl Output {
             };
             let outcome = crate::ime::set_ime_conv_for_target(target, Some(raw_target), || {
                 crate::with_app(|runtime| runtime.platform.output.ime_mode_focus_gen.get())
-                    .unwrap_or_else(|| focus_gen.wrapping_add(1))
+                    .unwrap_or_else(|| focus_gen.next())
             })
             .await;
             tracing::info!("[conv-actuate] {reason:?} → 結果: {outcome:?}");

@@ -76,7 +76,7 @@ Your `config.toml` carries over. These settings behave differently in v2.
 - **The default of `keys.ime_toggle` is now empty.** It used to be `VK_KANJI` (Hankaku/Zenkaku). If your `config.toml` explicitly contains `VK_KANJI`, it is respected and kept. The exact old default written by the v1 settings app (`["VK_KANJI"]`) is treated as empty and removed when you save.
 - **The defaults of `keys.ime_detect.on` / `off` are now empty** (they used to be `IMEオン` / `IMEオフ`). Following the IME On/Off keys works automatically without them. Values you wrote are used as before.
 - **`keys.engine_on_ime_key` / `engine_off_ime_key` were removed.** If you saved settings in the settings app before 2026-08-15, the old defaults may remain in your `config.toml` and the feature that sends a full-width/half-width mode key when the engine turns on/off may have been active. In v2 it stops (leftover values are ignored and a notice appears at startup; saving from the settings app removes the lines). There is no replacement. Use `keys.ime_on` / `ime_off` to open/close the IME.
-- **`muhenkan_solo_tap_ime_action` / `henkan_solo_tap_ime_action` were removed.** They are migrated to the equivalent `keys.ime_*` entries when loaded, with a warning (not migrated if the same key already has an entry). A single tap of Muhenkan/Henkan now follows the Suppress/Passthrough setting.
+- **`muhenkan_solo_tap_ime_action` / `henkan_solo_tap_ime_action` were removed.** If they remain in your `config.toml`, their values are **ignored** and a notice appears at startup (saving from the settings app removes the lines). To open/close the IME with a single tap of Muhenkan/Henkan, list the key alone in `keys.ime_on` / `keys.ime_off` (e.g. `ime_on = ["変換"]`, `ime_off = ["無変換"]`). Otherwise a single tap follows the Suppress/Passthrough setting. (Up to v2.2.0 they were migrated to the equivalent `keys.ime_*` entries on load; that migration has ended.)
 - **`confirm_mode` now has two choices: `wait` and `ngram_predictive`.** Old values are treated as `wait` on load and rewritten to `wait` on save.
 - **Key-name parsing is now uniform.** Spellings that were silently ignored before (no `VK_`, lowercase, Japanese names, ...) now take effect, so a remap you forgot about may start working after the update. The old spelling `[[keymap]]` (correct: `[[keymaps]]`) also starts working.
 
@@ -159,7 +159,7 @@ Default key bindings:
 | Switch to romaji input | **Ctrl+Shift+無変換** |
 | IME ON | **Ctrl+変換** (if the IME is already ON, resets it to hiragana / romaji / CapsLock OFF) |
 | IME OFF | **Ctrl+無変換** |
-| Toggle IME-ON halfwidth alphanumeric (MS-IME only) | **Left Shift single tap** (press and release without any other key; tap again to cancel) |
+| Toggle IME-ON halfwidth alphanumeric (enabled by default for both MS-IME and Google Japanese Input; can be disabled in the settings app's Advanced Settings (上級者向け設定) tab) | **Left Shift single tap** (press and release without any other key; tap again to cancel) |
 | Manually switch per-app behavior | **Ctrl+Shift+F11** |
 
 > You can change these through the GUI by right-clicking the tray icon → "Settings".
@@ -242,13 +242,11 @@ force_text = [
 force_bypass = [
     { process = "launcher.exe", class = "LauncherClass" },
 ]
-# TSF ネイティブモード（WezTerm 等）
-force_tsf = [
-    { process = "wezterm-gui.exe", class = "org.wezfurlong.wezterm" },
-]
 ```
 
 You can find the process name and class name in the log output of `RUST_LOG=debug awase.exe`.
+
+Characters are sent to every app as VK keystrokes (through the IME), except characters that are not in the table and characters given directly in a `.yab` (such as `\u`), which are sent directly as Unicode. The former `force_vk` and `force_tsf` (which chose how to send) are no longer needed and have been retired (they are ignored if present).
 
 ---
 
@@ -314,6 +312,21 @@ Identification results are learned and cached per app class name (`cache.toml`) 
 
 ---
 
+## mozc-readable (optional, experimental)
+
+[mozc-readable](https://github.com/cuzic/mozc-readable) is an unofficial build of [Mozc](https://github.com/google/mozc), the open-source edition of Google Japanese Input, that lets other processes read the IME's on/off state and input mode. It exists so awase can use the IME's own value instead of guessing in windows it cannot read.
+
+Because mozc-readable tells awase the IME's open/closed state and input mode using values the IME itself publishes, it is expected to fundamentally solve the problem of "awase's assumption drifting from the IME's actual state." It is still an experimental feature, and we are continuing to verify it on real machines.
+
+- awase reads the values mozc-readable publishes in shared memory to learn whether the IME is open or closed, and turns thumb-shift (NICOLA) input on or off to match (no setting needed; awase does nothing in windows that are not using mozc-readable; [ADR-268](docs/adr/268-mozc-shm-belief-connection.md), in Japanese).
+- If the first romaji right after switching windows or pressing the hiragana key is left as plain letters instead of becoming composing text, awase detects it, deletes it, and types it again ([ADR-270](docs/adr/270-mozc-first-send-composition-check.md), [BUG-209](docs/known-bugs/BUG-209.md), in Japanese).
+- It is distributed through mozc-readable's [GitHub Releases](https://github.com/cuzic/mozc-readable/releases) (also available from [the install section on awase.cc](https://awase.cc/index.en.html#mozc-readable)). The installer is unsigned.
+- After installing, add "Mozc Readable" as an input method in Windows language settings (the input method's display name is "Mozc Readable"). If you install over an earlier version, you may need to sign out before the new display name appears in the language settings list.
+- Mozc (the official edition and mozc-readable) is treated as the same family as Google Japanese Input (automatic reading of the IME's key settings is for Google Japanese Input only).
+- **For people building their own keyboards (QMK etc.)**: there is a specification of the shared memory and a minimal reader example, aimed at tying an OLED or layers to the IME state. → [Shared-memory specification](https://github.com/cuzic/mozc-readable/blob/readable/readable/docs/shared-memory.md) (in Japanese)
+
+---
+
 ## Troubleshooting
 
 **No characters are typed / strange characters appear**  
@@ -336,3 +349,5 @@ Identification results are learned and cached per app class name (`cache.toml`) 
 ## License
 
 You may choose either the [Apache License, Version 2.0](LICENSE-APACHE) or the [MIT License](LICENSE-MIT).
+
+Sources and attribution for the statistical data bundled with awase (derived from Wikipedia, Tatoeba, etc.) are in [docs/third-party-data.md](docs/third-party-data.md) (Japanese).

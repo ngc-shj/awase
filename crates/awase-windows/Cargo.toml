@@ -1,6 +1,6 @@
 [package]
 name = "awase-windows"
-version = "2.0.0"
+version = "2.2.0"
 edition = "2021"
 
 [lib]
@@ -26,11 +26,19 @@ awase-build-support = { path = "../awase-build-support" }
 awase = { path = "../.." }
 awase-gji-config = { path = "../awase-gji-config" }
 awase-vkmap = { path = "../awase-vkmap" }
+# 純粋な核(ADR-229 D4)。windows crate に依存しない。
+awase-ime-core = { path = "../awase-ime-core" }
+# フック・修飾キー・半角英数トグルの状態の核(ADR-274 段階 1)。windows crate に依存しない。
+awase-hook-core = { path = "../awase-hook-core" }
+# TSF とフォーカスの「計画」(Facts → Plan の純粋な判断)の核(ADR-274 段階 1)。windows crate に依存しない。
+awase-windows-plans = { path = "../awase-windows-plans" }
+# Scancode Map（キー入れ替え）の判断・編集モデル・適用の核（ADR-274 段階 1）。外部の依存を持たない。
+awase-scancode = { path = "../awase-scancode" }
+# 不具合報告のペイロードの組み立て・サイズの縮め・再送計画・gzip の核（ADR-274 段階 1）。windows crate に依存しない。
+awase-bug-report = { path = "../awase-bug-report" }
 # ADR-195段階4: T3の永続化スキーマ(`persist`モジュール)を読むためだけの依存。OS非依存クレート
 # なのでWindows限定にしない(coreがOS非依存クレートに依存されるだけ、という既存の向きに合わせる)。
 awase-keymap-learn = { path = "../awase-keymap-learn" }
-measured-macro = { path = "../measured-macro" }
-actuation-choke-point-macro = { path = "../actuation-choke-point-macro" }
 timed-fsm = { path = "../timed-fsm", version = "0.5.0" }
 tracing = "0.1"
 # tracing-log は default feature（他の default: smallvec/fmt/ansi/std も維持する
@@ -40,12 +48,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 anyhow = "1"
 toml = "0.8"
-itertools = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
-flate2 = "1"
-base64 = "0.22"
-thiserror = "2"
 strum = { version = "0.27", features = ["derive"] }
 quanta = "0.12"
 
@@ -56,17 +60,17 @@ path = "../win32-async"
 path = "../win32-worker"
 version = "0.1.0"
 
-[dev-dependencies]
-# ADR-158 TI1: classify_*系の純粋関数へproptestを適用するスパイク。
-# 非gatedモジュール(state/conv_classify.rs)向けのためホストターゲットで動く
-# 通常のdev-dependenciesに置く(windows限定にしない)。
-proptest = "1.11.0"
+[target.'cfg(windows)'.dependencies.windows-core]
+# `#[implement(...)]`（windows-rs）が生成する内部コードが `::windows_core::...` を直接参照するため、
+# `windows::core` の再エクスポート越しではなく実クレートとして必要（ADR-283 §10: `observer/indicator_glyph.rs` の
+# UIA push 通知ハンドラ本体で使う。以前は example 専用だったため dev-dependencies にしかなかった）。
+version = "0.62"
 
-[target.'cfg(windows)'.dev-dependencies]
-# `#[implement(...)]` マクロ展開が `::windows_core::...` を直接参照するため、
-# `windows::core` の再エクスポート越しではなく実クレートとして必要
-# (`examples/spike_langbar_input_mode.rs` 専用、本体コードは未使用)。
-windows-core = "0.62"
+[dev-dependencies]
+# 核のテスト専用の口（`set_desired_open_for_test` など）を殻のテストから使う。
+awase-ime-core = { path = "../awase-ime-core", features = ["testing"] }
+# journal 再生 fixture のハーネス(ADR-229)。非公開の dev 専用 crate。
+awase-replay = { path = "../awase-replay" }
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.62"
@@ -74,12 +78,15 @@ features = [
     "Win32_Foundation",
     "Win32_UI_Accessibility",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Input_Ime",
     "Win32_UI_TextServices",
     "Win32_Graphics_Gdi",
+    "Win32_Storage_Xps",
     "Win32_System_Console",
     "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_System_ProcessStatus",
@@ -94,30 +101,5 @@ features = [
     "Win32_System_Variant",
 ]
 
-[lints.rust]
-unsafe_code = "warn"
-unused_qualifications = "warn"
-missing_debug_implementations = "warn"
-unreachable_pub = "warn"
-
-[lints.clippy]
-all = { level = "deny", priority = -1 }
-pedantic = { level = "deny", priority = -1 }
-nursery = { level = "deny", priority = -1 }
-cargo_common_metadata = "allow"
-multiple_crate_versions = "allow"
-doc_markdown = "allow"
-# `unreachable_pub` (Rust lint) と矛盾するため allow: pub(crate) モジュール内の pub(crate) アイテムは両方が矛盾して fire する
-redundant_pub_crate = "allow"
-# Win32 内部 API 関数の全エラーパスを文書化するのは不要
-missing_errors_doc = "allow"
-# Windows 状態管理構造体は bool フラグが多数必要
-struct_excessive_bools = "allow"
-# 行数制限はコンパイラ向けロジックで越えることがある
-too_many_lines = "allow"
-# 内部コンストラクタの bool パラメータ
-fn_params_excessive_bools = "allow"
-# I/O 統計の u64 → f64 変換は許容精度
-cast_precision_loss = "allow"
-# 1.96 で新たに const 化可能と判断されたが、依存先が const でないため個別対応より blanket allow が安全
-missing_const_for_fn = "allow"
+[lints]
+workspace = true

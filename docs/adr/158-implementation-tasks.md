@@ -509,6 +509,8 @@ tuning-constants.md`記載の実測値（`79134f5`の326ms等）が、対応す�
 
 ### TE3: `AppImeProfile`能力表の段階的宣言化（観測フェーズ開始、2026-09-09——昇格フェーズは性質上ここでは完了不能）
 
+**2026-10-22 撤去**: 昇格は進まず、マクロの使用は `can_use_imm32_cross_process` の 1 か所だけだったため、`crates/actuation-choke-point-macro` と `#[track_caller]`(ラッパ 2 つ)・その順序ガードを撤去し、`can_use_imm32_cross_process`・`imm_cross_applicable` を `const fn` に戻した。TE3 の昇格フェーズは見送り。以下は当時の記録。
+
 **内容**: `focus/class_names.rs::AppImeProfile`の各バリアントが持つ能力を、まず
 [ADR-161](161-single-source-spec-generation.md)実証実験5の属性マクロ（実行時記録版）で
 観測し、数セッション分のログを集めた上で、確信が持てた範囲からdylintの許可リストへ
@@ -598,6 +600,8 @@ ADR-159段階2（送信列の記録・再生）は実質**未着手**のまま�
 「シャドー実行の差分記録」の実績ではない。**ADR-162 round4 TJ4 M5が既に訂正した通り、
 E1・E4の着手条件は「配線確認」ではなく「削除・統合1件を送信列差分ゼロで検証できたこと」
 という能力ベースの基準であり、この実測データ単独ではその基準を満たさない。**
+
+**追記（2026-10-06）: TF2（`shadow_send_trace.rs`）は予定された消費者（INV-3/4/5の判定器）は未実装・使用実績0件で、lparamを残さない所有者判断により撤去した。以下は当時の記録。**
 
 **残タスクの実装完了（2026-09-10、`feat/adr159-tf2-shadow-send-trace`ブランチ、
 PR #193）**: 新規モジュール`crates/awase-windows/src/shadow_send_trace.rs`を

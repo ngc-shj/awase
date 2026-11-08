@@ -20,7 +20,7 @@ logic.
 
 ```sh
 # Compile check (what you'll use most while iterating)
-cargo check --target x86_64-pc-windows-msvc -p awase -p awase-windows
+cargo check --target x86_64-pc-windows-msvc -p awase -p awase-windows -p awase-ime-core
 # or: mise run check
 
 # Clippy (same target requirement)
@@ -55,7 +55,7 @@ under `#![cfg(windows)]` and only assert for real in the `windows-build` CI job 
 
 The same applies one level deeper and less visibly: `crates/awase-windows/src/runtime/mod.rs`
 carries `#[cfg(windows)]` on the whole module tree, so any `#[cfg(test)]` unit test living inside
-`runtime/` (e.g. `runtime/open_chain.rs`, `runtime/transport.rs::plan_tests`) or inside any other
+`runtime/` (e.g. `runtime/open_chain.rs`, `runtime/key_pipeline.rs`) or inside any other
 `#[cfg(windows)]`-gated file (`ime_controller.rs`, `ime.rs`, `imm.rs`, `hook.rs`, ...) silently
 does not exist in the native-Linux test binary at all — it won't show up in `cargo test --list`,
 `cargo nextest list`, or even `strings` on the compiled binary, and there is no error or skip
@@ -67,7 +67,7 @@ even when the code is correct — that failure is expected here, not a signal).
 
 ```sh
 # Custom dylint lints (layer-boundary enforcement — see Architecture below)
-cargo install cargo-dylint dylint-link --version 6.0.0 --locked   # once
+cargo install cargo-dylint dylint-link --version 6.3.0 --locked   # once
 DYLINT_RUSTFLAGS="-D warnings" cargo dylint --all -p awase-windows -- --target x86_64-pc-windows-msvc
 
 # Mutation testing (slow — validity of tests, not coverage)
@@ -85,12 +85,42 @@ Dead-dependency check: `cargo machete`. Security advisories: `cargo audit` (tria
 
 ```
 awase (root crate, src/)      Platform-independent core: engine/, config.rs, ngram.rs, kana_table.rs, yab/
-crates/awase-windows/         Windows platform implementation (the bulk of the complexity)
-crates/awase-linux/           Linux platform stub
-crates/awase-macos/           macOS platform stub
+crates/awase-windows/         Windows platform implementation (the shell; the bulk of the complexity)
+crates/awase-macos/           macOS platform implementation (fork-only, macos-port branch; removed upstream)
+crates/awase-ime-core/        The IME core (ADR-229 D4, renamed from awase-windows-core in ADR-274): IME-state (belief) /
+                              observation / actuation decisions and the journal; state/ (the modules not moved to the sibling
+                              core crates below, except platform_state.rs + sync_actuation.rs + ime_decision_view.rs),
+                              journal(_policy), indicator_evidence, tsf/literal_facts. Sits above awase-windows-base and
+                              awase-key-effect. Same `src/` layout as before the split; awase-windows re-exports it (`pub use`)
+                              so `crate::state::...` paths are unchanged. No `windows` dependency (guard-tested).
+                              ADR-274: split into role-named cores; the list of core crates is `tools/core-split/core-crates.txt`
+                              (wiring checked by `tools/core-split/check_wiring.py`, layer direction by
+                              `tools/core-split/deps.py --check`, both in the CI `core-layers` job).
+crates/awase-windows-base/    OS-independent core base (ADR-274 stage 2): tuning, vk, keymap, state/{generation,event_origin,
+                              hub_clock,foreground_scope,layout_language,ime_kind,focus_gen,app_suppression,
+                              scoped_latch} + TickMs, focus/{kinds,class_names}, tsf/converter_target. No dependency on other
+                              core crates; every other core crate sits above it. Same relative paths as before the move.
+crates/awase-key-effect/      OS-independent core (ADR-274 stage 2): key-effect tables and prediction: state/{key_effect_predictor,
+                              key_effect_runtime,key_effect_table,keymap_latch,
+                              late_keymap_plan,state_dependent_key_warning}. Depends only on awase-windows-base.
+crates/awase-hook-core/       OS-independent core: hook / modifier-key / half-width-alnum toggle state (ADR-274 stage 1):
+                              state/{hook_state,hook_watchdog,alt_impersonation,foreign_modifier,win_key_guard,
+                              half_width_alnum,half_width_resume_hold}. Same `src/state/` relative paths as before the
+                              move; depends only on `awase` and `awase-ime-core`.
+crates/awase-windows-plans/   OS-independent core: TSF / focus "plans" (Facts → Plan pure decisions, ADR-274 stage 1):
+                              state/{warm_send_plan,deferred_gate_plan,raw_recovery_plan,relay_plan,post_bypass,
+                              focus_classify_plan,focus_probe_plan,focus_resolve_plan,focus_resync_policy,
+                              msaa_role_plan}, focus/hwnd_cache. Same relative paths as before the move (`focus/` spans crates).
+crates/awase-scancode/        OS-independent core: Scancode Map (key-swap) decisions / edit model / diagram text / apply
+                              (ADR-230, ADR-274 stage 1): scancode_{map,pairs,editor,diagram,apply}. No dependencies.
+                              The registry I/O stays in the shell (`awase-windows/src/scancode_registry.rs`, cfg(windows));
+                              awase-windows re-exports `awase_windows::scancode_*`.
+crates/awase-bug-report/      OS-independent core: bug-report payload build / size shrink / retry plan / gzip (ADR-274 stage 1):
+                              bug_report. The learned-table file read stays in the shell (`key_effect_io`).
 crates/win32-async/           Async executor + blocking-API timeout isolation (run_with_timeout)
 crates/win32-worker/          Worker-thread primitives used by win32-async
 crates/awase-settings/        Settings GUI (eframe/egui) — separate binary, awase-settings.exe
+crates/awase-settings-wgpu/   wgpu/egui-wgpu/eframe "wgpu" feature の置き場（awase-settings の optional 依存 `wgpu-fallback`、既定 ON。PR の CI だけ外す）
 crates/awase-gji-config/      GJI (Google 日本語入力) config file handling
 crates/awase-vkmap/           VK code / scan code mapping tables
 crates/awase-keymap-learn/     IME key-effect learning (not the ADR-176 calibration UI), pure logic, OS-independent (ADR-191/195/196):
@@ -102,7 +132,6 @@ crates/awase-keymap-learn-win/ Windows real-machine driver for the above: indepe
 crates/awase-build-support/   Shared build.rs logic (manifest embedding etc.)
 crates/xtask-adr-evidence/    Checks that fix-requires-evidence.md's family table is covered by the pre-push target regex (CI adr-evidence-consistency, ADR-158 TB2)
 crates/measured-macro/        `#[measured(...)]` attribute macro forcing value_ms/commit metadata on tuning.rs constants (ADR-158 TE1)
-crates/actuation-choke-point-macro/  `#[actuation_choke_point(callers = ...)]` observation-phase attribute macro (ADR-158 TE3 prerequisite)
 crates/timed-fsm/             Standalone timer-aware FSM framework (published to crates.io independently)
 ```
 
@@ -187,8 +216,10 @@ a map of what to expect, not a substitute for reading them when the relevant are
   checkouts, not the same working tree.
 - `experiment-logging.md` — revert commits touching IME control/warmup/focus/key-selection must
   document the observed failure (app, IME, repro) in the commit body.
-- `tuning-constants.md` — changes to timing constants in `crates/awase-windows/src/tuning.rs` must
+- `tuning-constants.md` — changes to timing constants in `crates/awase-windows-base/src/tuning.rs` must
   cite a real measurement (ms) in the commit body, not "increase until it works."
 - `fix-requires-evidence.md` — fixes in the warmup/focus/belief/conv/key-selection "reincidence
   families" need either a regression test or a new `docs/known-bugs/BUG-NNN.md` entry.
 - `ime-belief-architecture.md` — see Architecture section above.
+- `agent-handoff.md` — 並列のエージェント開発での PR 本文・DIRTY の確認、報告と主張の再確認、取り消しの書き方、push の仕方(ADR-242・ADR-243)。
+- `one-off-verification-workflows.md` — 1 回限りの検証 workflow・`ci/*` ブランチ・スクリプトは、結果を docs/ADR/BUG に書いたら同じ PR で撤去し、撤去コミットのハッシュを BUG/ADR に書く。`e2e-ime.yml` の observe 構成には `until=` を付ける。

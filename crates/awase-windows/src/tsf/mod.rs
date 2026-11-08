@@ -10,33 +10,36 @@
 //!   タイマー駆動で進め `ProbeAction` を emit（TickableFsm family / strategy）
 //! - `probe_bridge` — メッセージループ統合: OUTPUT_GATE / WM_DRAIN_OUTPUT_QUEUE
 //!
-//! `gji_fsm` 以外の全サブモジュールは windows crate に依存するため `#[cfg(windows)]`。
-//! `gji_fsm`（TSF composition の warm/cold 状態機械）だけは windows crate 依存が
-//! ゼロのため ungated にし、`cargo test -p awase-windows --lib` から Linux でも
-//! 常時実行できるようにしている（ADR-082 決定1実施記録の次の一歩、BUG-33 追補3・4）。
+//! windows crate、または gated なモジュール(`hook`・`tsf::observer` など)に依存するサブモジュールは
+//! `#[cfg(windows)]`。windows crate 依存が
+//! ゼロの `gji_fsm`（TSF composition の warm/cold 状態機械）・`literal_facts` は ungated にし、`cargo test -p awase-windows --lib`
+//! から Linux でも常時実行できるようにしている（ADR-082 決定1実施記録の次の一歩、
+//! BUG-33 追補3・4、ADR-229 T2）。
 //! 上記リストの相互参照は intra-doc link にすると非 Windows ビルドで解決できなく
 //! なるためプレーンテキストにしている。
 
-// 唯一の ungated モジュール。呼び出し元（warmup_strategy.rs）
-// は windows-gated のため非 Windows では未使用になる。
+// 呼び出し元（warmup_strategy.rs）は windows-gated のため非 Windows では未使用になる。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) mod cold_reason;
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) mod gji_fsm;
 #[cfg(windows)]
 mod gji_monitor;
-#[cfg(windows)]
-pub(crate) mod ime_mode_fsm;
+#[cfg(test)]
+mod gji_sync_model;
 #[cfg_attr(not(windows), allow(dead_code))]
-pub mod literal_facts;
-#[cfg(windows)]
+pub(crate) mod ime_mode_fsm;
+pub use awase_ime_core::tsf::converter_target;
+#[cfg_attr(not(windows), allow(dead_code))]
+pub use awase_ime_core::tsf::literal_facts;
+#[cfg_attr(not(windows), allow(dead_code))]
 pub mod observer;
 #[cfg(windows)]
 pub mod output;
-#[cfg(windows)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub mod probe;
-#[cfg(windows)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub mod probe_bridge;
-#[cfg(windows)]
-pub mod send;
 #[cfg(windows)]
 pub(super) mod tip_detector;
 // ADR196-T2「1e前半」(opus-adversarial-consult 2026-09-23 A-5): tip_detectorモジュール自体は
@@ -44,14 +47,117 @@ pub(super) mod tip_detector;
 // crate外から呼べるようにする。
 #[cfg(windows)]
 pub use tip_detector::query_tip_identity_on_current_sta;
-#[cfg(windows)]
-pub(crate) mod tsf_gate;
-#[cfg(windows)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) mod warmup;
 #[cfg(windows)]
 mod win_event_obs;
 
-#[cfg(windows)]
-pub use tsf_gate::{
-    GateEvent, GateTimer, TsfGate, TsfGateMachine, TsfGateState, TsfReadiness, WARMUP_TIMEOUT_MS,
-};
+// ── Windows 専用の副作用への入口(ADR-272 段階 A-2c) ──
+//
+// `tsf/warmup/` の FSM が呼ぶ Win32 依存の関数は、ここで cfg を振り分ける。
+// 非 Windows(Linux のテスト)では観測点・副作用が無い値を返す。
+
+/// composition の診断ログを 1 行出す。非 Windows では何もしない。
+#[cfg_attr(not(windows), allow(unused_variables))]
+pub(crate) fn log_composition_probe(
+    cold_seq: crate::state::event_origin::Generation,
+    label: &'static str,
+) {
+    #[cfg(windows)]
+    crate::ime_diagnostic::log_composition_probe(cold_seq, label);
+}
+
+/// Mozc の共有メモリから composition を読む。非 Windows では読めない(`Unreadable`)。
+#[cfg_attr(not(windows), allow(unused_variables))]
+pub(crate) fn read_mozc_compose(
+    thread_id: u32,
+    process_id: u32,
+) -> crate::state::mozc_shm::ComposeReading {
+    #[cfg(windows)]
+    {
+        crate::observer::mozc_shm::read_compose(thread_id, process_id)
+    }
+    #[cfg(not(windows))]
+    {
+        crate::state::mozc_shm::ComposeReading::Unreadable
+    }
+}
+
+/// 対象のスレッドの共有メモリから、キー押下ごとの食べた/素通りの数（version 5）を読む。診断用。読めなければ `None`。
+#[cfg_attr(not(windows), allow(unused_variables))]
+pub(crate) fn read_mozc_key_results(
+    thread_id: u32,
+    process_id: u32,
+) -> Option<crate::state::mozc_shm::KeyResults> {
+    #[cfg(windows)]
+    {
+        crate::observer::mozc_shm::read_key_results(thread_id, process_id)
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// 対象のスレッドの共有メモリから、キーボードフォーカスの時刻（version 5）を読む。診断用。読めなければ `None`。
+#[cfg_attr(not(windows), allow(unused_variables))]
+pub(crate) fn read_mozc_focus_ticks(
+    thread_id: u32,
+    process_id: u32,
+) -> Option<crate::state::mozc_shm::FocusTicks> {
+    #[cfg(windows)]
+    {
+        crate::observer::mozc_shm::read_focus_ticks(thread_id, process_id)
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// 対象のスレッドの共有メモリから、Mozc 自身の入力方式（ローマ字/JISかな直接入力、version 5、ADR-287）を読む。
+/// 観測専用（belief・actuation には使わない）。読めなければ `None`。
+#[cfg_attr(not(windows), allow(unused_variables))]
+pub(crate) fn read_mozc_input_style(
+    thread_id: u32,
+    process_id: u32,
+) -> Option<crate::state::mozc_shm::InputStyle> {
+    #[cfg(windows)]
+    {
+        crate::observer::mozc_shm::read_input_style(thread_id, process_id)
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// OS のかな入力ロックビット（`GetKeyState(VK_KANA)`、ADR-118）を読む。ADR-287 決定3: version 5 の
+/// `prefer_kana_input` と並べて journal/ログに残し、実機で両者がどれだけ一致/食い違うかを比較するためだけに使う
+/// （belief・actuation には使わない）。非 Windows では `Unknown`。
+// Win32 FFI を直接呼ぶモジュール単位で allow する既存の作法（lib.rs 冒頭コメント）に合わせる。
+#[allow(unsafe_code)]
+pub(crate) fn read_os_kana_lock() -> awase::engine::kana_input_warn::KanaLockReading {
+    #[cfg(windows)]
+    {
+        // SAFETY: 呼び出し元(`MozcComposeCheckFsm::tick`)はメッセージループスレッドで駆動される。
+        unsafe { crate::observer::kana_lock::read_kana_lock() }
+    }
+    #[cfg(not(windows))]
+    {
+        awase::engine::kana_input_warn::KanaLockReading::Unknown
+    }
+}
+
+/// 窓のスレッドが `timeout_ms` 以内に応答するか。非 Windows では常に応答する。
+#[cfg_attr(not(windows), allow(unused_variables))]
+pub(crate) fn window_thread_responds(hwnd_addr: usize, timeout_ms: u32) -> bool {
+    #[cfg(windows)]
+    {
+        crate::ime::window_thread_responds(hwnd_addr, timeout_ms)
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}

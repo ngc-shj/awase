@@ -239,6 +239,19 @@ impl NgramModel {
         }
     }
 
+    /// 2 連の表を `((前の文字, 次の文字), score)` で列挙する（`score` は最大を 0 にした `log10` の頻度）。
+    ///
+    /// `frequency_score` は未知の組を `0.0`（= 最頻の組と同じ点）で返すため確率には使えない。
+    /// 言語判定（`lang_detect`）のように条件付き確率を作りたい呼び出し元は、こちらで生の表を読む。
+    pub fn bigram_scores(&self) -> impl Iterator<Item = ((char, char), f32)> + '_ {
+        self.bigram.iter().map(|(&k, &v)| (k, v))
+    }
+
+    /// 3 連の表を `((1 つ目, 2 つ目, 3 つ目), score)` で列挙する（`bigram_scores` と同じ形。`lang_detect` が条件付き確率を作る）。
+    pub fn trigram_scores(&self) -> impl Iterator<Item = ((char, char, char), f32)> + '_ {
+        self.trigram.iter().map(|(&k, &v)| (k, v))
+    }
+
     /// Compute the frequency score for a candidate character given recent output.
     ///
     /// Tries 3-gram first (if enough history), then falls back to 2-gram.

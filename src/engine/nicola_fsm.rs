@@ -100,8 +100,7 @@ impl From<&YabValue> for KeyAction {
     fn from(value: &YabValue) -> Self {
         match value {
             // kana が解決済みの場合は Char で直接出力。
-            // Unicode モードでは IME を経由せず直接送信、VK モードでは
-            // send_char_as_vk が kana_to_romaji で逆引きして batched 送信する。
+            // VK モードでは send_char_as_vk が kana_to_romaji で逆引きして batched 送信する。
             YabValue::Romaji { kana: Some(ch), .. } => Self::Char(*ch),
             // kana 未解決（拗音など単一 char に収まらないケース）は VK 経由でフォールバック
             YabValue::Romaji { romaji, kana: None } => Self::Romaji(romaji.clone()),
@@ -204,8 +203,7 @@ pub struct NicolaFsm {
     /// が実際に Shift かどうかを（Platform 層依存の判定になるため）core 層だけでは
     /// 判定できず、`false`（無効・従来面のみ）で初期化する。**Platform 層は
     /// 起動直後に必ず `set_thumb_shift_faces_enabled()` を呼んで実際の値を
-    /// 設定すること**（`crates/awase-windows/src/app/bootstrap.rs`・
-    /// `crates/awase-linux/src/main.rs`・`crates/awase-macos/src/main.rs` 参照）。
+    /// 設定すること**（`crates/awase-windows/src/app/bootstrap.rs` 参照）。
     /// 呼び忘れても「複合面が使えない」に留まり、親指自体が Shift のケースで
     /// 複合面が誤って有効化される（誤出力）方向には倒れない——`true` を既定にすると
     /// 呼び忘れ時にこの誤出力が起こるため、意図的に安全側の `false` を既定にしている。
@@ -217,7 +215,7 @@ pub struct NicolaFsm {
     /// 親指キーを生キーで送出する。既定の `Unknown` は「保留キーが入力された
     /// ウィンドウと今のウィンドウが同じ保証が無いので抑制する」ための安全側の
     /// 挙動だが、親指キーが IME 切替キーを兼ねる構成ではこれが**ユーザーの
-    /// 切替操作そのものを消す**（BUG-189: 英数 の直後に かな を押すと、かな が
+    /// 切替操作そのものを消す**（BUG-230: 英数 の直後に かな を押すと、かな が
     /// 同時打鍵判定に consume され、非活性化フラッシュで捨てられて IME が ON に
     /// ならない）。切替キーは文字を生まないため、抑制の本来の目的である
     /// 「別ウィンドウへの生 `VK_SPACE` 誤注入」のような実害が無い。
@@ -388,8 +386,7 @@ pub struct NicolaFsm {
 
     /// ADR-120 決定0a 項目7(a)専用: 物理 BACKSPACE の VK コード。Platform 層が
     /// 判定して渡す（`space_thumb_vk` 等と同様、実際の VK 番号は Platform 層の
-    /// 責務）。`None`（既定）なら項目7(a)の集計は行わない
-    /// （`crates/awase-linux`/`crates/awase-macos` はまだ配線しない）。
+    /// 責務）。`None`（既定）なら項目7(a)の集計は行わない。
     backspace_vk: Option<VkCode>,
 
     /// ADR-120 決定0a 項目7(a) (should-fix所見S4対応): 物理 BACKSPACE が
@@ -612,7 +609,7 @@ impl NicolaFsm {
                         thumb.suppresses_solo_output(),
                     ),
                     // 親指キーが IME 切替キーそのものの構成では、抑制すると
-                    // ユーザーの切替操作が消える（BUG-189）。切替キーは文字を
+                    // ユーザーの切替操作が消える（BUG-230）。切替キーは文字を
                     // 生まないので、抑制が防いでいる誤注入の実害が無い
                     ThumbRawVkEmission::Denied if self.thumb_keys_are_ime_switch => {
                         let action = KeyAction::Key(thumb.vk_code);
@@ -976,6 +973,16 @@ impl NicolaFsm {
                 }))
     }
 
+    /// 無変換/変換の `vk_code` 側に、専用 Fn キー・bare `keys.ime_*` 由来の強制 open 軸操作・IME 設定由来の役割の
+    /// どれかがあるか（ADR-255 決定2 条件6-i。`ModeKeyConfig` が Passthrough かどうかは問わない）。
+    /// 親指キーとして設定されていない vk は常に偽。
+    pub(super) fn thumb_has_ime_function(&self, vk_code: VkCode) -> bool {
+        let special = self.thumb_solo_special_handling(vk_code);
+        special.dedicated_fn_key.is_some()
+            || special.forced_open_action.is_some()
+            || special.role_open_action.is_some()
+    }
+
     fn thumb_solo_special_handling(&self, vk_code: VkCode) -> ThumbSoloSpecialHandling {
         if self.muhenkan_vk == Some(vk_code) {
             ThumbSoloSpecialHandling {
@@ -1077,12 +1084,12 @@ impl NicolaFsm {
 
     /// `GeneralConfig` の調整可能フィールドを一括反映する。
     ///
-    /// プラットフォームエントリポイント（`bootstrap.rs`/`awase-linux`/
-    /// `awase-macos`）がそれぞれ個別に `set_timing_margins` 呼び出しを
-    /// コピペしていたが、この重複自体が `awase-linux`/`awase-macos` での
+    /// プラットフォームエントリポイント（`bootstrap.rs` と、2026-10-22 に撤去した
+    /// `awase-linux`/`awase-macos` スタブ）がそれぞれ個別に `set_timing_margins`
+    /// 呼び出しをコピペしていたが、この重複自体がスタブ側での
     /// 呼び忘れの原因になった（/code-review指摘、PR #127、7回目）。
     /// 将来 `GeneralConfig` に他のFSM調整項目が増えたら、ここに追加すれば
-    /// 全プラットフォームへ自動的に反映される。
+    /// エントリポイントへ自動的に反映される。
     pub fn apply_general_config(&mut self, config: &GeneralConfig) {
         self.set_timing_margins(
             config.timing_margin_percent,
@@ -3601,6 +3608,8 @@ mod tests {
                 left_thumb_down_snapshot: None,
                 right_thumb_down_snapshot: None,
                 injected: false,
+                foreign_ctrl: false,
+                impersonated: false,
             };
             let r = fsm.release_only(&ev);
             assert!(r.actions.is_empty(), "pass_through must not emit actions");

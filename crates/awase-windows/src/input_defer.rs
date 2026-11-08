@@ -1,4 +1,4 @@
-//! 入力遅延キュー — OUTPUT_GATE active 中・TsfGate drain など複数の退避経路を集約する。
+//! 入力遅延キュー — OUTPUT_GATE active 中など複数の退避経路を集約する。
 //!
 //! すべての退避経路は classify 済みの `RawKeyEvent` として同一キューに積む。
 //! `enrich_ime_relevance`（sync key 判定）のみ drain 側で `with_app` 内に実行する。
@@ -52,7 +52,7 @@ impl InputDeferQueue {
         self.push_with_cap(&mut q, event);
     }
 
-    /// TsfGate・タイムアウト等から保留キーをまとめて再投入する。空でも安全（no-op）。
+    /// タイムアウト等から保留キーをまとめて再投入する。空でも安全（no-op）。
     pub fn replay_later(&self, events: impl IntoIterator<Item = RawKeyEvent>) {
         let mut q = match self.queue.lock() {
             Ok(q) => q,
@@ -141,6 +141,8 @@ mod tests {
             left_thumb_down_snapshot: None,
             right_thumb_down_snapshot: None,
             injected: false,
+            foreign_ctrl: false,
+            impersonated: false,
         }
     }
 
@@ -197,5 +199,24 @@ mod tests {
         assert_eq!(q.overflow_count.load(Ordering::Relaxed), 2);
         let _ = q.take_all();
         assert_eq!(q.overflow_count.load(Ordering::Relaxed), 0);
+    }
+
+    /// `pending_len_nonblocking` は積んだ件数を返す(`None`/固定値ではない)。
+    #[test]
+    fn pending_len_nonblocking_reports_queue_length() {
+        let q = InputDeferQueue::new();
+        assert_eq!(q.pending_len_nonblocking(), Some(0));
+        for i in 0..3u64 {
+            q.defer_during_output(evt(i));
+        }
+        assert_eq!(q.pending_len_nonblocking(), Some(3));
+        let _ = q.take_all();
+        assert_eq!(q.pending_len_nonblocking(), Some(0));
+    }
+
+    #[test]
+    fn debug_names_the_type() {
+        let q = InputDeferQueue::new();
+        assert!(format!("{q:?}").contains("InputDeferQueue"));
     }
 }

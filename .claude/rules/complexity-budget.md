@@ -11,9 +11,10 @@ E1が定める規約を文書化したものだが、発効条件（下記「発
 同種1件の削除を伴わない限り許可しない（1-in-1-outの複雑性予算制）。
 
 - **actuation合流点数**: `lints/actuation_call_guard/src/lib.rs::RESTRICTED_CALLS`が
-  宣言する各チョークポイント（`set_ime_open`・`send_input_safe`・`send_ime_control`・
-  `apply_ime_open_with_view`）の許可呼び出し元リスト。
-- **tuning定数数**: `crates/awase-windows/src/tuning.rs`の`pub const`定数
+  宣言する各チョークポイント（`set_ime_open`・`send_input_safe`・`actuate_ime_control`・
+  `probe_ime_control`・`apply_ime_open_with_view`・`apply_sync`・`dispatch_set_open`。
+  旧 `send_ime_control` は `actuate_`/`probe_` に分かれた。2026-10-13 時点のリスト）の許可呼び出し元リスト。
+- **tuning定数数**: `crates/awase-windows-base/src/tuning.rs`の`pub const`定数
   （`#[measured_macro::measured(...)]`が必須、[tuning-constants](./tuning-constants.md)
   参照）。
 
@@ -54,8 +55,8 @@ round2相当レビュー2026-09-12で「送信列」という語を明確化—�
 
 2026-09-12時点で**TH1d（既知バグ由来fixtureの実機ダンプからの投入）まで完了**した
 （`tests/journals/actuation_decision/bug-131-report-01m29kdnz.json`、37レコード）。
-ADR-159段階2（TF2、送信内容のログ出力、`shadow_send_trace.rs`）はPR#193で実装済みだが
-蓄積・突合せ（自動A/B）は未着手のまま将来課題（ADR-163「TF2との突合せ」節参照）。
+ADR-159段階2（TF2、送信内容のログ出力、`shadow_send_trace.rs`）はPR#193で実装されたが
+蓄積・突合せ（自動A/B）は未着手のまま（予定された消費者の判定器も未実装・使用実績0件で）、2026-10-06に所有者判断で撤去した（ADR-159段階2・ADR-163「TF2との突合せ」節の追記参照）。
 [ADR-163](../../docs/adr/163-actuation-decision-io-separation-and-replay-harness.md)が
 定める「決定点への再投入（再生）」側はTH1a〜TH1dまで完了し、**残る未達成条件はTH1e
 （凍結コーパスを使った実際の削除・統合+差分ゼロ再生証明、本ルールの発効条件そのもの）

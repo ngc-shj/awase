@@ -275,23 +275,9 @@ pub unsafe fn send_ime_mode_key_with_shift_release_prefix(
     all_sent
 }
 
-/// 現在フォーカスされているウィンドウの IME 変換モード生値を返す（診断ログ専用）。
-///
-/// ビット定義: NATIVE=0x0001 KATAKANA=0x0002 FULLSHAPE=0x0008 ROMAN=0x0010
-///
-/// # Safety
-/// Calls Win32 APIs.
-#[must_use]
-pub unsafe fn get_ime_conversion_mode_raw() -> Option<u32> {
-    // SAFETY: get_focused_hwnd は unsafe fn で GetGUIThreadInfo().hwndFocus を優先し
-    //         GetForegroundWindow にフォールバックする（BUG-55 参照）。NULL を返す可能性が
-    //         あるが detect_ime_conversion_for_hwnd 内の non_null() チェックで処理される。
-    detect_ime_conversion_for_hwnd(unsafe { get_focused_hwnd() })
-}
-
 /// タイムアウト指定版 IME 変換モード取得（H1 タイミング計測専用）。
 ///
-/// `get_ime_conversion_mode_raw` の 50ms 固定タイムアウトを変更できるバージョン。
+/// 50ms 固定タイムアウトの版（`get_ime_conversion_mode_raw`、呼び出し元が無く撤去）の timeout を指定できる。
 /// 短い timeout_ms（例: 10ms）を指定することで、warmup 直後の応答時間を細かく計測できる。
 ///
 /// # Safety
@@ -874,7 +860,7 @@ pub unsafe fn read_ime_state_fast() -> FastImeProbeResult {
     // ime_on=None を返して shadow 状態に委ねる。
     // - TsfNative（Alt/Win 一時オーバーレイ等）: imc_open=false で Engine 誤 deactivate
     // - Imm32Unavailable（Chrome/Edge: Chrome_WidgetWin_1 等）: 常に 0 を返す
-    if !profile.can_read_imm32_open_status() {
+    if !profile.can_use_imm32_cross_process() {
         tracing::debug!(
             "read_ime_state_fast: profile={profile:?} class={class_name} → ime_on=None (shadow preserving)"
         );
@@ -945,6 +931,26 @@ pub unsafe fn get_focused_hwnd() -> HWND {
         .unwrap_or_else(|| unsafe { GetForegroundWindow() })
 }
 
+/// ウィンドウのスレッドが、IME の読み取りに `timeout_ms` ミリ秒以内に応答するか（ADR-270）。
+///
+/// 既存の読み取り（`get_ime_conversion_mode_for_hwnd`。`imm.rs` の唯一の `SendMessageTimeoutW` を通る）をワーカースレッドで
+/// 実行し、`run_with_timeout` で待つ。IME への同期の呼び出し（Mozc サーバーの応答待ちなど）でスレッドが止まっていると
+/// 応答しない（ハングしているか、止まっている）。IME のウィンドウが無い窓も `false`（確かめられないので、消さない側）。
+///
+/// 応答しないとき、止まっている間に届いたキーはまだ処理されていないので、Backspace を送ってはいけない。メインスレッドから
+/// 直接送ると、待っている間に届く別スレッドからの送信メッセージで `with_app` に再入しうる（BUG-90）ので、ワーカーで実行する。
+#[must_use]
+pub fn window_thread_responds(hwnd_addr: usize, timeout_ms: u32) -> bool {
+    let wait = std::time::Duration::from_millis(u64::from(timeout_ms) + 10);
+    crate::win32::run_with_timeout(wait, move || {
+        // SAFETY: `hwnd_addr` は `GetGUIThreadInfo` が返したウィンドウのアドレス（無効になっていても `get_ime_wnd` が `None` を
+        //         返すか、`probe_ime_control` が失敗を返すだけ）。`probe_ime_control` は `SMTO_ABORTIFHUNG` の読み取りで、
+        //         actuation のフェンスを進めない（読み取り）。
+        unsafe { get_ime_conversion_mode_for_hwnd(HWND(hwnd_addr as *mut _), timeout_ms).is_some() }
+    })
+    .unwrap_or(false)
+}
+
 /// `get_focused_hwnd` の async 版（ワーカースレッドで実行）。
 ///
 /// [`ActuationTarget`] の捕獲・再検証の両方がこれを使う（ADR-086 §7-3）。
@@ -983,13 +989,13 @@ pub async fn get_focused_hwnd_async() -> HWND {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ActuationTarget {
     hwnd: HWND,
-    focus_gen: u32,
+    focus_gen: crate::state::focus_gen::FocusGen,
 }
 
 impl ActuationTarget {
     /// 起案時点の hwnd を捕獲する。hwnd が取得できない場合（フォーカス無し等）は
     /// `None`。
-    pub(crate) async fn capture(focus_gen: u32) -> Option<Self> {
+    pub(crate) async fn capture(focus_gen: crate::state::focus_gen::FocusGen) -> Option<Self> {
         let hwnd = get_focused_hwnd_async().await;
         hwnd.non_null().map(|hwnd| Self { hwnd, focus_gen })
     }
@@ -1016,35 +1022,12 @@ impl ActuationTarget {
     ///
     /// # Safety
     /// Win32 API を呼び出す。メインスレッドから呼ぶこと。
-    pub(crate) unsafe fn capture_blocking(focus_gen: u32) -> Option<Self> {
+    pub(crate) unsafe fn capture_blocking(
+        focus_gen: crate::state::focus_gen::FocusGen,
+    ) -> Option<Self> {
         // SAFETY: 呼び出し元がメインスレッドであることを保証する。
         let hwnd = unsafe { get_focused_hwnd() };
         hwnd.non_null().map(|hwnd| Self { hwnd, focus_gen })
-    }
-
-    /// 同期経路用の再検証。**hwnd のライブクエリを行わず、フォーカス世代だけを
-    /// 照合する**（ADR-089 §6 Phase C item 12）。
-    ///
-    /// [`Self::verify_still_current`] は `get_focused_hwnd_async().await` で
-    /// hwnd を読み直すが、同期経路では
-    ///
-    /// 1. 捕獲から書き込みまでの間に await 点が無く、hwnd が動く余地が構造的に
-    ///    無い（同一フレーム内の連続した文である）。
-    /// 2. 読み直すと Win32 往復が 1 回から 2 回へ倍増し、打鍵ホットパスに乗る
-    ///    force-ON 経路のレイテンシが変わる（`.claude/rules/tuning-constants.md`
-    ///    が実測を要求する軸）。
-    ///
-    /// ため、世代照合のみを行う。**この照合は現状では常に一致する**——
-    /// `consume_force_open_pending` が同じ理由で置いている gen フェンス
-    /// （「本経路は完全に同期的なため実際には常に一致するが、将来この経路に
-    /// 非同期処理が挟まれた場合の回帰を防ぐため明示的に確認する」）と同じ
-    /// 性質のガードである。
-    const fn verify_gen_only(self, current_focus_gen: u32) -> TargetVerifyOutcome {
-        if self.focus_gen == current_focus_gen {
-            TargetVerifyOutcome::Current(self.hwnd)
-        } else {
-            TargetVerifyOutcome::GenStale
-        }
     }
 
     /// 実行直前に呼ぶ。`read_current_focus_gen` は呼び出し元が最新の gen 値
@@ -1066,7 +1049,7 @@ impl ActuationTarget {
     #[allow(clippy::future_not_send)]
     pub(crate) async fn verify_still_current(
         self,
-        read_current_focus_gen: impl FnOnce() -> u32,
+        read_current_focus_gen: impl FnOnce() -> crate::state::focus_gen::FocusGen,
     ) -> TargetVerifyOutcome {
         let current_hwnd = get_focused_hwnd_async().await;
         if self.focus_gen != read_current_focus_gen() {
@@ -1167,43 +1150,21 @@ pub(crate) enum AbortReason {
 /// （`tests/architecture_guard.rs::sync_romaji_write_goes_through_a_captured_target`
 /// が固定）。
 ///
-/// [`set_ime_conv_for_target`]（非同期版）との差:
-///
-/// | | 非同期版 | 本関数（同期版） |
-/// |---|---|---|
-/// | 再検証 | `verify_still_current`（hwnd ライブクエリ + gen 照合） | [`ActuationTarget::verify_gen_only`]（gen 照合のみ） |
-/// | Win32 往復 | 捕獲 1 + 再検証 1 + write | 捕獲 1 + write |
-/// | 呼び出し文脈 | `spawn_local` の中（await 点あり） | 完全同期（await 点なし） |
-///
-/// hwnd を読み直さない理由は [`ActuationTarget::verify_gen_only`] の doc を参照。
-/// **`Aborted` を成功として扱わないこと**（INV-14）——呼び出し元は結果を必ず
-/// ログに残す。
+/// [`set_ime_conv_for_target`]（非同期版）との差: 非同期版は `spawn_local` の中（await 点あり）で
+/// `verify_still_current`（hwnd のライブクエリ + フォーカス世代の照合）をしてから書くが、本関数は完全同期
+/// （捕獲から書き込みまで await 点が無く、同一フレームの連続した文）なので**再検証をしない**。
+/// 旧版は世代だけを照合する `verify_gen_only` を持っていたが、呼び出し元が同じ `focus_gen` を捕獲と照合の両方へ
+/// 渡していたため常に一致する恒真の比較で、撤去した（ECRS DD2-03、2026-10-21）。将来この経路に await 点を
+/// 挟むなら、非同期版の `verify_still_current` を使うこと。
 ///
 /// # Safety
 /// Win32 API を呼び出す。メインスレッドから呼ぶこと。
 pub(crate) unsafe fn set_ime_romaji_mode_for_target_blocking(
     target: ActuationTarget,
-    current_focus_gen: u32,
 ) -> ActuationOutcome {
-    let hwnd = match target.verify_gen_only(current_focus_gen) {
-        TargetVerifyOutcome::Current(hwnd) => hwnd,
-        TargetVerifyOutcome::GenStale => {
-            tracing::debug!(
-                "[imm-romaji] Aborted(GenStale): captured_gen={} current_gen={current_focus_gen}",
-                target.focus_gen
-            );
-            return ActuationOutcome::Aborted(AbortReason::GenStale);
-        }
-        TargetVerifyOutcome::TargetMoved => {
-            // `verify_gen_only` は hwnd を読み直さないため構造的に返らないが、
-            // `TargetVerifyOutcome` の網羅性のために残す。
-            tracing::debug!("[imm-romaji] Aborted(TargetMoved)");
-            return ActuationOutcome::Aborted(AbortReason::TargetMoved);
-        }
-    };
     // SAFETY: hwnd は capture_blocking が non_null() で検証済みのウィンドウハンドル。
     //         set_ime_romaji_mode_for_hwnd は SendMessageTimeoutW ベースでタイムアウト付き。
-    if unsafe { set_ime_romaji_mode_for_hwnd(hwnd, None) } {
+    if unsafe { set_ime_romaji_mode_for_hwnd(target.hwnd, None) } {
         ActuationOutcome::Written
     } else {
         ActuationOutcome::Failed
@@ -1231,7 +1192,7 @@ pub(crate) unsafe fn set_ime_romaji_mode_for_target_blocking(
 pub(crate) async fn set_ime_conv_for_target(
     target: ActuationTarget,
     conv: Option<u32>,
-    read_current_focus_gen: impl FnOnce() -> u32,
+    read_current_focus_gen: impl FnOnce() -> crate::state::focus_gen::FocusGen,
 ) -> ActuationOutcome {
     match target.verify_still_current(read_current_focus_gen).await {
         TargetVerifyOutcome::GenStale => {
@@ -1348,7 +1309,7 @@ pub(crate) async fn set_ime_open_then_conv_for_target(
     target: ActuationTarget,
     open: bool,
     conv_after_open: ConvAfterOpen,
-    read_current_focus_gen: impl FnOnce() -> u32,
+    read_current_focus_gen: impl FnOnce() -> crate::state::focus_gen::FocusGen,
 ) -> ImmCrossOutcome {
     match target.verify_still_current(read_current_focus_gen).await {
         TargetVerifyOutcome::GenStale => {
@@ -1449,42 +1410,6 @@ mod actuation_target_tests {
             TargetVerifyOutcome::TargetMoved
         );
     }
-}
-
-/// フォーカスウィンドウの IMM32 HIMC に composition string が存在するか確認する。
-///
-/// TSF warm probe 用。TSF が active な場合、romaji キー到達後に composition string が
-/// 非空になる。TSF が cold（未初期化）な場合、キーはリテラルとして抜けるため空のまま。
-///
-/// クロスプロセスで `ImmGetCompositionStringW`（GCS_COMPSTR）を呼び出す。
-/// TSF→IMM32 bridge が HIMC を更新するため、外部プロセスからも読み取り可能。
-///
-/// # Safety
-/// Win32 API を呼び出す。
-#[must_use]
-pub unsafe fn check_tsf_composition_active(hwnd: HWND) -> bool {
-    if hwnd.non_null().is_none() {
-        return false;
-    }
-    // SAFETY: hwnd は non_null() で NULL チェック済みの有効なウィンドウハンドル。
-    //         ImmContextGuard は ImmGetContext/ImmReleaseContext を RAII で管理し、
-    //         NULL HIMC を取得した場合は None を返す。
-    let Some(ctx) = (unsafe { crate::imm::ImmContextGuard::new(hwnd) }) else {
-        return false;
-    };
-    // GCS_COMPSTR: null バッファで呼ぶと composition string のバイト長を返す
-    // SAFETY: ctx.himc() は ImmContextGuard が保持する有効な HIMC。
-    //         lpBuf=None かつ dwBufLen=0 で呼ぶのは MSDN で明示的に許可されており
-    //         バッファオーバーフローの危険はない。
-    let len = unsafe {
-        ImmGetCompositionStringW(
-            ctx.himc(),
-            IME_COMPOSITION_STRING(crate::imm::GCS_COMPSTR),
-            None,
-            0,
-        )
-    };
-    len > 0
 }
 
 /// `ImmGetCompositionStringW` の各 index を読み取って診断用スナップショットを返す。
@@ -1734,3 +1659,15 @@ pub unsafe fn set_ime_mode_for_target(
 // 効くと確認済みの値に固定した上で再検証して無反応と確定したため撤去した
 // （BUG-61 追補）。Win32 にこの入力方式を外部から切り替える公式手段は
 // 存在しないと確定している。
+
+/// ADR-263 PR 2b: 日本語入力と判定できたとき、ひらがなキー（`VK_DBE_HIRAGANA`、「IME ON かつ ひらがな」）を 1 回送る。
+///
+/// **呼び出し元が、Alt/Win が押されていないこと**（`hook::ime_mode_key_injection_blocked_by_modifier`）を確かめてから呼ぶこと
+/// （Alt 中の合成かなキーは JIS かな入力への切替に化ける。`kp_restore_kana_from_half_width` と同じ判定）。
+/// Ctrl/Shift は `send_ime_mode_key` が一時的に解放する。メインスレッドから呼ぶこと。
+#[must_use]
+pub fn send_hiragana_key() -> bool {
+    // SAFETY: `send_ime_mode_key` は Win32 SendInput を呼ぶだけで、メインスレッドからの呼び出しが前提。
+    // 本関数もメッセージループのスレッド（`with_app` の中）からだけ呼ばれる。
+    unsafe { send_ime_mode_key(crate::vk::VK_DBE_HIRAGANA) }
+}

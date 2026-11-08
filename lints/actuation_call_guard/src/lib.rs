@@ -82,6 +82,10 @@ const RESTRICTED_CALLS: &[(&str, &[&str])] = &[
             "send_unicode_char",
             "send_vk_pair",
             "send_vk_run_batch",
+            // BUG-217: ペース付き送信（`key_pacer.rs`）が、キューから取り出した INPUT を実際に送る関数
+            // （2026-10-24追記。旧 `send_vk_with_hold`/`send_vk_without_hold` の2件を撤去して1件を足したので、
+            // 複雑性予算制〈`.claude/rules/complexity-budget.md`〉の1-in-1-out も満たす）。
+            "send_direct",
             "flush_raw_tsf_literal_backspaces",
             "kp_restore_kana_from_half_width",
             "send_all_modifier_key_ups",
@@ -117,10 +121,32 @@ const RESTRICTED_CALLS: &[(&str, &[&str])] = &[
     // 2026-09-19: reassert_explicit_physical_key（ADR-121、TsfNative向けON方向
     // 救済の一部）を撤去したため4→3。同日、force_on_and_correct_romaji
     // （force-ON実送信、TsfNative向けON方向救済の一部）も撤去したため3→2。
+    // 2026-10-07（ADR-241 決定2）: executor の Engine の SetOpen は判断ごと核の
+    // `state::sync_actuation::dispatch_set_open` へ移り、核の `apply_sync` を直接呼ぶため2→1。
+    ("apply_ime_open_with_view", &["ir_apply_drift_correction"]),
+    // apply_sync（`state/sync_actuation.rs`）: 同期経路の唯一の合流点（旧`ImeController::apply`の本体、
+    // ADR-119・ADR-241）。呼び出し元は殻の`ImeController::apply`（関数名`apply`）と核の`dispatch_set_open`
+    // だけ。名前一致のみの照合なので、`apply`という名前の無関係な関数からの呼び出しは許してしまう
+    // （`architecture_guard.rs::sync_confluence_entries_are_pinned_for_adr241`がファイル・関数単位で補う）。
+    ("apply_sync", &["apply", "dispatch_set_open"]),
+    // dispatch_set_open（同）: executorのEngineのSetOpenの判断の核。殻の`dispatch_ime_set_open`だけが呼ぶ。
+    ("dispatch_set_open", &["dispatch_ime_set_open"]),
+    // 記録系（`applied` を書く入口、INV-A97-1・BUG-69。`state/platform_state/shell.rs` の殻のラッパー）。
+    // ADR-275 の Opus レビュー: 呼び出し元ファイルの件数は `architecture_guard.rs::applied_state_recorders_call_sites_are_accounted_for`
+    // （`RECORDERS`）が固定するが、そちらは `.record_*(` で始まる文字列なので `ImeStateHub::record_confirmed(hub, ..)` の
+    // 完全修飾呼び出しを見逃す。この lint はその穴を塞ぐ（両方残す。許可は関数名で、件数は数えない）。
+    // 2026-10-21 時点で `fn record_optimistic|record_confirmed|record_ime_apply_result` の定義は殻の 3 つだけ（同名の無関係な関数なし）。
+    ("record_optimistic", &["ir_apply_drift_correction"]),
     (
-        "apply_ime_open_with_view",
-        &["dispatch_ime_set_open", "ir_apply_drift_correction"],
+        "record_confirmed",
+        &[
+            "presync_applied_open_on",
+            "ir_post_focus_change_snapshot",
+            "kp_shadow_actuate",
+            "process_deferred_keys",
+        ],
     ),
+    ("record_ime_apply_result", &["on_ime_apply_complete"]),
 ];
 
 fn allowed_fns_for(target: &str) -> Option<&'static [&'static str]> {

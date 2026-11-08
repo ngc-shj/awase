@@ -48,7 +48,6 @@ dylint_linting::declare_late_lint! {
     ///         mode: InputModeState::AssumedRomaji { .. },
     ///         source: ObservationSource::ImmGetOpenStatus,
     ///         confidence: ObservationConfidence::High,
-    ///         at: tick_ms,
     ///     },
     ///     tick_ms,
     /// );
@@ -63,7 +62,6 @@ dylint_linting::declare_late_lint! {
     ///         mode: InputModeState::AssumedRomaji { .. },
     ///         strategy: InputModeApplyStrategy::PostSetOpenEisuReset,
     ///         result: InputModeApplyResult::Applied,
-    ///         at: tick_ms,
     ///     },
     ///     tick_ms,
     /// );
@@ -79,7 +77,11 @@ dylint_linting::declare_late_lint! {
 /// occurrence is necessarily a disguise.
 const RESTRICTED_SOURCES: &[(&str, &[&str])] = &[
     ("ImmGetOpenStatus", &[]),
-    ("ConvBitsInference", &["apply_idle_conv_check"]),
+    // `follow_direct_read_in_scope`(ADR-188): 直接観測の窓の中で、prefetch が実際に読んだ conv の NATIVE ビットから英数を決める。
+    (
+        "ConvBitsInference",
+        &["apply_idle_conv_check", "follow_direct_read_in_scope"],
+    ),
     // GJI I/O 活動からの ObservedEisu 矛盾訂正。GJI I/O タイムスタンプという実観測に
     // 基づく designated 経路は Blacklist observe stage のみ（source を名乗れるのは
     // observe_gji_after_focus の結果を dispatch する箇所に限る）。
@@ -168,7 +170,9 @@ fn emit(cx: &rustc_lint::LateContext<'_>, span: Span, source_variant: &str, fn_n
 /// Returns `true` if the type path ends with `ime_event::ImeEvent`.
 fn is_ime_event<'tcx>(cx: &rustc_lint::LateContext<'tcx>, ty: Ty<'tcx>) -> bool {
     if let TyKind::Adt(adt_def, _) = ty.kind() {
-        cx.tcx.def_path_str(adt_def.did()).ends_with("ime_event::ImeEvent")
+        cx.tcx
+            .def_path_str(adt_def.did())
+            .ends_with("ime_event::ImeEvent")
     } else {
         false
     }

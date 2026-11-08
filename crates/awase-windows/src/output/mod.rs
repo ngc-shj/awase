@@ -1,5 +1,6 @@
-use crate::state::event_origin::Generation;
+use crate::state::deferred_gate_plan;
 use crate::state::half_width_alnum::HalfWidthAlnumAction;
+use crate::state::warm_send_plan;
 use crate::tsf::warmup::probe_fsm::DeferredOrigin;
 use crate::vk::ascii_to_vk;
 use awase::types::{KeyAction, VkCode};
@@ -9,9 +10,7 @@ pub use crate::tsf::output::ColdReason;
 pub use crate::tsf::output::{INJECTED_MARKER, TSF_MARKER};
 
 pub mod sender;
-pub(crate) mod types;
 pub(crate) use sender::OutputSession;
-pub(crate) use types::InjectionMode;
 
 pub(crate) mod conv_actuation;
 pub(crate) mod held_modifiers;
@@ -25,10 +24,8 @@ pub(crate) use tsf_warmup_coord::TsfWarmupCoordinator;
 
 /// 公開ヘルパー: ASCII → VK 変換（`platform.rs` の dispatcher 用）。
 pub(crate) use crate::vk::ascii_to_vk as resolve_ascii_to_vk;
-/// SendInput / Unicode / VK 送信コンポーネント。
+/// SendInput / VK 送信コンポーネント。
 pub(crate) use key_injector::{KeyInjector, VkMarker};
-/// 公開ヘルパー: TSF 送信パイプライン（`platform.rs` の dispatcher 用）。
-pub(crate) use vk_send::TsfSendPipeline;
 
 /// VK コード＋シフトフラグのペアを要素とする VK シーケンス型。
 pub(crate) type VkSequence = Vec<(VkCode, bool)>;
@@ -59,9 +56,9 @@ pub(crate) fn fmt_ms(ms: u64) -> String {
 ///
 /// キー注入の低レベル操作は [`KeyInjector`] に委譲する Facade。
 pub struct Output {
-    /// SendInput / Unicode / VK 送信コンポーネント。
+    /// SendInput / VK 送信コンポーネント。
     ///
-    /// `kana_table`・`symbol_to_vk`・`unicode_cold_defer` 等を内包し、
+    /// `kana_table`・`symbol_to_vk` 等を内包し、
     /// 低レベルのキー注入操作を一括して管理する。
     pub(crate) injector: KeyInjector,
     /// TSF composition context の warm/cold 状態管理。
@@ -75,20 +72,10 @@ pub struct Output {
     /// GJI FSM 橋渡しバッファ群を集約する。詳細は [`TsfWarmupCoordinator`] を参照。
     /// `output` モジュール外からは `Output` の公開メソッド経由でのみ操作する。
     warmup_coord: TsfWarmupCoordinator,
-    /// フォーカス変更直後の TSF モード確定前にキーを一時保留するゲート。
-    ///
-    /// PendingWarmup 状態中のみキーを保留し、run_with_prefetched 完了後に
-    /// Probing または Bypass に遷移して保留キーを再処理する。
-    pub(crate) tsf_gate: crate::tsf::TsfGate,
-    /// フォーカス変更時に Runtime から push される注入モード。
-    ///
-    /// フォーカスが確定するたびに `update_injection_mode()` で更新される。
-    /// `with_app_ref` によるグローバル読み取りを排除し、output 層を self-contained にする。
-    pub(crate) injection_mode: InjectionMode,
     /// IME 変換モード管理コンポーネント。
     ///
     /// `kp_stage_idle_conv_check` が `observe()` で更新し、
-    /// `cold_warmup` と `transmit_tsf` が warmup VK と `ImmSetConversionStatus` 目標値の選択に使う。
+    /// `ImmSetConversionStatus` 目標値の選択に使う。
     pub(crate) conv_mode: crate::state::ConvModeMgr,
     /// IME 入力モード belief（Off / Hiragana / Katakana / Unknown）。
     ///
@@ -101,7 +88,18 @@ pub struct Output {
     /// フォーカス変更のたびにインクリメントし、`spawn_local` クロージャが取得時の世代を
     /// キャプチャする。コールバック到達時に現在値と一致しない（= その後に別のフォーカス変更
     /// が来た）場合は stale として破棄し、古いポーリング結果で ImeModeFsm を汚染しない。
-    pub(crate) ime_mode_focus_gen: std::cell::Cell<u32>,
+    pub(crate) ime_mode_focus_gen: std::cell::Cell<crate::state::focus_gen::FocusGen>,
+    /// `RAW_TSF_LITERAL` に予約した回収の宛先(段の開始時に採った focus 世代と前景窓、BUG-194、ADR-246)。
+    /// `flush_raw_tsf_literal_recovery` が flush 時点の値と照合し、違えば回収を捨てる。
+    raw_literal_origin: std::cell::Cell<Option<crate::state::raw_recovery_plan::StageOrigin>>,
+    /// 観測専用（ADR-246 Q3、判断には使わない）: `record_raw_tsf_literal` 時点の前景スレッドの `hwndFocus`。
+    raw_literal_focus_hwnd: std::cell::Cell<Option<isize>>,
+    /// 観測専用: 予約あり flush で `focus_hwnd_changed` を求めた結果。outcome に載せて取り出す。
+    raw_focus_hwnd_changed: std::cell::Cell<Option<bool>>,
+    /// ADR-270: Mozc の最初の送信の後に張る「入力中の文字ができたかの確認」の予約。`dispatch_probe_actions` が段の終わりに
+    /// 立て、`step_probe` が段末の deferred 解放より前に取り出して `MozcComposeCheckFsm` を張る。
+    mozc_compose_request:
+        std::cell::RefCell<Option<crate::tsf::warmup::mozc_compose_check_fsm::MozcComposeTarget>>,
     /// MS-IME confirm-then-transmit ゲート（BUG-13）の give-up latch。
     ///
     /// `start_ms_ime_ready_poll` が「期限まで IMC が一度も確認できなかった」ときに立てる。
@@ -130,6 +128,10 @@ pub struct Output {
     /// `deadline_ms`（送信試行時点起点、BUG-13 の元々の cold-start 保護）が
     /// そのまま効く。`shift-conv-guard` と無関係な確認待ちには一切影響しない。
     pub(crate) confirm_gate_deadline_override_ms: std::cell::Cell<u64>,
+    /// ADR-245 追補 2 R1: MS-IME 本体の戻り待ちの復元(`FromResume`)の書き込みが最初に `Written` を返した時刻。
+    /// これ以前に始まった ImmCrossProbe の読みは、書き込み前の状態を見うるので棄却する
+    /// (`state::resume_observation::read_predates_restore_write`)。R1 を予約したときだけ書く。解除しない。
+    pub(crate) resume_restore_floor: std::cell::Cell<Option<crate::state::TickMs>>,
     /// `confirm_gate_deadline_override_ms` の所有権世代（ADR-084 BUG-49 追補2、
     /// Opus pass-5 レビュー指摘）。
     ///
@@ -146,25 +148,12 @@ pub struct Output {
     /// 再発する（pass-5 レビューで発見）。世代不一致のときはループを即座に
     /// 中断し、IMC write すら行わない（フォーカスが既に別の対象へ移っている
     /// 可能性があるため、無関係な書き込みもしない）。
-    pub(crate) shift_conv_guard_gen: std::cell::Cell<u32>,
-    /// Unicode 送信後に GJI write 観測を行うフラグ。
-    ///
-    /// Platform::send_keys が Unicode モード + 未学習クラスのときにセットし、
-    /// send_keys 内の `KeyAction::Romaji` 処理で `UnicodeLiteralObserverFsm` をインストールする。
-    /// フラグは最初の Romaji 送信時に消費される（swap false）。
-    observe_unicode_literal: std::sync::atomic::AtomicBool,
+    pub(crate) shift_conv_guard_gen: std::cell::Cell<crate::state::focus_gen::ShiftConvGuardGen>,
     /// `ConvModeAuthority::AwaseOwned` のときだけ true。
     ///
     /// `send_eager_tsf_warmup` / `ImmSetConversionStatus` 等の conv mutation を一括ガードする。
     /// `Platform::set_conv_mode_authority` が `allows_conv_mutation()` の結果を push する。
     pub(crate) conv_mutation_allowed: std::cell::Cell<bool>,
-    /// Output → Runtime の遅延リクエストを蓄積するアウトボックス。
-    ///
-    /// キー注入中に `with_app` 経由で Runtime を直接呼ぶと再入するため、
-    /// `RuntimeRequest` を積んでキー処理境界で Runtime が `take_pending_requests` で drain する。
-    /// H-4-b: vk_send.rs Chrome cold パスが `StartTsfProbe` を積み、
-    /// drain_runtime_requests が TIMER_TSF_PROBE を起動する。
-    pub(crate) runtime_outbox: std::cell::RefCell<crate::runtime::outbox::RuntimeOutbox>,
     /// ADR-128: drain-before-send が実際に flush した件数を Platform へ渡す
     /// ための一時バッファ。0 は「未 flush」を表す（`vk_count` は 0 の場合
     /// push されないため曖昧さは無い、`suppressed_literal_confirms` と
@@ -208,14 +197,26 @@ impl std::fmt::Debug for Output {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum RawRecoveryOutcome {
     /// `pending_deferred` を実際に flush した（0 件なら「取り残しなし」）。
-    Flushed { vk_count: usize },
+    Flushed {
+        vk_count: usize,
+        /// 観測専用（ADR-246 Q3）。journal の `Flushed.focus_hwnd_changed` へ運ぶ。
+        focus_hwnd_changed: Option<bool>,
+    },
+    /// 予約してから flush までに宛先の窓が変わっていたため、ESC/BS/romaji と `pending_deferred` を送らずに捨てた
+    /// （BUG-194、ADR-246）。
+    DiscardedStale {
+        backs: usize,
+        romaji_present: bool,
+        deferred_vk_count: usize,
+        /// 観測専用（ADR-246 Q3）。
+        focus_hwnd_changed: Option<bool>,
+    },
 }
 
 /// `assess_warmth` の戻り値。composition の温度状態をまとめる。
 pub(super) struct WarmthContext {
     pub warm: bool,
     pub elapsed: u64,
-    pub session_expired: bool,
     pub prepend_f2_warmup: bool,
 }
 
@@ -229,24 +230,13 @@ pub(crate) struct StepProbeResult {
     /// `ProbeIo::mark_cold_raw_tsf` が呼ばれたとき true になる。
     /// `advance_tsf_probe` が `gji_on_composition_reset` を呼ぶために使う。
     pub needs_gji_composition_reset: bool,
-    /// `UnicodeLiteralObserverFsm` が GJI write なしと判断したとき true になる。
-    /// `advance_tsf_probe` がフォーカス中クラスを Tsf に昇格する。
-    pub learned_tsf: bool,
     pub completed_cold_seq: Option<u64>,
     pub literal_detect: crate::tsf::literal_facts::LiteralDetectTrace,
 }
 
-/// `ensure_tsf_warm` の戻り値。warmup フローの結果を表す。
-pub(crate) struct WarmupOutcome {
-    /// eager warmup パス（既存の F2 経由）を通ったか（Unicode 送信判定に使用）
-    pub used_eager_path: bool,
-    /// cold start シーケンス番号（ログ相関用）
-    pub cold_seq: Generation,
-}
-
 /// 状態管理・キー送信・TSF プローブ FSM を含む主実装ブロック。
 ///
-/// - 状態アクセサ（warmth、composition、injection_mode、TsfGate）
+/// - 状態アクセサ（warmth、composition）
 /// - キー送信（`send_keys`、`send_romaji_*`、`send_char_*`、`send_unicode_char`）
 /// - ノンブロッキング TSF/Chrome プローブ FSM（`advance_tsf_probe` とその内部メソッド群）
 impl Default for Output {
@@ -262,27 +252,22 @@ impl Output {
             injector: KeyInjector::new(),
             composition: crate::tsf::probe::CompositionState::new(),
             warmup_coord: TsfWarmupCoordinator::new(),
-            tsf_gate: crate::tsf::TsfGate::new(),
-            injection_mode: InjectionMode::Unicode,
             conv_mode: crate::state::ConvModeMgr::default(),
             ime_mode_fsm: std::cell::RefCell::new(crate::tsf::ime_mode_fsm::ImeModeFsm::new()),
-            ime_mode_focus_gen: std::cell::Cell::new(0),
+            ime_mode_focus_gen: std::cell::Cell::new(crate::state::focus_gen::FocusGen::INITIAL),
+            raw_literal_origin: std::cell::Cell::new(None),
+            raw_literal_focus_hwnd: std::cell::Cell::new(None),
+            raw_focus_hwnd_changed: std::cell::Cell::new(None),
+            mozc_compose_request: std::cell::RefCell::new(None),
             ms_ime_gate_give_up: std::cell::Cell::new(false),
             confirm_gate_deadline_override_ms: std::cell::Cell::new(0),
-            shift_conv_guard_gen: std::cell::Cell::new(0),
-            observe_unicode_literal: std::sync::atomic::AtomicBool::new(false),
+            resume_restore_floor: std::cell::Cell::new(None),
+            shift_conv_guard_gen: std::cell::Cell::new(
+                crate::state::focus_gen::ShiftConvGuardGen::INITIAL,
+            ),
             conv_mutation_allowed: std::cell::Cell::new(false),
-            runtime_outbox: std::cell::RefCell::new(crate::runtime::outbox::RuntimeOutbox::new()),
             pending_drain_before_send_flush: std::cell::Cell::new(0),
         }
-    }
-
-    /// Output が蓄積した `RuntimeRequest` を全件取り出す。
-    ///
-    /// Runtime がキー処理境界（`WM_EXECUTE_EFFECTS` / `WM_DRAIN_OUTPUT_QUEUE` 末尾）で呼び、
-    /// 各リクエストを実行する。H-4-b で push 側が配線されるまでは常に空を返す。
-    pub(crate) fn take_pending_requests(&self) -> Vec<crate::runtime::outbox::RuntimeRequest> {
-        self.runtime_outbox.borrow_mut().drain()
     }
 
     /// ADR-128: drain-before-send が実際に flush した `vk_count` を Platform
@@ -300,21 +285,6 @@ impl Output {
         self.conv_mutation_allowed.set(allowed);
     }
 
-    /// 次の Unicode モード Romaji 送信後に GJI write 観測を行うようリクエストする。
-    ///
-    /// `Platform::send_keys` が Unicode モード + 未学習クラスのときに呼ぶ。
-    pub(crate) fn request_unicode_observation(&self) {
-        self.observe_unicode_literal
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    // ── Unicode cold-start warmup ────────────────────────────────────────────
-
-    /// フォーカス変更時に Runtime から呼ばれ、注入モードを更新する。
-    pub(crate) const fn update_injection_mode(&mut self, mode: InjectionMode) {
-        self.injection_mode = mode;
-    }
-
     // ── GjiFsm ヘルパー ─────────────────────────────────────────────────────
 
     /// GjiFsm にイベントを送り、Response を返す（`WindowsPlatform::dispatch_gji_response` に渡す）。
@@ -329,10 +299,9 @@ impl Output {
         self.warmup_coord.gji_state_label()
     }
 
-    /// `OnComposing` 状態の現在 epoch を返す。`EndComposition` イベント送信に使う。
-    /// `OnComposing` 以外の状態では `None`。
-    pub(crate) fn gji_current_composition_epoch(&self) -> Option<crate::tsf::gji_fsm::FocusEpoch> {
-        self.warmup_coord.gji_current_composition_epoch()
+    /// GjiFsm が `OnComposing` 状態か。`EndComposition` イベント送信の前提に使う。
+    pub(crate) fn gji_is_composing(&self) -> bool {
+        self.warmup_coord.gji_is_composing()
     }
 
     // ── ImeModeFsm ヘルパー ─────────────────────────────────────────────────────
@@ -362,7 +331,7 @@ impl Output {
         let now_ms = crate::hook::current_tick_ms();
         self.ime_mode_fsm.borrow_mut().on_focus_changed(now_ms);
         self.ime_mode_focus_gen
-            .set(self.ime_mode_focus_gen.get().wrapping_add(1));
+            .set(self.ime_mode_focus_gen.get().next());
         // 新しいフォーカス先では IMC が読める可能性があるため give-up latch を解除する。
         self.ms_ime_gate_give_up.set(false);
         // ADR-084（BUG-49 追補2、Opus レビュー指摘2）: フォーカス変更は
@@ -382,13 +351,14 @@ impl Output {
     // ── shift-conv-guard confirm-gate override（ADR-084 BUG-49 追補2）───────────
 
     /// `shift_conv_guard_gen` を新しい値に進め、直前までの世代を「所有権を
-    /// 失った」ものとする。以下の 4 箇所で呼ぶ:
+    /// 失った」ものとする。以下の 5 箇所で呼ぶ:
     /// 1. 新しい hold の開始（`kp_shift_conv_guard_key_down` の MS-IME entry 分岐）。
     /// 2. 同関数の早期 return 分岐（かな入力コンテキスト前提が崩れた場合）。
     /// 3. フォーカス変更（`on_ime_mode_focus_changed`）。
     /// 4. `SetOpen(true)` 適用（`platform.rs`）。
-    pub(crate) fn bump_shift_conv_guard_gen(&self) -> u32 {
-        let next = self.shift_conv_guard_gen.get().wrapping_add(1);
+    /// 5. 直接観測でかなへの追随を確認して持続トグルを手放すとき（`ir_follow_direct_mode_key_read`、ADR-244）。
+    pub(crate) fn bump_shift_conv_guard_gen(&self) -> crate::state::focus_gen::ShiftConvGuardGen {
+        let next = self.shift_conv_guard_gen.get().next();
         self.shift_conv_guard_gen.set(next);
         next
     }
@@ -400,7 +370,11 @@ impl Output {
     /// 変わった）場合は何もせず `false` を返す。`kp_restore_kana_from_half_width`
     /// の detached retry task が、自分より新しい hold の override を誤って
     /// 延長・上書きしないためのガード（pass-5 レビュー指摘、blocking）。
-    pub(crate) fn extend_confirm_gate_override(&self, owner_gen: u32, until_ms: u64) -> bool {
+    pub(crate) fn extend_confirm_gate_override(
+        &self,
+        owner_gen: crate::state::focus_gen::ShiftConvGuardGen,
+        until_ms: u64,
+    ) -> bool {
         if self.shift_conv_guard_gen.get() != owner_gen {
             return false;
         }
@@ -414,7 +388,10 @@ impl Output {
     /// 一致しない場合は何もしない — 既に次の hold が override を所有して
     /// いる可能性があり、それを誤ってクリアしてはならない（pass-5 レビュー
     /// 指摘、blocking。この不一致無視こそが本ガードの主目的）。
-    pub(crate) fn clear_confirm_gate_override(&self, owner_gen: u32) {
+    pub(crate) fn clear_confirm_gate_override(
+        &self,
+        owner_gen: crate::state::focus_gen::ShiftConvGuardGen,
+    ) {
         if self.shift_conv_guard_gen.get() == owner_gen {
             self.confirm_gate_deadline_override_ms.set(0);
         }
@@ -435,33 +412,9 @@ impl Output {
         self.warmup_coord.store_probe_id(id);
     }
 
-    /// `GjiAction::StartProbe` の forces_prepend_f2 / is_long_cold を記録する。
-    ///
-    /// `send_romaji_as_tsf` が `GjiWarmupCoro::new` を生成する際に参照する。
-    /// GjiFsm の `Authorized` 状態から `ProbeParams` を読み出す。
-    ///
-    /// `Authorized` でない場合は `None` を返す。
-    pub(crate) fn gji_current_probe_params(&self) -> Option<crate::tsf::gji_fsm::ProbeParams> {
-        self.warmup_coord.current_probe_params()
-    }
-
     /// 現在の GJI probe_id を返す（確認用、消費しない）。
     pub(crate) fn gji_current_probe_id(&self) -> Option<crate::tsf::gji_fsm::ProbeId> {
         self.warmup_coord.current_probe_id()
-    }
-
-    /// GJI probe の OUTPUT_GATE ガードを開始する。
-    ///
-    /// `send_romaji_as_tsf` の cold パスで `GjiWarmupCoro::new` を呼ぶ直前に使う。
-    pub(crate) fn gji_begin_probe_guard(&self) {
-        self.warmup_coord.begin_probe_guard();
-    }
-
-    /// GJI probe の OUTPUT_GATE ガードを解放する。
-    ///
-    /// `step_probe` 完了時 / `CancelProbe` 時に呼ぶ。
-    pub(crate) fn gji_end_probe_guard(&self) {
-        self.warmup_coord.end_probe_guard();
     }
 
     /// `pending_gji_key_responses` を全件取り出す。
@@ -487,13 +440,6 @@ impl Output {
     /// 次の VK / TSF composition 送信時に VK_IME_ON ウォームアップを
     /// 先行送信させる。Enter/Space/Escape の reinject・エンジン toggle 等のタイミングで呼ぶ。
     /// フォーカス変更は `on_focus_changed()` を使うこと（epoch も更新される）。
-    ///
-    /// # NativeF2Consumed でも eager_warmup_sent_ms をリセットする理由
-    ///
-    /// 物理 F2 が押された = 新しい F2 が届き TSF 初期化が再トリガーされる。FocusChange 時の
-    /// タイムスタンプを保持すると「古い F2 からの経過時間」を elapsed として計算してしまう
-    /// （"hoんらい" 化け: BUG-06 の派生形）。BUG-173 以降は物理 F2 の代わりの warmup を送らないので、
-    /// 基準点は 0（未送信）のまま次の送信まで残る。
     ///
     pub fn mark_composition_cold(&self, reason: ColdReason) {
         self.composition.mark_composition_cold(reason);
@@ -540,67 +486,6 @@ impl Output {
         self.composition.on_focus_changed();
         // deferred_vks は TsfProbeData に内包されているため、
         // pending_tsf が Some の場合は probe と一緒にドロップされる。
-    }
-
-    // ── TsfGate ラッパー ──────────────────────────────────────────────────
-
-    /// フォーカス変更時に `tsf_gate` を `PendingWarmup` に遷移させる。
-    ///
-    /// 呼び出し後に `TIMER_TSF_GATE` を `WARMUP_TIMEOUT_MS` ms でセットすること。
-    ///
-    /// Chrome/Edge は複数の focus イベントを連続発生させる（タブ・アドレスバー・コンテンツ等）。
-    /// すでに `PendingWarmup` 中なら `on_focus_change()` を呼ばず held バッファを保持する。
-    /// 呼び出し元がタイマーをリセットするため warmup 期間は延長されるが、
-    /// Ctrl+T 等のショートカットが複数回のフォーカスイベントで消去されることを防ぐ。
-    pub fn on_focus_change_tsf(&mut self) {
-        if self.tsf_gate.state() == crate::tsf::TsfGateState::PendingWarmup {
-            tracing::debug!(
-                "[tsf-gate] focus change while PendingWarmup — held バッファを保持して再初期化スキップ (Chrome等の連続フォーカスイベント対策)"
-            );
-            return;
-        }
-        self.tsf_gate.on_focus_change();
-    }
-
-    /// TSF モード確定時に `tsf_gate` を `Probing` に遷移させ、保留キーを返す。
-    ///
-    /// 呼び出し後に `TIMER_TSF_GATE` を kill すること。
-    #[must_use]
-    pub(crate) fn confirm_tsf(&mut self) -> Vec<awase::types::RawKeyEvent> {
-        self.tsf_gate.on_tsf_confirmed()
-    }
-
-    /// 非 TSF モード確定時に `tsf_gate` を `Bypass` に遷移させ、保留キーを返す。
-    ///
-    /// 呼び出し後に `TIMER_TSF_GATE` を kill すること。
-    #[must_use]
-    pub(crate) fn bypass_tsf(&mut self) -> Vec<awase::types::RawKeyEvent> {
-        self.tsf_gate.on_bypass()
-    }
-
-    /// `TIMER_TSF_GATE` タイムアウト時に呼ぶ。`Bypass` にフォールバックし、保留キーを返す。
-    #[must_use]
-    pub fn on_tsf_warmup_timeout(&mut self) -> Vec<awase::types::RawKeyEvent> {
-        self.tsf_gate.on_warmup_timeout()
-    }
-
-    /// キーを `tsf_gate` で処理する。`true` = 保留（呼び出し元は Consumed を返すこと）。
-    pub fn try_hold_key(&mut self, event: awase::types::RawKeyEvent) -> bool {
-        self.tsf_gate.try_hold(event)
-    }
-
-    /// TSF プローブ完了時に `tsf_gate` を `Probing` → `Ready` に遷移させる。
-    pub(crate) fn on_tsf_probe_ready(&mut self) {
-        self.tsf_gate.on_ready();
-    }
-
-    /// 現在のフォーカス先が TSF 注入モードかどうかを返す。
-    ///
-    /// TSF モード（WezTerm 等）では物理 F2 の扱いが特殊なため、
-    /// executor がこのメソッドで判定してキー処理を切り替える。
-    #[must_use]
-    pub fn is_tsf_mode(&self) -> bool {
-        self.injection_mode == InjectionMode::Tsf
     }
 
     /// BUG-25 GJI 用の「IME-ON 半角英数」entry/exit トグルを送信する。
@@ -681,24 +566,20 @@ impl Output {
 
     /// アクション列を順に実行する
     ///
-    /// 注入モードは `resolve_injection_mode()` で決定:
-    /// - Unicode: Win32/UWP デフォルト。Unicode 直接注入で IME をバイパス。
-    /// - Vk: Chrome/Edge/Electron。Batched VK で IME composition。
-    /// - Tsf: WezTerm 等。Sequential VK で TSF/IME に composition させる。
-    // 注入モード(Unicode/Vk/Tsf)ごとの分岐が本質的に多いディスパッチャ。分割は挙動変更
-    // リスクが高いため、複雑度警告のみ抑制する。
-    #[expect(clippy::cognitive_complexity)]
+    /// 文字・ローマ字は常に Batched VK で送り、IME に composition させる（ADR-276 で Unicode 注入、
+    /// 2026-10-22 に Tsf〈Sequential VK〉注入を撤去した。ADR-0004 追記）。
     pub fn send_keys(&self, actions: &[KeyAction]) {
         // モード解決 + OutputActiveGuard 取得をセッションオブジェクトに委譲
         let session = OutputSession::begin(self);
 
         // mark_send() より前に elapsed を読む。mark_send() は last_send_ms を上書きするため、
-        // 内部の send_romaji_as_tsf 等での ms_since_last_send() は常に ~0ms を返す。
+        // 内部の send_romaji_batched 等での ms_since_last_send() は常に ~0ms を返す。
         // 真の「前回送信からの経過時間」はここで記録する。
         let prev_elapsed_ms = self.ms_since_last_send();
+        // `mode=Vk` は固定(注入は Batched VK だけ)。e2e のスクリプト(`check_startup.py` 等)が
+        // この文字列を手がかりに読むので形を変えない(`test_log_anchors_in_rust_source.py`)。
         tracing::debug!(
-            "send_keys: mode={:?} actions={actions:?} prev_elapsed={}ms",
-            session.mode,
+            "send_keys: mode=Vk actions={actions:?} prev_elapsed={}ms",
             fmt_ms(prev_elapsed_ms)
         );
 
@@ -726,44 +607,18 @@ impl Output {
                     self.injector.send_key(*vk, true);
                 }
                 KeyAction::Char(ch) => {
-                    tracing::debug!("  → Char('{ch}') via {}", sender.mode_label());
+                    tracing::debug!("  → Char('{ch}')");
                     sender.send_char(*ch);
                 }
                 KeyAction::Suppress => {
                     tracing::debug!("  → Suppress");
                 }
                 KeyAction::Romaji(s) => {
-                    tracing::debug!("  → Romaji(\"{s}\") via {}", sender.mode_label());
+                    tracing::debug!("  → Romaji(\"{s}\")");
                     sender.send_romaji(s);
-                    // Unicode モードで未学習クラスの場合、GJI write を観測して事後昇格を判断する。
-                    // observe_unicode_literal フラグは Platform が request_unicode_observation() でセット。
-                    // 最初の Romaji 送信時に 1 回だけ消費する（複数文字を 1 回の send_keys で送る場合も 1 度のみ）。
-                    if self
-                        .observe_unicode_literal
-                        .swap(false, std::sync::atomic::Ordering::Relaxed)
-                        && self.injection_mode == InjectionMode::Unicode
-                        && !self.warmup_coord.has_pending_tsf()
-                    {
-                        use crate::tsf::ime_mode_fsm::ImeModeState;
-                        let ime_state = self.ime_mode_fsm.borrow().state();
-                        if matches!(ime_state, ImeModeState::Hiragana | ImeModeState::Katakana) {
-                            let baseline = crate::tsf::observer::gji_write_bytes();
-                            let cold_seq = self.composition.cold_start_count();
-                            tracing::debug!(
-                                "[unicode-obs] cold={cold_seq} Unicode Romaji 送信後に GJI write 観測開始 \
-                                (baseline={baseline})",
-                                cold_seq = cold_seq.value(),
-                            );
-                            self.install_pending_tsf(Box::new(
-                                crate::tsf::warmup::unicode_literal_observer::UnicodeLiteralObserverFsm::new(
-                                    baseline, cold_seq,
-                                ),
-                            ));
-                        }
-                    }
                 }
                 KeyAction::KeySequence(s) => {
-                    tracing::debug!("  → KeySequence(\"{s}\") via {}", sender.mode_label());
+                    tracing::debug!("  → KeySequence(\"{s}\")");
                     sender.send_key_sequence(s);
                 }
                 KeyAction::CtrlChord(vk) => {
@@ -799,11 +654,9 @@ impl Output {
             }
         }
 
-        // VK/TSF モードで出力した場合、直後の IME ポーリングをガードするため
+        // VK/TSF モードで出力した直後の IME ポーリングをガードするため
         // タイムスタンプを記録する（母音落ち「て→tえ」防止）。
-        if session.is_vk_mode() {
-            Self::mark_vk_output();
-        }
+        Self::mark_vk_output();
 
         // executor が「output in-flight」判定に使う送信時刻を記録する。
         self.mark_send();
@@ -813,15 +666,18 @@ impl Output {
     /// composition の温度状態を評価する。
     #[must_use]
     pub(super) fn assess_warmth(&self) -> WarmthContext {
+        // 判断は `warm_send_plan::plan_warmth`（FCIS F6b）。読むのは副作用の無い Cell/RefCell だけ。
         let warm = self.is_composition_warm();
         let elapsed = self.ms_since_last_send();
-        let session_expired =
-            warm && elapsed < u64::MAX && elapsed > crate::tuning::COMPOSITION_TIMEOUT_MS;
+        let plan = warm_send_plan::plan_warmth(warm_send_plan::WarmthFacts {
+            warm,
+            needs_f2_probe: self.warmup_coord.needs_f2_probe(),
+        });
+        tracing::trace!("[warmth] reason={:?}", plan.reason);
         WarmthContext {
             warm,
             elapsed,
-            session_expired,
-            prepend_f2_warmup: (!warm || session_expired) && self.warmup_coord.needs_f2_probe(),
+            prepend_f2_warmup: plan.prepend_f2_warmup,
         }
     }
 
@@ -840,7 +696,7 @@ impl Output {
     }
 
     /// `defer_if_probe_in_flight` から `raw_recovery_owns_deferred()` の条件だけを
-    /// 除いた版。`send_romaji_batched_bypass_gate`/`send_romaji_as_tsf_bypass_gate`
+    /// 除いた版。`send_romaji_batched_bypass_gate`
     /// （raw recovery 回収再送・ADR-101 決定3 retry 専用）が使う。
     ///
     /// `raw_recovery_owns_deferred()` は「今まさに自分が処理している recovery か」
@@ -859,18 +715,32 @@ impl Output {
         self.defer_if_probe_or_recovery_in_flight(romaji, origin, false)
     }
 
-    /// `defer_if_probe_or_recovery_in_flight` と同じ「defer すべきか」の
-    /// 判定だけを、実際に defer せず覗き見る版。
-    /// `vk_send.rs::drain_pending_deferred_before_send_if_queue_only`
-    /// （ADR-123 決定4-3 drain-before-send）が、`pending_deferred` が
-    /// 「queue-only」（誰も blocking していないのに非空）かどうかを判定する
-    /// ために使う。`raw_recovery_owns_deferred()` の呼び出し箇所を
-    /// `output/mod.rs` 内に閉じておくため（INV-F 系の集約方針、
-    /// `tests/architecture_guard.rs::raw_recovery_owns_deferred_call_sites_are_accounted_for`
-    /// 参照）、`vk_send.rs` 側から直接呼ばずこの accessor 経由にする。
+    /// probe/recovery が進行中か（`probe_or_recovery_block_reason` の bool 版。ADR-203 の参照用）。
     pub(super) fn is_probe_or_recovery_blocking(&self, check_raw_recovery: bool) -> bool {
-        self.warmup_coord.has_pending_tsf()
-            || (check_raw_recovery && self.raw_recovery_owns_deferred())
+        self.probe_or_recovery_block_reason(check_raw_recovery)
+            .is_some()
+    }
+
+    /// 判断は `deferred_gate_plan::plan_blocking`（FCIS F6）。`raw_recovery_owns_deferred()` は元の短絡評価と同じく
+    /// 必要なときだけ読む。使い手は `finish_probe_stage`（段末の解放。F6c）と、
+    /// `vk_send.rs::drain_pending_deferred_before_send_if_queue_only`（ADR-123 決定4-3）。後者は、
+    /// `pending_deferred` が「queue-only」（誰も blocking していないのに非空）かを判定するためにこれを使う。
+    /// `raw_recovery_owns_deferred()` の呼び出し箇所を `output/mod.rs` 内に閉じておくため（INV-F 系の集約方針、
+    /// `tests/architecture_guard.rs::raw_recovery_owns_deferred_call_sites_are_accounted_for` 参照）、
+    /// `vk_send.rs` 側から直接呼ばずこの accessor 経由にする。
+    pub(super) fn probe_or_recovery_block_reason(
+        &self,
+        check_raw_recovery: bool,
+    ) -> Option<deferred_gate_plan::BlockReason> {
+        let has_pending_tsf = self.warmup_coord.has_pending_tsf();
+        let raw_recovery_owns =
+            deferred_gate_plan::needs_raw_recovery_read(check_raw_recovery, has_pending_tsf)
+                && self.raw_recovery_owns_deferred();
+        deferred_gate_plan::plan_blocking(deferred_gate_plan::BlockingFacts {
+            has_pending_tsf,
+            check_raw_recovery,
+            raw_recovery_owns,
+        })
     }
 
     fn defer_if_probe_or_recovery_in_flight(
@@ -900,24 +770,29 @@ impl Output {
         check_raw_recovery: bool,
         log_desc: &str,
     ) -> bool {
-        if !self.is_probe_or_recovery_blocking(check_raw_recovery) {
-            return false;
-        }
-        // ADR-123 変更A+C 決定4-3: 件数上限を超える場合は defer を諦め、
-        // 通常送信経路（今日の挙動と同じ、probe保護なしの可能性あり）へ
-        // degrade する。「最も古いエントリから強制flush」は probe の
-        // per-VK confirm 中に生VKを割り込ませることになり危険なため採らない
-        // （`TsfWarmupCoordinator::would_exceed_deferred_cap` の doc コメント
-        // 参照）。この呼び出しが持つ VK 数（`vks.len()`）を渡して判定する
-        // ——1件だけを見て許可すると、複数VKからなるromajiの一括pushで
-        // 上限を超えうる（2026-09-03 code review指摘で修正）。
-        if self.warmup_coord.would_exceed_deferred_cap(vks.len()) {
-            tracing::error!(
-                "[pending-deferred] count limit exceeded, degrading to immediate send: \
-                 input={log_desc:?} origin={origin:?} vk_count={}",
-                vks.len()
-            );
-            return false;
+        let blocking = self.probe_or_recovery_block_reason(check_raw_recovery);
+        // 件数上限は進行中のときだけ読む（元の読む回数と同じ）。
+        let would_exceed_cap =
+            blocking.is_some() && self.warmup_coord.would_exceed_deferred_cap(vks.len());
+        match deferred_gate_plan::plan_defer(blocking, would_exceed_cap) {
+            deferred_gate_plan::DeferPlan::NotBlocked => return false,
+            // ADR-123 変更A+C 決定4-3: 件数上限を超える場合は defer を諦め、
+            // 通常送信経路（今日の挙動と同じ、probe保護なしの可能性あり）へ
+            // degrade する。「最も古いエントリから強制flush」は probe の
+            // per-VK confirm 中に生VKを割り込ませることになり危険なため採らない
+            // （`TsfWarmupCoordinator::would_exceed_deferred_cap` の doc コメント
+            // 参照）。この呼び出しが持つ VK 数（`vks.len()`）を渡して判定する
+            // ——1件だけを見て許可すると、複数VKからなるromajiの一括pushで
+            // 上限を超えうる（2026-09-03 code review指摘で修正）。
+            deferred_gate_plan::DeferPlan::DegradeCapExceeded(reason) => {
+                tracing::error!(
+                    "[pending-deferred] count limit exceeded, degrading to immediate send: \
+                     input={log_desc:?} origin={origin:?} vk_count={} reason={reason:?}",
+                    vks.len()
+                );
+                return false;
+            }
+            deferred_gate_plan::DeferPlan::Defer(_) => {}
         }
         tracing::debug!(
             "[tsf] probe/recovery in flight → deferred {} VK(s) for {:?}",
@@ -931,7 +806,7 @@ impl Output {
     /// probe/recovery 進行中なら単一 VK を deferred_vks に追記し true を返す。
     /// 進行中でなければ何もせず false を返す。
     ///
-    /// 呼び出し元 (`vk_send.rs` の `send_char_as_tsf`/`send_char_as_vk`) は
+    /// 呼び出し元 (`vk_send.rs` の `send_char_as_vk`) は
     /// `CharResolution::Vk` の生 VK フォールバック経路にあり、2026-08-05 の
     /// BUG-47 追補修正で `vk_pair_to_ascii` が `build_symbol_to_vk` の全記号を
     /// カバーするようになったため、現状この2箇所は理論上到達しない
@@ -962,22 +837,31 @@ impl Output {
         )
     }
 
+    /// 前景窓が、per-VK の確認の「2 番目以降の疑い」を信用できないクラスか(BUG-215)。
+    #[allow(unsafe_code)] // 前景窓のクラス名の読み取り(Win32)
+    fn foreground_later_vk_literal_check_unreliable() -> bool {
+        // SAFETY: Win32 GetForegroundWindow + GetClassName; returns empty string on failure.
+        let fg_class = unsafe { crate::ime::get_foreground_window_class() };
+        crate::focus::class_names::is_later_vk_literal_check_unreliable_window(&fg_class)
+    }
+
     /// TIMER_TSF_PROBE ハンドラから呼ぶ。probe を 1 ステップ進め、結果を返す。
     ///
     /// `WindowsPlatform::advance_tsf_probe` は `timer_cmd` を `apply_timer_command` に渡し、
     /// `gji_response` を `dispatch_gji_response` に渡す。
     /// pending_tsf の有無とタイマー kill/set の判断はここで完結する。
-    pub(crate) fn step_probe(&mut self) -> StepProbeResult {
+    pub(crate) fn step_probe(&self) -> StepProbeResult {
         let tick_t = crate::hook::current_tick_ms();
         let env = {
             let ime_fsm = self.ime_mode_fsm.borrow();
             crate::tsf::warmup::probe_fsm::TsfEnvSnapshot {
-                is_tsf_mode: self.is_tsf_mode(),
                 gji_active: crate::tsf::observer::gji_is_active_ime(),
+                later_vk_literal_check_unreliable:
+                    Self::foreground_later_vk_literal_check_unreliable(),
+                stage_origin_now: Some(self.current_stage_origin()),
                 ime_mode: ime_fsm.state(),
                 ime_mode_confirmed: ime_fsm.is_confirmed(),
                 confirm_gate_deadline_override_ms: self.confirm_gate_deadline_override_ms.get(),
-                deferred_pending: self.warmup_coord.has_pending_deferred(),
                 gji_candidate_visible_now: crate::tsf::observer::gji_candidate_visible_now(),
                 literal_session_confirmed_gen:
                     crate::tsf::observer::literal_session_confirmed_gen_snapshot(),
@@ -993,7 +877,6 @@ impl Output {
                 },
                 gji_response: None,
                 needs_gji_composition_reset: false,
-                learned_tsf: false,
                 completed_cold_seq: None,
                 literal_detect: crate::tsf::literal_facts::LiteralDetectTrace::default(),
             };
@@ -1019,29 +902,63 @@ impl Output {
                     },
                     gji_response: None,
                     needs_gji_composition_reset,
-                    learned_tsf: false,
                     completed_cold_seq: None,
                     literal_detect,
                 }
             }
             probe_io::DispatchResult::Ended(end) => {
                 // `machine` はここで drop される（restore しない）＝段の終わり。
-                let learned_tsf = end.reason == crate::tsf::gji_fsm::StageEndReason::UpgradedToTsf;
                 drop(machine);
                 let needs_gji_composition_reset = self.warmup_coord.take_composition_reset();
+                // ADR-270: 段末の deferred 解放（`finish_probe_stage`）より前に、Mozc の確認を張る。張った後は
+                // `pending_tsf` があるので、後続のキーは保留されたまま、確認の終わりで解放される。
+                let compose_check_installed = self.install_mozc_compose_check_if_requested();
                 let gji_response = self.finish_probe_stage(end);
                 StepProbeResult {
-                    timer_cmd: TimerCommand::Kill {
-                        id: crate::TIMER_TSF_PROBE,
+                    timer_cmd: if compose_check_installed {
+                        TimerCommand::Continue {
+                            id: crate::TIMER_TSF_PROBE,
+                            delay: Duration::from_millis(10),
+                        }
+                    } else {
+                        TimerCommand::Kill {
+                            id: crate::TIMER_TSF_PROBE,
+                        }
                     },
                     gji_response,
                     needs_gji_composition_reset,
-                    learned_tsf,
                     completed_cold_seq: Some(cold_seq),
                     literal_detect,
                 }
             }
         }
+    }
+
+    /// ADR-270: 予約があれば、Mozc の「入力中の文字ができたかの確認」を `pending_tsf` に張る。張ったら `true`。
+    ///
+    /// 予約は常にここで取り出す（張らなかった段の予約が、後の別の段に持ち越されない）。
+    fn install_mozc_compose_check_if_requested(&self) -> bool {
+        let Some(target) = self.mozc_compose_request.borrow_mut().take() else {
+            return false;
+        };
+        tracing::debug!(
+            "[mozc-compose] cold={} checking composition after sending {:?} (thread={} deadline={}ms)",
+            target.cold_seq.value(),
+            target.romaji,
+            target.thread_id,
+            crate::tuning::MOZC_COMPOSE_CHECK_MS
+        );
+        // 終わる段の記録を壊さない `install_followup_tsf` で張る（`install_pending_tsf` は `begin_stage()` で記録を初期化する）。
+        // 確認の FSM は、終わる段の宛先（最初の送信より前に採った値）を持って、宛先の窓が変わったら確認も回収もやめる。
+        let origin = self.warmup_coord.stage_origin();
+        self.warmup_coord.install_followup_tsf(Box::new(
+            crate::tsf::warmup::mozc_compose_check_fsm::MozcComposeCheckFsm::new(
+                target,
+                crate::tuning::MOZC_COMPOSE_CHECK_MS,
+                origin,
+            ),
+        ));
+        true
     }
 
     /// deferred VK の解放権が raw literal 回収 / GJI reinit retry 側にあるか（INV-F）。
@@ -1069,27 +986,38 @@ impl Output {
     /// 呼び出し元は `step_probe` の `Ended` アームただ1つ（machine が drop される
     /// 唯一の点）。`cancel_probe` は別途、段を畳んで捨てる形で同じ資源を後始末する。
     fn finish_probe_stage(
-        &mut self,
+        &self,
         end: probe_io::StageEnd,
     ) -> Option<timed_fsm::Response<crate::tsf::gji_fsm::GjiAction, crate::tsf::gji_fsm::GjiTimer>>
     {
         // (a) deferred VK の解放。所有権が raw literal 回収側にある間は触らない（INV-F）。
-        if self.raw_recovery_owns_deferred() {
-            tracing::debug!(
-                "[stage-end] {:?}: deferred の解放は raw recovery 側に委ねる",
-                end.reason
-            );
+        // 判断は defer 側・drain-before-send 側と同じ `plan_blocking`（FCIS F6c）。段末では probe は終わっているので
+        // `TsfProbeInFlight` は通常出ないが、出ても flush が何もしない（`take_pending_deferred_if_probe_idle`）のと同じ結果。
+        if let Some(reason) = self.probe_or_recovery_block_reason(true) {
+            let why = match reason {
+                deferred_gate_plan::BlockReason::RawRecoveryOwnsDeferred => {
+                    "raw recovery 側に委ねる"
+                }
+                deferred_gate_plan::BlockReason::TsfProbeInFlight => "見送る（probe が進行中）",
+            };
+            tracing::debug!("[stage-end] {:?}: deferred の解放は{why}", end.reason);
         } else {
             let n = self.flush_pending_deferred_vks();
             if n > 0 {
                 tracing::debug!("[stage-end] {:?}: deferred {n} VK(s) を flush", end.reason);
             }
         }
-        // (c) TsfGate / OUTPUT_GATE ガード。deferred を送り切ってからゲートを開ける。
-        self.on_tsf_probe_ready();
-        self.gji_end_probe_guard();
+        // （旧 (c): GJI probe の OUTPUT_GATE ガード〈`gji_probe_guard`〉は、張る側の Tsf 注入経路
+        // 〈`GjiWarmupCoro`〉とともに 2026-10-22 に撤去した。`TsfProbeCoro` は自分のガードを持つ。）
         // (b) GjiFsm への通知。
         let rec = self.warmup_coord.take_stage_record();
+        // ADR-270: 段末に確認の FSM が続いているなら、終わる段の宛先を、空になった記録へ引き継ぐ。確認の FSM が
+        // リテラルと判断して `record_raw_tsf_literal` を呼んだとき、BUG-194 の宛先照合が効くように。
+        if self.warmup_coord.has_pending_tsf() {
+            if let Some(origin) = rec.origin {
+                self.warmup_coord.stamp_stage_origin(origin);
+            }
+        }
         let probe_id = self.warmup_coord.take_probe_id()?;
         Some(self.gji_on_event(if rec.injected && !rec.recovered {
             crate::tsf::gji_fsm::GjiEvent::WarmupComplete { probe_id }
@@ -1110,6 +1038,17 @@ impl Output {
         machine: Box<dyn crate::tsf::warmup::tickable_fsm::TickableFsm>,
     ) {
         self.warmup_coord.install_pending_tsf(machine);
+        // 段の開始時(最初の VK 送信より前)の宛先を採る。raw literal 回収の破棄判断に使う(BUG-194)。
+        self.warmup_coord
+            .stamp_stage_origin(self.current_stage_origin());
+    }
+
+    /// 現時点の宛先の識別(focus 世代 + 前景窓)。`GetForegroundWindow` は非ブロッキング。
+    fn current_stage_origin(&self) -> crate::state::raw_recovery_plan::StageOrigin {
+        crate::state::raw_recovery_plan::StageOrigin {
+            focus_gen: self.ime_mode_focus_gen.get(),
+            foreground: crate::win32::foreground_scope(),
+        }
     }
 
     /// Chrome/LiteralDetect/GjiWarmup probe が実行中なら継続タイマー命令を返す。
@@ -1130,17 +1069,15 @@ impl Output {
         self.warmup_coord.pending_deferred_len()
     }
 
-    /// GJI probe をキャンセルし、OUTPUT_GATE ガードを解放する。
+    /// GJI probe をキャンセルする。
     ///
     /// `GjiAction::CancelProbe` ハンドラが呼ぶ。内部で以下を一括実行する:
-    /// 1. `pending_tsf` をクリア
-    /// 2. OUTPUT_GATE ガードを解放
-    /// 3. `current_gji_probe_id` をクリア
+    /// 1. `pending_tsf` をクリア（`TsfProbeCoro` のガードも一緒に drop される）
+    /// 2. `current_gji_probe_id` をクリア
     ///
     /// 呼び出し元は続けて `TIMER_TSF_PROBE` を kill すること（タイマー操作は platform の責務）。
     pub(crate) fn cancel_probe(&self) {
         self.warmup_coord.clear_pending_tsf();
-        self.gji_end_probe_guard();
         let _ = self.warmup_coord.take_probe_id();
         let _ = self.warmup_coord.take_stage_record();
         // ADR-103 決定4-f: cancel_probe が発火するのは ImeOff / FocusChange /
@@ -1159,42 +1096,10 @@ impl Output {
 
     /// `warmup_coord` の composition reset フラグを取り出す。
     ///
-    /// `SymbolVkSent` 等の VK 記号送信直後に `send_char_as_tsf` が立てたフラグを
+    /// raw literal 回収（`mark_cold_raw_tsf`）等が立てたフラグを
     /// `platform.rs::send_keys` が drain して `gji_on_composition_reset` を呼ぶために使う。
     pub(crate) fn take_composition_reset(&self) -> bool {
         self.warmup_coord.take_composition_reset()
-    }
-}
-
-impl awase::platform::CompositionOutput for Output {
-    fn send_romaji(&self, romaji: &str) {
-        match self.injection_mode {
-            InjectionMode::Vk => self.send_romaji_batched(romaji),
-            InjectionMode::Tsf => self.send_romaji_as_tsf(romaji),
-            InjectionMode::Unicode => self.send_romaji_as_unicode(romaji),
-        }
-    }
-
-    fn send_kana_char(&self, ch: char) {
-        self.send_char_as_tsf(ch);
-    }
-
-    fn is_composition_warm(&self) -> bool {
-        self.is_composition_warm()
-    }
-
-    fn mark_cold(&self, reason: awase::platform::PlatformColdReason) {
-        use awase::platform::PlatformColdReason;
-        let cold_reason = match reason {
-            PlatformColdReason::FocusChange => ColdReason::FocusChange,
-            PlatformColdReason::ConfirmKey => ColdReason::PassthroughConfirmKey,
-            PlatformColdReason::ImeToggle => ColdReason::SetOpenTrue,
-        };
-        self.mark_composition_cold(cold_reason);
-    }
-
-    fn on_focus_changed(&self) {
-        self.on_focus_changed();
     }
 }
 
@@ -1211,7 +1116,6 @@ impl Output {
     ///
     /// `escape_composition`: partial literal（candidate 表示中に一部だけ literal 化）回収時に
     /// `true`。バックスペース前に `VK_ESCAPE` を送って composition を確実に破棄する。
-    #[expect(clippy::unused_self)]
     pub(crate) fn record_raw_tsf_literal(
         &self,
         backs: usize,
@@ -1219,6 +1123,11 @@ impl Output {
         escape_composition: bool,
     ) {
         use std::sync::atomic::Ordering::Relaxed;
+        // 検出時(literal の 300〜500ms 後)でなく、段の開始時に採った宛先を引き継ぐ。
+        self.raw_literal_origin
+            .set(self.warmup_coord.stage_origin());
+        // 観測専用(ADR-246 Q3): 検出時の hwndFocus。literal 検出は稀なので同期で読む（短いタイムアウト）。
+        self.raw_literal_focus_hwnd.set(Self::observe_focus_hwnd());
         crate::RAW_TSF_LITERAL.backs.store(backs, Relaxed);
         crate::RAW_TSF_LITERAL
             .escape_composition
@@ -1229,9 +1138,81 @@ impl Output {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = romaji;
     }
 
+    /// 観測専用（ADR-246 Q3）。稀な 2 箇所（literal 検出・予約あり flush）からだけ呼ぶこと。
+    #[allow(unsafe_code)]
+    fn observe_focus_hwnd() -> Option<isize> {
+        // SAFETY: Win32 API 呼び出し。タイムアウト付きでワーカースレッド上で実行される。
+        unsafe { crate::win32::focus_hwnd_observed(Duration::from_millis(30)) }
+    }
+
+    /// 予約（`record_raw_tsf_literal`）から flush までに宛先の窓が変わっていたら、送らずに丸ごと捨てる（BUG-194、ADR-246）。
+    ///
+    /// 残った ESC/BS/romaji と、旧窓で打って `pending_deferred` に残っている後続キーが新しい前面窓へ届くのを防ぐ。
+    /// この窓の間は `finish_probe_stage` が probe_id を抜いており GjiFsm も probe を持たないので、FocusChange は
+    /// `cancel_probe` を発火させない。deferred は自分で捨てる必要がある。
+    /// 判断は `state::raw_recovery_plan::plan_raw_recovery`（focus 世代 + 前景窓）。
+    /// 予約も deferred も無ければ何もしない（`None`）。
+    fn discard_raw_recovery_if_moved(&self) -> Option<RawRecoveryOutcome> {
+        self.discard_raw_recovery_if_moved_at(self.current_stage_origin())
+    }
+
+    /// `discard_raw_recovery_if_moved` の本体。flush 時点の宛先 `now` を引数で受ける（テストで前景窓を固定するため）。
+    fn discard_raw_recovery_if_moved_at(
+        &self,
+        now: crate::state::raw_recovery_plan::StageOrigin,
+    ) -> Option<RawRecoveryOutcome> {
+        use crate::state::raw_recovery_plan::{plan_raw_recovery, RawRecoveryDisposition};
+        use std::sync::atomic::Ordering::Relaxed;
+        // 予約が無いときは何もしない（flush は drain のたびに走る。予約の無い回に無関係な deferred を捨てない）。
+        let reserved = crate::RAW_TSF_LITERAL.backs.load(Relaxed) != 0
+            || crate::RAW_TSF_LITERAL.escape_composition.load(Relaxed)
+            || !crate::RAW_TSF_LITERAL
+                .romaji
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty();
+        self.raw_focus_hwnd_changed.set(None);
+        if !reserved {
+            return None;
+        }
+        // 観測専用（判断には使わない）。予約ありの flush だけで読む。
+        self.raw_focus_hwnd_changed
+            .set(crate::state::raw_recovery_plan::focus_hwnd_changed(
+                self.raw_literal_focus_hwnd.get(),
+                Self::observe_focus_hwnd(),
+            ));
+        let recorded = self.raw_literal_origin.get();
+        if plan_raw_recovery(recorded, now) == RawRecoveryDisposition::Send {
+            return None;
+        }
+        self.raw_literal_origin.set(None);
+        let backs = crate::RAW_TSF_LITERAL.backs.swap(0, Relaxed);
+        let esc = crate::RAW_TSF_LITERAL
+            .escape_composition
+            .swap(false, Relaxed);
+        let romaji = std::mem::take(
+            &mut *crate::RAW_TSF_LITERAL
+                .romaji
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let deferred_vk_count = self.warmup_coord.take_pending_deferred().len();
+        tracing::warn!(
+            "[raw-tsf-literal] 宛先の窓が変わったため回収を破棄 backs={backs} esc={esc} \
+             romaji_present={} deferred_vk_count={deferred_vk_count} recorded={recorded:?} now={now:?}",
+            !romaji.is_empty()
+        );
+        Some(RawRecoveryOutcome::DiscardedStale {
+            backs,
+            romaji_present: !romaji.is_empty(),
+            deferred_vk_count,
+            focus_hwnd_changed: self.raw_focus_hwnd_changed.take(),
+        })
+    }
+
     /// WM_DRAIN_OUTPUT_QUEUE ハンドラから呼ぶ。`flush_raw_tsf_literal_backspaces` の後に呼ぶこと。
     ///
-    /// `RAW_TSF_LITERAL.romaji` に退避されたローマ字を読み取り、`send_romaji_as_tsf` で再送する。
+    /// `RAW_TSF_LITERAL.romaji` に退避されたローマ字を読み取り、`send_romaji_batched_bypass_gate` で再送する。
     /// cold 状態（RawTsfLiteralRecovery）で呼ばれるため warmup probe が走り正しく compose される。
     /// drain キーの前に呼ぶことで「backspace → raw TSF literal char → drain keys」の順を保証する。
     pub fn flush_raw_tsf_literal_romaji(&self) {
@@ -1246,28 +1227,22 @@ impl Output {
             return;
         }
         tracing::debug!("[raw-tsf-literal] re-sending raw TSF literal romaji={romaji:?}");
-        self.send_romaji_dispatching_on_gate(&romaji);
+        self.send_romaji_recovery(&romaji);
     }
 
-    /// TSF gate の状態に応じて `romaji` を通常送信経路へ振り分ける。
+    /// raw literal の回収再送・give-up 後の retry の `romaji` を送る。
     ///
-    /// Bypass (Chrome) では `send_romaji_as_tsf` が GJI probe (`TransmitTarget::Tsf`) を
-    /// 起動するが、Chrome は gate=Bypass のため `dispatch_probe_actions` でスキップされる。
-    /// Chrome バッチパス (`TransmitTarget::Chrome`) を使うことで正しく送信できる。
+    /// 常に Batched VK（`send_romaji_batched_bypass_gate`）で送る。以前は TsfGate が Bypass でない間
+    /// （フォーカス直後の PendingWarmup 中を含む）Tsf 経路へ振り分けていたが、Tsf 注入経路と TsfGate は
+    /// 2026-10-22 に撤去した（ADR-0004 追記）。
     /// `flush_raw_tsf_literal_romaji`（consecutive==0 の通常リカバリ）と
     /// `resend_gji_reinit_retry_romaji`（give-up 後、reinit confirmed 後の retry、
-    /// ADR-101）が共有する — コードレビュー指摘: 以前は同じ分岐が2箇所に
-    /// 手書きで重複していた。
-    fn send_romaji_dispatching_on_gate(&self, romaji: &str) {
-        use probe_io::ProbeIo as _;
+    /// ADR-101）が共有する。
+    fn send_romaji_recovery(&self, romaji: &str) {
         // ADR-123 変更A+C 決定4-2: 新設した defer gate をこの2経路（raw recovery
         // 回収再送・ADR-101 決定3 retry）には適用しない。理由は
         // `send_romaji_batched_bypass_gate` の doc コメント参照。
-        if self.gate_is_bypass() {
-            self.send_romaji_batched_bypass_gate(romaji);
-        } else {
-            self.send_romaji_as_tsf_bypass_gate(romaji);
-        }
+        self.send_romaji_batched_bypass_gate(romaji);
     }
 
     /// raw TSF literal 回収を一括実行: backspace 送信 → romaji 再送 → (あれば) GJI reinit
@@ -1287,10 +1262,16 @@ impl Output {
     /// 取り残された deferred VK を送出してはいけないため（先に送ると backspace が
     /// deferred 側の文字を巻き込んで消してしまう、`docs/known-bugs.md` BUG-38 参照）。
     pub(crate) fn flush_raw_tsf_literal_recovery(&self) -> RawRecoveryOutcome {
+        if let Some(discarded) = self.discard_raw_recovery_if_moved() {
+            return discarded;
+        }
         flush_raw_tsf_literal_backspaces();
         self.flush_raw_tsf_literal_romaji();
         let vk_count = self.flush_stale_deferred_vks_after_recovery();
-        RawRecoveryOutcome::Flushed { vk_count }
+        RawRecoveryOutcome::Flushed {
+            vk_count,
+            focus_hwnd_changed: self.raw_focus_hwnd_changed.take(),
+        }
     }
 
     /// give-up（romaji 再送なし）で `RawTsfLiteralRecovery` が終わった場合に、
@@ -1328,7 +1309,7 @@ impl Output {
     }
 
     /// `warmup_coord.pending_deferred`（probe実行中に届いた後続キーの退避キュー）
-    /// を条件付きで取り出し、TSF gate状態に応じた marker で送信する共通コア。
+    /// を条件付きで取り出し、scan code 付き（`VkMarker::InjectedWithScan`）で送信する共通コア。
     ///
     /// `flush_stale_deferred_vks_after_recovery`（raw recovery直後、`Polling`中は
     /// 呼び出し元が事前ガードする）と `flush_deferred_vks_after_gji_reinit_completion`
@@ -1361,12 +1342,7 @@ impl Output {
                 order_tokens
             );
         }
-        let marker = if self.gate_is_bypass() {
-            VkMarker::InjectedWithScan
-        } else {
-            VkMarker::Tsf
-        };
-        self.send_deferred_vks(&vks, marker);
+        self.send_deferred_vks(&vks, VkMarker::InjectedWithScan);
         len
     }
 }
@@ -1376,6 +1352,7 @@ pub use crate::tsf::output::flush_raw_tsf_literal_backspaces;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::event_origin::Generation;
     use crate::tsf::probe_bridge::OutputActiveGuard;
 
     // ── ColdReason impl メソッドテスト ────────────────────────────────────────
@@ -1387,16 +1364,6 @@ mod tests {
         assert!(!ColdReason::FocusChange.is_confirm_key());
         assert!(!ColdReason::RawTsfLiteralRecovery.is_confirm_key());
         assert!(!ColdReason::SetOpenFalse.is_confirm_key());
-    }
-
-    #[test]
-    fn cold_reason_requires_settle() {
-        assert!(ColdReason::FocusChange.requires_settle());
-        assert!(ColdReason::NativeF2Consumed.requires_settle());
-        assert!(ColdReason::SetOpenTrue.requires_settle());
-        assert!(!ColdReason::PassthroughConfirmKey.requires_settle());
-        assert!(!ColdReason::RawTsfLiteralRecovery.requires_settle());
-        assert!(!ColdReason::SetOpenFalse.requires_settle());
     }
 
     // ── Output 状態管理テスト ───────────────────────────────────────────────────
@@ -1510,6 +1477,9 @@ mod tests {
     #[test]
     fn raw_tsf_literal_backs_roundtrip() {
         use std::sync::atomic::Ordering::Relaxed;
+        let _g = RAW_LITERAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::RAW_TSF_LITERAL.backs.store(3, Relaxed);
         let n = crate::RAW_TSF_LITERAL.backs.swap(0, Relaxed);
         assert_eq!(n, 3);
@@ -1518,6 +1488,9 @@ mod tests {
 
     #[test]
     fn raw_tsf_literal_romaji_roundtrip() {
+        let _g = RAW_LITERAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         {
             let mut guard = crate::RAW_TSF_LITERAL.romaji.lock().unwrap();
             *guard = "konnichiwa".to_string();
@@ -1531,8 +1504,110 @@ mod tests {
         assert!(now_empty.is_empty());
     }
 
-    // ── discard_raw_recovery_if_focus_stale テスト（ADR-101/BUG-74 コードレビュー
-    // 指摘: backspace 送信より前に focus 世代を照合する）──────────────────────────
+    /// BUG-194: record から flush までに FocusChange が割り込んだら、予約（backs/romaji/ESC）と
+    /// 旧窓で打った deferred は捨てられる。実際の順序を模す: 段中に deferred が溜まり、`record`、
+    /// 段末で probe が外れる（`finish_probe_stage` 相当）、`cancel_probe` を介さずに FocusChange、flush。
+    /// 前景窓の変化は純関数 `plan_raw_recovery` のテストで固定する（ここでは世代だけ動かせる）。
+    /// グローバルを触るので `RAW_LITERAL_TEST_LOCK` で直列化する。
+    #[test]
+    fn raw_tsf_literal_and_deferred_are_discarded_when_foreground_changed_before_flush() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _g = RAW_LITERAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let clear = || {
+            crate::RAW_TSF_LITERAL.backs.store(0, Relaxed);
+            crate::RAW_TSF_LITERAL
+                .escape_composition
+                .store(false, Relaxed);
+            crate::RAW_TSF_LITERAL
+                .romaji
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        };
+        let stage = |o: &Output| {
+            o.install_pending_tsf(Box::new(
+                crate::tsf::warmup::probe_fsm::TsfProbeCoro::new_chrome(
+                    "x",
+                    Generation::INITIAL,
+                    crate::tsf::probe::TsfReadinessProbe::new(0, Generation::INITIAL),
+                    OutputActiveGuard::begin(),
+                ),
+            ));
+            for _ in 0..2 {
+                assert!(o.defer_vk_if_probe_in_flight(
+                    VkCode(0x41),
+                    false,
+                    DeferredOrigin::UserInput
+                ));
+            }
+            o.record_raw_tsf_literal(2, "ka".to_string(), true);
+            o.warmup_coord.clear_pending_tsf(); // 段末: probe が外れる
+        };
+        clear();
+
+        use crate::state::foreground_scope::ForegroundScope;
+        use crate::state::raw_recovery_plan::StageOrigin;
+        // 前景窓は実機の値に依存させず、記録時の宛先と flush 時の宛先を明示する。
+        let origin = |o: &Output, hwnd: isize| StageOrigin {
+            focus_gen: o.ime_mode_focus_gen.get(),
+            foreground: ForegroundScope { pid: 1, hwnd },
+        };
+
+        // 宛先が変わっていない: 捨てない（予約も deferred も残る）。
+        let o = make_output();
+        stage(&o);
+        // install の刻印が record に引き継がれている（以降は前景を固定するため上書きする）。
+        assert!(o.raw_literal_origin.get().is_some());
+        o.raw_literal_origin.set(Some(origin(&o, 10)));
+        assert!(o.discard_raw_recovery_if_moved_at(origin(&o, 10)).is_none());
+        assert_eq!(crate::RAW_TSF_LITERAL.backs.load(Relaxed), 2);
+        assert_eq!(o.pending_deferred_len(), 2);
+
+        // N-M1: 世代だけ進み（debounce 済みの FocusChange）、前景窓は同じ: 捨てない。
+        o.on_ime_mode_focus_changed();
+        assert!(o.discard_raw_recovery_if_moved_at(origin(&o, 10)).is_none());
+        assert_eq!(o.pending_deferred_len(), 2);
+        clear();
+
+        // 前景窓が変わった（cancel_probe は呼ばれない）: 予約と deferred を捨てる。
+        let o = make_output();
+        stage(&o);
+        o.raw_literal_origin.set(Some(origin(&o, 10)));
+        let out = o.discard_raw_recovery_if_moved_at(origin(&o, 20));
+        assert!(matches!(
+            out,
+            Some(RawRecoveryOutcome::DiscardedStale {
+                backs: 2,
+                romaji_present: true,
+                deferred_vk_count: 2,
+                ..
+            })
+        ));
+        assert_eq!(crate::RAW_TSF_LITERAL.backs.load(Relaxed), 0);
+        assert!(!crate::RAW_TSF_LITERAL.escape_composition.load(Relaxed));
+        assert_eq!(o.pending_deferred_len(), 0);
+        assert!(!o.raw_recovery_owns_deferred());
+
+        // 予約が無い回は、世代が古くても無関係な deferred を捨てない。
+        o.install_pending_tsf(Box::new(
+            crate::tsf::warmup::probe_fsm::TsfProbeCoro::new_chrome(
+                "x",
+                Generation::INITIAL,
+                crate::tsf::probe::TsfReadinessProbe::new(0, Generation::INITIAL),
+                OutputActiveGuard::begin(),
+            ),
+        ));
+        assert!(o.defer_vk_if_probe_in_flight(VkCode(0x41), false, DeferredOrigin::UserInput));
+        o.on_ime_mode_focus_changed();
+        assert!(o.discard_raw_recovery_if_moved_at(origin(&o, 99)).is_none());
+        assert_eq!(o.pending_deferred_len(), 1);
+        clear();
+    }
+
+    /// `RAW_TSF_LITERAL`(プロセス内グローバル)を触るテストの直列化用。
+    static RAW_LITERAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     // ── defer_if_probe_in_flight_recovery_exempt テスト（ADR-123 変更A+C
     // 決定4-2、Opus敵対的レビュー round4指摘: raw recovery 自身の再送が
@@ -1545,11 +1620,10 @@ mod tests {
         // 超過分が通常送信へ degrade して消えた。通常の打鍵量では上限に達しない。
         let o = make_output();
         o.install_pending_tsf(Box::new(
-            crate::tsf::warmup::chrome_probe::ChromeProbe::new(
+            crate::tsf::warmup::probe_fsm::TsfProbeCoro::new_chrome(
                 "x",
                 Generation::INITIAL,
-                crate::tsf::probe::TsfReadinessProbe::new(0, Generation::INITIAL, 0),
-                0,
+                crate::tsf::probe::TsfReadinessProbe::new(0, Generation::INITIAL),
                 OutputActiveGuard::begin(),
             ),
         ));
@@ -1569,11 +1643,10 @@ mod tests {
         // 固定。romaji版の同名テストと対をなす。
         let o = make_output();
         o.install_pending_tsf(Box::new(
-            crate::tsf::warmup::chrome_probe::ChromeProbe::new(
+            crate::tsf::warmup::probe_fsm::TsfProbeCoro::new_chrome(
                 "x",
                 Generation::INITIAL,
-                crate::tsf::probe::TsfReadinessProbe::new(0, Generation::INITIAL, 0),
-                0,
+                crate::tsf::probe::TsfReadinessProbe::new(0, Generation::INITIAL),
                 OutputActiveGuard::begin(),
             ),
         ));
@@ -1603,11 +1676,10 @@ mod tests {
         // raw_recovery_owns_deferred() の項だけ。
         let o = make_output();
         o.install_pending_tsf(Box::new(
-            crate::tsf::warmup::chrome_probe::ChromeProbe::new(
+            crate::tsf::warmup::probe_fsm::TsfProbeCoro::new_chrome(
                 "x",
                 Generation::INITIAL,
-                crate::tsf::probe::TsfReadinessProbe::new(0, Generation::INITIAL, 0),
-                0,
+                crate::tsf::probe::TsfReadinessProbe::new(0, Generation::INITIAL),
                 OutputActiveGuard::begin(),
             ),
         ));
@@ -1633,11 +1705,10 @@ mod tests {
         // コメント参照）。
         let o = make_output();
         o.install_pending_tsf(Box::new(
-            crate::tsf::warmup::chrome_probe::ChromeProbe::new(
+            crate::tsf::warmup::probe_fsm::TsfProbeCoro::new_chrome(
                 "x",
                 Generation::INITIAL,
-                crate::tsf::probe::TsfReadinessProbe::new(0, Generation::INITIAL, 0),
-                0,
+                crate::tsf::probe::TsfReadinessProbe::new(0, Generation::INITIAL),
                 OutputActiveGuard::begin(),
             ),
         ));

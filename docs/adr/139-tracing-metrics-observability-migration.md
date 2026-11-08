@@ -63,7 +63,7 @@ related_adr:
   snapshot）に分かれていて一貫しない」ことに近い。
 - 独自の event-sourced ジャーナル基盤（`journal.rs`, `journal_policy.rs`,
   `tests/journal_replay.rs`）が既にあり、`state::ime_event::ImeEvent` 等の**ドメイン型を
-  そのまま**記録する（ADR-082 決定1）。`journal_replay.rs` は `tests/journals/*.json` に
+  そのまま**記録する（ADR-082 決定1）。`journal_replay.rs` は `tests/journals/conv_classify/*.json` に
   **手で転記・レビューした** fixture を読む決定論的リプレイ基盤であり、"tracing化すれば
   自動的に良くなる" 類のものではない。
 
@@ -372,7 +372,7 @@ journal の方向で統合する）は不採用と確定する。** 理由は以
    `JournalEntry::ImeEvent`（ADR-082 決定1 の主役、IME belief 系の中心）を含む経路で
    実際に発生し、決定論的リプレイの正確性要件を根本から壊す。
 
-なお `journal_replay.rs` が読むのは `tests/journals/*.json` に**手で転記・レビューした**
+なお `journal_replay.rs` が読むのは `tests/journals/conv_classify/*.json` に**手で転記・レビューした**
 fixture（`journal_replay.rs:22-24,35-40`）であり、発生源を `tracing` に一本化しても
 この人手の転記工程は消えない。Option B の便益はほぼゼロである。
 
@@ -658,3 +658,14 @@ ETW はそれを見せてくれない。
 - `docs/adr/082-*.md`（journal のドメイン型記録、決定4の前提）
 - `docs/adr/120-retroactive-ngram-correction.md`（決定5で置換対象となる手書きカウンタの例）
 - `docs/adr/125-*.md`（`awase.log` 747MB 肥大化の実測記録、決定2の根拠）
+
+## 追記(2026-10-10): 決定 4 は ADR-250 で改訂される(機構の足場は 4-0 で追加済み)
+
+[ADR-250](250-boundary-journal-and-log-unification.md) 決定 5 は、決定 4 の「`emit_tracing` は全 variant を `awase::journal` の `debug` へ出す」を次の 3 点で改める。
+
+1. **レベル**: 手書き行を置き換えた arm だけ、その手書き行の現在のレベル(info/warn)で出す。それ以外は今のまま debug。
+2. **target**: 置き換えた arm だけ、置き換えた手書き行の target(モジュールのパス)にする。つまり**置き換えた arm は `awase::journal` から外れる**(`RUST_LOG=awase::journal=debug` は、置き換えていない記録についてだけ効く)。
+3. **「variant ごとに個別判断すると新しい呼び出し元が増えるたびに前提が崩れる」への答え**: info 以上の arm の一覧と、その型の構築点(`JournalEntry::X {` の呼び出し元)の件数を `architecture_guard.rs` で固定する。
+
+現時点(段階 4-0)では、arm は 1 つも置き換えておらず、上の一覧は**空**で固定している(`journal_emit_tracing_non_debug_arms_are_pinned`)。各 arm のレベル・target の変更は、その手書き行を消す PR と同じ PR で一覧に足す。決定 2(ログ肥大の防止)は、既定 `info` の下での出力件数が増えないこと、CI の `awase.log` が閾値(ADR-250 台帳で提案した 10MB)以下であることで引き続き守る。
+

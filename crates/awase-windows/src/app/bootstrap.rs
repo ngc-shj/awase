@@ -30,10 +30,10 @@ use crate::{with_app, with_app_ref, LayoutEntry, Runtime, RUNTIME};
 use super::logging;
 use super::{
     build_panic_trigger_combos, cli_arg_config_path, ensure_default_layouts_exist,
-    init_ime_sync_keys, init_ngram_validated, load_config, parse_key_combos, resolve_relative,
-    run_message_loop, set_taskbar_created_msg, HotKeyGuard, RapidPressTracker, StartupDiagnostics,
-    DUMP_TRIGGER, HOTKEY_ID_FOCUS_OVERRIDE, HOTKEY_ID_TOGGLE, RAPID_IME_TIMESTAMPS,
-    WM_DUPLICATE_INSTANCE,
+    init_ime_sync_keys, init_lang_detect_validated, init_ngram_validated, load_config,
+    parse_key_combos, resolve_relative, run_message_loop, set_taskbar_created_msg, HotKeyGuard,
+    RapidPressTracker, StartupDiagnostics, DUMP_TRIGGER, HOTKEY_ID_FOCUS_OVERRIDE,
+    HOTKEY_ID_TOGGLE, RAPID_IME_TIMESTAMPS, WM_DUPLICATE_INSTANCE,
 };
 
 fn show_no_layouts_dialog(layouts_dir: &Path) {
@@ -89,6 +89,47 @@ pub(super) fn warn_layout_fallback(
     );
     crate::win32::show_error_dialog("awase - レイアウトの読み込みに失敗しました", &message);
     true
+}
+
+/// 親指キー割り当て由来の Engine 設定を適用する（起動時とリロード時の共通手順、ECRS A2/R5）。
+///
+/// left/right のいずれかが Space / 無変換 / 変換 / Enter に割り当てられている場合、その VK を
+/// Engine/NicolaFsm に伝える。core 側は VK 番号の意味を知らず、ここで渡した値との等値比較のみで
+/// 判定する（`config.rs` の `space_thumb_*`・`muhenkan/henkan_solo_tap_*`・`enter_thumb_*` doc 参照）。
+pub(crate) fn apply_thumb_engine_config(
+    engine: &mut Engine,
+    left_vk: VkCode,
+    right_vk: VkCode,
+    general: &awase::config::GeneralConfig,
+) {
+    let find = |target: VkCode| [left_vk, right_vk].into_iter().find(|&vk| vk == target);
+    engine.set_space_thumb_config(
+        find(crate::vk::VK_SPACE),
+        TextKeyConfig {
+            ignore_composing_guard: general.space_thumb_ignore_composing_guard,
+            shift_literal: general.space_thumb_shift_literal,
+        },
+    );
+    engine.set_thumb_key_solo_tap_config(
+        find(crate::vk::VK_NONCONVERT),
+        ModeKeyConfig::from_legacy_bools(
+            general.muhenkan_solo_tap_ignore_composing_guard,
+            general.muhenkan_solo_tap_always_suppress,
+        ),
+        find(crate::vk::VK_CONVERT),
+        ModeKeyConfig::from_legacy_bools(
+            general.henkan_solo_tap_ignore_composing_guard,
+            general.henkan_solo_tap_always_suppress,
+        ),
+    );
+    engine.set_enter_thumb_config(
+        find(crate::vk::VK_RETURN),
+        TextKeyConfig {
+            ignore_composing_guard: general.enter_thumb_ignore_composing_guard,
+            shift_literal: general.enter_thumb_shift_literal,
+        },
+    );
+    engine.set_thumb_shift_faces_enabled(thumb_shift_faces_enabled_for(left_vk, right_vk));
 }
 
 /// 親指+小指シフト複合面を有効にできる親指キー構成かを返す。
@@ -625,7 +666,7 @@ impl HotKeyGuard {
     /// ためだけの関数が型定義（`app/mod.rs`）から離れたファイルにあった）。
     /// 挙動は変更していない。
     fn register_toggle(hotkey_str: &str) -> Result<Self> {
-        let (modifiers, vk) = crate::vk::parse_hotkey(hotkey_str)
+        let (modifiers, vk) = crate::vk_windows::parse_hotkey(hotkey_str)
             .context(format!("Invalid toggle hotkey format: {hotkey_str}"))?;
         // SAFETY: RegisterHotKey with None HWND registers on the calling thread's message queue; VK and modifiers are valid values.
         unsafe {
@@ -747,8 +788,7 @@ pub(super) fn initialize_app(
             crate::focus::tracker::FocusTracker::new(
                 crate::focus::cache::FocusCache::new(),
                 crate::focus::classifier::ForceOverrides::new(config.app_overrides.clone()),
-                crate::focus::classifier::ImmCapabilityStore::new(base_dir.clone()),
-                crate::focus::classifier::InjectionModeStore::new(base_dir),
+                crate::focus::classifier::ImmCapabilityStore::new(base_dir),
             ),
             journal_stamper,
         ),
@@ -776,8 +816,12 @@ pub(super) fn initialize_app(
         app.set_predict_henkan_open_in_unreadable_windows(
             config.general.predict_henkan_open_in_unreadable_windows,
         );
+        // ADR-282 V2-2: Engine の入力の belief を候補 Z から読むか(隠し設定、既定 false)。
+        app.set_belief_v2(config.general.belief_v2);
         app.set_warn_state_dependent_mode_keys(config.general.warn_state_dependent_mode_keys);
         app.set_hook_self_heal_enabled(config.diagnostics.hook_self_heal);
+        // ADR-265 段階 1: mozc-readable の共有メモリの影の読み（観測のみ。既定は無効のオプトイン。反映は再起動後）
+        app.init_mozc_shm(config.diagnostics.mozc_shm_shadow);
         app.set_passthrough_thumb_mode_keys(&config.general);
         app.set_half_width_alnum_toggle_policy(config.general.half_width_alnum_toggle);
         app.set_muhenkan_dedicated_fn_key_config(dedicated_fn_key);
@@ -788,7 +832,9 @@ pub(super) fn initialize_app(
         ));
     });
     RAPID_IME_TIMESTAMPS.set(RapidPressTracker::new());
-    DUMP_TRIGGER.set(crate::journal::DumpTriggerTracker::new());
+    DUMP_TRIGGER.set(crate::journal::DumpTriggerTracker::with_clock(
+        quanta::Clock::new(),
+    ));
 }
 
 /// 起動時に IME 状態キャッシュを初期化する（Unknown → 実際の値）。
@@ -850,9 +896,8 @@ unsafe extern "system" fn win_event_proc(
 ) {
     use std::sync::atomic::{AtomicIsize, Ordering as AtomicOrdering};
     // 同一 HWND からの連続 EVENT_OBJECT_FOCUS は Chrome / UWP の子オブジェクト由来で
-    // 数 ms 間隔で多発する。毎回 TsfGate を PendingWarmup に巻き戻すと、
-    // ユーザーが押下した文字キーが held queue ごと破棄されて入力ロスする
-    // （特に Chrome で文字入力不能になる症状）。
+    // 数 ms 間隔で多発する。毎回フォーカス変更として扱うと、IME リフレッシュの再スケジュール等が
+    // 連発する（当初の理由は旧 TsfGate〈2026-10-22 撤去〉の held queue が破棄されて入力ロスすることだった）。
     // HWND が変わっていない場合は早期 return する。
     static LAST_FOCUS_HWND: AtomicIsize = AtomicIsize::new(0);
 
@@ -861,6 +906,18 @@ unsafe extern "system" fn win_event_proc(
     }
 
     if hwnd.non_null().is_none() {
+        return;
+    }
+
+    // BUG-202: コンテキストメニュー（クラス `#32768`）の項目がハイライトされると（マウスのホバー・
+    // キーボード）、メニュー窓へ `EVENT_OBJECT_FOCUS` が出る。メニューは元の窓にフォーカスを残した
+    // まま別の窓へこのイベントを出すだけで、入力先は変わらない。これを窓の切替として扱うと
+    // フォーカス窓の分類が走る（当時は旧 TsfGate の held 破棄も起きた。TsfGate は 2026-10-22 撤去）。
+    // **重複排除（`LAST_FOCUS_HWND`）より前で弾く**: 後だと `LAST_FOCUS_HWND` がメニュー窓に
+    // 上書きされ、メニューを閉じて元の窓へ戻る `FOCUS` が「新しい窓」として再び拾われる。
+    if crate::focus::class_names::is_popup_menu_window_class(
+        &crate::focus::classify::get_class_name_string(hwnd),
+    ) {
         return;
     }
 
@@ -879,6 +936,29 @@ unsafe extern "system" fn win_event_proc(
         #[expect(clippy::cast_sign_loss)]
         app.on_window_focus_event(crate::state::ime_event::HwndId(hwnd_isize as usize), now);
     });
+}
+
+/// ADR-261 段階 1: 入力インジケーターの字形の影の取り込み（観測のみ）の WinEvent コールバック。
+/// `EVENT_SYSTEM_FOREGROUND`（前面窓の変化）で、メッセージループ上で呼ばれる。重い判断はせず、
+/// `Runtime::indicator_glyph_on_foreground` へ渡すだけ（前置きのフィルタ・待ち時間はそちらとワーカーが扱う）。
+/// `observer/` 内では `with_app` を呼べない（B-1）ので、`win_event_proc` と同じくここ（`app/`）に置く。
+unsafe extern "system" fn indicator_glyph_foreground_event_proc(
+    _hook: windows::Win32::UI::Accessibility::HWINEVENTHOOK,
+    event: u32,
+    hwnd: HWND,
+    _id_object: i32,
+    _id_child: i32,
+    _event_thread: u32,
+    _event_time: u32,
+) {
+    use windows::Win32::UI::WindowsAndMessaging::EVENT_SYSTEM_FOREGROUND;
+    if event != EVENT_SYSTEM_FOREGROUND {
+        return;
+    }
+    let Some(hwnd) = hwnd.non_null() else {
+        return;
+    };
+    let _ = with_app(|app| app.indicator_glyph_on_foreground(hwnd));
 }
 
 /// Ctrl+C ハンドラを登録（Win32 SetConsoleCtrlHandler）
@@ -1169,79 +1249,25 @@ pub(super) fn run_all() -> Result<()> {
         &ime_control_off_keys,
         &ime_control_toggle_keys,
         config.general.engine_toggle_hotkey.as_deref(),
+        config.general.muhenkan_solo_tap_dedicated_fn_key.as_deref(),
     );
 
-    let mut special_keys = SpecialKeyCombos {
+    let special_keys = SpecialKeyCombos {
         engine_on: engine_on_keys,
         engine_off: engine_off_keys,
         ime_on: ime_control_on_keys,
         ime_off: ime_control_off_keys,
         ime_toggle: ime_control_toggle_keys,
     };
-    // ADR-206 決定4: 非推奨の `*_solo_tap_ime_action`（親指キーのもの）は bare の開閉として扱う。
-    crate::runtime::migrate_legacy_solo_tap_actions(&config.general, &mut special_keys);
     let forced_open_actions = crate::runtime::thumb_forced_open_actions(&special_keys);
     let mut engine = Engine::new(fsm, special_keys);
     engine.set_thumb_forced_open_actions(forced_open_actions.0, forced_open_actions.1);
-
-    // left/right のいずれかが Space (VK_SPACE) に割り当てられている場合、
-    // その VK を Engine/NicolaFsm に伝える。core 側は VK 番号の意味を知らず、
-    // ここで渡した値との等値比較のみで「Space かどうか」を判定する
-    // （config.rs の space_thumb_ignore_composing_guard/space_thumb_shift_literal doc 参照）。
-    let space_thumb_vk = [left_thumb_vk, right_thumb_vk]
-        .into_iter()
-        .find(|&vk| vk == crate::vk::VK_SPACE);
-    engine.set_space_thumb_config(
-        space_thumb_vk,
-        TextKeyConfig {
-            ignore_composing_guard: config.general.space_thumb_ignore_composing_guard,
-            shift_literal: config.general.space_thumb_shift_literal,
-        },
-    );
 
     // ADR-120 決定0a 項目7(a): 物理 BACKSPACE の VK を Engine/NicolaFsm に伝える
     // （観測専用、実際の変換結果には一切影響しない）。
     engine.set_backspace_vk(Some(crate::vk::VK_BACK));
 
-    // 同様に、left/right のいずれかが無変換/変換に割り当てられている場合、
-    // その VK を伝える（config.rs の muhenkan/henkan_solo_tap_ignore_composing_guard
-    // doc 参照）。
-    let muhenkan_vk = [left_thumb_vk, right_thumb_vk]
-        .into_iter()
-        .find(|&vk| vk == crate::vk::VK_NONCONVERT);
-    let henkan_vk = [left_thumb_vk, right_thumb_vk]
-        .into_iter()
-        .find(|&vk| vk == crate::vk::VK_CONVERT);
-    engine.set_thumb_key_solo_tap_config(
-        muhenkan_vk,
-        ModeKeyConfig::from_legacy_bools(
-            config.general.muhenkan_solo_tap_ignore_composing_guard,
-            config.general.muhenkan_solo_tap_always_suppress,
-        ),
-        henkan_vk,
-        ModeKeyConfig::from_legacy_bools(
-            config.general.henkan_solo_tap_ignore_composing_guard,
-            config.general.henkan_solo_tap_always_suppress,
-        ),
-    );
-
-    // 同様に、left/right のいずれかが Enter に割り当てられている場合、その VK を
-    // 伝える（config.rs の enter_thumb_ignore_composing_guard/enter_thumb_shift_literal
-    // doc 参照）。
-    let enter_thumb_vk = [left_thumb_vk, right_thumb_vk]
-        .into_iter()
-        .find(|&vk| vk == crate::vk::VK_RETURN);
-    engine.set_enter_thumb_config(
-        enter_thumb_vk,
-        TextKeyConfig {
-            ignore_composing_guard: config.general.enter_thumb_ignore_composing_guard,
-            shift_literal: config.general.enter_thumb_shift_literal,
-        },
-    );
-    engine.set_thumb_shift_faces_enabled(thumb_shift_faces_enabled_for(
-        left_thumb_vk,
-        right_thumb_vk,
-    ));
+    apply_thumb_engine_config(&mut engine, left_thumb_vk, right_thumb_vk, &config.general);
     engine.apply_general_config(&config.general);
 
     if let Some(vk) = config
@@ -1281,6 +1307,7 @@ pub(super) fn run_all() -> Result<()> {
     );
 
     init_ngram_validated(&config, &mut diag);
+    init_lang_detect_validated(&config, &mut diag);
     let _engine_window_guard = crate::runtime::engine_window::create_engine_window()?;
     let (hook_guard, _toggle_hotkey_guard, _app_override_hotkey_guard) =
         install_hooks_and_hotkeys_validated(&config, &mut diag)?;
@@ -1293,6 +1320,33 @@ pub(super) fn run_all() -> Result<()> {
         tracing::warn!("{e}");
     }
     let _focus_hook_guard = install_focus_hook().map_err(|e| tracing::warn!("{e}")).ok();
+    // ADR-271: 実効の段階（`min(設定値, ui_max_level())`）は起動時に 1 度だけ決めて固定する（反映は再起動後）。
+    let effective_evidence =
+        crate::indicator_evidence::EffectiveEvidence::from_config(&config.indicator_evidence);
+    let _ = with_app(|app| app.set_indicator_effective_evidence(effective_evidence));
+    // ADR-261 段階 1・ADR-271: `[indicator_evidence] glyph` の実効の段階が `observe` 以上のとき（既定は off のオプトイン）だけ、
+    // 入力インジケーターの字形の取り込みワーカーと WinEvent フックを起動する（観測のみ。belief・IME には何もしない）。
+    let _indicator_glyph_guards =
+        if effective_evidence.glyph >= awase::config::EvidenceLevel::Observe {
+            let (worker, tx, rx_feature) =
+                crate::observer::indicator_glyph::spawn_indicator_glyph_worker(
+                    effective_evidence.glyph_push_trigger,
+                );
+            // 見本の保存先は exe と同じディレクトリ（`cache.toml` と同じ。別ファイル `glyph_samples.json`）。
+            let base_dir = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(Path::to_path_buf))
+                .unwrap_or_else(|| PathBuf::from("."));
+            let _ = with_app(|app| app.init_indicator_glyph(Some(tx), Some(rx_feature), &base_dir));
+            Some((
+                worker,
+                crate::observer::indicator_glyph::install_foreground_hook(
+                    indicator_glyph_foreground_event_proc,
+                ),
+            ))
+        } else {
+            None
+        };
     let _obs_hook_guards = crate::tsf::observer::install_observation_hooks();
 
     // issue #165 自己修復 opus round2 B1(iii): `hook_alive_tick_ms`を
@@ -1314,13 +1368,14 @@ pub(super) fn run_all() -> Result<()> {
         app.start_hook_watchdog();
     });
 
-    let (_uia_worker, uia_tx) = crate::focus::uia::spawn_uia_worker();
     let _gji_worker = crate::tsf::observer::start_monitor_thread();
-    let _ = with_app(|app| app.set_uia_sender(uia_tx));
 
     let _wts_guard = register_session_notification()
         .map_err(|e| tracing::warn!("{e}"))
         .ok();
+    // 診断（issue #165）: フックとは別経路（Raw Input）で物理キーを観測する。失敗しても本体の動作に影響しない。
+    let _raw_key_guard = crate::runtime::engine_window::engine_hwnd()
+        .and_then(crate::observer::raw_key_input::register);
     let _ = with_app(Runtime::establish_initial_focus_scope);
     initialize_ime_cache();
 

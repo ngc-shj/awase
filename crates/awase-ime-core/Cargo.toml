@@ -1,0 +1,40 @@
+[package]
+name = "awase-ime-core"
+version = "2.2.0"
+edition = "2021"
+description = "IME の核: IME の状態(belief)・観測・書き込み(actuation)の判断と journal。土台・キー効果の crate の上に立つ(ADR-229 D4・ADR-274)。windows crate に依存しない"
+publish = false
+
+[lib]
+name = "awase_ime_core"
+path = "src/lib.rs"
+
+# この crate は windows crate に依存しない(`crate_does_not_depend_on_windows` が固定する)。
+[dependencies]
+awase = { path = "../.." }
+# 土台（定数・仮想キー・キーマップ表・世代・時計・IME 種別・アプリ分類。ADR-274 段階 2）
+awase-windows-base = { path = "../awase-windows-base" }
+# キー効果の学習結果の読み取りと予測（ADR-274 段階 2）
+awase-key-effect = { path = "../awase-key-effect" }
+awase-gji-config = { path = "../awase-gji-config" }
+thiserror = "2"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+strum = { version = "0.27", features = ["derive"] }
+quanta = "0.12"
+
+[features]
+# 殻の crate（`awase-windows`）のテストが使う、テスト専用の口（`set_desired_open_for_test` など）。本番では有効にしない。
+testing = ["awase-windows-base/testing"]
+
+[dev-dependencies]
+# core 自身のテスト（`tsf/literal_facts.rs` ほか）が土台の `FocusGen::new` を使う（`cfg(feature = "testing")`）。
+awase-windows-base = { path = "../awase-windows-base", features = ["testing"] }
+proptest = "1.11.0"
+# journal 再生 fixture のハーネス(ADR-229)。非公開の dev 専用 crate。
+awase-replay = { path = "../awase-replay" }
+toml = "0.8"
+
+[lints]
+workspace = true

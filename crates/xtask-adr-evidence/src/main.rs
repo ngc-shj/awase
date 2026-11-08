@@ -197,7 +197,99 @@ fn to_repo_relative_candidate(path: &str) -> String {
     }
 }
 
+mod core_registry;
+
+/// `.cargo/mutants-awase-*.toml` をすべて連結して返す（ファイル名の昇順）。核 crate が増えても足し忘れない。
+/// 1 件も無いときは panic（黙って「登録漏れなし」にしない）。
+fn all_mutants_configs(repo_root: &str) -> String {
+    let dir = Path::new(repo_root).join(".cargo");
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", dir.display()))
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("mutants-awase-") && n.ends_with(".toml"))
+        })
+        .collect();
+    files.sort();
+    assert!(
+        !files.is_empty(),
+        ".cargo/mutants-awase-*.toml が 1 件も見つからない"
+    );
+    files
+        .iter()
+        .map(|p| {
+            std::fs::read_to_string(p)
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", p.display()))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// FCIS V1: `core-registry <repo_root> <base_ref>`。`CORE_MODULES` に base 比で足された名前の
+/// 登録漏れを検査する。base が取れない・CORE_MODULES が読めないときは通さずに失敗する。
+fn run_core_registry(repo_root: &str, base_ref: &str) -> ExitCode {
+    let guard_rel = "crates/awase-windows/tests/layer_boundary_guard.rs";
+    let read = |rel: &str| {
+        std::fs::read_to_string(Path::new(repo_root).join(rel))
+            .unwrap_or_else(|e| panic!("failed to read {rel}: {e}"))
+    };
+    let head_src = read(guard_rel);
+    let head = match core_registry::parse_core_modules(&head_src) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("HEAD の {guard_rel}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let out = std::process::Command::new("git")
+        .args(["-C", repo_root, "show", &format!("{base_ref}:{guard_rel}")])
+        .output()
+        .expect("git を起動できない");
+    if !out.status.success() {
+        eprintln!(
+            "base {base_ref} の {guard_rel} を読めない: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return ExitCode::from(2);
+    }
+    let base = match core_registry::parse_core_modules(&String::from_utf8_lossy(&out.stdout)) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("base の {guard_rel}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let added = core_registry::added_modules(&base, &head);
+    println!("CORE_MODULES に追加された名前: {added:?}");
+    let violations = core_registry::check(
+        &added,
+        // `.cargo/mutants-awase-*.toml` のすべて（殻・核 crate〔awase-ime-core・awase-hook-core など、ADR-274〕）。
+        &all_mutants_configs(repo_root),
+    );
+    if violations.is_empty() {
+        println!("登録漏れなし。");
+        ExitCode::SUCCESS
+    } else {
+        for v in &violations {
+            eprintln!("  - {v}");
+        }
+        ExitCode::FAILURE
+    }
+}
+
 fn main() -> ExitCode {
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("core-registry") {
+        let root = args.next().unwrap_or_else(|| ".".to_string());
+        let Some(base) = args.next() else {
+            eprintln!("使い方: core-registry <repo_root> <base_ref>");
+            return ExitCode::from(2);
+        };
+        return run_core_registry(&root, &base);
+    }
     let repo_root = std::env::args().nth(1).unwrap_or_else(|| ".".to_string());
     let lint_path = Path::new(&repo_root).join("lints/actuation_call_guard/src/lib.rs");
     let src = std::fs::read_to_string(&lint_path)
@@ -279,7 +371,23 @@ fn main() -> ExitCode {
     };
     let after_quote = &target_line[quote_start + 1..];
     let quote_end = after_quote.rfind('\'').unwrap_or(after_quote.len());
-    let target_regex_src = &after_quote[..quote_end];
+    // `@CORE_ROOTS@` は pre-push 自身が `core_crate_roots` で置き換える目印（core 系 crate のディレクトリの選択肢）。
+    // 同じ一覧（`tools/core-split/core-crates.txt`、ADR-274 段階 0 の 5）から作って照合する。
+    let core_roots = {
+        let list_path = Path::new(&repo_root).join("tools/core-split/core-crates.txt");
+        let list = std::fs::read_to_string(&list_path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", list_path.display()));
+        let mut roots = vec!["crates/awase-windows".to_string()];
+        roots.extend(
+            list.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(|l| l.replace('.', "\\.")),
+        );
+        roots.join("|")
+    };
+    let target_regex_owned = after_quote[..quote_end].replace("@CORE_ROOTS@", &core_roots);
+    let target_regex_src = target_regex_owned.as_str();
 
     match regex::Regex::new(target_regex_src) {
         Ok(target_regex) => {

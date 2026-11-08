@@ -3,7 +3,7 @@ id: ADR-106
 title: |-
   fence 識別子の所有権是正と観測プロブナンスの型強制
 status: |-
-  一部実装(決定1〜4 実装済み・決定5 は未着手、2026-10-04 コード確認)。`FocusFence`(state/evidence.rs、state/probe_admission.rs ほか)が現存。決定5 は着手条件(統合対象サイトが2箇所に絞られること)未達のままとの本文記録以降の変化は未確認で、要確認。ADR-104 の決定6-a・6-c・7 を置換。
+  完了(決定1〜4 実装済み・決定5 は見送り、2026-10-06 所有者判断): `FocusFence`(state/probe_admission.rs)が現存し観測の受理は一本化済み。決定5(`Lease<P>`/`Captured<T>`)は、使用サイト 2 系統(ImmLikeTicket・ConvObservation)が既に同じ FocusFence を共有し統合の動機が薄いため実施しない。再オープン条件: 世代・柵の取り違えによる不具合が新たな型で防げると示されたとき。
   旧(2026-10-04 更新前):
   **決定1〜4 実装済み・決定3は実機（dragonflyg4）で回帰修正を確認済み（2026-08-26）。** [ADR-104](104-observation-freshness-and-hardening.md) に対し
   Opus 2体による独立レビュー（ラウンド1）→相互攻撃（ラウンド2）の敵対的レビューを実施した結果、
@@ -102,6 +102,7 @@ ADR-104 決定6-c が「正当な generation 値 `0` と衝突する」と書い
 > 1件 dispatch するようになり、`ImeEventLog.next_seq()` は
 > `try_force_on_bootstrap()` の時点で既に `1` 以上になっている。したがって
 > `generation = 0` の払い出しはこの経路では起きなくなった。
+> （ADR-232 D1 で、この Event は `InitialFocusScopeEstablished` 1 件に統合した。dispatch が 1 件以上であることは変わらない。）
 > **ただし決定の根拠は変わらない** ——`next_seq` を `generation` に流用する構造上の
 > 病（自分の都合で進む／初期値 `0` が二義的／割り当てと消費が型で結ばれていない）は
 > そのまま残っており、`generation = 0` が偶然到達不能になったことは修正ではない。

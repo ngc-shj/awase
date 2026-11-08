@@ -15,7 +15,7 @@
 # （= プラットフォーム非依存な）ファイルだけを examine_globs で明示的に
 # 許可する。ディレクトリ丸ごとの glob（例 `state/**`）を使わないのは、同じ
 # ディレクトリ内に #[cfg(windows)] ファイルが混在しているため
-# （例: state/platform_state.rs, state/ime_decision_view.rs 等は対象外）。
+# （例: state/ime_decision_view.rs は tsf::observer を読む cfg(windows) なので対象外）。
 #
 # 保守上の注意: このリストはメンテナンスが必要 —— 対象ファイルの
 # プラットフォーム依存性が変わったら（#[cfg(windows)] を追加/削除したら）、
@@ -25,22 +25,27 @@ examine_globs = [
     "crates/awase-windows/src/msime_key_assignment.rs",
     "crates/awase-windows/src/single_thread_cell.rs",
     "crates/awase-windows/src/lifetime_counter.rs",
-    "crates/awase-windows/src/state/ime_model.rs",
-    "crates/awase-windows/src/state/observation_store.rs",
-    "crates/awase-windows/src/state/conv_classify.rs",
-    "crates/awase-windows/src/state/conv_mode.rs",
-    "crates/awase-windows/src/state/eisu_recovery.rs",
-    "crates/awase-windows/src/state/force_guard.rs",
-    "crates/awase-windows/src/state/belief.rs",
-    "crates/awase-windows/src/state/hook_state.rs",
-    "crates/awase-windows/src/state/app_ime_policy.rs",
-    "crates/awase-windows/src/state/ime_event.rs",
-    "crates/awase-windows/src/state/input_barrier.rs",
-    "crates/awase-windows/src/state/probe_admission.rs",
-    "crates/awase-windows/src/state/transition.rs",
-    "crates/awase-windows/src/focus/class_names.rs",
+    "crates/awase-windows/src/state/sync_actuation.rs",
+    # ADR-275(Opus レビュー): 本番 2,337 行は Linux でもコンパイルされる(`mod shell;` だけが cfg(windows))。
+    # 以前は「cfg(windows) なので対象外」と書いていたが古い記述だった。IME belief ファミリーの中心で、
+    # 単体テスト約 2,700 行が Linux で走る。**未実行**: 追加直後の mutants 実行(workflow_dispatch)で
+    # ベースラインが通るか・timeout になる変異(壁時計待ち)が無いかを確かめ、あれば exclude_re に理由付きで足す。
+    "crates/awase-windows/src/state/platform_state.rs",
     "crates/awase-windows/src/focus/cache.rs",
-    "crates/awase-windows/src/focus/kinds.rs",
+    # ADR-272 段階 A で Linux でもビルドされるようになった FSM 群。グローバル(TSF_OBS・OUTPUT_GATE)を
+    # 直接触る observer.rs・probe_bridge.rs と、壁時計だけの clock.rs は対象にしない。
+    # 2026-10-20 に実行して確かめた(run 39418696310、8 shard が各 43 分前後で完走、ベースラインはどれも通った)。
+    # tsf/probe.rs には壁時計を待つ変異(TsfReadinessProbe::check_now)があり timeout になる(想定どおり)。
+    "crates/awase-windows/src/input_defer.rs",
+    "crates/awase-windows/src/tsf/ime_mode_fsm.rs",
+    "crates/awase-windows/src/tsf/probe.rs",
+    "crates/awase-windows/src/tsf/warmup/literal_detect_fsm.rs",
+    "crates/awase-windows/src/tsf/warmup/mozc_compose_check_fsm.rs",
+    "crates/awase-windows/src/tsf/warmup/ms_ime_ready_coro.rs",
+    "crates/awase-windows/src/tsf/warmup/probe_coro_state.rs",
+    "crates/awase-windows/src/tsf/warmup/probe_fsm.rs",
+    "crates/awase-windows/src/tsf/warmup/tickable_fsm.rs",
+    "crates/awase-windows/src/tsf/warmup/warmup_strategy.rs",
 ]
 
 # ビルドが数十秒かかることがあるため、自動タイムアウト推定が短すぎて
@@ -63,8 +68,13 @@ exclude_re = [
     # 他の分岐（142 行目の old == Some(new) 等）は cfg 無しで実際にテスト対象。
     "conv_mode\\.rs:(147|148|152):",
 
-    # ime_event.rs: HwndId::to_hwnd と `From<HWND> for HwndId` は windows クレートの
-    # 型を直接扱う #[cfg(windows)] 専用の変換関数。
-    "HwndId::to_hwnd",
-    "for HwndId>::from",
+    # conv_mode.rs: ConvModeTarget::imm_conv_value の variant は HalfWidthAlnum（→ 0）だけなので、
+    # 「0 を返す」変異は元のコードと同じ値を返す等価変異（ADR-234 D0）。variant を足したら
+    # この除外は外すこと（足した variant の値を 0 にする変異もこの正規表現に当たり、黙って除外される）。
+    "ConvModeTarget::imm_conv_value -> u32 with 0$",
+
+    # observation_store.rs: trace_hwnd_only_mismatch は derive_filtered の識別照合で
+    # 「hwnd だけ不一致」を tracing::debug! に出すだけの関数で、判定に関わらない（ADR-234 D0。
+    # run 35920696097 の derive_filtered 822〜824 行の 4 件をこの関数へ切り出した）。
+    "trace_hwnd_only_mismatch",
 ]

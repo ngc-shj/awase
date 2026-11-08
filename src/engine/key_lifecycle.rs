@@ -101,6 +101,17 @@ impl KeyLifecycle {
         }
     }
 
+    /// エンジンが素通しと判断した KeyDown を、シェルが後から消費した場合に呼ぶ
+    /// （ADR-255 決定4、`Engine::record_shell_consumed`）。
+    ///
+    /// 非活性中の素通しとして記録済みでも、KeyDown は実際には OS に届いていないので
+    /// 「最初の disposition が勝つ」の対象外。記録を取り消して Consume として登録する。
+    /// 取り消さないと Up が素通しになり、OS には KeyDown 無しの KeyUp だけが届く。
+    pub fn on_key_down_shell_consumed(&mut self, event: &RawKeyEvent) {
+        self.passed_while_inactive.retain(|vk| *vk != event.vk_code);
+        self.on_key_down_consumed(event);
+    }
+
     /// Engine 非活性中に KeyDown を PassThrough した場合に呼ぶ。
     /// 対応する KeyUp も PassThrough すべきことを記録する
     /// （`passed_while_inactive` の doc 参照）。
@@ -194,6 +205,8 @@ mod tests {
             left_thumb_down_snapshot: None,
             right_thumb_down_snapshot: None,
             injected: false,
+            foreign_ctrl: false,
+            impersonated: false,
         }
     }
 

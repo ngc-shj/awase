@@ -4,7 +4,7 @@
 //! GJI FSM への橋渡しバッファ群を一括して管理する。`Output` はこの構造体への
 //! Facade として残り、各操作をメソッド委譲する。
 //!
-//! `step_probe` のように `Output` 全体（`ime_mode_fsm`・`tsf_gate` 等）へのアクセスが
+//! `step_probe` のように `Output` 全体（`ime_mode_fsm` 等）へのアクセスが
 //! 必要な処理は `Output` 側に残し、ここではプローブ状態の take/set を提供する。
 
 use super::TimerCommand;
@@ -13,8 +13,7 @@ use std::cell::{Cell, RefCell};
 use std::time::Duration;
 
 use crate::tsf::gji_fsm::GjiTimer;
-use crate::tsf::gji_fsm::{FocusEpoch, GjiAction, GjiEvent, GjiFsm, ProbeId, ProbeParams};
-use crate::tsf::probe_bridge::OutputActiveGuard;
+use crate::tsf::gji_fsm::{GjiAction, GjiEvent, GjiFsm, ProbeId};
 use crate::tsf::warmup::probe_fsm::{DeferredOrigin, DeferredVk};
 use crate::tsf::warmup::tickable_fsm::TickableFsm;
 use crate::tsf::warmup::warmup_strategy::ImeWarmupStrategy;
@@ -27,6 +26,8 @@ pub(crate) struct StageRecord {
     pub injected: bool,
     /// この段が raw literal 回収を出したか。
     pub recovered: bool,
+    /// 段の開始(probe のインストール時、最初の VK 送信より前)に採った宛先の識別(BUG-194、ADR-246)。
+    pub origin: Option<crate::state::raw_recovery_plan::StageOrigin>,
 }
 
 /// GJI ウォームアップ / TSF プローブ状態の集約。
@@ -40,17 +41,15 @@ pub(crate) struct TsfWarmupCoordinator {
     pub(super) pending_tsf: RefCell<Option<Box<dyn TickableFsm>>>,
     /// 現在実行中の GJI probe の ID（`GjiAction::StartProbe` 受信時にセット）。
     pub(super) current_gji_probe_id: Cell<Option<ProbeId>>,
-    /// GJI probe 中に OUTPUT_GATE を活性化するガード。
-    gji_probe_guard: RefCell<Option<OutputActiveGuard>>,
     /// 現在の probe 段における注入/回収事実。
     stage: Cell<StageRecord>,
     /// `ProbeIo::mark_cold_raw_tsf` → `GjiFsm::CompositionReset` の橋渡しフラグ。
     pub(super) pending_gji_composition_reset: Cell<bool>,
-    /// `send_romaji_as_tsf` / `send_romaji_batched` の `GjiFsm::KeyInput` Response バッファ。
+    /// `send_romaji_batched` の `GjiFsm::KeyInput` Response バッファ。
     pending_gji_key_responses: RefCell<Vec<GjiResponse>>,
     /// probe 進行中に届いた後続 VK の単一キュー。
     ///
-    /// 個々の probe machine（`GjiWarmupCoro` 等）ではなく coordinator が直接所有する。
+    /// 個々の probe machine（`TsfProbeCoro` 等）ではなく coordinator が直接所有する。
     /// これにより「最初の tick で握り潰される」「probe が上書きされて drop される」という
     /// 2種類のデータ消失を構造的に防ぐ（probe の生存期間に依存しない単一の書き込み先）。
     pending_deferred: RefCell<Vec<DeferredVk>>,
@@ -64,7 +63,6 @@ impl TsfWarmupCoordinator {
             tsf_warmup: RefCell::new(Box::new(GjiFsm::new())),
             pending_tsf: RefCell::new(None),
             current_gji_probe_id: Cell::new(None),
-            gji_probe_guard: RefCell::new(None),
             stage: Cell::new(StageRecord::default()),
             pending_gji_composition_reset: Cell::new(false),
             pending_gji_key_responses: RefCell::new(Vec::new()),
@@ -125,14 +123,9 @@ impl TsfWarmupCoordinator {
         self.tsf_warmup.borrow_mut().on_gji_long_idle()
     }
 
-    /// `OnComposing` 状態の現在 epoch を返す。それ以外の状態では `None`。
-    pub(crate) fn gji_current_composition_epoch(&self) -> Option<FocusEpoch> {
-        self.tsf_warmup.borrow().gji_current_composition_epoch()
-    }
-
-    /// `Authorized` 状態の `ProbeParams` を返す。それ以外なら `None`。
-    pub(crate) fn current_probe_params(&self) -> Option<ProbeParams> {
-        self.tsf_warmup.borrow().current_probe_params()
+    /// GjiFsm が `OnComposing` 状態か。
+    pub(crate) fn gji_is_composing(&self) -> bool {
+        self.tsf_warmup.borrow().gji_is_composing()
     }
 
     // ── probe_id ──────────────────────────────────────────────────────────
@@ -152,22 +145,21 @@ impl TsfWarmupCoordinator {
         self.current_gji_probe_id.take()
     }
 
-    // ── OUTPUT_GATE ガード ─────────────────────────────────────────────────
-
-    /// GJI probe の OUTPUT_GATE ガードを開始する。
-    pub(crate) fn begin_probe_guard(&self) {
-        *self.gji_probe_guard.borrow_mut() = Some(OutputActiveGuard::begin());
-    }
-
-    /// GJI probe の OUTPUT_GATE ガードを解放する。
-    pub(crate) fn end_probe_guard(&self) {
-        *self.gji_probe_guard.borrow_mut() = None;
-    }
-
     // ── stage record ─────────────────────────────────────────────────────
 
     pub(crate) fn begin_stage(&self) {
         self.stage.set(StageRecord::default());
+    }
+
+    /// 段の開始時に採った宛先の識別を記録する(`install_pending_tsf` の直後に呼ぶ)。
+    pub(crate) fn stamp_stage_origin(&self, origin: crate::state::raw_recovery_plan::StageOrigin) {
+        let mut stage = self.stage.get();
+        stage.origin = Some(origin);
+        self.stage.set(stage);
+    }
+
+    pub(crate) fn stage_origin(&self) -> Option<crate::state::raw_recovery_plan::StageOrigin> {
+        self.stage.get().origin
     }
 
     pub(crate) fn note_stage_injection(&self) {
@@ -230,6 +222,20 @@ impl TsfWarmupCoordinator {
                 machine.cold_seq_hint().value()
             );
         }
+        *slot = Some(machine);
+    }
+
+    /// 段が終わる直前に、後続の確認の FSM を `pending_tsf` に張る（ADR-270）。
+    ///
+    /// **段の記録（`StageRecord`）には触れない**。`install_pending_tsf` は `begin_stage()` で記録を初期化するので、
+    /// 段末の `take_stage_record` が、終わる段の記録（注入した・宛先）ではなく、張ったばかりの確認の段の空の記録を取り出して
+    /// しまう。後続の FSM が張られている間、後続のキーは `has_pending_tsf()` で保留される。
+    pub(crate) fn install_followup_tsf(&self, machine: Box<dyn TickableFsm>) {
+        let mut slot = self.pending_tsf.borrow_mut();
+        debug_assert!(
+            slot.is_none(),
+            "follow-up probe installed over a live probe"
+        );
         *slot = Some(machine);
     }
 
@@ -377,7 +383,7 @@ impl TsfWarmupCoordinator {
 
     /// deferred キューが空でないかを覗き見る（消費しない）。
     ///
-    /// `decide_transmit_plan` の eager path 判定に使う。
+    #[cfg(test)]
     pub(crate) fn has_pending_deferred(&self) -> bool {
         !self.pending_deferred.borrow().is_empty()
     }
@@ -443,6 +449,48 @@ mod tests {
         fn cold_seq_hint(&self) -> crate::state::event_origin::Generation {
             crate::state::event_origin::Generation::INITIAL
         }
+    }
+
+    fn test_origin() -> crate::state::raw_recovery_plan::StageOrigin {
+        crate::state::raw_recovery_plan::StageOrigin {
+            focus_gen: crate::state::focus_gen::FocusGen::INITIAL,
+            foreground: crate::state::foreground_scope::ForegroundScope { pid: 7, hwnd: 70 },
+        }
+    }
+
+    /// ADR-270 のレビュー C1: 段末に後続の確認の FSM を張るとき、終わる段の記録を壊さない。
+    ///
+    /// `install_pending_tsf` は `begin_stage()` で記録を初期化するので、段末に使うと、`take_stage_record` が空の記録を
+    /// 取り出し、BUG-194 の宛先照合が効かず、成功した段が `WarmupAborted` で伝わる。
+    #[test]
+    fn install_followup_tsf_keeps_the_ending_stage_record() {
+        let coord = TsfWarmupCoordinator::new();
+        coord.begin_stage();
+        coord.stamp_stage_origin(test_origin());
+        coord.note_stage_injection();
+        coord.install_followup_tsf(Box::new(StubMachine { ticks: 0 }));
+        assert!(coord.has_pending_tsf());
+        let rec = coord.take_stage_record();
+        assert!(rec.injected, "終わる段の注入の記録が残っている");
+        assert!(!rec.recovered);
+        assert_eq!(
+            rec.origin,
+            Some(test_origin()),
+            "終わる段の宛先が残っている"
+        );
+    }
+
+    /// 対照: 段の開始に使う `install_pending_tsf` は、記録を初期化する（これが `install_followup_tsf` を別に持つ理由）。
+    #[test]
+    fn install_pending_tsf_resets_the_stage_record() {
+        let coord = TsfWarmupCoordinator::new();
+        coord.begin_stage();
+        coord.stamp_stage_origin(test_origin());
+        coord.note_stage_injection();
+        coord.install_pending_tsf(Box::new(StubMachine { ticks: 0 }));
+        let rec = coord.take_stage_record();
+        assert!(!rec.injected);
+        assert_eq!(rec.origin, None);
     }
 
     #[test]

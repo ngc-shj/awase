@@ -12,7 +12,7 @@
 //!
 //! - [`gji_monitor`] バックグラウンドスレッド → `TSF_OBS.gji_last_io_ms`, `TSF_OBS.gji_monitor_ok`
 //! - [`win_event_obs`] `observation_event_proc` → `TSF_OBS.gji_candidate_visible`,
-//!   `TSF_OBS.gji_candidate_show`, `TSF_OBS.focus_namechange`, `TSF_OBS.ime_composition_active`
+//!   `TSF_OBS.gji_candidate_show`, `TSF_OBS.ime_composition_active`
 //!
 //! [`ObservedState::from_snapshot()`]: crate::state::ime_decision_view::ObservedState::from_snapshot
 //! [`gji_monitor`]: super::gji_monitor
@@ -71,21 +71,11 @@ pub(in crate::tsf) struct Baseline(u32);
 /// 書き込み元:
 /// - `GjiMonitor` バックグラウンドスレッド → `gji_last_io_ms`, `gji_monitor_ok`
 /// - `observation_event_proc` → `gji_candidate_visible`, `gji_candidate_show`,
-///   `focus_namechange`, `ime_composition_active`
+///   `ime_composition_active`
 ///
 /// 読み取りは judgement 層 (`probe.rs`) と action 層 (`output.rs`) から行う。
 #[derive(Debug)]
 pub struct TsfObservations {
-    /// OBJ_NAMECHANGE 発火のたびに +1 されるカウンタ。現在は write-only。
-    ///
-    /// かつて `gji_warmup_coro.rs` の NameChangeWait フェーズ（Phase 3）がこのカウンタの
-    /// 変化を読み取って GJI 応答を判定していたが、`DIAG_DISABLE_PROACTIVE_TSF_WARMUP`
-    /// （常時 true）下で当該フェーズ自体が到達不能だったため撤去した（`docs/known-bugs.md`
-    /// BUG-24 参照）。書き込み側（`observation_event_proc` の NAMECHANGE イベント通知、
-    /// `send_eager_tsf_warmup` によるリセット）は WinEventHook 登録・他フィールドと絡む
-    /// ため本コミットでは触れず残している。
-    pub(in crate::tsf) focus_namechange: ChangeCounter,
-
     /// `GoogleJapaneseInputCandidateWindow` が `EVENT_OBJECT_SHOW` で表示されるたびに +1 されるカウンタ。
     ///
     /// raw TSF literal 検出用: cold start ローマ字送信後にこのカウンタが増えれば
@@ -106,7 +96,7 @@ pub struct TsfObservations {
     /// GJI の最終 I/O 変化時刻 (GetTickCount64 ms)。0 = 未観測。
     ///
     /// バックグラウンドモニタースレッドが更新する。
-    /// `send_romaji_as_tsf` や `TsfReadinessJudge` が参照する。
+    /// `TsfReadinessJudge` 等が参照する。
     pub(super) gji_last_io_ms: AtomicU64,
 
     /// GJI モニターが GJI プロセスへ（再）接続した時刻 (GetTickCount64 ms)。0 = 未接続。
@@ -121,7 +111,7 @@ pub struct TsfObservations {
     /// F2（モード切り替え）は WriteTransferCount が増加しない（w_KB=+0.0）のに対し、
     /// 文字変換は +0.2KB 以上増加する。ベースラインとの差分で
     /// 「モード切り替えのみか文字コンポジションが発生したか」を区別できる。
-    /// [`LiteralDetector::new`]/[`LiteralDetector::new_with_pre_send_baseline`]
+    /// [`LiteralDetector::new_with_pre_send_baseline`]
     /// の composition 確認シグナルとして使用する（BUG-30 で TSF/Chrome 共通化）。
     /// 観測・状態推定用。0 = 未取得。
     pub(super) gji_write_bytes: AtomicU64,
@@ -174,6 +164,11 @@ pub struct TsfObservations {
     /// GJI モニターが利用可能か（プロセス発見・ハンドル取得成功）。
     pub(super) gji_monitor_ok: AtomicBool,
 
+    /// アクティブな TIP が Mozc 系で、GJI の I/O が証拠にならないと**確定している**か（`ConverterTarget::NoEvidence`、
+    /// ADR-269 D1）。`gji_monitor_ok` が偽なだけ（本物の GJI で変換プロセスが未起動・再接続待ち）とは区別する
+    /// （BUG-208。応答待ちを止めるのは前者のときだけ）。
+    pub(super) gji_evidence_absent: AtomicBool,
+
     /// GJI candidate が SHOW になってから次の `on_ime_applied` 呼び出しまでの間に
     /// 「shadow=OFF なのに候補ウィンドウが表示された（desync）」ことがあったかを記録するラッチ。
     ///
@@ -181,15 +176,15 @@ pub struct TsfObservations {
     /// `GjiDirectStrategy`（ADR-171）が shadow=false でも desync を検出して必要な再送を行えるようにする。
     pub(super) candidate_was_seen: AtomicBool,
 
-    /// `LiteralDetectCore` が最後に `CompositionConfirmed`（かつ非 partial-literal）を
-    /// 確認できた **`cold_seq`（`WarmEpoch::cold_start_count`）世代**。未確認なら `0`
+    /// per-VK confirm（`run_per_vk_confirm`）が最後に全 VK の `CompositionConfirmed` を
+    /// 確認できた **`cold_seq`（`CompositionState::cold_start_count`）世代**。未確認なら `0`
     /// （`cold_start_count` は 0 始まりで、確認は必ず何らかの cold-start 後にしか
     /// 起こらないため `0` を「未確認」の番人値として使える）。
     ///
     /// 「確認済みかどうか」は真偽値ではなく **この値が現在の `cold_seq` と一致するか**
     /// で判定する（[`literal_session_confirmed()`] 参照）。一致する間は、同一 cold
     /// 世代内の以降の文字は literal-detect 自体をスキップし即送信する（BUG-24:
-    /// `is_partial_literal()` の判定材料である `nc_fired` が `SetOpenTrue`/`FocusChange`/
+    /// 旧 `is_partial_literal()`〈ECRS MB-02 で撤去〉の判定材料である `nc_fired` が `SetOpenTrue`/`FocusChange`/
     /// `NativeF2Consumed` 等の cold 直後は構造的に信頼できず、正しく変換されているのに
     /// 不要な ESC+BS 訂正が発生していた）。
     ///
@@ -269,7 +264,6 @@ impl TsfObservations {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            focus_namechange: ChangeCounter::new(),
             gji_candidate_show: ChangeCounter::new(),
             gji_candidate_visible: AtomicBool::new(false),
             gji_last_io_ms: AtomicU64::new(0),
@@ -281,6 +275,7 @@ impl TsfObservations {
             gji_other_ops: AtomicU64::new(0),
             gji_other_bytes: AtomicU64::new(0),
             gji_monitor_ok: AtomicBool::new(false),
+            gji_evidence_absent: AtomicBool::new(false),
             candidate_was_seen: AtomicBool::new(false),
             literal_session_confirmed_gen: AtomicU64::new(0),
             pending_start_composition: AtomicBool::new(false),
@@ -304,18 +299,6 @@ impl TsfObservations {
     #[must_use]
     pub fn gji_attach_ms(&self) -> u64 {
         self.gji_attach_ms.load(Ordering::Relaxed)
-    }
-
-    /// GJI モニターが利用可能かを読み取る（Acquire）。
-    #[must_use]
-    pub fn gji_monitor_ok(&self) -> bool {
-        self.gji_monitor_ok.load(Ordering::Acquire)
-    }
-
-    /// GJI candidate window が現在表示中かを読み取る（Relaxed）。
-    #[must_use]
-    pub fn gji_candidate_visible(&self) -> bool {
-        self.gji_candidate_visible.load(Ordering::Relaxed)
     }
 
     /// 現在（GJI/MS-IME 問わず）IME composition window が可視かどうかを読み取る（Relaxed）。
@@ -451,7 +434,7 @@ impl TsfObservations {
 ///
 /// - `GjiMonitor` バックグラウンドスレッド → `gji_last_io_ms`, `gji_monitor_ok`
 /// - `observation_event_proc` → `gji_candidate_visible`, `gji_candidate_show`,
-///   `focus_namechange`, `composition_probe`
+///   `composition_probe`
 pub(in crate::tsf) static TSF_OBS: TsfObservations = TsfObservations::new();
 
 /// `TSF_OBS` への並行テストアクセスを直列化する唯一のロック。
@@ -507,7 +490,7 @@ pub(crate) const fn gji_io_is_attach_artifact(last_io_ms: u64, attach_ms: u64) -
 
 /// 現在時刻と最終 GJI I/O 時刻の差（アイドル時間）を ms で返す。
 pub(crate) fn gji_idle_ms() -> u64 {
-    crate::hook::current_tick_ms().saturating_sub(gji_last_io_ms())
+    crate::clock::current_tick_ms().saturating_sub(gji_last_io_ms())
 }
 
 /// GJI プロセスの最終 WriteOperationCount 変化時刻 (ms) を返す。0 = 未観測。live 読み取り。
@@ -553,6 +536,14 @@ pub(crate) fn gji_other_ops() -> u64 {
 /// 参照できるよう、他のアクセサと対称に用意する（/code-review指摘、2026-09-07）。
 pub(crate) fn gji_other_bytes() -> u64 {
     TSF_OBS.gji_other_bytes.load(Ordering::Relaxed)
+}
+
+/// アクティブな TIP が Mozc 系で、GJI の I/O が証拠にならないと確定しているか（BUG-208、ADR-269 D3）。
+/// `gji_is_active_ime()` の否定ではない: 本物の GJI で監視が一時的に未接続のときも `gji_is_active_ime()` は
+/// 偽だが、こちらは偽のまま（従来どおり GJI の応答を待つ）。Mozc 系 → GJI に切り替えた直後は、
+/// `gji_monitor` が target を確定する（最大 4 秒）まで真のまま残りうる。
+pub(crate) fn gji_evidence_absent() -> bool {
+    TSF_OBS.gji_evidence_absent.load(Ordering::Acquire)
 }
 
 /// GJI プロセスが起動済みかつアクティブ IME として CLSID ベースで選択されているかどうか。
@@ -608,10 +599,9 @@ pub(crate) fn reset_candidate_was_seen() {
 /// （＝その後 `FocusChange`/`NativeF2Consumed` 等で新しい cold-start が実際に走り、
 /// `cold_seq` が進んでいた）場合は `false` を返す。これにより、フォーカス変更や
 /// 長時間 idle をまたいで「前の cold 世代で確認済み」がそのまま信頼され続けることは
-/// 構造的に起こらない。`true` の間、`LiteralDetectCore::poll` は検出処理自体を
-/// スキップして即 `Done` を返す。
+/// 構造的に起こらない。
 ///
-/// 決定分岐の呼び出し元（`probe_fsm.rs`/`literal_detect_fsm.rs`/`gji_warmup_coro.rs`）は
+/// 決定分岐の呼び出し元（`probe_fsm.rs`。`gji_warmup_coro.rs` は 2026-10-22 に撤去）は
 /// `TsfEnvSnapshot::literal_session_confirmed_gen` 経由の比較へ移行済み（belief 監査、
 /// `.claude/rules/ime-belief-architecture.md` 参照）。現在の呼び出し元は
 /// `tsf/probe.rs::evidence_now` のみで、journal に記録する診断専用の値
@@ -642,8 +632,8 @@ pub(crate) fn literal_session_confirmed_gen_snapshot() -> Option<Generation> {
 /// `reset_literal_session_confirmed()`（候補ウィンドウ HIDE）が呼ばれるまで、以降の
 /// 同世代内の文字の literal-detect をスキップさせる。
 ///
-/// `cold_seq` は呼び出し元（`run_per_vk_confirm`/`LiteralDetectCore`）が確認した VK を
-/// 送信した時点の `WarmEpoch::cold_start_count()` であること（`0` は「未確認」の番人値
+/// `cold_seq` は呼び出し元（`run_per_vk_confirm`）が確認した VK を
+/// 送信した時点の `CompositionState::cold_start_count()` であること（`0` は「未確認」の番人値
 /// のため渡さない）。
 pub(crate) fn mark_literal_session_confirmed(cold_seq: Generation) {
     debug_assert_ne!(
@@ -714,6 +704,28 @@ pub(crate) enum ActiveImeKind {
     MicrosoftIme,
 }
 
+impl ActiveImeKind {
+    /// この IME が修飾付きのモードキー（0xF0〜0xF4）を素のキーと同じに扱うか（ADR-281）。
+    ///
+    /// GJI/Mozc 系は 0xF0〜0xF4 の Ctrl・Shift・Alt を捨てる。Microsoft IME 本体は、CLSID で本体と同定できたときだけ
+    /// ひらがな（0xF2）の Ctrl が素のキーと同じ（CI 実測）。未検出（`tsf_active_kind=0`）は安全デフォルトの
+    /// `MicrosoftIme` で、本体と同定されていないので `Unknown`（起動直後と TIP の切り替え直後の約 2〜4 秒は従来どおり予測しない）。
+    #[must_use]
+    pub(crate) const fn mode_key_modifiers(
+        self,
+        ms_ime_native_identified: bool,
+    ) -> crate::state::key_effect_predictor::ModeKeyModifiers {
+        use crate::state::key_effect_predictor::ModeKeyModifiers;
+        match self {
+            Self::GoogleJapaneseInput => ModeKeyModifiers::DroppedByGjiMozc,
+            Self::MicrosoftIme if ms_ime_native_identified => {
+                ModeKeyModifiers::MsImeNativeCtrlOnHiragana
+            }
+            Self::MicrosoftIme => ModeKeyModifiers::Unknown,
+        }
+    }
+}
+
 /// ADR-089 §2.8: windows-gated な観測型から ungated な `ImeKindId` への唯一の
 /// 変換点（`focus/class_names.rs` の `From<AppImeProfile> for ImePolicyProfile`
 /// と同じ形）。
@@ -731,17 +743,55 @@ impl From<ActiveImeKind> for crate::state::ime_kind::ImeKindId {
 // GJI I/O モニターと WinEvent 観察フックは専用モジュールに分離している。
 // 外部からは引き続き `crate::tsf::observer::*` として参照できるよう re-export する。
 
+#[cfg(windows)]
 pub use super::gji_monitor::start_monitor_thread;
+#[cfg(windows)]
 pub use super::win_event_obs::{install_observation_hooks, WinEventHookGuard};
 
 #[cfg(test)]
-#[cfg(windows)]
 mod tests {
     use super::*;
 
     /// `TSF_OBS` はプロセス全体のグローバル状態のため、テスト間の競合を防ぐロック
     /// (`probe.rs`/`literal_detect_fsm.rs`と共有、詳細は`TSF_OBS_TEST_LOCK`のdoc参照)。
     use super::TSF_OBS_TEST_LOCK as TEST_LOCK;
+
+    /// ADR-281 (i): IME 種別が未検出の間は、修飾付きの 0xF0〜0xF4 を予測しない。
+    ///
+    /// 未検出（`tsf_active_kind=0`）は `MicrosoftIme` の安全デフォルトで、本体と同定されていないので `Unknown`。
+    /// GJI と判定されたときだけ予測し、MS-IME 本体と同定できたときは 0xF2 の Ctrl だけ予測する。
+    #[test]
+    fn adr281_ime_kind_decides_which_mode_key_modifiers_are_dropped() {
+        use crate::state::key_effect_predictor::ModeKeyModifiers as M;
+        let obs = TsfObservations::new();
+        assert!(!obs.ime_kind_detected(), "初期値は未検出");
+        assert_eq!(obs.active_ime_kind(), ActiveImeKind::MicrosoftIme);
+        assert_eq!(
+            obs.active_ime_kind()
+                .mode_key_modifiers(obs.ms_ime_native_identified()),
+            M::Unknown
+        );
+        obs.set_tsf_active_kind(ActiveImeKind::GoogleJapaneseInput);
+        assert_eq!(
+            obs.active_ime_kind()
+                .mode_key_modifiers(obs.ms_ime_native_identified()),
+            M::DroppedByGjiMozc
+        );
+        // GJI から MS-IME 本体へ切り替えたら、本体と同定されるまでは予測しない側へ戻る。
+        obs.set_tsf_active_kind(ActiveImeKind::MicrosoftIme);
+        assert_eq!(
+            obs.active_ime_kind()
+                .mode_key_modifiers(obs.ms_ime_native_identified()),
+            M::Unknown
+        );
+        obs.ms_ime_native_identified
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert_eq!(
+            obs.active_ime_kind()
+                .mode_key_modifiers(obs.ms_ime_native_identified()),
+            M::MsImeNativeCtrlOnHiragana
+        );
+    }
 
     /// BUG-176: 接続直後の `gji_last_io_ms`（累積カウンタ初回読み）は実 I/O ではない。接続後の実 I/O は区別できる。
     #[test]

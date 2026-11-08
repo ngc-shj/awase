@@ -3,12 +3,10 @@
 //! `Output` は Facade として本構造体を保持し、低レベルのキー注入操作を委譲する。
 
 use super::resolve::CharResolution;
-use crate::state::event_origin::Generation;
 use crate::tsf::output::{make_key_input_ex, INJECTED_MARKER};
 use crate::vk::VK_LSHIFT;
 use awase::kana_table::KanaTable;
 use awase::types::VkCode;
-use itertools::Itertools as _;
 use std::collections::HashMap;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY,
@@ -16,31 +14,25 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 
 /// VK INPUT に使うマーカー種別。
 ///
-/// - `Injected`: Chrome/VK モードの単発キー送信（Unicode フォールバック経路の
-///   `send_romaji_per_key`、LSHIFT・VK_ESCAPE・VK_BACK 等）、scan code なし
-///   （INJECTED_MARKER、`wScan=0`）
 /// - `InjectedWithScan`: Chrome composition 送信本体（scan code 付き、
 ///   INJECTED_MARKER。TSF 側の `make_tsf_key_input` と同じ construction を
 ///   使うが marker は `INJECTED_MARKER` のまま = 既存の自己注入識別を変えない）。
 ///   2026-07-19 に scan code 付与を実機ソークで確認済み（`f3a39a0`）、恒久仕様。
-/// - `Tsf`:      WezTerm TSF モード、scan code 付き（TSF_MARKER）
+///
+/// 旧 `Tsf`（WezTerm 等の Tsf 注入モード、TSF_MARKER）は Tsf 注入経路の撤去（2026-10-22）で削除した。
 ///
 /// LSHIFT は常に INJECTED_MARKER（scan なし）のため、このマーカーは VK 本体にのみ適用する。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VkMarker {
-    Injected,
     InjectedWithScan,
-    Tsf,
 }
 
 impl VkMarker {
     pub(crate) fn make_input(self, vk: VkCode, is_keyup: bool) -> INPUT {
         match self {
-            Self::Injected => make_key_input(vk, is_keyup),
             Self::InjectedWithScan => {
                 crate::tsf::output::make_scan_key_input(vk, is_keyup, INJECTED_MARKER)
             }
-            Self::Tsf => crate::tsf::output::make_tsf_key_input(vk, is_keyup),
         }
     }
 }
@@ -56,7 +48,7 @@ pub(crate) const fn make_key_input(vk: VkCode, is_keyup: bool) -> INPUT {
 /// `Output` は Facade として本構造体を保持し、
 /// 低レベルのキー注入操作を `KeyInjector` へ委譲する。
 pub(crate) struct KeyInjector {
-    /// ローマ字↔かな双方向テーブル（Unicode モード・Chrome VK モード両用）
+    /// ローマ字↔かな双方向テーブル
     pub(super) kana_table: KanaTable,
     /// Chrome VK モード用: 記号→VK コードマッピング
     pub(super) symbol_to_vk: HashMap<char, (VkCode, bool)>,
@@ -74,7 +66,7 @@ impl KeyInjector {
 
     /// 文字の送信方法をルックアップテーブルで解決する。
     ///
-    /// `send_char_as_tsf` / `send_char_as_vk` が共通で使う 3 段ルックアップ。
+    /// `send_char_as_vk` が使う 3 段ルックアップ。
     #[must_use]
     pub(super) fn resolve_char(&self, ch: char) -> CharResolution<'_> {
         if let Some(romaji) = self.kana_table.romaji_for_kana(ch) {
@@ -130,26 +122,6 @@ impl KeyInjector {
         let _ = crate::win32::send_input_safe(&inputs);
     }
 
-    /// PerKey モード: 1文字ずつ個別の SendInput 呼び出し
-    #[expect(clippy::unused_self)]
-    pub(super) fn send_romaji_per_key(&self, romaji: &str) {
-        for ch in romaji.chars() {
-            if let Some((vk, needs_shift)) = crate::vk::ascii_to_vk(ch) {
-                Self::send_vk_pair(vk, needs_shift, VkMarker::Injected);
-            }
-        }
-    }
-
-    /// Unicode モード: ローマ字→ひらがなに変換して Unicode 文字として直接送信
-    pub(super) fn send_romaji_as_unicode(&self, romaji: &str) {
-        if let Some(kana) = self.kana_table.kana_for_romaji(romaji) {
-            self.send_unicode_char(kana);
-            return;
-        }
-        // テーブルにない場合はフォールバック
-        self.send_romaji_per_key(romaji);
-    }
-
     // ── 静的ヘルパー（SendInput 操作） ────────────────────────────────────────
 
     /// `ch` を UTF-16 エンコードし、down/up ペアを `inputs` に追加する。
@@ -185,7 +157,15 @@ impl KeyInjector {
     }
 
     /// VK の DOWN+UP ペアを（オプション shift 付きで）1回の SendInput で送信する。
+    ///
+    /// 前景窓が、↓から↑まで時間を空けないと取りこぼす窓(Zoom のチャット)なら、↓の後に待ちを置く
+    /// (`key_pacer`、メッセージループは止めない)。
     pub(crate) fn send_vk_pair(vk: VkCode, needs_shift: bool, marker: VkMarker) {
+        let hold_ms = Self::key_hold_ms();
+        if hold_ms > 0 {
+            Self::send_vk_with_hold(vk, needs_shift, marker, hold_ms);
+            return;
+        }
         let mut inputs = Vec::with_capacity(4);
         if needs_shift {
             inputs.push(make_key_input(VK_LSHIFT, false));
@@ -198,8 +178,44 @@ impl KeyInjector {
         let _ = crate::win32::send_input_safe(&inputs);
     }
 
+    /// 前景窓が、注入キーの「↓から↑まで」に時間を空けないと取りこぼす窓なら、その待ち(ms)を返す。そうでなければ 0。
+    #[allow(unsafe_code)] // 前景窓のクラス名の読み取り(Win32)
+    fn key_hold_ms() -> u64 {
+        // SAFETY: Win32 GetForegroundWindow + GetClassName; returns a placeholder string on failure.
+        let fg_class = unsafe { crate::ime::get_foreground_window_class() };
+        if crate::focus::class_names::needs_key_hold_window(&fg_class) {
+            crate::tuning::ZOOM_KEY_HOLD_MS
+        } else {
+            0
+        }
+    }
+
+    /// 1 キーを「↓ → `hold_ms` 待つ → ↑」で送る(Shift が要るなら、その内側で押す)。
+    /// 待ちは `key_pacer` のタイマーで進めるので、メッセージループは止まらない。送信の順序は提出の順。
+    fn send_vk_with_hold(vk: VkCode, needs_shift: bool, marker: VkMarker, hold_ms: u64) {
+        let mut down = Vec::with_capacity(2);
+        if needs_shift {
+            down.push(make_key_input_ex(VK_LSHIFT, false, INJECTED_MARKER));
+        }
+        down.push(marker.make_input(vk, false));
+        let mut up = vec![marker.make_input(vk, true)];
+        if needs_shift {
+            up.push(make_key_input_ex(VK_LSHIFT, true, INJECTED_MARKER));
+        }
+        crate::key_pacer::send_paced(down, u32::try_from(hold_ms).unwrap_or(u32::MAX));
+        crate::key_pacer::send_paced(up, 0);
+    }
+
     /// 1 ラン分の INPUT を構築して送信し、送信した INPUT 数を返す。
     fn send_vk_run_batch(run: &[(VkCode, bool)], marker: VkMarker) -> usize {
+        let hold_ms = Self::key_hold_ms();
+        if hold_ms > 0 {
+            // 前景窓が、↓から↑まで時間を空けないとキーを取りこぼす窓(Zoom のチャット): キーを 1 つずつ順に送る。
+            for &(vk, needs_shift) in run {
+                Self::send_vk_with_hold(vk, needs_shift, marker, hold_ms);
+            }
+            return run.len() * 2;
+        }
         let mut inputs = Vec::with_capacity(run.len() * 4);
         for &(vk, needs_shift) in run {
             if needs_shift {
@@ -243,34 +259,6 @@ impl KeyInjector {
         for run in Self::split_vk_runs(chars) {
             let n = Self::send_vk_run_batch(run, VkMarker::InjectedWithScan);
             tracing::debug!("[vk-send] romaji={romaji:?} batch {n} inputs");
-        }
-    }
-
-    fn format_vk_run(run: &[(VkCode, bool)]) -> String {
-        run.iter()
-            .map(|&(v, s)| {
-                if s {
-                    format!("S{v:02X}")
-                } else {
-                    format!("{v:02X}")
-                }
-            })
-            .join(",")
-    }
-
-    /// VK run 分割送信: 同一 VK 連続境界でバッチを分割して IME のオートリピート誤検出を回避する。
-    pub(crate) fn send_vk_runs(chars: &[(VkCode, bool)], cold_seq: Generation) {
-        let runs = Self::split_vk_runs(chars);
-        let total_runs = runs.len();
-
-        for (run_idx, run) in runs.into_iter().enumerate() {
-            let run_gji_idle = crate::tsf::observer::gji_idle_ms();
-            tracing::debug!(
-                "[h1-run] cold={cold_seq} run={run_idx}/{total_runs} gji={run_gji_idle}ms vks=[{}]",
-                Self::format_vk_run(run),
-                cold_seq = cold_seq.value(),
-            );
-            Self::send_vk_run_batch(run, VkMarker::Tsf);
         }
     }
 

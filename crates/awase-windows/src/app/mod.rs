@@ -3,9 +3,8 @@ mod bootstrap;
 mod logging;
 pub(crate) use bootstrap::log_path as bug_report_log_path;
 pub(crate) use bootstrap::{
-    detect_conflicting_software, detect_relay_or_remap_software,
+    apply_thumb_engine_config, detect_conflicting_software, detect_relay_or_remap_software,
     is_relay_or_remap_software_process, list_all_running_process_names,
-    thumb_shift_faces_enabled_for,
 };
 pub(crate) use logging::flush_log_writer;
 
@@ -15,7 +14,7 @@ use anyhow::{Context, Result};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::UnregisterHotKey;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, TranslateMessage, MSG, WM_APP, WM_COMMAND, WM_HOTKEY,
+    DispatchMessageW, GetMessageW, TranslateMessage, MSG, WM_APP, WM_COMMAND, WM_HOTKEY, WM_INPUT,
     WM_INPUTLANGCHANGE, WM_POWERBROADCAST, WM_TIMER,
 };
 
@@ -30,8 +29,9 @@ use crate::vk::VkCodeExt;
 use crate::{
     with_app, with_app_or_repost, with_app_or_repost_with, WM_ASYNC_IME_APPLY_COMPLETE,
     WM_DRAIN_OUTPUT_QUEUE, WM_DUMP_JOURNAL, WM_DUPLICATE_INSTANCE, WM_ENGINE_QUIT_REQUEST,
-    WM_EXECUTE_EFFECTS, WM_FOCUS_KIND_UPDATE, WM_HOOK_IME_MODE_DIAGNOSTIC, WM_IME_KIND_CHANGED,
-    WM_KANA_LOCK_WARNING_CHANGED, WM_KEY_FROM_HOOK, WM_PANIC_RESET, WM_RELOAD_CONFIG,
+    WM_EXECUTE_EFFECTS, WM_HOOK_IME_MODE_DIAGNOSTIC, WM_IME_KIND_CHANGED,
+    WM_INDICATOR_GLYPH_PUSH_NOTIFY, WM_INDICATOR_GLYPH_READ, WM_KANA_LOCK_WARNING_CHANGED,
+    WM_KEY_FROM_HOOK, WM_PANIC_RESET, WM_RELOAD_CONFIG, WM_RESUME_HOLD_DONE,
 };
 
 // ── 定数 ──
@@ -467,6 +467,53 @@ fn init_ngram_validated(config: &ValidatedConfig, diag: &mut StartupDiagnostics)
     }
 }
 
+/// ADR-263 PR 2a: `[auto_detect]` の影の判定を起動する（`mode = off` や n-gram 表が読めないときは何もしない）。
+///
+/// 仮名 n-gram の表は `Engine` が持つもの（`init_ngram_validated`）とは別に、生の表を読むためにもう一度ロードする
+/// （`NgramModel::frequency_score` は未知の組を最頻と同点で返すので確率に使えない。ADR-263 D3）。
+fn init_lang_detect_validated(config: &ValidatedConfig, diag: &mut StartupDiagnostics) {
+    use awase::config::AutoDetectMode;
+    let cfg = &config.auto_detect;
+    let ngram = if cfg.mode == AutoDetectMode::Off {
+        None
+    } else if let Some(ref path) = config.general.ngram_file {
+        let path = resolve_relative(path);
+        match NgramModel::from_file(&path, 0, 0, 0) {
+            Ok(model) => Some(model),
+            Err(e) => {
+                diag.warn(format!(
+                    "auto_detect: n-gramモデル解析失敗（影の判定は無効）: {e}"
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // 保持と両立しない設定: Space を親指キーにした構成（英文のロールオーバーでも親指と文字の重なりが成立する）と、
+    // ADR-255 の遅いルール（`[[keymaps]]` の `ime = "off"`、IME OFF のとき親指キーを Space として打つ）。
+    // 表記ゆれ（`"Space"`・`"vk_space"` 等）を取りこぼさないよう、名前の一致ではなく VK を比べる（ADR-201 決定 1）。
+    let space_thumb = crate::state::alt_impersonation::is_thumb_key_vk(
+        &config.general.left_thumb_key,
+        &config.general.right_thumb_key,
+        crate::vk::VK_SPACE,
+    );
+    let late_keymap = config
+        .keymaps
+        .iter()
+        .any(|rule| rule.ime.as_deref() == Some("off"));
+    let hold_config_ok = !space_thumb && !late_keymap;
+    if matches!(cfg.mode, AutoDetectMode::ImeOn | AutoDetectMode::ImeOnEisu) && !hold_config_ok {
+        diag.warn(
+            "auto_detect: mode = \"ime_on\"/\"ime_on_eisu\" は、Space を親指キーにした構成と ADR-255 の遅いルール \
+             ([[keymaps]] の ime = \"off\") では打鍵を保持しません（判定の記録だけ行います）"
+                .to_string(),
+        );
+    }
+    let cfg = cfg.clone();
+    let _ = with_app(|app| app.init_lang_detect(&cfg, ngram, hold_config_ok));
+}
+
 /// `WM_INPUTLANGCHANGE` 時にキーボードレイアウトを検証する（message_handlers から呼ばれる）
 pub(crate) fn check_keyboard_layout_on_change() {
     let (is_japanese, lang_id) = ime::keyboard_layout_info();
@@ -533,6 +580,13 @@ pub(crate) fn dispatch_engine_message(
                 message_handlers::handle_wm_hook_ime_mode_diagnostic(app);
             });
         }
+        WM_RESUME_HOLD_DONE => {
+            // ADR-245 追補 2 R2: 復元タスクの完了の札の通知。`hold_id` が今の保持と一致するときだけ解放する。
+            let (wparam, lparam) = (wparam.0, lparam.0);
+            with_app_or_repost_with(WM_RESUME_HOLD_DONE, wparam, lparam, |app| {
+                app.resume_hold_on_done(wparam, lparam);
+            });
+        }
         WM_PANIC_RESET => {
             with_app_or_repost(WM_PANIC_RESET, |app| unsafe {
                 message_handlers::handle_wm_panic_reset(app);
@@ -558,11 +612,20 @@ pub(crate) fn dispatch_engine_message(
         WM_INPUTLANGCHANGE => {
             let _ = with_app(|app| unsafe { message_handlers::handle_wm_inputlangchange(app) });
         }
-        WM_FOCUS_KIND_UPDATE => {
+        // 診断（issue #165）: Raw Input で見た物理キーの時刻を残す。観測だけ。後始末の `DefWindowProcW` は中で呼ぶ。
+        WM_INPUT => {
+            crate::observer::raw_key_input::on_wm_input(hwnd, wparam, lparam);
+        }
+        // ADR-261 段階 1: 入力インジケーターの字形の取り込みワーカーの結果（記録のみ。挙動を変えない）。
+        WM_INDICATOR_GLYPH_READ => {
             let (wparam, lparam) = (wparam.0, lparam.0);
-            with_app_or_repost_with(WM_FOCUS_KIND_UPDATE, wparam, lparam, |app| unsafe {
-                message_handlers::handle_wm_focus_kind_update(app, wparam, lparam);
+            with_app_or_repost_with(WM_INDICATOR_GLYPH_READ, wparam, lparam, |app| {
+                app.indicator_glyph_on_result(wparam, lparam);
             });
+        }
+        // ADR-283 §10: T2〜T4 共通の push トリガー（インジケーター要素自身の `Name` の変化、記録のみ）。
+        WM_INDICATOR_GLYPH_PUSH_NOTIFY => {
+            let _ = with_app(crate::runtime::Runtime::indicator_glyph_on_push_notify);
         }
         WM_HOTKEY if wparam.0 == HOTKEY_ID_TOGGLE as usize => {
             let _ = with_app(|app| unsafe { message_handlers::handle_wm_hotkey_toggle(app) });
@@ -639,6 +702,23 @@ fn handle_hook_key_event(mut event: awase::types::RawKeyEvent) {
         if fired == Some(true) {
             crate::win32::post_to_main_thread(WM_DUMP_JOURNAL);
         }
+    }
+    // ADR-263: 窓切替直後・長い無操作のあとのエピソード先頭の打鍵の判定。`observe` は記録だけ（常に通す）。
+    // `ime_on` は観測の無い窓で打鍵を保持し、日本語入力と判定できたときだけひらがなキーを送ってから流す。
+    // パニック復旧キー・ジャーナルのダンプ契機は、保持より前（上の KeyDown 処理）で必ず見る。
+    // 既知の限界: RUNTIME が借用中（再入）で `with_app` が `None` のときは判定にも保持にも入らず、後段の `None` 経路で
+    // `INPUT_DEFER` に積まれる。保持中にこの再入が起きると、保持列より先に再生される（ネストしたメッセージポンプ中だけ）。
+    if matches!(
+        with_app(|app| app.lang_detect_on_key(&event)),
+        Some(crate::runtime::LangDetectIntake::Consumed)
+    ) {
+        return;
+    }
+    // ADR-245 追補 2 R2: 戻った窓の最初の打鍵を保持している間に届いた打鍵は保持に足す(OUTPUT_GATE・FOCUS_RESYNC の
+    // 判定より前。`[[keymap]]` 照合・Nested/NonText の即時 reinject などが先に取って順序が入れ替わらない)。
+    // `with_app` が `None`(再入)のときは足さず後段へ進む(`deliver_key_event` の先頭でも足す)。
+    if with_app(|app| app.resume_hold_on_key(&event)).unwrap_or(false) {
+        return;
     }
     let defer_for_resync =
         crate::focus_resync::FOCUS_RESYNC.is_armed() && event.starts_focus_resync();
@@ -792,6 +872,7 @@ pub(crate) fn reload_config() {
     diag.warn_config(&load_notes, config_warnings);
 
     init_ngram_validated(&config, &mut diag);
+    init_lang_detect_validated(&config, &mut diag);
 
     let engine_on = parse_key_combos(&config.keys.engine_on, "Engine ON keys", &mut diag);
     let engine_off = parse_key_combos(&config.keys.engine_off, "Engine OFF keys", &mut diag);
@@ -836,17 +917,15 @@ pub(crate) fn reload_config() {
         &ime_off,
         &ime_toggle,
         config.general.engine_toggle_hotkey.as_deref(),
+        config.general.muhenkan_solo_tap_dedicated_fn_key.as_deref(),
     );
-    let mut special_keys = SpecialKeyCombos {
+    let special_keys = SpecialKeyCombos {
         engine_on,
         engine_off,
         ime_on,
         ime_off,
         ime_toggle,
     };
-    // ADR-206 決定4: 非推奨の `*_solo_tap_ime_action`（親指キーのもの）は bare の開閉として扱う。
-    // `apply_config_update` は冒頭で `thumb_forced_open_actions(&special_keys)` を求めるので、その前に移す。
-    crate::runtime::migrate_legacy_solo_tap_actions(&config.general, &mut special_keys);
     let mut apply_warnings: Vec<String> = Vec::new();
     let _ = with_app(|app| {
         apply_warnings = app.apply_config_update(&config, special_keys, toggle, on, off);

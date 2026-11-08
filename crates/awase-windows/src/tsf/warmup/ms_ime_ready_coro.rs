@@ -15,18 +15,17 @@
 //! （フォーカス先の conversion mode。準備完了で NATIVE ビットが立つ）を使う。
 //! Chrome 経路の `send_chrome_gji_reinit_and_poll` で運用実績のあるシグナル。
 //!
-//! この観測シグナル自体は injection mode に依存しないため、`InjectionMode::Vk`
-//! （Chrome/Edge/Electron、既定設定の TsfNative アプリ）にも同じゲートを展開している
-//! （`Output::ms_ime_gate_defer` 参照）。`target: TransmitTarget` で Phase 2 の送信先を
-//! Tsf/Chrome のどちらにするか切り替える。
+//! 当初は Tsf 注入モードにだけ配線していたが、観測シグナル自体は注入モードに依存しないため
+//! Vk（Batched VK）にも展開した（`Output::ms_ime_gate_defer` 参照）。Tsf 注入経路は 2026-10-22 に
+//! 撤去したので、Phase 2 の送信先は Batched VK だけ。
 //!
 //! ```text
-//! send_romaji_as_tsf / send_romaji_batched（MS-IME + ImeModeFsm 未確認）
+//! send_romaji_batched（MS-IME + ImeModeFsm 未確認）
 //!   ├─ romaji を保持して MsImeReadyCoro を pending_tsf に設置
 //!   ├─ Output::start_ms_ime_ready_poll が IMC ポーリング開始（10ms 間隔、async）
 //!   │    └─ ImeModeFsm を on_conversion_mode_read で確定させる
 //!   └─ コルーチン: env.ime_mode が NATIVE 確認されるまで tick 待機
-//!        ├─[確認]────────► Transmit(target) → deferred VK flush → Done
+//!        ├─[確認]────────► Transmit → deferred VK flush → Done
 //!        └─[期限切れ]────► 強制 Transmit（安全弁。give-up latch はポーリング側が設定。
 //!                          未確認のまま送るため IMC が読めない環境では先頭文字が
 //!                          リテラル化する可能性が残る）
@@ -58,7 +57,7 @@ use std::rc::Rc;
 use crate::state::event_origin::Generation;
 use crate::tsf::ime_mode_fsm::ImeModeState;
 use crate::tsf::probe_bridge::OutputActiveGuard;
-use crate::tsf::warmup::probe_fsm::{ProbeAction, TransmitPlan, TransmitTarget, TsfEnvSnapshot};
+use crate::tsf::warmup::probe_fsm::{ProbeAction, TransmitPlan, TsfEnvSnapshot};
 use crate::tsf::warmup::tickable_fsm::TickableFsm;
 use timed_fsm::coro::{yield_step, Channel, CoroStep, StepCoro};
 
@@ -82,18 +81,17 @@ async fn ms_ime_ready_coro_body(
     cold_seq: Generation,
     romaji: String,
     deadline_ms: u64,
-    target: TransmitTarget,
 ) {
     // ── Phase 1: ImeModeFsm の NATIVE 確認待ち ─────────────────────────────
     // 確認の実体は Output::start_ms_ime_ready_poll の async IMC ポーリング。
     // ここでは env 経由で結果を観測するだけ（tick = TIMER_TSF_PROBE 10ms 間隔）。
-    let start_ms = crate::hook::current_tick_ms();
+    let start_ms = crate::clock::current_tick_ms();
     loop {
         let env = yield_step(ch.clone(), vec![]).await;
         if env_native_ready(env) {
             tracing::info!(
                 "[msime-ready] cold={cold_seq} IME mode NATIVE 確認 (+{}ms) → 送信 {romaji:?}",
-                crate::hook::current_tick_ms().saturating_sub(start_ms),
+                crate::clock::current_tick_ms().saturating_sub(start_ms),
                 cold_seq = cold_seq.value(),
             );
             break;
@@ -110,7 +108,7 @@ async fn ms_ime_ready_coro_body(
         // 続く `kp_restore_kana_from_half_width` のリトライループが
         // `shift_conv_guard_gen` が一致する限り毎試行ごとに同じ幅で押し出し続ける。
         let effective_deadline_ms = deadline_ms.max(env.confirm_gate_deadline_override_ms);
-        if crate::hook::current_tick_ms() >= effective_deadline_ms {
+        if crate::clock::current_tick_ms() >= effective_deadline_ms {
             // 安全弁: IMC が読めない環境でタイピングを止めない。
             // give-up latch（連続発動の抑止）は start_ms_ime_ready_poll 側が設定する。
             tracing::warn!(
@@ -153,12 +151,10 @@ async fn ms_ime_ready_coro_body(
             ProbeAction::Transmit {
                 cold_seq,
                 plan: TransmitPlan {
-                    used_eager_path: false,
                     needs_literal: false,
                     literal_detect_ms: crate::tuning::RAW_TSF_LITERAL_DETECT_MS,
                 },
                 romaji,
-                target,
             },
             ProbeAction::Done,
         ],
@@ -169,8 +165,7 @@ async fn ms_ime_ready_coro_body(
 /// MS-IME confirm-then-transmit コルーチン。
 ///
 /// [`TickableFsm`] を実装し `pending_tsf` に格納される。
-/// 設置は `Output::ms_ime_gate_defer`（`send_romaji_as_tsf` / `send_romaji_batched`
-/// のゲート）。
+/// 設置は `Output::ms_ime_gate_defer`（`send_romaji_batched` のゲート）。
 pub(crate) struct MsImeReadyCoro {
     coro: StepCoro<TsfEnvSnapshot, Vec<ProbeAction>>,
     cold_seq: Generation,
@@ -181,18 +176,13 @@ pub(crate) struct MsImeReadyCoro {
 }
 
 impl MsImeReadyCoro {
-    pub(crate) fn new(
-        romaji: &str,
-        cold_seq: Generation,
-        deadline_ms: u64,
-        target: TransmitTarget,
-    ) -> Self {
+    pub(crate) fn new(romaji: &str, cold_seq: Generation, deadline_ms: u64) -> Self {
         let romaji = romaji.to_string();
         let mut coro = StepCoro::new(async move |ch| {
-            ms_ime_ready_coro_body(ch, cold_seq, romaji, deadline_ms, target).await;
+            ms_ime_ready_coro_body(ch, cold_seq, romaji, deadline_ms).await;
         });
         // pending_tsf に格納して外部から本物の tick を受け取り始める前に prime() で
-        // 消費しておく（詳細は `GjiWarmupCoro::new` のコメント参照）。
+        // 消費しておく（詳細は `ProbeCoroState::new` のコメント参照）。
         let primed = coro.prime();
         debug_assert!(
             matches!(&primed, CoroStep::Yielded(actions) if actions.is_empty()),
@@ -276,8 +266,8 @@ mod tests {
         let _lk = GATE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let deadline = crate::hook::current_tick_ms() + 60_000;
-        let mut coro = MsImeReadyCoro::new("wo", Generation::new(7), deadline, TransmitTarget::Tsf);
+        let deadline = crate::clock::current_tick_ms() + 60_000;
+        let mut coro = MsImeReadyCoro::new("wo", Generation::new(7), deadline);
 
         // 未確認の間は待機（アクションなし）
         for _ in 0..3 {
@@ -290,33 +280,8 @@ mod tests {
         assert_eq!(actions.len(), 2);
         assert!(matches!(
             &actions[0],
-            ProbeAction::Transmit { romaji, target: TransmitTarget::Tsf, plan, .. }
+            ProbeAction::Transmit { romaji, plan, .. }
                 if romaji == "wo" && !plan.needs_literal
-        ));
-        assert!(matches!(actions[1], ProbeAction::Done));
-    }
-
-    /// Vk 注入モード（Chrome/Edge/Electron 等）向け: ゲートが `TransmitTarget::Chrome` で
-    /// 設置された場合、Phase 2 の Transmit も Chrome ターゲットで発行されること。
-    /// `TransmitTarget::Tsf` へのハードコードが復活する退行を防ぐための固定テスト。
-    #[test]
-    fn coro_transmits_via_chrome_target_when_installed_for_vk_mode() {
-        let _lk = GATE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let deadline = crate::hook::current_tick_ms() + 60_000;
-        let mut coro =
-            MsImeReadyCoro::new("ka", Generation::new(9), deadline, TransmitTarget::Chrome);
-
-        let actions = coro.tick(env(ImeModeState::Hiragana, false));
-        assert!(actions.is_empty(), "未確認中は待機するはず: {actions:?}");
-
-        let actions = coro.tick(env(ImeModeState::Hiragana, true));
-        assert_eq!(actions.len(), 2);
-        assert!(matches!(
-            &actions[0],
-            ProbeAction::Transmit { romaji, target: TransmitTarget::Chrome, plan, .. }
-                if romaji == "ka" && !plan.needs_literal
         ));
         assert!(matches!(actions[1], ProbeAction::Done));
     }
@@ -327,8 +292,8 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // 安全弁: IMC が読めない環境でも期限でタイピングを止めない。
-        let deadline = crate::hook::current_tick_ms(); // 即座に期限切れ
-        let mut coro = MsImeReadyCoro::new("ka", Generation::new(8), deadline, TransmitTarget::Tsf);
+        let deadline = crate::clock::current_tick_ms(); // 即座に期限切れ
+        let mut coro = MsImeReadyCoro::new("ka", Generation::new(8), deadline);
 
         let actions = coro.tick(env(ImeModeState::Unknown, false));
         assert_eq!(actions.len(), 2);
@@ -355,8 +320,8 @@ mod tests {
         let _lk = GATE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let deadline = crate::hook::current_tick_ms(); // 元の期限は即座に切れる
-        let mut coro = MsImeReadyCoro::new("!", Generation::new(10), deadline, TransmitTarget::Tsf);
+        let deadline = crate::clock::current_tick_ms(); // 元の期限は即座に切れる
+        let mut coro = MsImeReadyCoro::new("!", Generation::new(10), deadline);
 
         for _ in 0..5 {
             let actions = coro.tick(env_with_override(ImeModeState::Off, true, u64::MAX));
@@ -386,15 +351,10 @@ mod tests {
     /// バグになる）。
     #[test]
     fn coro_prefers_the_later_of_deadline_ms_and_finite_override() {
-        let already_passed_deadline = crate::hook::current_tick_ms(); // 即座に期限切れのはずの値
-        let mut coro = MsImeReadyCoro::new(
-            "de",
-            Generation::new(11),
-            already_passed_deadline,
-            TransmitTarget::Tsf,
-        );
+        let already_passed_deadline = crate::clock::current_tick_ms(); // 即座に期限切れのはずの値
+        let mut coro = MsImeReadyCoro::new("de", Generation::new(11), already_passed_deadline);
 
-        let future_override = crate::hook::current_tick_ms() + 10_000;
+        let future_override = crate::clock::current_tick_ms() + 10_000;
         let actions = coro.tick(env_with_override(ImeModeState::Off, true, future_override));
         assert!(
             actions.is_empty(),
@@ -420,8 +380,8 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let active_before = OUTPUT_GATE.is_active();
-        let deadline = crate::hook::current_tick_ms() + 60_000;
-        let mut coro = MsImeReadyCoro::new("!", Generation::new(12), deadline, TransmitTarget::Tsf);
+        let deadline = crate::clock::current_tick_ms() + 60_000;
+        let mut coro = MsImeReadyCoro::new("!", Generation::new(12), deadline);
 
         // Phase 1: 未確認の間、tick を重ねても OUTPUT_GATE は動かない。
         for _ in 0..3 {

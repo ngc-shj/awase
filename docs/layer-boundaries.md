@@ -16,7 +16,7 @@ PR レビューと定期的な audit のチェックリストとして使う。
 
 **ルール**: `src/` は Windows / macOS / Linux のいずれにも依存しない。
 
-**Why**: ADR-019。macOS/Linux 対応のため lib を OS API 非依存に保つ。
+**Why**: ADR-019。lib を OS API 非依存に保ち、Linux 上でエンジンを単体テストできるようにする（macOS/Linux のスタブ crate は 2026-10-22 に撤去し、移植の予定は無い。SF-06）。
 
 **禁則**:
 - `windows-rs` / `core-foundation` 等の OS crate を依存に追加する
@@ -120,9 +120,10 @@ ADR-032 で定義した 6 つの設計原則をコード上で守るためのチ
 
 **ルール**: `ImeModel::reduce()` で `desired_open = ...` への代入は次の 4 アームのみ。
 
-- `UserImeSetIntent` / `UserImeToggleIntent` — 真のユーザー意図。`last_intent` を設定する。
+- `UserImeSetIntent` — 真のユーザー意図。`last_intent` を設定する。
 - `PanicReset` — パニックリセット（全面復旧）。`apply_panic_reset` 専用。`last_intent` を設定しない。
 - `HwndCacheRestored` — HWND キャッシュ復元。`apply_hwnd_cache_restore` 専用。`last_intent` を設定しない。
+- `ModeKeyPassedThrough` — 通過させたモードキーの結果（ADR-191）。`align_desired` かつ観測から導ける開閉があるときだけ揃える。`last_intent` を捨てる。
 
 **Why**: ADR-032 設計原則 1。intent と observation の責務分離。
 `PanicReset` / `HwndCacheRestored` は「観測ではないが、ユーザー意図でもない、直接書き込みの正当な例外」として明示的に隔離されている（かつて `UserIntentSource::Recovery` / `HwndCache` としてユーザー意図を偽装し confidence ガードをバイパスしていた抜け道を、型ごと削除して専用イベントに分離した経緯がある）。両者は `last_intent` を設定しないため `has_user_explicit_intent()` を汚染せず、後続の実観測が `effective_open()` を上書きできる。詳細は `.claude/rules/ime-belief-architecture.md` を参照。
@@ -137,8 +138,8 @@ ADR-032 で定義した 6 つの設計原則をコード上で守るためのチ
 ```sh
 grep -rn "desired_open\s*=" crates/awase-windows/src/
 ```
-期待: `state/ime_model.rs` の reduce 内 `UserImeSetIntent` / `UserImeToggleIntent` /
-`PanicReset` / `HwndCacheRestored` アームのみ（初期化の `Default::default()` 等は除く）。
+期待: `state/ime_model.rs` の reduce 内 `UserImeSetIntent` / `PanicReset` /
+`HwndCacheRestored` / `ModeKeyPassedThrough` アームのみ（テスト専用の `set_desired_open_for_test` ・初期化の `Default::default()` 等を除く）。
 
 ### C-2: Observer は `ImeEvent::ObserverReported` 経由で報告
 
@@ -220,14 +221,15 @@ grep -rn "ctrl_bypass_hold\|focus_transition_pending\|shadow_toggle_suppressed\|
 
 ### C-6: Event は seq 全順序
 
-**ルール**: 全 `ImeEvent` dispatch は `event_log.record()` 経由で seq が
+**ルール**: 全 `ImeEvent` dispatch は `event_log.record_at()` 経由で seq が
 付与される。reducer 内の順序判断は `envelope.time.seq` または
-`envelope.time.monotonic` を使う。`tick_ms` は表示用のみ。
+`envelope.time.monotonic` を使う。`tick_ms`（`GetTickCount64` 由来）は、
+キー効果の予測の照合など「ms 単位の経過」を見る箇所（`reconcile_key_effect_mode`）が読む。順序判断には使わない。
 
 **Why**: ADR-032 設計原則 6。壁時計依存の排除、リプレイ可能性の確保。
 
 **禁則**:
-- `event_log.record()` を経由せず reducer を直接呼ぶ
+- `event_log.record_at()` を経由せず reducer を直接呼ぶ
 - reducer 内の判断で `SystemTime::now()` / wall clock を使う
 
 **検出**:
@@ -245,7 +247,7 @@ grep -rn "self\.shadow_model\.reduce\|model\.reduce" crates/awase-windows/src/
 
 ### D-1: magic hex を `vk.rs` 外で書かない
 
-**ルール**: `VkCode` の hex literal (`0xVV`) は `crates/awase-windows/src/vk.rs`
+**ルール**: `VkCode` の hex literal (`0xVV`) は `crates/awase-windows-core/src/vk.rs`
 にのみ存在する。分類は `vk.rs` の helper、log は `UpperHex impl` を使う。
 
 **Why**: [[feedback_vk_encapsulation]]。VK 定数の意図を helper / 定数名で表現。
@@ -350,7 +352,7 @@ SendInput成功後のみ）という非対称な不変条件が、呼び出し�
 # （M4: 素朴な `pub {field}` リテラル一致だと `pub(crate) {field}` を
 # 検出できなかった、という指摘の反映）。
 grep -rnE "pub(\([a-zA-Z_:]+\))? *(left_tap_armed|right_tap_armed|conv_guard_pending|toggle_held|entry_policy)" \
-  crates/awase-windows/src/state/half_width_alnum.rs
+  crates/awase-windows-core/src/state/half_width_alnum.rs
 ```
 期待: 0件（`crates/awase-windows/tests/architecture_guard.rs::
 half_width_alnum_state_fields_are_not_accessed_directly` が
@@ -388,7 +390,7 @@ grep -rn "SendMessageTimeoutW" crates/awase-windows/src/ | grep -v "imm\.rs\|ime
 
 # カテゴリ F
 grep -rnE "pub(\([a-zA-Z_:]+\))? *(left_tap_armed|right_tap_armed|conv_guard_pending|toggle_held|entry_policy)" \
-  crates/awase-windows/src/state/half_width_alnum.rs
+  crates/awase-windows-core/src/state/half_width_alnum.rs
 ```
 
 ### 違反候補の分類
@@ -406,7 +408,7 @@ architectural risk の高い順:
 1. C-1 (Intent → desired_open 経路) — 違反すると Observer/Intent の責務分離崩壊
 2. C-2 (Observer → ObserverReported 経由) — 違反すると intent 破壊復活
 3. C-3 (generation 照合) — 違反すると stale apply race 復活
-4. A-1, A-2 (lib プラットフォーム独立性) — 違反すると macOS/Linux 対応コスト爆発
+4. A-1, A-2 (lib プラットフォーム独立性) — 違反すると Linux 上の単体テストが成り立たなくなる
 5. その他
 
 ---

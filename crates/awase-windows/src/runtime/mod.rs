@@ -1,34 +1,39 @@
 mod conv_actuation;
+mod drift_follow_would;
 #[cfg(windows)]
 pub(crate) mod engine_window;
 pub(crate) mod executor;
+mod focus_switch_hold;
 mod focus_tracker;
 mod focus_tracking;
 mod ime_actuation;
 mod ime_coordinator;
 mod ime_refresh;
+mod indicator_glyph_shadow;
 mod key_pipeline;
 mod lang_check;
+mod lang_detect_shadow;
+mod mozc_shm_shadow;
+mod resume_hold;
+pub(crate) use lang_detect_shadow::LangDetectIntake;
 // ADR-089 §2.3 Phase B: ImmCross を機構チェーンの要素として実行する非同期経路。
 pub(crate) mod message_handlers;
 pub(crate) mod open_chain;
-pub(crate) mod outbox;
 mod transport;
 
 pub(crate) use transport::{PassthroughQueue, PhysicalKeyDisposition};
 
 use crate::focus::FocusKind;
+use crate::key_effect_io::{KeymapCacheShellExt as _, RuntimeTableCacheShellExt as _};
 use awase::config::ValidatedConfig;
 use awase::engine::{
-    Engine, EngineCommand, InputContext, InputModeState, KanaLockHysteresis, ModeKeyConfig,
-    SpecialKeyCombos, TextKeyConfig,
+    Engine, EngineCommand, InputContext, InputModeState, KanaLockHysteresis, SpecialKeyCombos,
 };
 use awase::ngram::NgramModel;
 use awase::types::Timestamp;
 use awase::types::{ContextChange, RawKeyEvent, VkCode};
 
 use crate::focus::cache::DetectionSource;
-use crate::focus::classifier::InjectionHint;
 use crate::platform::WindowsPlatform;
 use crate::runtime::executor::ImeApplyPair;
 use crate::vk::VkCodeExt as _;
@@ -47,22 +52,6 @@ pub(crate) fn thumb_forced_open_actions(
         special.bare_ime_action(crate::vk::VK_NONCONVERT),
         special.bare_ime_action(crate::vk::VK_CONVERT),
     )
-}
-
-/// ADR-206 決定4: 非推奨の `*_solo_tap_ime_action`（親指キーに割り当てられているものだけ）を、
-/// 該当キーの bare コンボ（`keys.ime_on/off/toggle` に単独で書いたのと同じ）としてメモリ上の照合表へ移す。
-/// `SpecialKeyCombos` を組み立てた直後、`thumb_forced_open_actions` を求める**前**に呼ぶこと。
-pub(crate) fn migrate_legacy_solo_tap_actions(
-    general: &awase::config::GeneralConfig,
-    special: &mut SpecialKeyCombos,
-) {
-    let (muhenkan, henkan) = general.legacy_thumb_solo_tap_actions();
-    if let Some(action) = muhenkan {
-        special.set_bare_ime_action_if_absent(crate::vk::VK_NONCONVERT, action);
-    }
-    if let Some(action) = henkan {
-        special.set_bare_ime_action_if_absent(crate::vk::VK_CONVERT, action);
-    }
 }
 
 #[cfg(test)]
@@ -140,8 +129,7 @@ pub(crate) fn resolve_dedicated_fn_key(name: Option<&str>) -> (Option<VkCode>, O
 /// `modifiers` はフック時点でキャプチャした `ModifierState` を渡すこと。
 /// タイマー等のイベント非同期パスでは呼び出し元が `read_os_modifiers()` で取得する。
 ///
-/// `ime_on` は呼び出し元が `platform_state.ime.effective_open()` を評価して渡す。
-/// `input_mode` は `ImeStateHub::input_mode()`（SSOT = `shadow_model.input_mode`）から取得する。
+/// `ime_on`・`input_mode` は呼び出し元が `platform_state.ime.engine_belief()`（ADR-282 V2 の唯一の切替点）から渡す。
 /// `is_japanese_ime` は `ImeBelief::is_japanese_ime()` から取得する。
 /// `composing` は呼び出し元が `tsf::observer::ime_composition_active_now()` を評価して渡す。
 #[must_use]
@@ -323,6 +311,25 @@ pub struct Runtime {
     focus_tracker: focus_tracker::FocusTracker,
     /// ADR-223 段階 0: 打鍵時の入力言語の記録(記録のみ、belief は変えない)
     lang_check: lang_check::LangCheck,
+    /// ADR-263 PR 2a: 窓切替直後・長い無操作のあとのエピソードの影の判定（記録のみ、挙動を変えない）
+    lang_detect: lang_detect_shadow::LangDetectShadow,
+    indicator_glyph: indicator_glyph_shadow::IndicatorGlyphShadow,
+    /// ADR-265 段階 1: mozc-readable の共有メモリの影の読み（記録のみ、挙動を変えない。既定は無効）
+    mozc_shm: mozc_shm_shadow::MozcShmShadow,
+    /// ADR-279 案 P の段階 P0: 明示 OFF の意図の間の IMM の読みの開の連続（記録のみ、挙動を変えない）
+    drift_follow_would: drift_follow_would::DriftFollowWould,
+    /// ADR-245 追補 2 R2: 戻った窓の最初の打鍵の保持(MS-IME 本体の復元後、R1 の観測が記録されるまで)。
+    resume_hold: crate::state::half_width_resume_hold::ResumeHold<RawKeyEvent>,
+    /// PR #809 の M1: 窓切替直後、refresh が新しい窓を読み終える前に届いた打鍵の保持(`runtime/focus_switch_hold.rs`)。
+    focus_switch_hold: crate::state::focus_switch_hold::FocusSwitchHold<RawKeyEvent>,
+    /// フォーカス変更の世代(`on_window_focus_event` ごとに 1 増える)。refresh は spawn 時に読んだ値で保持を解放する。
+    focus_event_seq: u64,
+    /// R2: Resume の段が作った R1 の ticket と完了の札。`kp_restore_kana_from_half_width` が取り出して復元タスクへ渡す
+    /// (取り出されなかった札は段が `NotOwner` で通知する)。
+    pending_resume_r1: Option<(
+        crate::state::probe_admission::ImmLikeTicket,
+        resume_hold::ResumeDoneToken,
+    )>,
     /// Platform 層の全状態
     platform_state: crate::PlatformState,
     /// 全キーマップルール（アプリフィルタ前）
@@ -334,6 +341,8 @@ pub struct Runtime {
     /// 進行中の IME actuation 試行（ADR-080）。`desired` 変化・`FocusChanged`・
     /// `Resolution` 確定でのみ破棄・再構築する（`runtime/ime_actuation.rs`）。
     active_actuation: Option<ime_actuation::Actuation>,
+    /// drift correction の計画を edge 記録するための追跡(ADR-250 段階 1)。理由が変わった tick だけ journal へ載せる。
+    drift_plan_edges: crate::state::drift_plan::DriftEdgeTracker,
     /// `config1.db` のキーマップ（打鍵時予測用）のキャッシュ。打鍵ごとに読み直さない。
     key_effect_keymap: crate::state::key_effect_predictor::KeymapCache,
     /// 直前のOS読み取り（`OsPoll`）で観測（`ime_on`）を得られたか。時間切れ・空振りは`false`。
@@ -485,34 +494,24 @@ impl Runtime {
         // Alt なりすまし中は本物の Alt 押下を無視する（hook.rs の
         // `is_alt_impersonation_active` doc 参照。ここを直さないと、hook.rs 側の
         // RawKeyEvent.modifier_snapshot は正しく補正されていても、
-        // bypass_reason() が実際に見る PhysicalKeyState.modifiers はこの
-        // build_ctx() の戻り値から来る（別経路）ため、なりすましたキーが
-        // 常に OsModifierHeld でバイパスされてしまう）。
+        // この build_ctx() の戻り値（タイマー・フォーカス・refresh 用の別経路）は
+        // 補正されないままになる）。なお打鍵の bypass_reason() が見る ctx は
+        // `key_pipeline.rs` が hook 時点の `event.modifier_snapshot` から組む
+        // （ADR-129）ので、ここではない。他アプリの注入 Ctrl（ADR-249）も
+        // 打鍵の snapshot にだけ足しており、この関数には入れない。
         if crate::hook::is_alt_impersonation_active() {
             modifiers.alt = false;
         }
         let (left_thumb_down, right_thumb_down) = crate::hook::thumb_down_timestamps();
+        let belief = self.platform_state.ime.engine_belief();
         build_input_context(
-            self.platform_state.ime.effective_open(),
-            self.platform_state.ime.input_mode(),
+            belief.open,
+            belief.input_mode,
             self.platform_state.ime.belief.is_japanese_ime(),
             crate::tsf::observer::ime_composition_active_now(),
             &modifiers,
             left_thumb_down,
             right_thumb_down,
-        )
-    }
-
-    /// output 層が注入モードを決定するために呼ぶ公開 API。
-    ///
-    /// focus の `injection_hint()` と `platform_state.app_kind` を組み合わせて
-    /// `InjectionHint` を返す。output 層はこのメソッドのみを呼び、
-    /// focus/classify の内部型に直接アクセスしない。
-    #[must_use]
-    pub fn injection_hint(&self) -> (InjectionHint, crate::focus::AppKind) {
-        (
-            self.platform.injection_hint(),
-            self.platform_state.focus.app_kind,
         )
     }
 
@@ -571,19 +570,7 @@ impl Runtime {
     }
 
     /// 現在フォーカス中のアプリが IMM32 クロスプロセス制御を使えるか返す。
-    ///
-    /// ADR-158 TE3: `AppImeProfile::can_use_imm32_cross_process`が観測用の
-    /// `#[actuation_choke_point]`を付けた際に`const fn`ではなくなったため、
-    /// 以前ここにあった`#[expect(clippy::missing_const_for_fn)]`（「const化できる」
-    /// というclippy提案の抑制）は不要になった。
-    ///
-    /// `#[track_caller]`（opus code review S3で追加）: このメソッドは薄いラッパで、
-    /// `AppImeProfile::can_use_imm32_cross_process`が`std::panic::Location::caller()`で
-    /// 記録する呼び出し元は「直近1段」のみ。このラッパに`#[track_caller]`が無いと、
-    /// このラッパ経由の呼び出しがすべて`runtime/mod.rs`のこの行として記録され、
-    /// 真の呼び出し元（このラッパをさらに呼んでいる側）が観測ログから消える。
     #[must_use]
-    #[track_caller]
     pub fn can_use_imm32_cross_process(&self) -> bool {
         self.platform
             .current_app_profile()
@@ -596,10 +583,15 @@ impl Runtime {
     /// 避けるため、開く・閉じるの両方向とも GJI に限る（round: PR #377 Opus レビュー 1・2）。
     #[must_use]
     pub fn external_change_watch_applies(&self) -> bool {
-        self.platform.current_app_profile()
-            == crate::focus::class_names::AppImeProfile::Imm32Unavailable
-            && crate::tsf::observer::tsf_obs().active_ime_kind()
-                == crate::tsf::observer::ActiveImeKind::GoogleJapaneseInput
+        external_change_watch_applies_for(self.platform.current_app_profile())
+    }
+
+    /// ADR-188・ADR-244: 直接観測の窓（物理のモードキー通過／FSM 再送出の直後の読みを belief と照合する）を適用する
+    /// IME 種別。`Imm32Unavailable` の窓で GJI／同定済み MS-IME 本体のときだけ `Some`（ADR-205 の外部変化の監視は
+    /// 別の述語 `external_change_watch_applies` で GJI 限定のまま）。
+    #[must_use]
+    pub fn direct_mode_key_watch_kind(&self) -> Option<crate::state::ime_kind::ImeKindId> {
+        direct_mode_key_watch_kind_for(self.platform.current_app_profile())
     }
 
     /// IMM 検出の前後ミス数から、クラス名単位の IMM 能力をキャッシュに記録する。
@@ -671,7 +663,7 @@ impl Runtime {
         if is_kanji && event.injected {
             return; // injected は付けない。静的 Toggle のまま（現行と同じ）。
         }
-        if !is_kanji && !crate::vk::is_role_candidate(event.vk_code) {
+        if !is_kanji && !crate::vk_windows::is_role_candidate_cached(event.vk_code) {
             return;
         }
         let is_fkey = crate::vk::is_role_fkey(event.vk_code);
@@ -1001,7 +993,11 @@ impl Runtime {
         // （issue #137 3周目のレビューで指摘・修正）。
         let was_user_enabled = self.engine.is_user_enabled();
         let ctx = self.build_ctx();
-        let decision = self.engine.on_command(EngineCommand::ToggleEngine, &ctx);
+        let mut decision = self.engine.on_command(EngineCommand::ToggleEngine, &ctx);
+        // ECRS DD5-03: トレイ・ホットキー起点の ON/OFF は、1 回のユーザー操作として押下 ID を載せる。載せないと、
+        // `press=None` の ON が `applied`（フォーカス時の写しや、書かれなかった OFF の後の古い値）で「すでに一致」と
+        // 省かれ、実 IME が閉じたまま残る（実 Chrome × GJI の CI で再現。docs/tasks/mech-ecrs-2026-10-21/dd503-ci-result.md）。
+        decision.stamp_set_open_press(Some(crate::hook::allocate_command_press_id()));
         self.execute_decision(decision);
         if was_user_enabled && !self.engine.is_user_enabled() {
             // エンジンが無効化されている間は romaji VK を送信しないため
@@ -1020,7 +1016,9 @@ impl Runtime {
     /// トレイの「状態をリセット」等、現在の ON/OFF に関わらず必ず有効化したい場合に使う。
     pub fn force_engine_on(&mut self) {
         let ctx = self.build_ctx();
-        let decision = self.engine.on_command(EngineCommand::ForceEngineOn, &ctx);
+        let mut decision = self.engine.on_command(EngineCommand::ForceEngineOn, &ctx);
+        // ECRS DD5-03: `toggle_engine` と同じ理由で、1 回のユーザー操作として押下 ID を載せる。
+        decision.stamp_set_open_press(Some(crate::hook::allocate_command_press_id()));
         self.execute_decision(decision);
     }
 
@@ -1055,19 +1053,14 @@ impl Runtime {
     pub fn spawn_ime_refresh(&mut self) {
         self.platform.timer.kill(crate::TIMER_IME_REFRESH);
 
-        // NOTE: ここで send_eager_tsf_warmup() を呼ばない。
-        // focus_transition_pending=true の時点では injection_mode が前ウィンドウ（WezTerm 等）
-        // の stale な Tsf のままであり、新しいウィンドウが Chrome/Edge の場合に誤って
-        // VK_DBE_HIRAGANA を送信して Chrome の IME を ON にしてしまうバグがあった。
-        // eager warmup は post_focus_change_snapshot (run_with_prefetched 内) で injection_mode
-        // 確定後に正しく送信される。
-
-        win32_async::spawn_local(async {
+        // 窓切替直後の打鍵の保持(M1)は、この refresh が spawn 時点で見ていたフォーカスの世代で解放する
+        // (フォーカス変更より前に spawn された refresh の完了で解放しない)。
+        let focus_seq = self.focus_event_seq;
+        win32_async::spawn_local(async move {
             let focus = crate::focus::probe::run_focus_probe_async().await;
             let snap = crate::ime::read_ime_state_full_async().await;
             let _ = crate::with_app(|app| {
-                app.run_ime_refresh_with_prefetched(focus, &snap);
-                app.settle_tsf_gate_after_refresh();
+                app.run_ime_refresh_with_prefetched(focus, &snap, focus_seq);
             });
         });
     }
@@ -1124,7 +1117,6 @@ impl Runtime {
                 mode,
                 strategy,
                 result: crate::state::ime_event::InputModeApplyResult::Applied,
-                at: tick_ms,
             },
             tick_ms,
         );
@@ -1161,6 +1153,26 @@ impl Runtime {
             self.schedule_ime_refresh(crate::tuning::MODE_KEY_PASS_REREAD_MS.min(remaining + 1));
             return;
         }
+        // ADR-238(BUG-190): 英数モードの候補(1 回目の英数の読み)が寿命内の間は、確認の読み直しを予約する。
+        // 通常のポーリング間隔(500ms)で上書きしない。`explicit_intent` による停止(下の早期 return)より前に置く:
+        // 明示意図があるとポーリング自体が止まり、確認の読みが届かず候補が確定も破棄もされないため。
+        // 間隔は通過マークと同じ(`mode_key_pass_next_read_ms`、直前の読みが失敗したら寿命の終わりの 1 回に絞る。BUG-158)。
+        // 候補は寿命が切れたら捨てる(確定しない)ので、この枝は寿命内に限る。読めない窓(`can_use_imm32_cross_process` が
+        // false)では確認の読みができないので予約しない。
+        if self.can_use_imm32_cross_process() {
+            if let Some(remaining) = self
+                .platform_state
+                .ime
+                .eisu_candidate_remaining_ms(now_for_watch)
+            {
+                self.schedule_ime_refresh(crate::state::mode_key_pass::mode_key_pass_next_read_ms(
+                    self.last_ime_read_ok,
+                    remaining,
+                    crate::tuning::MODE_KEY_PASS_REREAD_MS,
+                ));
+                return;
+            }
+        }
         // ADR-187: 無変換/変換の生キー通過後、窓が有効な間は follow の読み直しを予約する。通常のポーリング間隔で
         // 上書きしない。意図を捨てた後は`explicit_intent()`が`None`になるため、ここで上書きすると読み直しが
         // 窓(300ms)より後(既定500ms)に飛び、最初の観測が古い状態を読んだ回で追随できない。
@@ -1184,6 +1196,10 @@ impl Runtime {
             if self.platform_state.ime.explicit_intent().is_some()
                 || self.platform_state.ime.mode_key_pass_mark_live(now_ms)
             {
+                // ADR-279 案 P の段階 P0（観測だけ）: refresh は止めたまま、明示 OFF の意図の間の IMM の読みを専用の
+                // タイマーで取る（refresh を再開しない。GJI の I/O 推論が drift correction の根拠になるため、
+                // `runtime/drift_follow_would.rs` 参照）。対象外の窓では何もしない。
+                self.drift_follow_would_ensure_timer();
                 return;
             }
         } else if let Some(remaining) = self
@@ -1199,41 +1215,11 @@ impl Runtime {
             return;
         }
         if self.platform_state.ime.explicit_intent().is_some() {
+            // ADR-279 P0: 上と同じ（対象は `Imm32Unavailable` の窓だけなので、読める窓では何もしない）。
+            self.drift_follow_would_ensure_timer();
             return;
         }
         self.schedule_ime_refresh(u64::from(self.platform_state.focus.ime_poll_interval_ms));
-    }
-
-    /// `spawn_ime_refresh` の async タスク内で IME リフレッシュ後に TsfGate を遷移させる。
-    ///
-    /// `run_ime_refresh_with_prefetched` 完了後に呼ぶ。`last_focus_info` が更新済みのため
-    /// `injection_hint` を読んで正しい TsfGate 状態に遷移できる。
-    fn settle_tsf_gate_after_refresh(&mut self) {
-        // PendingWarmup 以外（Probing/Ready/Bypass）なら空 Vec が返る。
-        // confirm_tsf は PendingWarmup/Bypass → Probing、bypass_tsf は PendingWarmup/Probing → Bypass。
-        let is_tsf = matches!(self.platform.injection_hint(), InjectionHint::ForceTsf);
-        let held = if is_tsf {
-            self.platform.confirm_tsf()
-        } else {
-            // ここで belief（IME open observation）を書いてはならない。
-            // かつて ce45b82 が「非TSFウィンドウには日本語IMEが存在しない」という誤った
-            // 前提で write_focus_probe(false) の偽観測を注入していたが、Edge/Chrome
-            // （Imm32Unavailable, injection=Unicode）は非TSF注入かつ日本語IME有効であり、
-            // 実観測経路を持たないため偽 Low false が most_recent_trusted() 経由で belief を
-            // 支配し、フォーカス約500ms後（次ポーリング）に Engine が必ず OFF になった
-            // （docs/known-bugs.md BUG-07）。ce45b82 の元バグ（Win+X メニューの1文字
-            // ショートカットが NICOLA 変換される）は、現在は classify.rs の既知 NonText
-            // クラス判定 + message_handlers.rs の NonText パススルーが belief と独立に防ぐ。
-            self.platform.bypass_tsf()
-        };
-        self.platform.timer.kill(crate::TIMER_TSF_GATE);
-        if !held.is_empty() {
-            tracing::debug!(
-                "[tsf-gate] draining {} held keys via INPUT_DEFER",
-                held.len()
-            );
-            crate::INPUT_DEFER.replay_later(held);
-        }
     }
 
     /// IME を実際に ON/OFF する直接呼び出し（`Decision`/`Effect` を経由しない経路）が、
@@ -1380,7 +1366,7 @@ impl Runtime {
                 self.platform_state.ime.effective_open(),
                 self.platform_state.ime.is_force_on_guard_active(),
                 self.platform_state.ime.input_mode(),
-                self.platform_state.ime.belief.prev_conversion_mode(),
+                self.platform_state.ime.belief.eisu_candidate(),
                 self.platform.focus.process_name(),
             )
         };
@@ -1402,7 +1388,8 @@ impl Runtime {
         // 到達すれば、直前の `poll_and_classify_ime` の新鮮な観測を経由せず
         // `effective_open()`（belief、explicit-intent 分岐が優先される）を
         // そのまま書く点に注意。将来 sync key gate を復活させる際は
-        // `focus_tracking.rs:409` と同型のプロファイル分岐を検討すること。
+        // `focus_tracking.rs:409` と同型のプロファイル分岐（`state::applied_mirror_plan::may_mirror_applied_on_focus`
+        // が見る TsfNative と実測学習による降格）を検討すること。
         let observed_ime_on = self.platform_state.ime.effective_open();
         self.platform_state
             .ime
@@ -1457,11 +1444,22 @@ impl Runtime {
                 sync_off_keys,
             ),
             lang_check: lang_check::LangCheck::default(),
+            lang_detect: lang_detect_shadow::LangDetectShadow::disabled(),
+            indicator_glyph: indicator_glyph_shadow::IndicatorGlyphShadow::disabled(),
+            mozc_shm: mozc_shm_shadow::MozcShmShadow::disabled(),
+            drift_follow_would: drift_follow_would::DriftFollowWould::default(),
+            resume_hold: crate::state::half_width_resume_hold::ResumeHold::new(),
+            focus_switch_hold: crate::state::focus_switch_hold::FocusSwitchHold::new(
+                crate::tuning::FOCUS_SWITCH_HOLD_MAX_MS,
+            ),
+            focus_event_seq: 0,
+            pending_resume_r1: None,
             platform_state,
             all_keymaps,
             post_bypass_rules,
             ime_coordinator: ime_coordinator::ImeCoordinator::new(),
             active_actuation: None,
+            drift_plan_edges: crate::state::drift_plan::DriftEdgeTracker::new(),
             key_effect_keymap: crate::state::key_effect_predictor::KeymapCache::default(),
             last_ime_read_ok: true,
             key_effect_keymap_native: crate::state::key_effect_predictor::KeymapCache::default(),
@@ -1513,6 +1511,11 @@ impl Runtime {
         self.predict_henkan_open_in_unreadable_windows = enabled;
     }
 
+    /// ADR-282 V2-2: `config.general.belief_v2`(隠し設定、既定 false)。Engine の入力の belief を候補 Z から読むか。
+    pub(crate) fn set_belief_v2(&mut self, enabled: bool) {
+        self.platform_state.ime.set_engine_belief_z(enabled);
+    }
+
     pub(crate) const fn set_update_check_enabled(&mut self, enabled: bool) {
         self.update_check_enabled = enabled;
     }
@@ -1522,7 +1525,7 @@ impl Runtime {
     }
 
     /// 状態依存キー警告の対象にする親指キーを、設定（抑止・専用Fnキー・bare `keys.ime_*`）から決める。
-    /// bare の開閉（旧 `*_solo_tap_ime_action` の移行分を含む）を持つキーは awase が単独タップを消費する。
+    /// bare の開閉を持つキーは awase が単独タップを消費する。
     /// IME 設定由来の役割は打鍵ごとにしか求まらず静的に判定できないため、ここでは含めない
     /// （役割のあるキーで警告が出ることがあるが、警告は案内であり動作には影響しない）。
     pub(crate) fn set_passthrough_thumb_mode_keys(
@@ -1719,27 +1722,24 @@ impl Runtime {
             .ime
             .try_set_focus_transition_barrier(hwnd_id, now);
 
-        // デバウンスタイマー（~50ms）が完了する前にキーが来た場合でも injection_mode が
-        // 正しくなるよう、フォーカス変更直後に新ウィンドウの class/pid から同期更新する。
-        // WezTerm(ForceTsf) → Chrome 等の遷移でも hint を新ウィンドウから引くため stale にならない。
+        // フォーカス変更直後に新ウィンドウの class/pid を読み、ログと BUG-37 の再プライム判定に使う。
+        // （以前はここで注入モード〈`force_tsf` の Tsf/Vk〉も同期更新していたが、Tsf 注入経路は
+        // 2026-10-22 に撤去した。）
         {
+            use crate::win32::HwndIdExt as _;
             let hwnd = hwnd_id.to_hwnd();
             let class_name = crate::focus::classify::get_class_name_string(hwnd);
             if !class_name.is_empty() {
                 let pid = crate::focus::classify::get_window_process_id(hwnd);
                 let new_app_kind = crate::observer::focus_observer::detect_app_kind(&class_name);
-                let hint = self.platform.injection_hint_for(pid, &class_name);
-                let new_mode = crate::output::types::InjectionMode::from((hint, new_app_kind));
-                self.platform.update_injection_mode(new_mode);
                 tracing::debug!(
-                    "[focus-sync] hwnd=0x{:X} class={class_name:?} \
-                     app_kind={new_app_kind:?} hint={hint:?} → mode={new_mode:?}",
+                    "[focus-sync] hwnd=0x{:X} class={class_name:?} app_kind={new_app_kind:?}",
                     hwnd_id.0
                 );
 
                 // BUG-37: この `EVENT_OBJECT_FOCUS` 経路（Ctrl+T 新規タブ等、同一プロセス内の
                 // フォーカス移動を含む）は belief（desired_open/effective_open）を一切触らない。
-                // 判定ロジックは `should_reprime_on_lightweight_focus_sync` のドキュメント参照
+                // 判定ロジックは `!can_use_imm32_cross_process()`(実 IME の状態を問い合わせられない窓、BUG-37)かつ belief=ON のとき再プライムする
                 // （唯一の訂正チャネルである物理 IME キー押下が shadow-toggle の no-op に
                 // 握り潰される問題を、真のフォーカス変更と同じ再プライム機構で補う）。
                 // cold mark 自体は次に実際に入力するまで何も送信しない遅延フラグなので、
@@ -1757,10 +1757,9 @@ impl Runtime {
                     crate::focus::classify::AppImeProfile::resolve(&class_name, relay_apps, || {
                         crate::focus::classify::get_process_name(pid)
                     });
-                if profile.should_reprime_on_lightweight_focus_sync(
-                    &class_name,
-                    self.platform_state.ime.effective_open(),
-                ) {
+                if !profile.can_use_imm32_cross_process()
+                    && self.platform_state.ime.effective_open()
+                {
                     tracing::debug!(
                         "[focus-sync] belief=ON かつ実状態を問い合わせられないプロファイル \
                          (profile={profile:?}) → 次の入力で再プライムするため cold mark"
@@ -1770,11 +1769,9 @@ impl Runtime {
             }
         }
 
-        self.platform.on_focus_change_tsf();
-        self.platform.timer.set(
-            crate::TIMER_TSF_GATE,
-            std::time::Duration::from_millis(crate::tsf::WARMUP_TIMEOUT_MS),
-        );
+        // PR #809 の M1: この後の refresh が新しい窓を読み終えるまでに届いた最初の打鍵を保持する(全窓。期限は
+        // `tuning::FOCUS_SWITCH_HOLD_MAX_MS`)。旧 TsfGate の保持とは別の小さな機構(`state/focus_switch_hold.rs`)。
+        self.focus_switch_hold_on_focus_event();
         let debounce_ms = u64::from(self.platform_state.focus.focus_debounce_ms);
         self.schedule_ime_refresh(debounce_ms);
     }
@@ -2065,14 +2062,6 @@ impl Runtime {
         }
     }
 
-    /// UIA ワーカースレッドへの送信チャネルを登録する。
-    pub(crate) fn set_uia_sender(
-        &mut self,
-        tx: std::sync::mpsc::Sender<crate::focus::uia::SendableHwnd>,
-    ) {
-        self.platform.set_uia_sender(tx);
-    }
-
     /// システムトレイのバルーン通知を表示する。
     pub(crate) fn show_tray_balloon(&mut self, title: &str, text: &str) {
         self.platform.tray.show_balloon(title, text);
@@ -2135,6 +2124,7 @@ impl Runtime {
         self.set_predict_henkan_open_in_unreadable_windows(
             config.general.predict_henkan_open_in_unreadable_windows,
         );
+        self.set_belief_v2(config.general.belief_v2);
         self.set_keyboard_model(config.general.keyboard_model);
         self.set_update_check_enabled(config.general.update_check);
         self.set_warn_state_dependent_mode_keys(config.general.warn_state_dependent_mode_keys);
@@ -2173,34 +2163,7 @@ impl Runtime {
                 left_alt_impersonates,
                 right_alt_impersonates,
             );
-            let space_thumb_vk = [left, right]
-                .into_iter()
-                .find(|&vk| vk == crate::vk::VK_SPACE);
-            self.engine.set_space_thumb_config(
-                space_thumb_vk,
-                TextKeyConfig {
-                    ignore_composing_guard: config.general.space_thumb_ignore_composing_guard,
-                    shift_literal: config.general.space_thumb_shift_literal,
-                },
-            );
-            let muhenkan_vk = [left, right]
-                .into_iter()
-                .find(|&vk| vk == crate::vk::VK_NONCONVERT);
-            let henkan_vk = [left, right]
-                .into_iter()
-                .find(|&vk| vk == crate::vk::VK_CONVERT);
-            self.engine.set_thumb_key_solo_tap_config(
-                muhenkan_vk,
-                ModeKeyConfig::from_legacy_bools(
-                    config.general.muhenkan_solo_tap_ignore_composing_guard,
-                    config.general.muhenkan_solo_tap_always_suppress,
-                ),
-                henkan_vk,
-                ModeKeyConfig::from_legacy_bools(
-                    config.general.henkan_solo_tap_ignore_composing_guard,
-                    config.general.henkan_solo_tap_always_suppress,
-                ),
-            );
+            crate::app::apply_thumb_engine_config(&mut self.engine, left, right, &config.general);
             let manual_fn_key = config.general.muhenkan_solo_tap_dedicated_fn_key.as_deref();
             let (fn_key, fn_key_warning) = resolve_dedicated_fn_key(manual_fn_key);
             warnings.extend(fn_key_warning);
@@ -2211,20 +2174,6 @@ impl Runtime {
                 &config.general.right_thumb_key,
                 crate::vk::VK_SPACE,
             ));
-            let enter_thumb_vk = [left, right]
-                .into_iter()
-                .find(|&vk| vk == crate::vk::VK_RETURN);
-            self.engine.set_enter_thumb_config(
-                enter_thumb_vk,
-                TextKeyConfig {
-                    ignore_composing_guard: config.general.enter_thumb_ignore_composing_guard,
-                    shift_literal: config.general.enter_thumb_shift_literal,
-                },
-            );
-            self.engine
-                .set_thumb_shift_faces_enabled(crate::app::thumb_shift_faces_enabled_for(
-                    left, right,
-                ));
             tracing::info!(
                 "Thumb keys updated: left={:?}, right={:?}",
                 config.general.left_thumb_key,
@@ -2298,32 +2247,6 @@ impl Runtime {
         let _ = self
             .engine
             .on_command(EngineCommand::SetNgramModel(model), &ctx);
-    }
-
-    /// Output が積んだ `RuntimeRequest` を drain して処理する。
-    ///
-    /// キー処理境界（`WM_EXECUTE_EFFECTS` / `WM_DRAIN_OUTPUT_QUEUE` 末尾）で呼ぶ。
-    ///
-    /// `Output` はキー注入中に `with_app` を再入させられないため、IME リフレッシュ・
-    /// TSF プローブ起動などの Runtime 操作を `RuntimeOutbox` に積んでおき、
-    /// ここで一括実行する（H-4-b: `StartTsfProbe` が Chrome cold パスから積まれる）。
-    pub(crate) fn drain_runtime_requests(&mut self) {
-        use crate::runtime::outbox::RuntimeRequest;
-        let requests = self.platform.output.take_pending_requests();
-        if requests.is_empty() {
-            return;
-        }
-        tracing::debug!("[runtime-outbox] {} request(s) を drain", requests.len());
-        for request in requests {
-            match request {
-                RuntimeRequest::StartTsfProbe => {
-                    tracing::debug!("[runtime-outbox] StartTsfProbe → pending TSF timer 適用");
-                    if let Some(cmd) = self.platform.output.pending_tsf_timer() {
-                        self.platform.apply_timer_command(cmd);
-                    }
-                }
-            }
-        }
     }
 
     /// パニックリセット: IME 関連キー連打で発動する緊急リセット。
@@ -2576,4 +2499,30 @@ mod layout_entry_tests {
             0
         );
     }
+}
+
+/// [`Runtime::direct_mode_key_watch_kind`] の本体（executor は `Runtime` を持たないので共有する）。判定は
+/// 純関数 `state::external_change_watch::direct_watch_kind`。
+#[must_use]
+pub(crate) fn direct_mode_key_watch_kind_for(
+    profile: crate::focus::class_names::AppImeProfile,
+) -> Option<crate::state::ime_kind::ImeKindId> {
+    crate::state::external_change_watch::direct_watch_kind(
+        profile == crate::focus::class_names::AppImeProfile::Imm32Unavailable,
+        crate::tsf::observer::tsf_obs().table_ime_kind(),
+        // Mozc 系は開閉を共有メモリ（ADR-268、High）が担う。IMM の開閉は入力モードを区別できず、実機で偽の「閉」が追随を通った（BUG-219、出所は未解明）。
+        crate::tsf::observer::gji_evidence_absent(),
+    )
+}
+
+/// `Runtime::external_change_watch_applies` の述語本体。executor（`Runtime` を持たない）からも同じ条件で呼ぶ（ADR-188）。
+#[must_use]
+pub(crate) fn external_change_watch_applies_for(
+    profile: crate::focus::class_names::AppImeProfile,
+) -> bool {
+    profile == crate::focus::class_names::AppImeProfile::Imm32Unavailable
+        && crate::tsf::observer::tsf_obs().active_ime_kind()
+            == crate::tsf::observer::ActiveImeKind::GoogleJapaneseInput
+        // Mozc 系（GJI 系だが Google 版でない）は対象外（BUG-219）。開閉は共有メモリが担い、実機で IMM の偽の「閉」が追随を通った。
+        && !crate::tsf::observer::gji_evidence_absent()
 }

@@ -47,7 +47,7 @@ status: |-
   （`read_legacy_compat_mode_enabled()`、`cargo test --lib`776件・clippy・architecture_guard/
   layer_boundary_guard113件いずれも緑）で、この撤回と無関係に独立して有効。
   `msime_legacy_keymap.rs`のmodule docは[BUG-161](../known-bugs/BUG-161.md)として訂正済み。
-  opus-adversarial-consult round1（`197-opus-review-round1.md`）のM1〜M5・S1〜S7は撤回した
+  opus-adversarial-consult round1（`review/197-opus-review-round1.md`）のM1〜M5・S1〜S7は撤回した
   決定1〜3が対象だったため未反映のままクローズする。develop未マージ、docs/known-bugs/BUG-161.md
   の新規作成が残作業。
 related_adr:
@@ -323,7 +323,7 @@ f03c-411b-9ce2-aa23e1171e36}\NoTsf3Override2`、dragonflyg4実機で`1`＝互換
 
 ### 決定1の前提は実機で否定された（2026-09-23 CI実機検証4パターン＋ユーザー本人の物理キー確認）
 
-round1レビューB1（`197-opus-review-round1.md`）は、ADR-148の実機確認が「変換キーを押すと
+round1レビューB1（`review/197-opus-review-round1.md`）は、ADR-148の実機確認が「変換キーを押すと
 IME ONになった」ことしか記録しておらず、**それは既定のNATURAL挙動（変換キーは元々OFF→ONに
 働く）と区別できない**、無変換キー（唯一区別できるはずのケース）は一度も実機で確認されて
 いない、と指摘した。この裏取りのため、GitHub Actions CI（windows-latest、`ci/e2e-ime.yml`に
@@ -466,6 +466,25 @@ keymap.rs`のようなレジストリ静的解析による検出全般に構造�
   区別していない——これは決定4が提供する`read_legacy_compat_mode_enabled()`と`keystyle`
   読み取りを、ADR-196側のフィンガープリント・学習対象構成の判定に活かせる具体的な理由でもある
   （ADR196-T5が既にこの情報を要求している、決定4参照）。
+
+## 訂正(2026-10-10、[ADR-254](254-msime-legacy-custom-keytable-read.md))
+
+本 ADR の結論「レジストリの記述内容は実挙動と相関しない」と、その根拠となった7パターンの否定的結果は、
+**部分的に誤り**だった。2026-10-10 の CI スパイクと実機(dragonflyg4、設定アプリの互換トグルで互換 ON に切り替えて測定)で、
+次が分かった。詳細は ADR-254 とその実測(`docs/tasks/msime-legacy-keytable-findings-2026-10-10.md`)。
+
+1. `key` の **1 列目は「開いている・入力なし」**(旧UIの列見出し No Input・Only Input・Converted…と1対1)。本 ADR の
+   「1列目 `CE`=直接入力→ON方向」は列の読み違い。IME が**閉じている間**のキーは `StyleList\Custom\S4key` が決める。
+2. 本 ADR の CI 7 パターンと実機確認は、いずれも閉じた状態で `key` だけを書いて(`S4key` を欠いて)無変換を押したので、
+   無反応は当然だった。`keystyle=Custom` かつ互換 ON のときは、`S4key`・`key` を揃えるとレジストリの表は実際に効く。
+3. dragonflyg4 の `無変換=CE CD CD CD CD CD`(dragonflyg4 の実際の `Custom` の表。`S4key` にも無変換の行がある)は、互換 ON・`Custom` では、閉・無変換が IME を開き、開・入力なしでは何もせず、
+   かな未確定では半角英数(conv 0x10)にする。本 ADR の「NATURAL `無変換=97` → IME OFF」は誤りで、97 は開・入力なしのかな切替。
+4. 互換 OFF(新エンジン)は `Custom` の表を読まない。`keystyle=ATOK` 等は新旧エンジンとも読むが、内蔵表が違う。
+5. 互換トグル(設定アプリ)は確認ダイアログの「OK」で `NoTsf3Override2` を書く。決定4の読み取りは UI の実状態を正しく表す。
+
+決定1〜3(`CE` だけを見る実行時警告)の撤回は、検出対象が `CE` のみだった点で今も妥当。「静的に読んで機能を推測しない」という
+結論部の一般化は、ADR-254 の実測(コード別の効果を CI と実機で測った上で、効果が確かめられたコードだけを使う)の範囲では
+緩めてよい。ただし未確認のコードは常に「予測しない」(ADR-254 決定5)。
 
 ## 関連
 

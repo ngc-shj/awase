@@ -1,7 +1,7 @@
 //! judgement 層 — 観測データから TSF 状態を推測する。
 //!
-//! - `TsfReadinessProbe`: GJI I/O 静止を待って「composition が受け付け可能か」を判定
-//! - `CompositionState`: warm/cold epoch 管理（フォーカス変更で自動無効化）
+//! - `TsfReadinessProbe`: 送信時点の GJI I/O 観測（settled / idle）を切り出す
+//! - `CompositionState`: warm/cold 状態管理（フォーカス変更で自動無効化）
 //! - `LiteralDetector`: 文字送信後に GJI 候補ウィンドウ変化を監視して
 //!   「composition が成功したか / raw literal が出力されたか」を判定
 
@@ -10,53 +10,25 @@ use std::sync::atomic::Ordering;
 use crate::state::event_origin::Generation;
 use crate::tsf::literal_facts::{DetectEvidence, LiteralVerdict};
 use crate::tsf::observer::{Baseline, TSF_OBS};
-use crate::tuning::{GJI_IDLE_MS, POST_IDLE_MARGIN_MS};
 
 // ── TsfReadinessProbe ──
 
-/// TSF composition readiness を観測し「ready になるまで待つ」プローブ。
+/// cold-start 送信時点の GJI I/O 観測を切り出す probe（待機はしない）。
 ///
-/// `send_romaji_as_tsf` の固定 sleep を置き換える。
-///
-/// ## 判断ロジック（2フェーズ）
-///
-/// ### Phase 1 — 必須最小待機 (`min_ms` from `warmup_sent_ms`)
-///
-/// VK_IME_ON 送信直後は GJI の I/O がまだ始まっていない可能性がある。
-/// `min_ms` 経過するまでは GJI I/O の観測値を信頼せず待機する。
-///
-/// ### Phase 2 — GJI I/O 静止監視
-///
-/// - `last_io >= warmup_ms`（warmup 後に GJI I/O が発生した）かつ
-///   80ms 静止 → settled → `POST_IDLE_MARGIN_MS` 待機後に送信
-/// - `last_io < warmup_ms`（warmup 後に I/O なし）→ GJI は既に正常状態と推定、
-///   min_ms 経過済みなので即解放
-///   （WezTerm 等 F2 に応じて GJI I/O を出さないアプリでは常にこのパス）
-/// - `now >= max_deadline` → タイムアウト（フォールバック、通常は到達しない）
-///
-/// ## `min_ms` の目安（ColdReason 別）
-///
-/// | 状況 | min_ms |
-/// |---|---|
-/// | FocusChange / SetOpenTrue / NativeF2Consumed (long_idle) | 300ms |
-/// | FocusChange / SetOpenTrue / NativeF2Consumed (short_idle) | 100ms |
-/// | SessionExpired | 200ms |
-/// | PassthroughConfirmKey / ReinjectConfirmKey | 50ms |
-/// | SymbolVkSent | 30ms |
-/// | その他 | 100ms |
+/// 本番の producer（`vk_send.rs` の cold パス。Tsf 側の `cold_warmup.rs::run_start` は 2026-10-22 に撤去）は
+/// 予防 F2 / 事前待機の撤去（2026-07-18）以後 `min_ms=0`・`total_max_ms=0` しか渡さず（旧 API）、
+/// 旧 `check_now` の GJI 静止待ち（`GJI_IDLE_MS`/`POST_IDLE_MARGIN_MS`）は一度も通らなかった。
+/// 待機ロジックと 2 定数を撤去し、`warmup_sent_ms` 以後の GJI I/O の有無を返す
+/// [`outcome`](Self::outcome) だけを残した（ECRS T01）。
 #[derive(Debug)]
 pub struct TsfReadinessProbe {
     /// VK_IME_ON を送信した時刻 (GetTickCount64 ms)。
     pub warmup_sent_ms: u64,
     /// ログ相関用 cold-start シーケンス番号。
     pub cold_seq: Generation,
-    /// VK_IME_ON 送信から最低この ms が経過するまで I/O 観測を信頼しない。
-    pub min_ms: u64,
-    /// GJI 静止を最初に検出した時刻（POST_IDLE_MARGIN 用）。0 = 未検出。
-    settled_at_ms: std::cell::Cell<u64>,
 }
 
-/// [`TsfReadinessProbe::check_now`] が `true` を返したときに合わせて返す観測スナップショット。
+/// [`TsfReadinessProbe::outcome`] が返す観測スナップショット。
 #[derive(Debug)]
 pub struct GjiProbeOutcome {
     /// `warmup_sent_ms` からの経過時間（ms）
@@ -71,154 +43,139 @@ pub struct GjiProbeOutcome {
 
 impl TsfReadinessProbe {
     #[must_use]
-    pub const fn new(warmup_sent_ms: u64, cold_seq: Generation, min_ms: u64) -> Self {
+    pub const fn new(warmup_sent_ms: u64, cold_seq: Generation) -> Self {
         Self {
             warmup_sent_ms,
             cold_seq,
-            min_ms,
-            settled_at_ms: std::cell::Cell::new(0),
         }
     }
 
-    /// タイマーポーリング用判定。完了時に settle 情報も返す。
-    ///
-    /// `None` = まだ待機中、`Some(outcome)` = 送信可能。
-    /// TIMER_TSF_PROBE ハンドラから 10ms ごとに呼ぶ。
-    #[tracing::instrument(level = "debug", skip_all, fields(total_max_ms = total_max_ms))]
-    pub fn check_outcome(&self, total_max_ms: u64) -> Option<GjiProbeOutcome> {
-        if !self.check_now(total_max_ms) {
-            return None;
-        }
-        let now = crate::hook::current_tick_ms();
+    /// 現時点の観測スナップショット。
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub fn outcome(&self) -> GjiProbeOutcome {
+        let now = crate::clock::current_tick_ms();
         let monitor_healthy = TSF_OBS.gji_monitor_ok.load(Ordering::Acquire);
         let gji_last_io = TSF_OBS.gji_last_io_ms.load(Ordering::Relaxed);
-        let gji_idle_ms = now.saturating_sub(gji_last_io);
-        Some(GjiProbeOutcome {
+        GjiProbeOutcome {
             elapsed_ms: now.saturating_sub(self.warmup_sent_ms),
             settled: gji_last_io >= self.warmup_sent_ms,
             monitor_healthy,
-            gji_idle_ms,
-        })
-    }
-
-    /// タイマーポーリング用ノンブロッキング判定。
-    ///
-    /// `true` = 送信可能（GJI 静止 or タイムアウト）、`false` = まだ待機中。
-    /// TIMER_TSF_PROBE ハンドラから 10ms ごとに呼ぶ。
-    ///
-    /// 2026-07-19 時点、本番の producer（`cold_warmup.rs::run_start`・
-    /// `vk_send.rs` の Chrome cold パス）はいずれも `min_ms=0`・`total_max_ms=0`
-    /// を渡すため、`min_deadline`/`max_deadline` は共に `warmup_sent_ms` と等しくなり、
-    /// このメソッドは実質「常に最初の呼び出しで `true` を返す」（`GJI_IDLE_MS`/
-    /// `settled_at_ms`/`POST_IDLE_MARGIN_MS` の待機ロジックは通らない）。
-    /// これは値が静的に固定されている（`ProbeObservations.gji_resumed` や
-    /// `DIAG_DISABLE_PROACTIVE_TSF_WARMUP` のような）到達不能ではなく、両呼び出し元が
-    /// たまたま実行時に 0 を渡しているだけの状態（コンパイラは保証しない）。
-    /// 本メソッド自体は任意の `min_ms`/`total_max_ms` に対して汎用的に正しく動作する
-    /// タイミング primitive であり、cold-start 待機時間の調整は本リポジトリで
-    /// 何度も出し入れされてきた領域（`tuning-constants.md` の釣り上げ履歴参照）。
-    /// 「今 0 が渡っているから」という理由だけでこの分岐自体を削除しないこと。
-    pub fn check_now(&self, total_max_ms: u64) -> bool {
-        let now = crate::hook::current_tick_ms();
-        let max_deadline = self.warmup_sent_ms.saturating_add(total_max_ms);
-        let min_deadline = self.warmup_sent_ms.saturating_add(self.min_ms);
-
-        if !TSF_OBS.gji_monitor_ok.load(Ordering::Acquire) {
-            return now >= max_deadline;
+            gji_idle_ms: now.saturating_sub(gji_last_io),
         }
-        if now < min_deadline {
-            return false;
-        }
-        if now >= max_deadline {
-            return true;
-        }
-        let gji_io = TSF_OBS.gji_last_io_ms.load(Ordering::Relaxed);
-        let found_io_after_warmup = gji_io >= self.warmup_sent_ms;
-        if found_io_after_warmup {
-            let gji_idle = now.saturating_sub(gji_io);
-            if gji_idle >= GJI_IDLE_MS {
-                let settled_at = self.settled_at_ms.get();
-                if settled_at == 0 {
-                    self.settled_at_ms.set(now);
-                    return false;
-                }
-                let since_settled = now.saturating_sub(settled_at);
-                return since_settled >= POST_IDLE_MARGIN_MS;
-            }
-            self.settled_at_ms.set(0); // GJI が再びアクティブになった
-        }
-        // warmup 後に GJI I/O が来ていない = GJI は既に正常状態 → min_ms 経過済みで即解放
-        true
     }
 }
 
-// ── WarmEpoch ──
+// ── CompositionState ──
 
-/// warmup epoch・送信タイミング・cold-start 回数を管理するサブ構造体。
+/// TSF composition context の warm/cold 状態を管理する。
 ///
-/// フォーカス epoch とウォーム epoch の組み合わせにより、
-/// フォーカス変更後の古いウォーム状態を自動無効化する。
+/// `Output` 構造体がこれをフィールドとして保持する。フォーカス変更後の古い
+/// ウォーム状態は `on_focus_changed` / `mark_composition_cold` で無効化する。
 #[derive(Debug)]
-pub struct WarmEpoch {
-    /// 最後の `send_keys` 完了時刻（ms）
+pub struct CompositionState {
+    /// 最後の `send_keys` 完了時刻（ms）。0 = 未送信。
     last_send_ms: std::cell::Cell<u64>,
     /// Cold-start 発生回数カウンタ
     cold_start_count: std::cell::Cell<Generation>,
-    /// KEYEVENTF_UNICODE で文字を送信した時刻（ms）。0 = 未送信 / リセット済み。
-    ///
-    /// GJI probe が settled=false で完了した後 unicode fallback を使った際にセットされる。
-    /// `gji_last_io_ms() > last_unicode_transmit_ms` になれば GJI が応答したとみなし、
-    /// 次の warm パスは通常 VK sequential に戻る（`PendingGjiConfirm` 状態の SSOT）。
-    last_unicode_transmit_ms: std::cell::Cell<u64>,
+    /// 最後に cold にマークされた理由
+    last_cold_reason: std::cell::Cell<crate::tsf::cold_reason::ColdReason>,
+    /// 最後に cold になった時点での idle 時間（ms）
+    idle_ms_at_last_cold: std::cell::Cell<u64>,
+    /// `RawTsfLiteralRecovery` が連続で発火した回数
+    raw_tsf_literal_consecutive_count: std::cell::Cell<u32>,
 }
 
-impl WarmEpoch {
+impl Default for CompositionState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CompositionState {
     #[must_use]
     pub const fn new() -> Self {
         Self {
             last_send_ms: std::cell::Cell::new(0),
             cold_start_count: std::cell::Cell::new(Generation::INITIAL),
-            last_unicode_transmit_ms: std::cell::Cell::new(0),
+            last_cold_reason: std::cell::Cell::new(
+                crate::tsf::cold_reason::ColdReason::FocusChange,
+            ),
+            idle_ms_at_last_cold: std::cell::Cell::new(0),
+            raw_tsf_literal_consecutive_count: std::cell::Cell::new(0),
         }
     }
 
-    /// コールド状態にマークする（last_unicode_transmit_ms をリセット）。
-    pub fn mark_cold(&self) {
-        self.last_unicode_transmit_ms.set(0);
+    /// IME composition context をコールド状態にマークする。
+    pub fn mark_composition_cold(&self, reason: crate::tsf::cold_reason::ColdReason) {
+        let idle_ms = self.ms_since_last_send();
+        if reason == crate::tsf::cold_reason::ColdReason::RawTsfLiteralRecovery {
+            let n = self.increment_consecutive_count();
+            tracing::debug!("[composition] marked cold reason={reason:?} idle={idle_ms}ms consecutive={n} → next VK/TSF output will send VK_DBE_HIRAGANA warmup");
+        } else {
+            // consecutive_count はフォーカス変更と SetOpenTrue（engine activation）でリセット。
+            // SetOpenTrue = engine が新たに IME ON を決定した瞬間。前回セッションのリテラル履歴は
+            // 新しい IME ON セッションには無関係なため、リセットして recovery の機会を再付与する。
+            // これにより「0xF2→literal→BS再送(count=1)→0xF0→0xF2→literal→give up→stuck」を防ぐ。
+            // PassthroughConfirmKey / ReinjectConfirmKey / SymbolVkSent 等の通常タイピング操作では
+            // リセットしないことで「GJI 非対応ウィンドウでスペースを押すたびに BS が発動する」
+            // false positive ループを防ぐ。
+            if matches!(
+                reason,
+                crate::tsf::cold_reason::ColdReason::FocusChange
+                    | crate::tsf::cold_reason::ColdReason::SetOpenTrue
+            ) {
+                self.reset_consecutive_count();
+            }
+            tracing::debug!("[composition] marked cold reason={reason:?} idle={idle_ms}ms → next VK/TSF output will send VK_DBE_HIRAGANA warmup");
+        }
+        self.last_cold_reason.set(reason);
+        self.idle_ms_at_last_cold.set(idle_ms);
+        // PassthroughConfirmKey/ReinjectConfirmKey は物理 Space/Enter/Escape が
+        // 実際に OS の TSF composition context へ届くタイミングであり、それ自体が
+        // 「活動」である。send_keys() を経由しないローマ字非出力の確定キー連打では
+        // last_send_ms が更新されず、idle_ms が壁時計時間で単調増加し続けて通常の
+        // タイピングを long_idle と誤判定してしまう（2026-07-10 診断）。確定キー系
+        // の reason に限り last_send_ms をここで touch し、次回の idle_ms 計算を
+        // このイベント基準にリセットする。
+        if reason.is_confirm_key() {
+            self.update_last_send_ms();
+        }
     }
 
-    /// フォーカス変更時に last_unicode_transmit_ms をリセットする。
+    /// フォーカスウィンドウが変わったことを通知する。
     pub fn on_focus_changed(&self) {
-        self.last_unicode_transmit_ms.set(0);
-    }
-
-    /// unicode 送信時刻を返す。0 = 未送信。
-    #[must_use]
-    pub const fn last_unicode_transmit_ms(&self) -> u64 {
-        self.last_unicode_transmit_ms.get()
-    }
-
-    /// unicode 送信時刻をセットする。
-    pub fn set_last_unicode_transmit_ms(&self, ms: u64) {
-        self.last_unicode_transmit_ms.set(ms);
+        let idle_ms = self.ms_since_last_send();
+        // FocusChange で last_cold_reason を更新し、F2NonTsf などの前回理由が
+        // フォーカス遷移後も残り続けて誤判定される不具合を防ぐ。
+        self.last_cold_reason
+            .set(crate::tsf::cold_reason::ColdReason::FocusChange);
+        self.idle_ms_at_last_cold.set(idle_ms);
+        self.reset_consecutive_count();
+        tracing::debug!("[composition] focus changed → marked cold");
     }
 
     /// 最後の `send_keys` 完了からの経過時間（ms）。
-    /// 一度も送信していない場合は `u64::MAX` を返す。
+    /// 一度も送信していない場合は `u64::MAX` を返す（= 永久に in-flight でない）。
     #[must_use]
     pub fn ms_since_last_send(&self) -> u64 {
         let last = self.last_send_ms.get();
         if last == 0 {
             return u64::MAX;
         }
-        crate::hook::current_tick_ms().saturating_sub(last)
+        crate::clock::current_tick_ms().saturating_sub(last)
     }
 
     /// `last_send_ms` を現在時刻に更新する。
     pub fn update_last_send_ms(&self) {
-        let ms = crate::hook::current_tick_ms();
+        let ms = crate::clock::current_tick_ms();
         tracing::debug!("[mark-send] last_send_ms={ms}");
         self.last_send_ms.set(ms);
+    }
+
+    /// 最後に cold になった時点での idle 時間（ms）を返す。
+    #[must_use]
+    pub const fn idle_ms_at_last_cold(&self) -> u64 {
+        self.idle_ms_at_last_cold.get()
     }
 
     /// cold-start 発生回数を返す。
@@ -233,84 +190,10 @@ impl WarmEpoch {
         self.cold_start_count.set(n);
         n
     }
-}
-
-impl Default for WarmEpoch {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ── ColdContext ──
-
-/// cold になった理由・idle 時間・連続 recovery 回数を保持するサブ構造体。
-#[derive(Debug)]
-pub struct ColdContext {
-    /// 最後に cold にマークされた理由
-    last_cold_reason: std::cell::Cell<crate::output::ColdReason>,
-    /// 最後に cold になった時点での idle 時間（ms）
-    idle_ms_at_last_cold: std::cell::Cell<u64>,
-    /// `RawTsfLiteralRecovery` が連続で発火した回数
-    raw_tsf_literal_consecutive_count: std::cell::Cell<u32>,
-    /// 「literal だった」という否定的証拠（`SuspectedLiteral`）の累計（ADR-200 決定1）。
-    /// `StaleConfirm` は着弾を否定する証拠を持たない（BUG-075）ので数えない。
-    /// `consecutive` と同じ場所でリセットされる。give-up 時の reinit（VK_IME_OFF→ON は
-    /// 未確定 preedit を破棄する、BUG-168）を、この値が2以上のときだけ許すために使う。
-    negative_evidence_count: std::cell::Cell<u32>,
-}
-
-impl ColdContext {
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            last_cold_reason: std::cell::Cell::new(crate::output::ColdReason::FocusChange),
-            idle_ms_at_last_cold: std::cell::Cell::new(0),
-            raw_tsf_literal_consecutive_count: std::cell::Cell::new(0),
-            negative_evidence_count: std::cell::Cell::new(0),
-        }
-    }
-
-    /// cold にマークされた理由と idle 時間を記録する。
-    pub fn record_cold(&self, reason: crate::output::ColdReason, idle_ms: u64) {
-        self.last_cold_reason.set(reason);
-        self.idle_ms_at_last_cold.set(idle_ms);
-    }
-
-    /// `RawTsfLiteralRecovery` 連続カウントをインクリメントして新値を返す。
-    pub fn increment_consecutive_count(&self) -> u32 {
-        let n = self.raw_tsf_literal_consecutive_count.get() + 1;
-        self.raw_tsf_literal_consecutive_count.set(n);
-        n
-    }
-
-    /// `RawTsfLiteralRecovery` 連続カウントをリセットする（否定的証拠カウンタも同時にリセットする）。
-    pub fn reset_consecutive_count(&self) {
-        self.raw_tsf_literal_consecutive_count.set(0);
-        self.negative_evidence_count.set(0);
-    }
-
-    /// 否定的証拠（`SuspectedLiteral`）カウンタをインクリメントして新値を返す。
-    pub fn increment_negative_evidence_count(&self) -> u32 {
-        let n = self.negative_evidence_count.get() + 1;
-        self.negative_evidence_count.set(n);
-        n
-    }
-
-    /// 否定的証拠（`SuspectedLiteral`）の累計を返す。
-    #[must_use]
-    pub const fn negative_evidence_count(&self) -> u32 {
-        self.negative_evidence_count.get()
-    }
-
-    /// 最後に cold になった時点での idle 時間（ms）を返す。
-    #[must_use]
-    pub const fn idle_ms_at_last_cold(&self) -> u64 {
-        self.idle_ms_at_last_cold.get()
-    }
 
     /// 最後に cold にマークされた理由を返す。
     #[must_use]
-    pub const fn last_cold_reason(&self) -> crate::output::ColdReason {
+    pub const fn last_cold_reason(&self) -> crate::tsf::cold_reason::ColdReason {
         self.last_cold_reason.get()
     }
 
@@ -319,169 +202,27 @@ impl ColdContext {
     pub const fn consecutive_count(&self) -> u32 {
         self.raw_tsf_literal_consecutive_count.get()
     }
-}
 
-impl Default for ColdContext {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ── CompositionState ──
-
-/// TSF composition context の warm/cold 状態を管理する。
-///
-/// `Output` 構造体がこれをフィールドとして保持する。
-/// 内部を責務別サブ構造体に分割している:
-/// - `warm_epoch`: warmup epoch・送信タイミング・cold-start 回数
-/// - `cold_ctx`: cold の理由・idle 時間・連続 recovery 回数
-#[derive(Debug)]
-pub struct CompositionState {
-    /// warmup epoch・送信タイミング・cold-start 回数
-    pub warm_epoch: WarmEpoch,
-    /// cold の理由・idle 時間・連続 recovery 回数
-    pub cold_ctx: ColdContext,
-}
-
-impl Default for CompositionState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl CompositionState {
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            warm_epoch: WarmEpoch::new(),
-            cold_ctx: ColdContext::new(),
-        }
+    /// `RawTsfLiteralRecovery` 連続カウントをインクリメントして新値を返す。
+    fn increment_consecutive_count(&self) -> u32 {
+        let n = self.raw_tsf_literal_consecutive_count.get() + 1;
+        self.raw_tsf_literal_consecutive_count.set(n);
+        n
     }
 
-    /// IME composition context をコールド状態にマークする。
-    pub fn mark_composition_cold(&self, reason: crate::output::ColdReason) {
-        let idle_ms = self.ms_since_last_send();
-        if reason == crate::output::ColdReason::RawTsfLiteralRecovery {
-            let n = self.cold_ctx.increment_consecutive_count();
-            tracing::debug!("[composition] marked cold reason={reason:?} idle={idle_ms}ms consecutive={n} → next VK/TSF output will send VK_DBE_HIRAGANA warmup");
-        } else {
-            // consecutive_count はフォーカス変更と SetOpenTrue（engine activation）でリセット。
-            // SetOpenTrue = engine が新たに IME ON を決定した瞬間。前回セッションのリテラル履歴は
-            // 新しい IME ON セッションには無関係なため、リセットして recovery の機会を再付与する。
-            // これにより「0xF2→literal→BS再送(count=1)→0xF0→0xF2→literal→give up→stuck」を防ぐ。
-            // PassthroughConfirmKey / ReinjectConfirmKey / SymbolVkSent 等の通常タイピング操作では
-            // リセットしないことで「GJI 非対応ウィンドウでスペースを押すたびに BS が発動する」
-            // false positive ループを防ぐ。
-            if matches!(
-                reason,
-                crate::output::ColdReason::FocusChange | crate::output::ColdReason::SetOpenTrue
-            ) {
-                self.cold_ctx.reset_consecutive_count();
-            }
-            tracing::debug!("[composition] marked cold reason={reason:?} idle={idle_ms}ms → next VK/TSF output will send VK_DBE_HIRAGANA warmup");
-        }
-        self.warm_epoch.mark_cold();
-        self.cold_ctx.record_cold(reason, idle_ms);
-        // PassthroughConfirmKey/ReinjectConfirmKey は物理 Space/Enter/Escape が
-        // 実際に OS の TSF composition context へ届くタイミングであり、それ自体が
-        // 「活動」である。send_keys() を経由しないローマ字非出力の確定キー連打では
-        // last_send_ms が更新されず、idle_ms が壁時計時間で単調増加し続けて通常の
-        // タイピングを long_idle と誤判定してしまう（2026-07-10 診断）。確定キー系
-        // の reason に限り last_send_ms をここで touch し、次回の idle_ms 計算を
-        // このイベント基準にリセットする。
-        if reason.is_confirm_key() {
-            self.warm_epoch.update_last_send_ms();
-        }
-    }
-
-    /// フォーカスウィンドウが変わったことを通知する。
-    pub fn on_focus_changed(&self) {
-        let idle_ms = self.ms_since_last_send();
-        self.warm_epoch.on_focus_changed();
-        // FocusChange で last_cold_reason を更新し、F2NonTsf などの前回理由が
-        // フォーカス遷移後も残り続けて誤判定される不具合を防ぐ。
-        self.cold_ctx
-            .record_cold(crate::output::ColdReason::FocusChange, idle_ms);
-        self.cold_ctx.reset_consecutive_count();
-        tracing::debug!("[composition] focus changed → marked cold");
-    }
-
-    /// 最後の `send_keys` 完了からの経過時間（ms）。
-    /// 一度も送信していない場合は `u64::MAX` を返す（= 永久に in-flight でない）。
-    #[must_use]
-    pub fn ms_since_last_send(&self) -> u64 {
-        self.warm_epoch.ms_since_last_send()
-    }
-
-    /// `last_send_ms` を現在時刻に更新する。
-    pub fn update_last_send_ms(&self) {
-        self.warm_epoch.update_last_send_ms();
-    }
-
-    /// 最後に cold になった時点での idle 時間（ms）を返す。
-    #[must_use]
-    pub const fn idle_ms_at_last_cold(&self) -> u64 {
-        self.cold_ctx.idle_ms_at_last_cold()
-    }
-
-    /// cold-start 発生回数を返す。
-    #[must_use]
-    pub const fn cold_start_count(&self) -> Generation {
-        self.warm_epoch.cold_start_count()
-    }
-
-    /// cold-start 発生回数をインクリメントして新値を返す。
-    pub fn increment_cold_start_count(&self) -> Generation {
-        self.warm_epoch.increment_cold_start_count()
-    }
-
-    /// 最後に cold にマークされた理由を返す。
-    #[must_use]
-    pub const fn last_cold_reason(&self) -> crate::output::ColdReason {
-        self.cold_ctx.last_cold_reason()
-    }
-
-    /// `RawTsfLiteralRecovery` が連続で発火した回数を返す。
-    #[must_use]
-    pub const fn consecutive_count(&self) -> u32 {
-        self.cold_ctx.consecutive_count()
-    }
-
-    /// 否定的証拠（`SuspectedLiteral`）カウンタをインクリメントして新値を返す（ADR-200 決定1）。
-    pub fn increment_negative_evidence_count(&self) -> u32 {
-        self.cold_ctx.increment_negative_evidence_count()
-    }
-
-    /// 否定的証拠（`SuspectedLiteral`）の累計を返す（ADR-200 決定1）。
-    #[must_use]
-    pub const fn negative_evidence_count(&self) -> u32 {
-        self.cold_ctx.negative_evidence_count()
-    }
-
-    /// `RawTsfLiteralRecovery` 連続カウントをリセットする（否定的証拠カウンタも同時）。
+    /// `RawTsfLiteralRecovery` 連続カウントをリセットする。
     ///
     /// `DetectionResult::CompositionConfirmed`（非 partial）を確認した dispatcher が
     /// 呼ぶ（BUG-27 追補4）。フォーカス変更・`SetOpenTrue` 以外に、本物の confirm
     /// でも「連続失敗」の連続性が切れるため、ここでもリセットが必要。
     pub fn reset_consecutive_count(&self) {
-        self.cold_ctx.reset_consecutive_count();
-    }
-
-    /// unicode 送信時刻を返す。0 = 未送信。
-    #[must_use]
-    pub const fn last_unicode_transmit_ms(&self) -> u64 {
-        self.warm_epoch.last_unicode_transmit_ms()
-    }
-
-    /// unicode 送信時刻をセットする（`PendingGjiConfirm` 状態の開始）。
-    pub fn set_last_unicode_transmit_ms(&self, ms: u64) {
-        self.warm_epoch.set_last_unicode_transmit_ms(ms);
+        self.raw_tsf_literal_consecutive_count.set(0);
     }
 }
 
 // ── LiteralDetector ──
 
-/// `send_romaji_as_tsf` が文字を送信した直後に生成し、
+/// per-VK confirm が文字を送信する直前に生成し、
 /// GJI 候補ウィンドウの変化を監視して composition が成功したか判定する検出器。
 ///
 /// ## 確認シグナル（TSF/Chrome 共通、BUG-30 で統一）
@@ -510,11 +251,6 @@ pub struct LiteralDetector {
     gji_show_baseline: Baseline,
     /// 送信前の WriteTransferCount 累積値
     write_bytes_baseline: u64,
-    /// 候補ウィンドウ可視性による backspace veto（BUG-30）を適用してよいか。
-    ///
-    /// per-VK 単体確認（`TransmitSingleVk`）では前モーラ由来の誤 veto の恐れが
-    /// あるため `false` を渡すこと。単語単位のバッチ確認では `true`。
-    veto_eligible: bool,
     /// この detector が対応する送信（VK 送信 or romaji バッチ送信）の epoch。
     ///
     /// 構築時点（VK/バッチ送信の直前）の `current_tick_ms()`。ADR-079 の
@@ -572,28 +308,10 @@ impl LiteralDetector {
     /// この値を必要とするため。
     pub(crate) const EPOCH_FENCE_GRACE_MS: u64 = crate::tuning::GJI_SAMPLE_INTERVAL_MS as u64 * 2;
 
-    /// 現在の観測値からベースラインを取得して `LiteralDetector` を生成する。
-    ///
-    /// ローマ字送信直前に呼ぶこと。`veto_eligible` は
-    /// [`veto_eligible`](Self::veto_eligible) を参照。
-    #[must_use]
-    pub fn new(veto_eligible: bool) -> Self {
-        Self {
-            gji_show_baseline: TSF_OBS.gji_candidate_show.baseline(),
-            write_bytes_baseline: crate::tsf::observer::gji_write_bytes(),
-            veto_eligible,
-            epoch_send_ms: crate::hook::current_tick_ms(),
-            show_stale_hold_since_ms: std::cell::Cell::new(None),
-            write_ops_baseline: crate::tsf::observer::gji_write_ops(),
-            read_ops_baseline: crate::tsf::observer::gji_read_ops(),
-            other_ops_baseline: crate::tsf::observer::gji_other_ops(),
-        }
-    }
-
     /// VK 送信前に取得済みの WriteTransferCount ベースラインを使う `LiteralDetector` を生成する。
     ///
     /// `SacrificialWarmup` の Chrome パス・per-VK confirm で使用する。VK 送信後に
-    /// [`Self::new`] を呼ぶと、タイミングによっては当該 VK の write がベースラインに
+    /// ベースラインを取ると、タイミングによっては当該 VK の write がベースラインに
     /// 吸収されて検出できない。VK 送信直前に取得したベースラインを引数で渡すことで
     /// この race を解消する。
     ///
@@ -605,12 +323,11 @@ impl LiteralDetector {
     ///
     /// [`COMPOSITION_BYTES_THRESHOLD`] = 350 バイトで cold/warm を分離できる。
     #[must_use]
-    pub fn new_with_pre_send_baseline(write_bytes_before_vk: u64, veto_eligible: bool) -> Self {
+    pub fn new_with_pre_send_baseline(write_bytes_before_vk: u64) -> Self {
         Self {
             gji_show_baseline: TSF_OBS.gji_candidate_show.baseline(),
             write_bytes_baseline: write_bytes_before_vk,
-            veto_eligible,
-            epoch_send_ms: crate::hook::current_tick_ms(),
+            epoch_send_ms: crate::clock::current_tick_ms(),
             show_stale_hold_since_ms: std::cell::Cell::new(None),
             write_ops_baseline: crate::tsf::observer::gji_write_ops(),
             read_ops_baseline: crate::tsf::observer::gji_read_ops(),
@@ -635,7 +352,7 @@ impl LiteralDetector {
         deadline_ms: u64,
         cold_seq: Generation,
     ) -> DetectEvidence {
-        let now = crate::hook::current_tick_ms();
+        let now = crate::clock::current_tick_ms();
         let last_write_ms = crate::tsf::observer::gji_last_write_ms();
         let fencing_active = last_write_ms != 0;
         DetectEvidence {
@@ -663,6 +380,7 @@ impl LiteralDetector {
                 .get()
                 .map(|hold_since| now.saturating_sub(hold_since)),
             literal_session_confirmed: crate::tsf::observer::literal_session_confirmed(cold_seq),
+            mozc_key_seq: None,
         }
     }
 
@@ -691,7 +409,7 @@ impl LiteralDetector {
     ///   判定にフォールバックする。
     #[must_use]
     pub fn check_now(&self, deadline_ms: u64) -> Option<DetectionResult> {
-        let now = crate::hook::current_tick_ms();
+        let now = crate::clock::current_tick_ms();
 
         // COMPOSITION_BYTES_THRESHOLD (350B) は「VK_A→'あ' のように1VKで
         // 完結する1文字」の実測（5サンプル）に基づく値であり、per-VK confirm
@@ -710,8 +428,8 @@ impl LiteralDetector {
         // SHOW カウンタは「新規表示」でのみ増分するため、続く VK では SHOW が
         // 増えないケースがあり得る。その場合は write-bytes 閾値に委ねる
         // （OR 条件なので write-bytes 側が拾えば確認できる）。両方とも拾えない
-        // 残存ケースは `LiteralDetectCore::veto_decision`（BUG-30）が
-        // 候補ウィンドウ可視性ベースの veto で補う。
+        // 残存ケースはかつて語単位の `LiteralDetectCore::veto_decision`（BUG-30）が候補ウィンドウ
+        // 可視性ベースの veto で補っていたが、その経路は ECRS MB-02 で撤去した（per-VK 経路は元々通らない）。
         let write_confirmed = crate::tsf::observer::gji_write_bytes()
             > self
                 .write_bytes_baseline
@@ -799,161 +517,72 @@ impl LiteralDetector {
     /// backspace で失われる（実機で確認済み）。
     #[must_use]
     pub(crate) fn visible_fencing_verdict(&self, deadline_ms: u64) -> Option<DetectionResult> {
-        let now = crate::hook::current_tick_ms();
+        let now = crate::clock::current_tick_ms();
         let last_write_ms = crate::tsf::observer::gji_last_write_ms();
         let fencing_active = last_write_ms != 0;
         let evidence_is_fresh = !fencing_active || last_write_ms >= self.epoch_send_ms;
         self.grace_hold_verdict(now, deadline_ms, evidence_is_fresh)
     }
-
-    /// 候補ウィンドウ可視性による backspace veto（BUG-30）を適用してよいかどうか。
-    ///
-    /// 構築時に渡された `veto_eligible` をそのまま返す。per-VK 単体確認では
-    /// 前モーラ由来の誤 veto の恐れがあるため `false` で構築すること。
-    #[must_use]
-    pub(crate) fn veto_eligible(&self) -> bool {
-        self.veto_eligible
-    }
 }
 
 #[cfg(test)]
-#[cfg(windows)]
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering::SeqCst;
-    use std::time::Instant;
 
     /// テスト間でグローバルな観測atomicが競合しないようにシリアライズするロック
     /// (`observer.rs`/`literal_detect_fsm.rs`と共有、`TSF_OBS_TEST_LOCK`参照)。
     use crate::tsf::observer::TSF_OBS_TEST_LOCK as TEST_LOCK;
 
-    /// `check_now` が `true` を返すまでポーリングする（旧 `wait_until_ready`、
-    /// 本番未使用のため 2026-07-19 に撤去。`check_now` 自体のタイミング挙動を
-    /// 検証するテスト専用の待機ヘルパーとしてここに残す）。
-    fn poll_until_ready(probe: &TsfReadinessProbe, total_max_ms: u64) {
-        const POLL_MS: u64 = 10;
-        loop {
-            if probe.check_now(total_max_ms) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
-        }
-    }
-
-    /// GJI モニター不可のとき、total_max_ms ぶん待機して返る（フォールバックパス）
+    /// warmup 後に GJI I/O があれば settled、経過・idle は仮想時計から計算される
     #[test]
-    fn probe_fallback_waits_total_max_ms() {
+    fn outcome_settled_when_io_after_warmup() {
         let _g = TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        TSF_OBS.gji_monitor_ok.store(false, SeqCst);
-
-        let now_ms = crate::hook::current_tick_ms();
-        let probe = TsfReadinessProbe::new(now_ms, Generation::INITIAL, 0);
-        poll_until_ready(&probe, 100);
-
-        // `check_now()` 自体が `current_tick_ms()`（GetTickCount64）で判定するため、
-        // 経過時間の検証も同じクロックで行う。以前は `std::time::Instant`（別クロック、
-        // QueryPerformanceCounter 由来）で計測していたが、VM 環境ではハイパーバイザーが
-        // GetTickCount64 側だけを定期的に補正しジャンプさせることがあり、SUT は正しく
-        // 反応しているのに無関係な別クロックとの不一致でテストだけ誤検知で失敗しうる
-        // （2026-08-15 実機、"fallback too short: 10ms" を確認。BUG-65 追補3参照）。
-        let elapsed = crate::hook::current_tick_ms().saturating_sub(now_ms);
-        // フォールバック: warmup_ms=now, remaining=100ms → sleep_ms(100)
-        //
-        // 診断用（2026-08-15）: `check_now()` の第一分岐は
-        // `!gji_monitor_ok → return now >= max_deadline` であり、`current_tick_ms()`
-        // は単調増加のため、この分岐で `true` が返るなら本アサーション時点の
-        // `elapsed` は理論上必ず 100ms 以上になるはず。elapsed が 60ms 未満で
-        // 落ちるということは、この分岐を通っていない＝`gji_monitor_ok` が
-        // `true` のまま観測された、という意味のはず。原因の切り分けのため
-        // 失敗メッセージに現在値を含める。
-        assert!(
-            elapsed >= 60,
-            "fallback too short: {elapsed}ms (gji_monitor_ok={}, gji_last_io_ms={})",
-            TSF_OBS.gji_monitor_ok.load(Ordering::Acquire),
-            TSF_OBS.gji_last_io_ms.load(Ordering::Relaxed),
-        );
-        assert!(elapsed < 400, "fallback too long: {elapsed}ms");
-    }
-
-    /// GJI モニター有効・warmup 後にすでに 80ms+ 静止していれば即 settled
-    #[test]
-    fn probe_phase2_detects_already_settled() {
-        let _g = TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now_ms = crate::hook::current_tick_ms();
-
-        // warmup 200ms 前、GJI 最終 I/O は warmup の 50ms 後（= 150ms 前）
-        // → idle = 150ms > 80ms → settled 検出済み
+        let _clock = crate::clock::freeze();
+        let now_ms = crate::clock::current_tick_ms();
         let warmup_ms = now_ms.saturating_sub(200);
-        let io_ms = warmup_ms + 50;
-
         TSF_OBS.gji_monitor_ok.store(true, SeqCst);
-        TSF_OBS.gji_last_io_ms.store(io_ms, SeqCst);
+        TSF_OBS.gji_last_io_ms.store(warmup_ms + 50, SeqCst);
 
-        let start = Instant::now();
-        let probe = TsfReadinessProbe::new(warmup_ms, Generation::INITIAL, 0); // min_ms=0
-        poll_until_ready(&probe, 1_000);
-
-        let elapsed = start.elapsed().as_millis();
-        // 即 settled（margin = POST_IDLE_MARGIN_MS = 30ms 以内）
-        assert!(
-            elapsed < 150,
-            "should settle quickly (idle>80ms), got {elapsed}ms"
-        );
+        let o = TsfReadinessProbe::new(warmup_ms, Generation::INITIAL).outcome();
+        assert!(o.settled);
+        assert!(o.monitor_healthy);
+        assert_eq!(o.elapsed_ms, 200);
+        assert_eq!(o.gji_idle_ms, 150);
     }
 
-    /// phase1: min_ms が経過するまで probe は I/O 観測を信頼しない
+    /// warmup 後に GJI I/O が無ければ settled=false（WezTerm 等 F2 に I/O を出さないアプリ）
     #[test]
-    fn probe_phase1_min_wait_respected() {
+    fn outcome_not_settled_when_no_io_after_warmup() {
         let _g = TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now_ms = crate::hook::current_tick_ms();
-
-        // GJI は settled 状態だが min_ms=80 のため phase1 で 80ms 待機する
-        TSF_OBS.gji_monitor_ok.store(true, SeqCst);
-        TSF_OBS
-            .gji_last_io_ms
-            .store(now_ms.saturating_sub(200), SeqCst); // 200ms 前に I/O（warmup 前）
-
-        let start = Instant::now();
-        let probe = TsfReadinessProbe::new(now_ms, Generation::INITIAL, 80); // min_ms=80
-        poll_until_ready(&probe, 300);
-
-        let elapsed = start.elapsed().as_millis();
-        // min_ms=80 の phase1 wait 後に即解放（I/O なし → 正常状態）
-        // → 60ms 以上 200ms 以内に完了するはず
-        assert!(elapsed >= 60, "phase1 min_wait not respected: {elapsed}ms");
-        assert!(
-            elapsed < 200,
-            "should release at ~80ms, not wait full 300ms: {elapsed}ms"
-        );
-    }
-
-    /// warmup 後に GJI I/O が発生しない場合は min_ms 経過後に即解放（WezTerm 等の正常ケース）
-    #[test]
-    fn probe_phase2_ready_immediately_when_no_io_after_warmup() {
-        let _g = TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now_ms = crate::hook::current_tick_ms();
-
-        // GJI I/O は warmup より前 → warmup 後に I/O なし → 既に正常状態 → min_ms 経過で即解放
+        let _clock = crate::clock::freeze();
+        let now_ms = crate::clock::current_tick_ms();
         TSF_OBS.gji_monitor_ok.store(true, SeqCst);
         TSF_OBS
             .gji_last_io_ms
             .store(now_ms.saturating_sub(5_000), SeqCst);
 
-        let start = Instant::now();
-        let probe = TsfReadinessProbe::new(now_ms, Generation::INITIAL, 0); // min_ms=0
-        poll_until_ready(&probe, 1_000);
+        let o = TsfReadinessProbe::new(now_ms, Generation::INITIAL).outcome();
+        assert!(!o.settled);
+        assert_eq!(o.elapsed_ms, 0);
+        assert_eq!(o.gji_idle_ms, 5_000);
+    }
 
-        let elapsed = start.elapsed().as_millis();
-        // min_ms=0 なので即解放（1000ms タイムアウトを待たない）
-        assert!(elapsed < 100, "should release immediately, got {elapsed}ms");
+    /// モニター不可は monitor_healthy=false として伝わる
+    #[test]
+    fn outcome_reports_unhealthy_monitor() {
+        let _g = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _clock = crate::clock::freeze();
+        TSF_OBS.gji_monitor_ok.store(false, SeqCst);
+        let now_ms = crate::clock::current_tick_ms();
+        let o = TsfReadinessProbe::new(now_ms, Generation::INITIAL).outcome();
+        assert!(!o.monitor_healthy);
     }
 
     /// 確定キー(Space/Enter/Escape)連打時、ローマ字出力(send_keys)を伴わなくても
@@ -969,23 +598,24 @@ mod tests {
         let _g = TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _clock = crate::clock::freeze();
         let state = CompositionState::new();
 
         // 実際のローマ字送信 (send_keys 相当) を模擬した baseline。
         state.update_last_send_ms();
-        std::thread::sleep(std::time::Duration::from_millis(60));
+        crate::clock::advance(60);
 
-        state.mark_composition_cold(crate::output::ColdReason::PassthroughConfirmKey);
-        let first_idle = state.cold_ctx.idle_ms_at_last_cold();
+        state.mark_composition_cold(crate::tsf::cold_reason::ColdReason::PassthroughConfirmKey);
+        let first_idle = state.idle_ms_at_last_cold();
         assert!(
             (40..150).contains(&first_idle),
             "1回目の idle は直前 sleep の ~60ms を反映するはず: {first_idle}ms"
         );
 
-        std::thread::sleep(std::time::Duration::from_millis(60));
+        crate::clock::advance(60);
 
-        state.mark_composition_cold(crate::output::ColdReason::PassthroughConfirmKey);
-        let second_idle = state.cold_ctx.idle_ms_at_last_cold();
+        state.mark_composition_cold(crate::tsf::cold_reason::ColdReason::PassthroughConfirmKey);
+        let second_idle = state.idle_ms_at_last_cold();
         assert!(
             (40..150).contains(&second_idle),
             "確定キー連打のたびに last_send_ms がリセットされ idle は ~60ms のはず\
@@ -1012,7 +642,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         TSF_OBS.gji_write_bytes.store(1_000, SeqCst);
 
-        let detector = LiteralDetector::new_with_pre_send_baseline(1_000, true);
+        let detector = LiteralDetector::new_with_pre_send_baseline(1_000);
 
         // write_bytes は閾値未満のまま（子音単体で完結した1文字分の書き込みが
         // 起きないケースを模擬）。
@@ -1021,7 +651,7 @@ mod tests {
         // しかし候補ウィンドウの SHOW イベントは観測されている。
         TSF_OBS.gji_candidate_show.notify();
 
-        let now_ms = crate::hook::current_tick_ms();
+        let now_ms = crate::clock::current_tick_ms();
         let result = detector.check_now(now_ms + 10_000); // まだ deadline 未到達
         assert!(
             matches!(result, Some(DetectionResult::CompositionConfirmed)),
@@ -1041,12 +671,12 @@ mod tests {
         let baseline_show = TSF_OBS.gji_candidate_show.baseline();
         TSF_OBS.gji_last_write_ms.store(0, SeqCst);
 
-        let detector = LiteralDetector::new_with_pre_send_baseline(2_000, true);
+        let detector = LiteralDetector::new_with_pre_send_baseline(2_000);
 
         // write_bytes・candidate_show とも変化なし（本物の literal 化を模擬）。
         assert!(!TSF_OBS.gji_candidate_show.has_changed(baseline_show));
 
-        let now_ms = crate::hook::current_tick_ms();
+        let now_ms = crate::clock::current_tick_ms();
         let result = detector.check_now(now_ms); // deadline は既に到達済み
         assert!(
             matches!(result, Some(DetectionResult::SuspectedLiteral)),
@@ -1065,8 +695,8 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         TSF_OBS.gji_write_bytes.store(4_000, SeqCst);
-        let detector = LiteralDetector::new_with_pre_send_baseline(4_000, true);
-        let now_ms = crate::hook::current_tick_ms();
+        let detector = LiteralDetector::new_with_pre_send_baseline(4_000);
+        let now_ms = crate::clock::current_tick_ms();
         TSF_OBS.gji_last_write_ms.store(now_ms, SeqCst); // epoch_send_ms 以降
         TSF_OBS.gji_write_bytes.store(4_400, SeqCst); // 閾値(350B)超過
 
@@ -1088,20 +718,20 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         TSF_OBS.gji_write_bytes.store(5_000, SeqCst);
-        let detector = LiteralDetector::new_with_pre_send_baseline(5_000, true); // epoch > stale_write_ms
-                                                                                 // detector構築時刻(epoch_send_ms)より確実に前のwrite根拠を模擬する。
-                                                                                 // GetTickCount64は解像度が粗い(既定~15.6ms)ため、実時間sleep(5ms)で
-                                                                                 // 「epochより後」を作ろうとすると同一tickに丸められることがあり、
-                                                                                 // evidence_is_fresh(tieをfresh扱いする`>=`比較)が意図せずtrueになって
-                                                                                 // flakyに失敗する(2026-07-25実CI実行で初めてWindows実機上でこのテストが
-                                                                                 // 実行され、この非決定性が顕在化した)。saturating_subで明示的に確実な
-                                                                                 // 過去時刻を作ることで解像度に依存しないようにする(下のcheck_now_show_only_confirm_*
-                                                                                 // テストと同じ手法)。
-        let stale_write_ms = crate::hook::current_tick_ms().saturating_sub(50);
+        let detector = LiteralDetector::new_with_pre_send_baseline(5_000); // epoch > stale_write_ms
+                                                                           // detector構築時刻(epoch_send_ms)より確実に前のwrite根拠を模擬する。
+                                                                           // GetTickCount64は解像度が粗い(既定~15.6ms)ため、実時間sleep(5ms)で
+                                                                           // 「epochより後」を作ろうとすると同一tickに丸められることがあり、
+                                                                           // evidence_is_fresh(tieをfresh扱いする`>=`比較)が意図せずtrueになって
+                                                                           // flakyに失敗する(2026-07-25実CI実行で初めてWindows実機上でこのテストが
+                                                                           // 実行され、この非決定性が顕在化した)。saturating_subで明示的に確実な
+                                                                           // 過去時刻を作ることで解像度に依存しないようにする(下のcheck_now_show_only_confirm_*
+                                                                           // テストと同じ手法)。
+        let stale_write_ms = crate::clock::current_tick_ms().saturating_sub(50);
         TSF_OBS.gji_last_write_ms.store(stale_write_ms, SeqCst);
         TSF_OBS.gji_write_bytes.store(5_400, SeqCst); // 閾値超過だが根拠は stale
 
-        let now_ms = crate::hook::current_tick_ms();
+        let now_ms = crate::clock::current_tick_ms();
         let result = detector.check_now(now_ms + 10_000); // deadline 未到達
         assert!(
             matches!(result, Some(DetectionResult::StaleConfirm)),
@@ -1121,15 +751,15 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         TSF_OBS.gji_write_bytes.store(6_000, SeqCst);
-        let epoch_ms = crate::hook::current_tick_ms();
+        let epoch_ms = crate::clock::current_tick_ms();
         TSF_OBS
             .gji_last_write_ms
             .store(epoch_ms.saturating_sub(50), SeqCst); // stale
 
-        let detector = LiteralDetector::new_with_pre_send_baseline(6_000, true);
+        let detector = LiteralDetector::new_with_pre_send_baseline(6_000);
         TSF_OBS.gji_candidate_show.notify(); // write_bytes は閾値未満のまま
 
-        let far_deadline = crate::hook::current_tick_ms() + 10_000;
+        let far_deadline = crate::clock::current_tick_ms() + 10_000;
         let held = detector.check_now(far_deadline);
         assert!(
             held.is_none(),
@@ -1139,7 +769,7 @@ mod tests {
         // 猶予中に gji_last_write_ms が追いつく。
         TSF_OBS
             .gji_last_write_ms
-            .store(crate::hook::current_tick_ms(), SeqCst);
+            .store(crate::clock::current_tick_ms(), SeqCst);
         let resolved = detector.check_now(far_deadline);
         assert!(
             matches!(resolved, Some(DetectionResult::CompositionConfirmed)),
@@ -1155,27 +785,24 @@ mod tests {
         let _g = TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _clock = crate::clock::freeze();
         TSF_OBS.gji_write_bytes.store(7_000, SeqCst);
-        let epoch_ms = crate::hook::current_tick_ms();
+        let epoch_ms = crate::clock::current_tick_ms();
         TSF_OBS
             .gji_last_write_ms
             .store(epoch_ms.saturating_sub(50), SeqCst); // stale のまま追いつかない
 
-        let detector = LiteralDetector::new_with_pre_send_baseline(7_000, true);
+        let detector = LiteralDetector::new_with_pre_send_baseline(7_000);
         TSF_OBS.gji_candidate_show.notify();
 
-        let far_deadline = crate::hook::current_tick_ms() + 10_000;
+        let far_deadline = crate::clock::current_tick_ms() + 10_000;
         let held = detector.check_now(far_deadline);
         assert!(held.is_none(), "猶予開始直後はまだ None のはず: {held:?}");
 
-        // +10ms マージンは `GetTickCount64` の既定タイマー分解能（~15.6ms）より
-        // 小さく、CI runner 負荷下では実経過 30ms でも tick 差分が量子化により
-        // grace(20ms) 未満に丸まることがあった（windows-build run 34659416676
-        // で1回再現、`docs/known-bugs/BUG-131.md`）。tick 分解能を確実に上回る
-        // マージンに広げて量子化ぶれを吸収する。
-        std::thread::sleep(std::time::Duration::from_millis(
-            LiteralDetector::EPOCH_FENCE_GRACE_MS + 50,
-        ));
+        // 実時間の sleep は `GetTickCount64` の既定タイマー分解能（~15.6ms）と CI の負荷で
+        // フレークした（windows-build run 34659416676、`docs/known-bugs/BUG-131.md`）。
+        // 仮想時計を進めれば分解能にも負荷にも依らない（ADR-272 段階 B0）。
+        crate::clock::advance(LiteralDetector::EPOCH_FENCE_GRACE_MS + 50);
         let result = detector.check_now(far_deadline);
         assert!(
             matches!(result, Some(DetectionResult::StaleConfirm)),
@@ -1196,10 +823,10 @@ mod tests {
         TSF_OBS.gji_last_write_ms.store(0, SeqCst);
         TSF_OBS.gji_write_bytes.store(8_000, SeqCst);
 
-        let detector = LiteralDetector::new_with_pre_send_baseline(8_000, true);
+        let detector = LiteralDetector::new_with_pre_send_baseline(8_000);
         TSF_OBS.gji_candidate_show.notify(); // write_bytes は閾値未満のまま
 
-        let far_deadline = crate::hook::current_tick_ms() + 10_000;
+        let far_deadline = crate::clock::current_tick_ms() + 10_000;
         let result = detector.check_now(far_deadline);
         assert!(
             matches!(result, Some(DetectionResult::CompositionConfirmed)),
@@ -1226,7 +853,7 @@ mod tests {
         TSF_OBS.gji_read_ops.store(20, SeqCst);
         TSF_OBS.gji_other_ops.store(5, SeqCst);
 
-        let detector = LiteralDetector::new_with_pre_send_baseline(1_000, true);
+        let detector = LiteralDetector::new_with_pre_send_baseline(1_000);
 
         // write_bytes は閾値未満のまま（子音単体を模擬）だが、I/O 回数は増える。
         TSF_OBS.gji_write_bytes.store(1_100, SeqCst); // +100B < 350B 閾値
@@ -1236,7 +863,7 @@ mod tests {
 
         let evidence = detector.evidence_now(
             false,
-            crate::hook::current_tick_ms() + 10_000,
+            crate::clock::current_tick_ms() + 10_000,
             Generation::new(1),
         );
         assert_eq!(
@@ -1266,8 +893,9 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::tsf::observer::reset_literal_session_confirmed();
 
-        let detector = LiteralDetector::new(true);
-        let deadline = crate::hook::current_tick_ms() + 10_000;
+        let detector =
+            LiteralDetector::new_with_pre_send_baseline(crate::tsf::observer::gji_write_bytes());
+        let deadline = crate::clock::current_tick_ms() + 10_000;
 
         let before = detector.evidence_now(false, deadline, Generation::new(301));
         assert!(!before.literal_session_confirmed, "mark 前は false のはず");
@@ -1289,39 +917,61 @@ mod tests {
         crate::tsf::observer::reset_literal_session_confirmed();
     }
 
-    // ---- ADR-200: 否定的証拠カウンタの寿命は `consecutive` と同じ ----
+    // ---- 連続 recovery カウント(`consecutive`)の寿命 ----
+    // 否定的証拠カウンタ(ADR-200)は同じ場所でリセットされていたが、ADR-212 P3 以降本番の呼び出し元が無く撤去した
+    // (ADR-227 の追随案は別の `GiveUpTracker` で実装済み)。リセットの規則は `consecutive` で固定する。
 
     #[test]
-    fn negative_evidence_count_is_reset_together_with_consecutive() {
+    fn consecutive_count_is_reset_by_reset_consecutive_count() {
+        use crate::tsf::cold_reason::ColdReason;
         let c = CompositionState::new();
-        assert_eq!(c.increment_negative_evidence_count(), 1);
-        assert_eq!(c.increment_negative_evidence_count(), 2);
-        assert_eq!(c.negative_evidence_count(), 2);
+        c.mark_composition_cold(ColdReason::RawTsfLiteralRecovery);
+        c.mark_composition_cold(ColdReason::RawTsfLiteralRecovery);
+        assert_eq!(c.consecutive_count(), 2);
         // CompositionConfirmed の dispatch（reset_consecutive_count）でリセットされる。
         c.reset_consecutive_count();
-        assert_eq!(c.negative_evidence_count(), 0);
+        assert_eq!(c.consecutive_count(), 0);
     }
 
     #[test]
-    fn negative_evidence_count_survives_raw_recovery_cold_mark_but_resets_on_focus_and_set_open() {
-        use crate::output::ColdReason;
+    fn consecutive_count_survives_confirm_key_cold_mark_but_resets_on_focus_and_set_open() {
+        use crate::tsf::cold_reason::ColdReason;
         let c = CompositionState::new();
-        c.increment_negative_evidence_count();
-        // give-up の cold mark（RawTsfLiteralRecovery）自体はリセットしない。
         c.mark_composition_cold(ColdReason::RawTsfLiteralRecovery);
-        assert_eq!(c.negative_evidence_count(), 1);
-        // 通常のタイピング操作の cold mark でもリセットしない（consecutive と同じ）。
+        assert_eq!(c.consecutive_count(), 1);
+        // 通常のタイピング操作の cold mark ではリセットしない。
         c.mark_composition_cold(ColdReason::PassthroughConfirmKey);
-        assert_eq!(c.negative_evidence_count(), 1);
+        assert_eq!(c.consecutive_count(), 1);
         // SetOpenTrue でリセット。
         c.mark_composition_cold(ColdReason::SetOpenTrue);
-        assert_eq!(c.negative_evidence_count(), 0);
+        assert_eq!(c.consecutive_count(), 0);
         // FocusChange（mark 経由と on_focus_changed 経由）でもリセット。
-        c.increment_negative_evidence_count();
+        c.mark_composition_cold(ColdReason::RawTsfLiteralRecovery);
         c.mark_composition_cold(ColdReason::FocusChange);
-        assert_eq!(c.negative_evidence_count(), 0);
-        c.increment_negative_evidence_count();
+        assert_eq!(c.consecutive_count(), 0);
+        c.mark_composition_cold(ColdReason::RawTsfLiteralRecovery);
         c.on_focus_changed();
-        assert_eq!(c.negative_evidence_count(), 0);
+        assert_eq!(c.consecutive_count(), 0);
+    }
+
+    // ── CompositionState の状態(mutants で MISSED だった穴、ADR-272) ──
+
+    /// cold-start 回数の increment。
+    #[test]
+    fn composition_state_increments_cold_start_count() {
+        let c = CompositionState::new();
+        let before = c.cold_start_count().value();
+        let n = c.increment_cold_start_count();
+        assert_eq!(n.value(), before + 1);
+        assert_eq!(c.cold_start_count().value(), n.value());
+    }
+
+    /// 一度も送信していない状態で cold にすると、idle は `u64::MAX`(= 無限)として記録される。
+    #[test]
+    fn composition_state_records_idle_at_last_cold() {
+        let c = CompositionState::new();
+        assert_eq!(c.idle_ms_at_last_cold(), 0);
+        c.mark_composition_cold(crate::tsf::cold_reason::ColdReason::SetOpenTrue);
+        assert_eq!(c.idle_ms_at_last_cold(), u64::MAX);
     }
 }

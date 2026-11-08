@@ -1,0 +1,7 @@
+crates/awase-ime-core
+crates/awase-hook-core
+crates/awase-windows-plans
+crates/awase-scancode
+crates/awase-bug-report
+crates/awase-windows-base
+crates/awase-key-effect

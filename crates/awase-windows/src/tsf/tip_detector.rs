@@ -35,6 +35,9 @@ use super::observer::{ActiveImeKind, TSF_OBS};
 /// `discover_and_cache_gji_clsid` により一度だけセットされる。
 /// `None` = GJI 未インストールまたは `EnumProfiles` で発見できなかった。
 static GJI_CLSID: OnceLock<GUID> = OnceLock::new();
+/// GJI 系（Google 日本語入力・Mozc とそのフォーク）の TIP の CLSID 全部（`ActiveImeKind` の判定用）。
+/// `GJI_CLSID`（Google 版のみ、`TipIdentity::Gji` 用）とは別に持つ。
+static GJI_FAMILY_CLSIDS: OnceLock<Vec<GUID>> = OnceLock::new();
 static PROFILE_DESCRIPTIONS: RwLock<Vec<ProfileDescription>> = RwLock::new(Vec::new());
 
 #[derive(Debug, Clone)]
@@ -78,9 +81,15 @@ pub(super) fn discover_and_cache_gji_clsid(
     mgr: &ITfInputProcessorProfileMgr,
     profiles: &ITfInputProcessorProfiles,
 ) {
-    if GJI_CLSID.get().is_some() {
+    if GJI_CLSID.get().is_some() && GJI_FAMILY_CLSIDS.get().is_some() {
         return;
     }
+    let family = find_gji_family_clsids(mgr, profiles);
+    tracing::info!(
+        "[tip-detect] GJI family CLSIDs: {}",
+        family.iter().map(fmt_guid).collect::<Vec<_>>().join(", ")
+    );
+    let _ = GJI_FAMILY_CLSIDS.set(family);
     match find_gji_clsid(mgr, profiles) {
         Some(clsid) => {
             let _ = GJI_CLSID.set(clsid);
@@ -90,6 +99,42 @@ pub(super) fn discover_and_cache_gji_clsid(
             tracing::info!("[tip-detect] GJI not found in EnumProfiles(JA)");
         }
     }
+}
+
+/// 日本語 TIP のうち、表示名が GJI 系（[`is_gji_family_description`]）のものの CLSID を全部集める。
+fn find_gji_family_clsids(
+    mgr: &ITfInputProcessorProfileMgr,
+    profiles: &ITfInputProcessorProfiles,
+) -> Vec<GUID> {
+    let mut found = Vec::new();
+    unsafe {
+        let Ok(enumerator) = mgr.EnumProfiles(0x0411 /* Japanese */) else {
+            return found;
+        };
+        loop {
+            let mut prof = TF_INPUTPROCESSORPROFILE::default();
+            let mut fetched: u32 = 0;
+            let res = enumerator.Next(std::slice::from_mut(&mut prof), &raw mut fetched);
+            if res.is_err() || fetched == 0 {
+                break;
+            }
+            if prof.dwProfileType != TF_PROFILETYPE_INPUTPROCESSOR {
+                continue;
+            }
+            if let Ok(bstr) = profiles.GetLanguageProfileDescription(
+                &raw const prof.clsid,
+                prof.langid,
+                &raw const prof.guidProfile,
+            ) {
+                if crate::state::ime_kind::is_gji_family_description(&bstr.to_string())
+                    && !found.contains(&prof.clsid)
+                {
+                    found.push(prof.clsid);
+                }
+            }
+        }
+    }
+    found
 }
 
 fn find_gji_clsid(
@@ -165,6 +210,8 @@ fn enabled_ja_tips(mgr: &ITfInputProcessorProfileMgr) -> Vec<crate::state::ime_k
 /// `MicrosoftIme` になるこの軸だけ単発フリップに無防備だった）。
 ///
 /// - プロセス内キャッシュ済み GJI CLSID と一致 → `(GoogleJapaneseInput, Gji)`
+/// - GJI 系（Mozc とそのフォーク）の CLSID と一致 → `(GoogleJapaneseInput, Other)`（`TipIdentity::Gji` は
+///   Google 版のみ。`config1.db` を読む相手を広げないため）
 /// - それ以外の TIP または IMM32 HKL → `(MicrosoftIme, MsImeNative | Other)`
 /// - 取得失敗 → `None`（呼び出し元はフォールバック値を使う）
 pub(super) fn query_active_kind(
@@ -192,11 +239,83 @@ pub(super) fn query_active_kind(
             Some(prof.clsid.to_u128()),
             GJI_CLSID.get().map(GUID::to_u128),
         );
-        if identity == TipIdentity::Gji {
+        let in_family = GJI_FAMILY_CLSIDS
+            .get()
+            .is_some_and(|set| set.contains(&prof.clsid));
+        if identity == TipIdentity::Gji || in_family {
             return Some((ActiveImeKind::GoogleJapaneseInput, identity));
         }
         Some((ActiveImeKind::MicrosoftIme, identity))
     }
+}
+
+/// [`query_active_kind_on_fresh_thread`] の時間切れで残る孤児スレッドの枠（このモジュール専用）。共有の既定プール
+/// （フォーカス分類の IMM32/MSAA/UIA が使う 8 枠）と分ける: TSF が詰まって枠を使い切ると、無関係なフォーカス分類まで
+/// 巻き添えでタイムアウト扱いになる（`hook.rs` の `HOOK_JOIN_LEAKED_THREADS` と同じ理由）。
+static TIP_QUERY_LEAKED_THREADS: crate::win32::LeakedThreadPool =
+    crate::win32::LeakedThreadPool::new(2);
+
+/// 新しいスレッドで取れない問い合わせがこの回数続いたとき、一度だけ warn を出す。
+const FRESH_QUERY_WARN_AFTER: u32 = 5;
+static FRESH_QUERY_CONSECUTIVE_FAILURES: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// 新しい STA スレッドでアクティブな TIP を問い合わせる（BUG-207、ADR-269 D1a）。
+///
+/// `gji-io-monitor` スレッドで起動時に作った `ITfInputProcessorProfileMgr` の `GetActiveProfile` は、起動後に
+/// セッション内で入力方式を切り替えても（CI: `ActivateProfile` の `TF_IPPMF_FORSESSION`）古い値を返し続けた
+/// （起動時 Google 版 GJI、7 秒後に Mozc へ切り替えても 15 秒以上 `(Gji)` のまま、run 39181228739）。短命の新しい
+/// スレッドで問い合わせると、その時点の値を返した（run 39182258683）。**原因は未確定**: メッセージループが無いこと
+/// が効くのかは未検証で、新しいスレッドにもループは無い。Win+Space（BUG-195 では CI で効かなかった）と同じ効果か、
+/// 「アプリごとに入力方式を切り替える」が ON のときに前面アプリの TIP と一致するかも未確認。
+///
+/// 返り値が `None` のとき（時間切れ・スレッドの失敗・`GetActiveProfile` の失敗）は「観測なし」。呼び出し元は
+/// その tick を飛ばすこと（古い値へ戻さない）。`run_with_timeout`（300ms）で隔離する: 詰まっても `monitor_loop`
+/// の I/O の標本化を止めない。所要時間は debug ログに出す（スレッドの生成と COM の初期化の所要は未測定）。
+pub(super) fn query_active_kind_on_fresh_thread(
+) -> Option<(ActiveImeKind, crate::state::ime_kind::TipIdentity)> {
+    let started = std::time::Instant::now();
+    let result = win32_async::run_with_timeout_in(
+        &TIP_QUERY_LEAKED_THREADS,
+        std::time::Duration::from_millis(300),
+        || {
+            // SAFETY: 新しいスレッドの先頭で一度だけ初期化し、成功したときだけ COM オブジェクトを手放した後に対で終了する。
+            let init = unsafe {
+                windows::Win32::System::Com::CoInitializeEx(
+                    None,
+                    windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+                )
+            };
+            let result = create_profile_ctx().and_then(|(mgr, _profiles)| query_active_kind(&mgr));
+            if init.is_ok() {
+                // SAFETY: 上の `CoInitializeEx` が成功したときだけ対にする。`result` は COM オブジェクトを持たない値。
+                unsafe { windows::Win32::System::Com::CoUninitialize() };
+            }
+            result
+        },
+    )
+    .flatten();
+    // 連続して取れない環境（COM が使えない等）では、種別が起動時の値のまま固定される。気づけるよう一度だけ warn を出す。
+    if result.is_some() {
+        FRESH_QUERY_CONSECUTIVE_FAILURES.store(0, std::sync::atomic::Ordering::Relaxed);
+    } else if FRESH_QUERY_CONSECUTIVE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1
+        == FRESH_QUERY_WARN_AFTER
+    {
+        tracing::warn!(
+            "[tip-detect] fresh-thread query failed {FRESH_QUERY_WARN_AFTER} times in a row: the IME kind stays at its last value"
+        );
+    }
+    tracing::debug!(
+        "[tip-detect] fresh-thread query: {}ms ({})",
+        started.elapsed().as_millis(),
+        if result.is_some() {
+            "ok"
+        } else {
+            "no observation"
+        }
+    );
+    result
 }
 
 /// 現在のSTAスレッドでアクティブな`TipIdentity`を一発で問い合わせる（ADR196-T2「1e前半」）。

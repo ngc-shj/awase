@@ -13,6 +13,24 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, PostMessageW, GUITHREADINFO,
 };
 
+/// `HWND` を `Send` 可能にするラッパー。
+///
+/// `HWND` は `*mut c_void` を含むため `Send` を実装していないが、ウィンドウハンドルの値自体はスレッド間で
+/// 安全に受け渡せる。ワーカースレッドへの HWND 送信専用（入力インジケーターの右クリックメニューの読み取り
+/// ワーカーなど）。以前は `focus/uia.rs`（UIA 非同期の分類ワーカー）にあったが、そのワーカーを撤去した
+/// （ECRS F1）ため、汎用の Win32 補助としてここに置く。
+#[derive(Clone, Copy)]
+pub struct SendableHwnd(pub HWND);
+
+impl std::fmt::Debug for SendableHwnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SendableHwnd").finish()
+    }
+}
+// Safety: HWND の値（ポインタ値）はスレッド間で安全に共有できる。ウィンドウハンドルはプロセス内でグローバルに
+// 有効であり、別スレッドから参照しても問題ない。
+unsafe impl Send for SendableHwnd {}
+
 /// タイムアウト付きで任意の処理をワーカースレッドで実行する。
 ///
 /// `win32_async::run_with_timeout` の re-export。
@@ -24,6 +42,23 @@ pub use win32_async::run_with_timeout;
 /// 別に、独立した用途（例: キーボードフック再インストールのjoin待ち）が
 /// 専用プールを持てるようにするためのもの。
 pub use win32_async::{run_with_timeout_in, LeakedThreadPool};
+
+/// `HwndId` から `HWND` への変換（ADR-229 D4）。
+///
+/// `HwndId` は純粋な核（`state/ime_event.rs`）にあり、`windows` クレートに依存させない。
+/// 変換は殻のここに集約する（`windows` の `HWND` 型変化〈`isize` → `*mut c_void`〉に
+/// 対して raw cast を直す場所も、ここだけ）。
+pub trait HwndIdExt {
+    /// `HWND` に変換する。
+    #[must_use]
+    fn to_hwnd(self) -> HWND;
+}
+
+impl HwndIdExt for crate::state::ime_event::HwndId {
+    fn to_hwnd(self) -> HWND {
+        HWND(self.0 as *mut _)
+    }
+}
 
 /// `HWND` の null チェック拡張トレイト。
 pub trait HwndExt {
@@ -41,23 +76,7 @@ impl HwndExt for HWND {
     }
 }
 
-/// post-bypass latch のスコープ。武装時と評価時で必ず同じ関数で採る。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ForegroundScope {
-    pub pid: u32,
-    /// `GetForegroundWindow()` の生値（`HWND` は `Send` でないため isize で持つ）。
-    pub hwnd: isize,
-}
-
-impl ForegroundScope {
-    /// 取得失敗（前景窓なし・pid 0）。実在のスコープとは決して等しくならない。
-    pub const INVALID: Self = Self { pid: 0, hwnd: 0 };
-
-    #[must_use]
-    pub const fn is_valid(self) -> bool {
-        self.pid != 0 && self.hwnd != 0
-    }
-}
+pub use crate::state::foreground_scope::ForegroundScope;
 
 #[must_use]
 pub fn foreground_scope() -> ForegroundScope {
@@ -91,7 +110,7 @@ pub fn foreground_scope() -> ForegroundScope {
 /// ワーカースレッド（gji-io-monitor / UIA worker 等）から呼ぶとメッセージが誰にも
 /// 処理されず消失していた。これにより `WM_IME_KIND_CHANGED` が main に一度も届かず、
 /// MS-IME 環境でも warmup 戦略がデフォルトの GjiFsm のまま走り続けた
-/// （docs/known-bugs.md BUG-09）。`WM_FOCUS_KIND_UPDATE`（UIA worker 発）も同罪だった。
+/// （docs/known-bugs.md BUG-09）。`WM_FOCUS_KIND_UPDATE`（UIA worker 発、ECRS F1 で撤去）も同罪だった。
 ///
 /// `engine_hwnd()` がまだ `None` の起動最初期だけは互換フォールバックとして
 /// `PostMessageW(None, ..)` を使う。この分岐は BUG-09 と同型の罠を持つため、
@@ -187,14 +206,14 @@ fn input_may_mutate_conv(input: &INPUT) -> bool {
 /// actuation が不可視になる経路が出て、測定したい対象が測定できなくなる本末転倒を招く。
 ///
 /// **`IME_KANJI_MARKER` だけでは不十分**（ADR-140コードレビュー指摘、MAJOR）:
-/// `tsf/send.rs::send_eager_warmup_vk_pair`（ADR-140が確認済みの3経路のうち
+/// `tsf/send.rs::send_eager_warmup_vk_pair`(ADR-212 P4 で撤去済み)（ADR-140が確認済みの3経路のうち
 /// warmup経路(c)）は`tsf/output.rs::make_tsf_key_input`経由で`TSF_MARKER`を
 /// 使い`IME_KANJI_MARKER`を使わないため、`IME_KANJI_MARKER`単独判定だと
 /// この経路のVK_IME_ON送信が診断ログに一切出ない「ログが無い＝発火していない」
 /// という誤読を招く（この診断が防ごうとしている罠そのもの）。
 ///
 /// **`TSF_MARKER`単独では判定しない**: このマーカーは通常のローマ字文字出力
-/// （`output/key_injector.rs::InjectionMode::Tsf`）やF2 warmup
+/// （旧 Tsf 注入モード〈2026-10-22 撤去〉）やF2 warmup
 /// （`VK_DBE_HIRAGANA`）にも広く使われる「サブシステム単位」のマーカーであり、
 /// これだけで actuation と判定すると通常の文字出力のたびに誤検出（ノイズ）を
 /// 生む。`TSF_MARKER`は`VK_IME_ON`/`VK_IME_OFF`（open/close軸）と組み合わさった
@@ -256,19 +275,8 @@ pub(crate) fn last_actuation_issue_us() -> u64 {
     LAST_ACTUATION_ISSUE_US.load(Ordering::Relaxed)
 }
 
-/// `send_input_safe` が送った 1 キーボードイベントの記録（不具合報告用、journal の
-/// `SentInput` へ変換される）。`INPUT` の生値のうち、送信内容の再構成に要るものだけを持つ。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SentKeyEvent {
-    /// `wVk`。Unicode 送信（`KEYEVENTF_UNICODE`）では 0。
-    pub vk: u16,
-    /// `wScan`。Unicode 送信では UTF-16 code unit そのもの。
-    pub scan: u16,
-    pub up: bool,
-    pub unicode: bool,
-    /// `dwExtraInfo`（自己注入マーカー。どの送信経路かの識別に使う）。
-    pub marker: usize,
-}
+// `SentKeyEvent` は Windows API に依存しない POD のため `journal` に定義がある（ADR-229 T4）。
+pub use crate::journal::SentKeyEvent;
 
 /// `send_input_safe` 1 回ぶん（= `SendInput` 1 回）の記録。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -292,7 +300,7 @@ std::thread_local! {
     ///
     /// 不具合報告で「awase が実際に何を送ったか」を追えなかった（LINE で「いまは」が
     /// 「いいい」になった報告 01M43NK5P13Q7EQP7CS0N3X4ED。journal の `KeyInput` は物理入力のみで、
-    /// 送信側は IME 操作キー用の `[shadow-send]`〈debug ログ〉しか無かった）ための恒久診断。
+    /// 送信側は `[ime-io]`〈debug ログ〉しか無かった）ための恒久診断。
     static SENT_INPUT_TRACE: std::cell::RefCell<std::collections::VecDeque<SentInputBatch>> =
         const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
 
@@ -348,6 +356,10 @@ fn sent_key_events(inputs: &[INPUT]) -> Vec<SentKeyEvent> {
 /// `INPUT` のサイズが `i32` に収まらない場合（実際には起こらない）。
 #[must_use]
 pub(crate) fn send_input_safe(inputs: &[INPUT]) -> u32 {
+    // BUG-217: ペース付き送信で待っている間は、他の送信も順序を守るため、キューの後ろに回す(`key_pacer`)。
+    if crate::key_pacer::divert(inputs) {
+        return u32::try_from(inputs.len()).unwrap_or(u32::MAX);
+    }
     if inputs.iter().any(input_may_mutate_conv) {
         crate::conv_mutation::bump();
     }
@@ -364,9 +376,6 @@ pub(crate) fn send_input_safe(inputs: &[INPUT]) -> u32 {
         tracing::debug!(
             "[ime-io] actuation SendInput kind={kind} vk={vks:02X?} issue_us={issue_us}"
         );
-        // ADR-159 段階2(TF2、`shadow_send_trace`doc参照): 上と同一の条件で
-        // 実際の送信内容を構造化記録する。新しい条件は増やさない。
-        crate::shadow_send_trace::record_send_input(kind, &vks, issue_us);
     }
     let size = i32::try_from(size_of::<INPUT>()).expect("INPUT size fits in i32");
     let issue_us = crate::hook::now_timestamp_us();
@@ -522,6 +531,37 @@ pub unsafe fn get_gui_thread_info_with_timeout(timeout: Duration) -> GuiThreadRe
             }
         }
     }
+}
+
+/// 前景スレッドの `hwndFocus` だけを観測する（BUG-194 / ADR-246 Q3 の観測版。判断には使わない）。
+///
+/// `get_gui_thread_info_with_timeout` と違い、取れなかったとき前景窓などで代用せず `None` を返す
+/// （フォーカス null・`GetGUIThreadInfo` 失敗・タイムアウト・ワーカー上限）。代用値が「違う窓」に見えると
+/// 変化の頻度を誤って過大に測るため。呼び出しは literal 検出時と予約あり flush の稀な 2 箇所に限ること。
+///
+/// # Panics
+/// `GUITHREADINFO` のサイズが `u32` に収まらない場合（実際には起こらない）。
+///
+/// # Safety
+/// Win32 API を呼び出す。
+#[must_use]
+pub unsafe fn focus_hwnd_observed(timeout: Duration) -> Option<isize> {
+    run_with_timeout(timeout, || {
+        let mut info = GUITHREADINFO {
+            cbSize: u32::try_from(size_of::<GUITHREADINFO>())
+                .expect("GUITHREADINFO size is a small constant that always fits in u32"),
+            ..Default::default()
+        };
+        // SAFETY: info は cbSize を正しく設定したスタック上の有効な構造体。
+        unsafe {
+            if GetGUIThreadInfo(0, &raw mut info).is_ok() {
+                info.hwndFocus.non_null().map(|h| h.0 as isize)
+            } else {
+                None
+            }
+        }
+    })
+    .flatten()
 }
 
 #[cfg(test)]

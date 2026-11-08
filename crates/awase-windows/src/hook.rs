@@ -44,7 +44,7 @@ const HOOK_IME_MODE_DIAGNOSTIC_CAP: usize = 64;
 ///
 /// **フィールドごとの`Ordering`は移行前と完全に同一**（1対1対応、変更禁止）。
 /// 実測: `Relaxed` 49・`Release` 9・`Acquire` 7・`SeqCst` 1（`hook_tid_init_slot`の
-/// リセット時のみ）。`focus_app_disabled`は書き`Release`・アクセサ読み`Acquire`・
+/// リセット時のみ）。`focus_app_disabled`は書き`Release`・
 /// ホットパス読み`Relaxed`という意図的な非対称を持つ（ADR-164フェーズ4参照）。
 struct HookState {
     /// IME モードキー（`VK_KANA`/`VK_IME_ON`/`VK_JUNJA`/`VK_KANJI`/`VK_IME_OFF`/
@@ -61,6 +61,14 @@ struct HookState {
     /// 自己注入キー含む全コールバックで更新する。エンジンスレッドの
     /// watchdog がここを読む。
     hook_alive_tick_ms: AtomicU64,
+    /// フックが最後に受けた**物理キーのキーダウン**（注入ではない）の時刻（`GetTickCount64`）。0 = まだ無い。
+    /// `hook_alive_tick_ms` は自己注入キーやカナリアでも進むので、「物理キーが届いているか」を見るには別に要る
+    /// （Raw Input 経由の観測 `observer::raw_key_input` との突き合わせ用。診断専用、issue #165）。
+    hook_physical_key_tick_ms: AtomicU64,
+    /// 最後に ImmCross で IME へ書き込みを**発行**した時刻（`GetTickCount64`）。0 = 未発行（ADR-268 D3）。
+    /// ImmCross の書き込みはフックを通らない（`hook_alive_tick_ms` に入らない）ので、共有メモリの読みが
+    /// 「awase の操作より後の事実か」を判定する基準（`max(hook_alive_tick_ms, この値)`）に別に足す。
+    imm_cross_write_tick_ms: AtomicU64,
     /// `install_hook` がフックスレッドからの TID 通知を待つスロット。
     /// 0 = 待機中、`u32::MAX` = `SetWindowsHookExW` 失敗、それ以外 = フックスレッド TID。
     hook_tid_init_slot: AtomicU32,
@@ -100,6 +108,9 @@ struct HookState {
     /// 50ms 救済窓を設けるため。「Ctrl↓ → 直後に 無変換↓」の意図的チョードでは
     /// false のままなので、即時 IME OFF できる。Ctrl↓/Ctrl↑ で false にリセットされる。
     ctrl_consumed_since_down: AtomicBool,
+    /// 他アプリが注入した Ctrl↓ の時刻(ADR-249、BUG-197)。**注入された打鍵の `modifier_snapshot` にだけ**
+    /// 期限内の ctrl として足す。`read_os_modifiers`・`HeldModifiers`・`ctrl_consumed_since_down` は読まない。
+    foreign_ctrl: crate::state::foreign_modifier::ForeignCtrlLatch,
     /// キーボードモデル（JIS/US）のキャッシュ。RUNTIME 借用なしで `classify_key`
     /// から参照するため `cached_thumb_vks` と同じ理由でキャッシュする。
     /// false = Jis（既定）、true = Us。
@@ -150,6 +161,8 @@ impl HookState {
             last_ime_mode_hook_ms: AtomicU64::new(0),
             cached_thumb_vks: AtomicU32::new(0),
             hook_alive_tick_ms: AtomicU64::new(0),
+            hook_physical_key_tick_ms: AtomicU64::new(0),
+            imm_cross_write_tick_ms: AtomicU64::new(0),
             hook_tid_init_slot: AtomicU32::new(0),
             physical_key_state: [const { AtomicBool::new(false) }; 256],
             physical_key_down_at_ms: [const { AtomicU64::new(0) }; 256],
@@ -159,6 +172,7 @@ impl HookState {
             left_thumb_down_scan: AtomicU32::new(0),
             right_thumb_down_scan: AtomicU32::new(0),
             ctrl_consumed_since_down: AtomicBool::new(false),
+            foreign_ctrl: crate::state::foreign_modifier::ForeignCtrlLatch::new(),
             cached_keyboard_model_is_us: AtomicBool::new(false),
             cached_left_alt_impersonation_enabled: AtomicBool::new(false),
             cached_right_alt_impersonation_enabled: AtomicBool::new(false),
@@ -310,9 +324,29 @@ pub(crate) fn tick_hook_alive() {
         .store(current_tick_ms(), Ordering::Relaxed);
 }
 
+/// フックが最後に受けた物理キーのキーダウンの時刻（ms、`GetTickCount64`）。0 = まだ無い。診断専用。
+#[must_use]
+pub fn hook_physical_key_tick_ms() -> u64 {
+    HOOK_STATE.hook_physical_key_tick_ms.load(Ordering::Relaxed)
+}
+
 /// フックコールバックの最終活動タイムスタンプ（ms）を返す
 pub fn hook_alive_tick_ms() -> u64 {
     HOOK_STATE.hook_alive_tick_ms.load(Ordering::Relaxed)
+}
+
+/// ImmCross で IME へ書き込みを発行した時刻を記録する（`runtime/open_chain.rs::imm_cross_write` の発行時、ADR-268 D3）。
+pub(crate) fn note_imm_cross_write() {
+    HOOK_STATE
+        .imm_cross_write_tick_ms
+        .store(current_tick_ms(), Ordering::Relaxed);
+}
+
+/// 共有メモリの読みが「awase の最後の操作より後の事実か」を判定する基準の時刻（ms、`GetTickCount64`）。
+/// `max(hook_alive_tick_ms, 最後の ImmCross の書き込みの発行時刻)`。全キー（自分の SendInput と KeyUp を含む）と
+/// ImmCross の書き込みの、どちらか新しい方（ADR-268 D3 の R3'）。
+pub fn last_operation_tick_ms() -> u64 {
+    hook_alive_tick_ms().max(HOOK_STATE.imm_cross_write_tick_ms.load(Ordering::Relaxed))
 }
 
 fn hook_tid_reset() {
@@ -361,7 +395,7 @@ pub fn physical_key_held_ms(vk: VkCode) -> Option<u64> {
 /// 自体は他キーには正常に応答していたため全面停止ではなく、Win キー固有の
 /// 経路でのみ KeyUp が失われたと考えられる）。
 ///
-/// `tsf/send.rs::send_eager_warmup_vk_pair` と `ime.rs::send_ime_mode_key`
+/// `tsf/send.rs::send_eager_warmup_vk_pair`(ADR-212 P4 で撤去済み) と `ime.rs::send_ime_mode_key`
 /// の両方が使う唯一の判定点（旧実装は各所で `is_physical_key_down` の OR を
 /// 個別に重複記述していた）。
 #[must_use]
@@ -418,7 +452,7 @@ pub fn alt_key_held() -> bool {
 /// Win/Alt ガード。`false` の場合、呼び出し元は注入をスキップすべき。
 ///
 /// Win: Win 押下中に送ると Win+VK として届き、Win↑ 時にスタートメニューが
-/// 開く（`tsf/send.rs::send_eager_warmup_vk_pair` と同じ判定点）。
+/// 開く（`tsf/send.rs::send_eager_warmup_vk_pair`(ADR-212 P4 で撤去済み) と同じ判定点）。
 ///
 /// Alt: Alt 押下中に合成 `VK_DBE_HIRAGANA` 等を送ると MS-IME の
 /// 「Alt+かな」ローマ字⇔JISかな直接入力切替ショートカット（BUG-61/62）と
@@ -491,6 +525,7 @@ pub fn reset_physical_key_state() {
         .store(false, Ordering::Relaxed);
     HOOK_STATE.alt_l_was_down.store(false, Ordering::Relaxed);
     HOOK_STATE.alt_r_was_down.store(false, Ordering::Relaxed);
+    HOOK_STATE.foreign_ctrl.clear();
     tracing::info!("[hook] PHYSICAL_KEY_STATE をリセット（全 VK を解放状態に）");
 }
 
@@ -548,6 +583,7 @@ pub(crate) fn clear_hook_latches_for_app_disable(
     HOOK_STATE.right_thumb_down_scan.store(0, Ordering::Relaxed);
 
     if matches!(edge, SuppressionEdge::Leave) {
+        HOOK_STATE.foreign_ctrl.clear();
         for vk in [
             VK_CONTROL,
             VK_LCONTROL,
@@ -613,6 +649,7 @@ pub(crate) fn clear_hook_latches_for_watchdog_reinstall() {
         .store(0, Ordering::Relaxed);
     HOOK_STATE.left_thumb_down_scan.store(0, Ordering::Relaxed);
     HOOK_STATE.right_thumb_down_scan.store(0, Ordering::Relaxed);
+    HOOK_STATE.foreign_ctrl.clear();
 
     for vk in [
         VK_CONTROL,
@@ -741,7 +778,8 @@ pub fn set_focus_app_disabled(disabled: bool) {
         .store(disabled, Ordering::Release);
 }
 
-/// 現在フォーカス中のアプリで awase が無効化されているか。
+/// 現在フォーカス中のアプリで awase が無効化されているか（`disable_apps` にマッチ）。
+/// 半角英数トグルの戻り待ちの復元（ADR-245）が、無効化された窓では復元しないために読む。
 #[must_use]
 pub fn is_focus_app_disabled() -> bool {
     HOOK_STATE.focus_app_disabled.load(Ordering::Acquire)
@@ -796,13 +834,8 @@ fn passthrough_or_swallow_for_impersonation(ncode: i32, wparam: WPARAM, lparam: 
     }
 }
 
-/// 現在時刻を `GetTickCount64` ミリ秒で返す。
-#[must_use]
-pub fn current_tick_ms() -> u64 {
-    // SAFETY: GetTickCount64 はどのスレッドからも安全に呼び出せるスレッドセーフな Win32 API。
-    //         引数なし・副作用なし・内部ロックにより安全性が保証される。
-    unsafe { windows::Win32::System::SystemInformation::GetTickCount64() }
-}
+/// 現在時刻をミリ秒で返す(実体は [`crate::clock::current_tick_ms`]、ADR-272 段階 A)。
+pub use crate::clock::current_tick_ms;
 
 /// OS 全体（他プロセス宛ても含む）で最後にユーザー入力（キー/マウス）があった
 /// `GetTickCount()` 時刻（ms）を返す。取得失敗時は `None`。
@@ -1046,7 +1079,7 @@ std::thread_local! {
 /// されるまでの短い間、フックチェーンには残り続けるが実害は無い。
 ///
 /// PR #349コードレビュー指摘（reuse）: 「単調増加する世代カウンタでstaleな
-/// 応答を弾く」という仕組み自体は`WarmEpoch`/`cold_seq`/`Actuation.attempts`
+/// 応答を弾く」という仕組み自体は`CompositionState`/`cold_seq`/`Actuation.attempts`
 /// が個別に再実装してきた経緯があり、`state::event_origin::Generation`
 /// （ADR-082）がその統合型として既に存在する。生の`AtomicU32`ではなく
 /// `Generation`（`AtomicU64`に払い出し値を格納し、比較・取り出しは
@@ -1280,6 +1313,9 @@ fn build_raw_key_event(
     injected: bool,
     was_down: bool,
     press_id: Option<awase::types::PressId>,
+    timestamp: Timestamp,
+    foreign_ctrl: bool,
+    impersonated: bool,
 ) -> RawKeyEvent {
     use crate::vk::VkCodeExt;
     RawKeyEvent {
@@ -1291,7 +1327,7 @@ fn build_raw_key_event(
             KeyEventType::KeyUp
         },
         extra_info,
-        timestamp: now_timestamp(),
+        timestamp,
         key_classification,
         physical_pos,
         ime_relevance: classify_ime_relevance(vk),
@@ -1302,11 +1338,21 @@ fn build_raw_key_event(
         injected,
         was_down,
         press_id,
+        foreign_ctrl,
+        impersonated,
     }
 }
 
 /// 次の `PressId` を採番する（ADR-208 決定2 D1）。フックスレッドだけが呼ぶ単調増加のカウンタ。
 static NEXT_PRESS_ID: AtomicU64 = AtomicU64::new(1);
+
+/// 物理キーを伴わないユーザー操作（トレイ・`general.engine_toggle_hotkey`）の `SetOpen` に載せる `PressId` を採番する
+/// （ECRS DD5-03）。キーの押下と同じカウンタなので、`PressLedger` の「1 押下 1 書き込み」と、
+/// `explicit_press_applied_pair` による `applied` の未知化（押下に由来する ON を「すでに一致」で省かない）が、
+/// そのまま効く。メインスレッドから呼んでよい（カウンタは `AtomicU64`）。
+pub(crate) fn allocate_command_press_id() -> awase::types::PressId {
+    awase::types::PressId::new(NEXT_PRESS_ID.fetch_add(1, Ordering::Relaxed))
+}
 
 /// 非注入の非リピート KeyDown（`awase::types::is_press_start`）にだけ `PressId` を振る。
 /// KeyUp・自動リピート・注入イベントは `None`（リピートは従来の `applied` 省略に任せる）。
@@ -1459,6 +1505,12 @@ unsafe extern "system" fn hook_callback(ncode: i32, wparam: WPARAM, lparam: LPAR
     // テストドライバの目印（`TEST_INJECTION_MARKER`）を付けた注入を物理キーとして扱う。
     // 本番では環境変数が無いため常に従来どおり（`LLKHF_INJECTED` = 注入）。
     let is_injected = (kb.flags.0 & LLKHF_INJECTED) != 0 && !is_test_injection(kb.dwExtraInfo);
+    // 診断（Raw Input との突き合わせ用、挙動は変えない）: 注入ではない物理キーのキーダウンの時刻を残す。
+    if is_keydown && !is_injected && !self_injected {
+        HOOK_STATE
+            .hook_physical_key_tick_ms
+            .store(current_tick_ms(), Ordering::Relaxed);
+    }
 
     // IME モードキー (VK_KANA/IME_ON/JUNJA/KANJI/IME_OFF/VK_DBE_*) 診断ログ。
     // 「Ctrl+無変換→Ctrl+変換 で IME-OFF Engine-ON になる」報告 (2026-07-06) の切り分け用:
@@ -1526,6 +1578,8 @@ unsafe extern "system" fn hook_callback(ncode: i32, wparam: WPARAM, lparam: LPAR
     // issue #136 系の foreign-injected 連打を誤って auto-repeat とみなさないよう、
     // 呼び出し側は was_down の値に関わらず injected を常に非畳み込みとして扱う）。
     let mut was_down = false;
+    // ADR-249: 記録・期限の比較・`event.timestamp` で同じ時刻を使う(コールバックで1回だけ取る)。
+    let callback_ts = now_timestamp();
     // PR #349コードレビュー指摘: 手前のIME診断分岐のログ出力でブロックしうる
     // （未実行の場合でも「このコールバックの直前で詰まった経路があった
     // かもしれない」という前提を各書き込み直前で確認する方が、どの分岐が
@@ -1534,7 +1588,24 @@ unsafe extern "system" fn hook_callback(ncode: i32, wparam: WPARAM, lparam: LPAR
     if !is_injected && is_zombie_hook_thread() {
         return CallNextHookEx(None, ncode, wparam, lparam);
     }
+    if is_injected {
+        // ADR-249: 他アプリの注入 Ctrl を別枠に記録する(`physical_key_state` は従来どおり更新しない)。
+        // `focus_app_disabled` の早期 return より前。フックコールバック上ではログを出さない。
+        if is_keydown {
+            HOOK_STATE.foreign_ctrl.on_injected_down(
+                vk,
+                callback_ts,
+                crate::tuning::FOREIGN_CTRL_TTL_MS * 1_000,
+            );
+        } else {
+            HOOK_STATE.foreign_ctrl.on_up(vk);
+        }
+    }
     if !is_injected {
+        if !is_keydown {
+            // ADR-249: 同じスロットの物理 Ctrl の Up は、OS の VK ごと1ビットと同じく記録も落とす。
+            HOOK_STATE.foreign_ctrl.on_up(vk);
+        }
         if let Some(slot) = HOOK_STATE.physical_key_state.get(vk.0 as usize) {
             was_down = slot.swap(is_keydown, Ordering::Relaxed);
         }
@@ -1737,6 +1808,10 @@ unsafe extern "system" fn hook_callback(ncode: i32, wparam: WPARAM, lparam: LPAR
         );
     }
     let rewritten_vk = apply_alt_impersonation(vk, is_keydown, alt_extended, config);
+    // ADR-255: Alt をなりすましで親指キーの vk に書き換えたイベントの印。遅いルール（`ime = "off"`）が、
+    // GJI 側で IME が閉じた直後の Alt（`cached_engine_enabled` が古く、なりすましの判断が外れる）を
+    // Space にしないために使う。scan code での判定は右 Alt→変換の取りこぼしやリマッパで外れる。
+    let impersonated = rewritten_vk != vk;
     if rewritten_vk != vk {
         tracing::debug!(
             "[alt-impersonation] impersonating: vk 0x{:02X} -> 0x{:02X}",
@@ -1832,6 +1907,16 @@ unsafe extern "system" fn hook_callback(ncode: i32, wparam: WPARAM, lparam: LPAR
     let (left_thumb_down_snapshot, right_thumb_down_snapshot) = thumb_down_timestamps();
     // SAFETY: GetAsyncKeyState はスレッドセーフで任意のスレッドから呼べる。
     let mut modifier_snapshot = crate::observer::focus_observer::read_os_modifiers();
+    // ADR-249(BUG-197): 他アプリが注入した Ctrl の期限内記録は、**注入された打鍵の snapshot にだけ**足す。
+    // 物理打鍵・`read_os_modifiers`・`HeldModifiers` には影響させない(ADR-054 の stuck を再発させない)。
+    let foreign_ctrl = is_injected
+        && !modifier_snapshot.ctrl
+        && HOOK_STATE
+            .foreign_ctrl
+            .ctrl_for_injected_key(callback_ts, crate::tuning::FOREIGN_CTRL_TTL_MS * 1_000);
+    if foreign_ctrl {
+        modifier_snapshot.ctrl = true;
+    }
     // Alt 物理押下中またはメニューモード（WM_SYSKEYDOWN コンテキスト）のキーは変換しない
     if kb.flags.0 & LLKHF_ALTDOWN != 0 {
         modifier_snapshot.alt = true;
@@ -1855,6 +1940,9 @@ unsafe extern "system" fn hook_callback(ncode: i32, wparam: WPARAM, lparam: LPAR
         is_injected,
         was_down,
         assign_press_id(is_keydown, is_injected, was_down),
+        callback_ts,
+        foreign_ctrl,
+        impersonated,
     );
 
     // opus round2 M2': 入口（`hook_callback`冒頭）のガードは、これから

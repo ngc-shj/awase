@@ -288,6 +288,53 @@ impl Engine {
         ActivationState::Active
     }
 
+    /// エンジンが非活性で、その理由が IME OFF か（ADR-255 決定2 条件1）。
+    /// `UserDisabled`/`NotJapaneseIme`/`NotRomajiInput` は含めない。判断は
+    /// `compute_state` のままで、呼び出し側が再実装しない。
+    #[must_use]
+    pub const fn ime_off_inactive(&self, ctx: &InputContext) -> bool {
+        matches!(
+            self.compute_state(ctx),
+            ActivationState::Inactive(InactiveReason::ImeOff)
+        )
+    }
+
+    /// このキーに、エンジンが知る IME の機能（遅いルールが奪ってはならないもの）があるか
+    /// （ADR-255 決定2 条件6-i の4源）: bare の `keys.ime_*`・明示の IME 制御コンボ・専用 Fn キー・
+    /// 強制 open 軸操作・IME 設定由来の役割（`thumb_role_open_actions`、単独タップ設定が Passthrough かどうかは
+    /// 問わない）・IME 側が定める開閉の方向（`ime_relevance.sync_direction`）。
+    /// `thumb_open_role_action` は流用しない（役割があっても単独タップ設定が Passthrough でないとき `None` を返す
+    /// ので、「役割なし」と読むと IME を開く手段を奪う）。判断はここに閉じ、殻は再実装しない。
+    #[must_use]
+    pub fn key_has_ime_function(&self, event: &RawKeyEvent) -> bool {
+        let vk = event.vk_code;
+        self.special_keys.bare_ime_action(vk).is_some()
+            || self.has_bare_ime_combo(vk)
+            || self.adapter.thumb_has_ime_function(vk)
+            || event.ime_relevance.sync_direction.is_some()
+    }
+
+    /// シェルが（エンジンの判断の後で）消費した KeyDown を、エンジンの `KeyLifecycle` に登録する
+    /// （ADR-255 決定4）。エンジンは素通しの KeyDown を記録しないので、シェルが消費したときは
+    /// この口で「対応する KeyUp を消費する義務」と、最初の押下なら `phase1_held` を立てる。
+    /// **エンジンの判断（活性/非活性・FSM の状態）は変えない**。
+    ///
+    /// `phase1_held` は `is_bare_thumb` を見ずに立てる（Opus レビュー R-M1）: `LeftThumb`/`RightThumb` への
+    /// 分類は設定した親指キーにしか付かず（`hook.rs::classify_key`）、右親指を Space にした構成では
+    /// 変換は `Passthrough` になる。そこで立てないと、リピートの Down が素通しになり、Up だけが
+    /// 飲まれる Down/Up の非対称になる。ガードは vk だけで判定するので、親指でなくても働く。
+    /// リピートの Down（`was_down`）と KeyUp は何もしない（KeyUp を登録すると次の Up が飲まれる）。
+    pub fn record_shell_consumed(&mut self, event: &RawKeyEvent) {
+        if !matches!(event.event_type, KeyEventType::KeyDown) {
+            debug_assert!(false, "record_shell_consumed は KeyDown だけに呼ぶ");
+            return;
+        }
+        self.lifecycle.on_key_down_shell_consumed(event);
+        if !event.was_down {
+            self.phase1_held = Some(event.vk_code);
+        }
+    }
+
     /// InputContext から実効状態を bool で返す（後方互換 API）。
     #[must_use]
     pub const fn compute_active(&self, ctx: &InputContext) -> bool {
@@ -1154,28 +1201,6 @@ fn matches_key_combo(combo: ParsedKeyCombo, event: &RawKeyEvent, modifiers: Modi
 }
 
 impl SpecialKeyCombos {
-    /// ADR-206 決定4: 旧 `*_solo_tap_ime_action` の移行用。`vk` に**無修飾の bare が既にあれば何もしない**
-    /// （ユーザーが明示した `keys.ime_*` を優先。旧設定が残ったまま新しい bare を足した場合に黙って上書きしない）。
-    /// 無ければ `action` の一覧へ bare を加える。修飾付きのコンボには触れない。config.toml は書き換えず、メモリ上の照合表だけを変える。
-    /// 戻り値は移行したか。
-    pub fn set_bare_ime_action_if_absent(&mut self, vk: VkCode, action: ShadowImeAction) -> bool {
-        if self.bare_ime_action(vk).is_some() {
-            return false;
-        }
-        let combo = ParsedKeyCombo {
-            ctrl: false,
-            shift: false,
-            alt: false,
-            vk,
-        };
-        match action {
-            ShadowImeAction::TurnOn => self.ime_on.push(combo),
-            ShadowImeAction::TurnOff => self.ime_off.push(combo),
-            ShadowImeAction::Toggle => self.ime_toggle.push(combo),
-        }
-        true
-    }
-
     /// 修飾なしの `vk` に対する open 軸操作。通常の特殊キー照合と同じく方向固定を toggle より優先し、
     /// on を off より先に評価する（ADR-192 決定3b。Platform 層の `thumb_forced_open_actions` と
     /// ADR-199 決定16 の役割合成が共有する）。

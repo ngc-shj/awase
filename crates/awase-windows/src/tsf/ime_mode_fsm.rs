@@ -31,9 +31,9 @@ pub(crate) enum ImeModeState {
 
 impl ImeModeState {
     pub(crate) fn from_conversion_mode(mode: u32) -> Self {
-        if mode & crate::imm::IME_CMODE_NATIVE == 0 {
+        if mode & crate::conv_flags::IME_CMODE_NATIVE == 0 {
             Self::Off
-        } else if mode & crate::imm::IME_CMODE_KATAKANA != 0 {
+        } else if mode & crate::conv_flags::IME_CMODE_KATAKANA != 0 {
             Self::Katakana
         } else {
             Self::Hiragana
@@ -103,7 +103,7 @@ impl ImeModeFsm {
         tracing::debug!("[ime-mode] SetOpen({open}) applied → {new_state:?} (belief, unconfirmed)");
         self.state = new_state;
         self.confirmed = false;
-        self.last_vk_send_ms = crate::hook::current_tick_ms();
+        self.last_vk_send_ms = crate::clock::current_tick_ms();
     }
 
     /// 外部要因で conv が変わった可能性があるとき、belief の state は保ったまま
@@ -162,7 +162,7 @@ impl ImeModeFsm {
     /// confirm-then-transmit ゲート）が「安全に送信してよい」と誤認し、
     /// フォーカス変更直後の TSF compose sink 未準備な状態へ romaji を
     /// 即送信してしまい先頭文字がリテラル化した（BUG-59）。`state` だけ
-    /// 更新すれば、他の消費者（`mod.rs` の Unicode cold-start 観測ゲート等）
+    /// 更新すれば、他の消費者
     /// にはヒントとして反映されつつ、`is_native_ready()` は
     /// `start_ms_ime_ready_poll`（`on_conversion_mode_read` を呼ぶ真の
     /// confirm-then-transmit ポーリング）が実際に確認するまで `false` のまま
@@ -217,7 +217,7 @@ mod tests {
     fn unconfirm_makes_native_ready_false_without_changing_state() {
         let mut fsm = ImeModeFsm::new();
         fsm.on_conversion_mode_read(Some(
-            crate::imm::IME_CMODE_NATIVE | crate::imm::IME_CMODE_ROMAN,
+            crate::conv_flags::IME_CMODE_NATIVE | crate::conv_flags::IME_CMODE_ROMAN,
         ));
         assert_eq!(fsm.state(), ImeModeState::Hiragana);
         assert!(fsm.is_native_ready(), "confirmed かつ Hiragana なら ready");
@@ -249,14 +249,14 @@ mod tests {
     fn on_conversion_mode_read_confirms_native_ready_again() {
         let mut fsm = ImeModeFsm::new();
         fsm.on_conversion_mode_read(Some(
-            crate::imm::IME_CMODE_NATIVE | crate::imm::IME_CMODE_ROMAN,
+            crate::conv_flags::IME_CMODE_NATIVE | crate::conv_flags::IME_CMODE_ROMAN,
         ));
         fsm.unconfirm("test");
         assert!(!fsm.is_native_ready());
 
         // IMC ポーリングが実際に NATIVE を確認し直すと ready に戻る。
         fsm.on_conversion_mode_read(Some(
-            crate::imm::IME_CMODE_NATIVE | crate::imm::IME_CMODE_ROMAN,
+            crate::conv_flags::IME_CMODE_NATIVE | crate::conv_flags::IME_CMODE_ROMAN,
         ));
         assert!(fsm.is_native_ready());
     }
@@ -274,12 +274,12 @@ mod tests {
         assert!(!fsm.is_native_ready());
 
         fsm.on_conversion_mode_hint(Some(
-            crate::imm::IME_CMODE_NATIVE | crate::imm::IME_CMODE_ROMAN,
+            crate::conv_flags::IME_CMODE_NATIVE | crate::conv_flags::IME_CMODE_ROMAN,
         ));
         assert_eq!(
             fsm.state(),
             ImeModeState::Hiragana,
-            "ヒントでも state は更新される（Unicode cold-start 観測ゲート等の消費者向け）"
+            "ヒントでも state は更新される（state を読む消費者向け）"
         );
         assert!(
             !fsm.is_native_ready(),
@@ -290,7 +290,7 @@ mod tests {
         // 真の confirm-then-transmit ポーリング（on_conversion_mode_read）が
         // 実際に確認して初めて ready になる。
         fsm.on_conversion_mode_read(Some(
-            crate::imm::IME_CMODE_NATIVE | crate::imm::IME_CMODE_ROMAN,
+            crate::conv_flags::IME_CMODE_NATIVE | crate::conv_flags::IME_CMODE_ROMAN,
         ));
         assert!(fsm.is_native_ready());
     }
@@ -302,5 +302,97 @@ mod tests {
         fsm.on_conversion_mode_hint(None);
         assert_eq!(fsm.state(), ImeModeState::Unknown);
         assert!(!fsm.is_native_ready());
+    }
+
+    /// `from_conversion_mode` は NATIVE ビットの有無で Off、KATAKANA ビットでカタカナを分ける。
+    /// NATIVE が無ければ KATAKANA が立っていても Off(ROMAN 単独・KATAKANA 単独は直接入力扱い)。
+    #[test]
+    fn from_conversion_mode_distinguishes_off_hiragana_katakana() {
+        use crate::conv_flags::{IME_CMODE_KATAKANA, IME_CMODE_NATIVE, IME_CMODE_ROMAN};
+        assert_eq!(ImeModeState::from_conversion_mode(0), ImeModeState::Off);
+        assert_eq!(
+            ImeModeState::from_conversion_mode(IME_CMODE_ROMAN),
+            ImeModeState::Off
+        );
+        assert_eq!(
+            ImeModeState::from_conversion_mode(IME_CMODE_KATAKANA),
+            ImeModeState::Off,
+            "NATIVE が無ければ KATAKANA だけでは Off"
+        );
+        assert_eq!(
+            ImeModeState::from_conversion_mode(IME_CMODE_NATIVE),
+            ImeModeState::Hiragana
+        );
+        assert_eq!(
+            ImeModeState::from_conversion_mode(IME_CMODE_NATIVE | IME_CMODE_ROMAN),
+            ImeModeState::Hiragana
+        );
+        assert_eq!(
+            ImeModeState::from_conversion_mode(IME_CMODE_NATIVE | IME_CMODE_KATAKANA),
+            ImeModeState::Katakana
+        );
+    }
+
+    /// `is_confirmed` は OS 読み取りで true、`unconfirm` で false になる。
+    #[test]
+    fn is_confirmed_follows_read_and_unconfirm() {
+        let mut fsm = ImeModeFsm::new();
+        assert!(!fsm.is_confirmed());
+        fsm.on_conversion_mode_read(Some(crate::conv_flags::IME_CMODE_NATIVE));
+        assert!(fsm.is_confirmed());
+        fsm.unconfirm("test");
+        assert!(!fsm.is_confirmed());
+    }
+
+    /// `on_set_open_applied` は belief を即時に Hiragana/Off へ更新し、unconfirmed にする。
+    #[test]
+    fn set_open_applied_updates_belief_and_unconfirms() {
+        let mut fsm = ImeModeFsm::new();
+        fsm.on_conversion_mode_read(Some(crate::conv_flags::IME_CMODE_NATIVE));
+        assert!(fsm.is_confirmed());
+
+        fsm.on_set_open_applied(false);
+        assert_eq!(fsm.state(), ImeModeState::Off);
+        assert!(!fsm.is_confirmed(), "SetOpen の直後は OS 側の準備待ち");
+
+        fsm.on_set_open_applied(true);
+        assert_eq!(fsm.state(), ImeModeState::Hiragana);
+        assert!(!fsm.is_confirmed());
+    }
+
+    /// VK 送信から 100ms 未満の FocusChange(Chrome の副作用)は state を保ち unconfirmed のみ。
+    #[test]
+    fn focus_changed_within_100ms_of_vk_send_keeps_state() {
+        let mut fsm = ImeModeFsm::new();
+        fsm.on_conversion_mode_read(Some(crate::conv_flags::IME_CMODE_NATIVE));
+        fsm.last_vk_send_ms = 1_000;
+
+        fsm.on_focus_changed(1_099);
+        assert_eq!(fsm.state(), ImeModeState::Hiragana, "99ms 後は state 維持");
+        assert!(!fsm.is_confirmed());
+    }
+
+    /// 送信から 100ms 以上(境界を含む)では Unknown に戻す。
+    #[test]
+    fn focus_changed_at_or_after_100ms_resets_to_unknown() {
+        for now in [1_100u64, 1_101, 5_000] {
+            let mut fsm = ImeModeFsm::new();
+            fsm.on_conversion_mode_read(Some(crate::conv_flags::IME_CMODE_NATIVE));
+            fsm.last_vk_send_ms = 1_000;
+            fsm.on_focus_changed(now);
+            assert_eq!(fsm.state(), ImeModeState::Unknown, "now={now}");
+            assert!(!fsm.is_confirmed(), "now={now}");
+        }
+    }
+
+    /// VK を一度も送っていない(last_vk_send_ms == 0)なら、now が小さくても Unknown に戻す。
+    #[test]
+    fn focus_changed_without_prior_vk_send_resets_to_unknown() {
+        let mut fsm = ImeModeFsm::new();
+        fsm.on_conversion_mode_read(Some(crate::conv_flags::IME_CMODE_NATIVE));
+        assert_eq!(fsm.last_vk_send_ms, 0);
+        fsm.on_focus_changed(50);
+        assert_eq!(fsm.state(), ImeModeState::Unknown);
+        assert!(!fsm.is_confirmed());
     }
 }

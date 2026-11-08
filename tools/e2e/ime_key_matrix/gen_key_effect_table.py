@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """格子第3版(--grid-setup=keys、全状態をキーだけで作る=リセットもIMM無し)の学習結果から、打鍵時予測の表(Rustのデータ)を生成する(ADR-191 決定3・4)。
 
-  gen_key_effect_table.py            grid-tables/{atok,msime,msime-native}.json → crates/awase-windows/src/state/key_effect_table.rs
+  gen_key_effect_table.py            grid-tables/{atok,msime,msime-native}.json → crates/awase-key-effect/src/state/key_effect_table.rs
   gen_key_effect_table.py --check    何も書かず、コミット済みの key_effect_table.rs が生成結果と一致するか検査する(不一致なら終了コード1)。
                                      `crates/awase-windows/tests/architecture_guard.rs` の `key_effect_table_matches_generator` が呼ぶ。
   gen_key_effect_table.py --diff-report <old_dir> <new_dir>
@@ -29,7 +29,7 @@ import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(HERE, "..", "..", "..", "crates", "awase-windows", "src", "state", "key_effect_table.rs")
+OUT = os.path.join(HERE, "..", "..", "..", "crates", "awase-key-effect", "src", "state", "key_effect_table.rs")
 PRESERVED_SUFFIX_MARKER = "// --- ADR-192 classification logic (the generator preserves this suffix) ---"
 MEASUREMENT_ENV_PATH = os.path.join(HERE, "grid-tables", "measurement-env.json")
 
@@ -98,7 +98,7 @@ KNOWN_UNSTABLE = {
 # GJI の MS-IME プリセット(msime.json)も各セル2試行で、非決定セルを検出しきれない(`nondeterministic: 0`は「割れない」でなく「n=2では見えない」)。
 # 実機ユーザーの構成がまさにこの表なので、ATOK の第2版(各セル4試行)で割れた「変換中のEsc・入力中のBS/Esc」は、プリセットが違っても
 # 同じキー・同じ段階なので、変換モード(0x19/0x09/0x1B/0x0B)を問わず「予測なし」にする(観測で追随する)。再学習(試行を増やす)で確定させるまでの暫定
-# (レビュー round2 A-M5。試行を増やせる適応学習 cal-fast-msime-* での確定は未実施)。
+# (レビュー round2 A-M5。試行を増やせる適応学習での確定は未実施。cal-fast-msime-* は一度も走らないまま撤去した)。
 KNOWN_UNSTABLE_MSIME = {
     f"on-c{c}-{stage}|{key}"
     for c in ("19", "09", "1B", "0B", "10")

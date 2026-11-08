@@ -3,33 +3,30 @@
 //! `WindowsPlatform` が散在して持っていた 6 つのフォーカス関連フィールドを
 //! `FocusTracker` に移動し、意味のある操作単位で API を提供する。
 
-use std::sync::mpsc::Sender;
-
 use crate::focus::FocusKind;
 use awase::engine::InputModeState;
 
 use crate::focus::cache::{DetectionSource, FocusCache};
-use crate::focus::classifier::{
-    ForceOverrides, ImmCapability, ImmCapabilityStore, InjectionHint, InjectionModeStore,
-};
+use crate::focus::classifier::{ForceOverrides, ImmCapability, ImmCapabilityStore};
 use crate::focus::current::CurrentFocus;
 use crate::focus::hwnd_cache::{HwndImeCache, HwndImeSnapshot};
-use crate::focus::uia::SendableHwnd;
 
 /// フォーカス追跡に関わる全状態を集約する構造体。
 ///
 /// `CurrentFocus`（ウィンドウ情報）、判定キャッシュ、IME キャッシュ、
-/// IMM 能力学習ストア、UIA 送信チャネルを一括で保持する。
+/// IMM 能力学習ストアを一括で保持する。
 pub(crate) struct FocusTracker {
     /// 現在フォーカス中のウィンドウ情報（pid / class_name / app_profile / process_name）
     pub(crate) current: CurrentFocus,
     cache: FocusCache,
     overrides: ForceOverrides,
-    uia_sender: Option<Sender<SendableHwnd>>,
     imm_learning: ImmCapabilityStore,
-    injection_mode_store: InjectionModeStore,
     hwnd_ime_cache: HwndImeCache,
     pub(crate) seen_threads: crate::focus::thread_scope::SeenThreads,
+    /// 現在の `app_profile` が実測学習（`ImmCapability::Unavailable`）で静的分類の `Standard` から
+    /// 降格されたものか（ADR-262 段階 A）。静的リスト由来の `Imm32Unavailable`（Chrome/Edge/UWP 等）は
+    /// 含まない。`update_with_process_name` が毎回再計算する。
+    demoted_by_learning: bool,
 }
 
 impl std::fmt::Debug for FocusTracker {
@@ -43,17 +40,15 @@ impl FocusTracker {
         cache: FocusCache,
         overrides: ForceOverrides,
         imm_learning: ImmCapabilityStore,
-        injection_mode_store: InjectionModeStore,
     ) -> Self {
         Self {
             current: CurrentFocus::unfocused(),
             cache,
             overrides,
-            uia_sender: None,
             imm_learning,
-            injection_mode_store,
             hwnd_ime_cache: HwndImeCache::new(),
             seen_threads: crate::focus::thread_scope::SeenThreads::default(),
+            demoted_by_learning: false,
         }
     }
 
@@ -61,6 +56,11 @@ impl FocusTracker {
 
     pub(crate) const fn is_focused(&self) -> bool {
         self.current.is_focused()
+    }
+
+    /// 実測学習で `Standard` から降格された窓か（窓内の IMM が読めないと学習された窓。ADR-262 段階 A）。
+    pub(crate) const fn is_demoted_by_learning(&self) -> bool {
+        self.demoted_by_learning
     }
 
     pub(crate) const fn pid(&self) -> u32 {
@@ -89,43 +89,10 @@ impl FocusTracker {
         self.overrides.input_relay_apps()
     }
 
-    pub(crate) fn injection_hint(&self) -> InjectionHint {
-        if !self.current.is_focused() {
-            return InjectionHint::Default;
-        }
-        let hint = self
-            .overrides
-            .injection_hint(self.current.pid, &self.current.class_name);
-        if hint != InjectionHint::Default {
-            return hint;
-        }
-        if self.injection_mode_store.has_tsf(&self.current.class_name) {
-            return InjectionHint::ForceTsf;
-        }
-        InjectionHint::Default
-    }
-
-    /// 指定した pid/class に対する injection_hint を返す（フォーカス変更直後の stale 回避用）。
-    /// `self.current` が更新される前に新ウィンドウの hint を引くために使う。
-    pub(crate) fn injection_hint_for(&self, pid: u32, class_name: &str) -> InjectionHint {
-        let hint = self.overrides.injection_hint(pid, class_name);
-        if hint != InjectionHint::Default {
-            return hint;
-        }
-        if self.injection_mode_store.has_tsf(class_name) {
-            return InjectionHint::ForceTsf;
-        }
-        InjectionHint::Default
-    }
-
     // ── フォーカス更新 ──────────────────────────────────────────────────────
 
     /// フォーカス情報を更新する。`app_profile` は `class_name` から自動導出したうえで、
     /// 実測学習（`ImmCapabilityStore`）による降格を適用する。
-    pub(crate) fn update(&mut self, pid: u32, class_name: String, hwnd: usize) {
-        self.update_with_process_name(pid, class_name, hwnd, None);
-    }
-
     pub(crate) fn update_with_process_name(
         &mut self,
         pid: u32,
@@ -158,12 +125,14 @@ impl FocusTracker {
             .imm_learning
             .get(&self.current.process_name, &self.current.class_name);
         let overridden = Self::apply_learned_imm_capability(self.current.app_profile, learned);
+        self.demoted_by_learning = overridden != self.current.app_profile;
         if overridden != self.current.app_profile {
             let same_window = prev_pid == pid && prev_class_name_matches;
             if Self::should_log_demotion(same_window, prev_profile, overridden) {
                 tracing::info!(
                     "[imm-learning] profile 降格: process={:?} class={:?} {:?} → {:?} \
-                     (実測学習 ImmCapability::Unavailable。誤学習なら cache.toml の \
+                     (実測学習 ImmCapability::Unavailable。学習の経路は同 process/class の \
+                     `IMM capability learned` 行〔NULL 連続観測か miss 閾値超え〕。誤学習なら cache.toml の \
                      [imm_capability] から該当 process/class を削除)",
                     self.current.process_name,
                     self.current.class_name,
@@ -205,13 +174,8 @@ impl FocusTracker {
         static_profile: crate::focus::class_names::AppImeProfile,
         learned: Option<ImmCapability>,
     ) -> crate::focus::class_names::AppImeProfile {
-        use crate::focus::class_names::AppImeProfile;
-        match (static_profile, learned) {
-            (AppImeProfile::Standard, Some(ImmCapability::Unavailable)) => {
-                AppImeProfile::Imm32Unavailable
-            }
-            (p, _) => p,
-        }
+        // 本体は Linux でも走る `learning_store.rs`（閉ループのハーネスの窓モデルも同じ関数を呼ぶ、ADR-277 段階 2）。
+        crate::focus::learning_store::apply_learned_imm_capability(static_profile, learned)
     }
 
     // ── フォーカスキャッシュ ────────────────────────────────────────────────
@@ -266,6 +230,7 @@ impl FocusTracker {
         ime_on: bool,
         input_mode: InputModeState,
         from_explicit_off_intent: bool,
+        now: crate::state::TickMs,
     ) {
         if !self.current.is_focused() {
             return;
@@ -277,15 +242,16 @@ impl FocusTracker {
             input_mode,
             from_explicit_off_intent,
             self.current.hwnd,
+            now,
         );
     }
 
     /// フォーカス入場時に新ウィンドウの IME 状態キャッシュを復元する。
     ///
     /// `self.current` の pid / class_name を使うため、`update()` の後に呼ぶこと。
-    pub(crate) fn restore_ime_state(&self) -> Option<HwndImeSnapshot> {
+    pub(crate) fn restore_ime_state(&self, now: crate::state::TickMs) -> Option<HwndImeSnapshot> {
         self.hwnd_ime_cache
-            .restore(self.current.pid, &self.current.class_name)
+            .restore(self.current.pid, &self.current.class_name, now)
     }
 
     // ── IMM 能力学習 ─────────────────────────────────────────────────────────
@@ -322,31 +288,6 @@ impl FocusTracker {
         self.imm_learning
             .clear_pending_unavailable(process_name, class_name);
     }
-
-    // ── Injection モード学習 ────────────────────────────────────────────────
-
-    /// class_name が Tsf モード必要と学習済みかどうか。
-    pub(crate) fn has_learned_injection_mode_tsf(&self, class_name: &str) -> bool {
-        self.injection_mode_store.has_tsf(class_name)
-    }
-
-    /// GJI write 観測で判明した「Tsf 必要」クラスを永続化する（事後昇格）。
-    pub(crate) fn learn_injection_mode_tsf(&mut self, class_name: String) {
-        self.injection_mode_store.learn_tsf(class_name);
-    }
-
-    // ── UIA ─────────────────────────────────────────────────────────────────
-
-    pub(crate) fn set_uia_sender(&mut self, tx: Sender<SendableHwnd>) {
-        self.uia_sender = Some(tx);
-    }
-
-    /// UIA ワーカーに hwnd を送る。チャネル未設定または送信失敗は黙って無視する。
-    pub(crate) fn try_send_uia(&self, hwnd: SendableHwnd) {
-        if let Some(sender) = &self.uia_sender {
-            let _ = sender.send(hwnd);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -366,6 +307,43 @@ mod tests {
             AppImeProfile::Imm32Unavailable,
             "実測で IMM 不可と学習済みの Standard クラスは降格する"
         );
+    }
+
+    #[test]
+    fn learned_demotion_is_reported_only_when_the_profile_actually_changes() {
+        // `demoted_by_learning = overridden != static`（ADR-262 段階 A）。静的リスト由来の
+        // `Imm32Unavailable`/`TsfNative`/`InputRelay` は学習が `Unavailable` でも変わらないので降格にならない。
+        for (static_profile, learned, demoted) in [
+            (
+                AppImeProfile::Standard,
+                Some(ImmCapability::Unavailable),
+                true,
+            ),
+            (AppImeProfile::Standard, Some(ImmCapability::Works), false),
+            (AppImeProfile::Standard, None, false),
+            (
+                AppImeProfile::Imm32Unavailable,
+                Some(ImmCapability::Unavailable),
+                false,
+            ),
+            (
+                AppImeProfile::TsfNative,
+                Some(ImmCapability::Unavailable),
+                false,
+            ),
+            (
+                AppImeProfile::InputRelay,
+                Some(ImmCapability::Unavailable),
+                false,
+            ),
+        ] {
+            let overridden = FocusTracker::apply_learned_imm_capability(static_profile, learned);
+            assert_eq!(
+                overridden != static_profile,
+                demoted,
+                "{static_profile:?} × {learned:?}"
+            );
+        }
     }
 
     #[test]

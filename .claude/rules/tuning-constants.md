@@ -1,10 +1,10 @@
 # タイミング定数の変更規約（`tuning.rs`）
 
-paths: `crates/awase-windows/src/tuning.rs`
+paths: `crates/awase-windows-base/src/tuning.rs`
 
 ## ルール
 
-`crates/awase-windows/src/tuning.rs` の **タイミング定数**（probe の min/max、idle 閾値、
+`crates/awase-windows-base/src/tuning.rs` の **タイミング定数**（probe の min/max、idle 閾値、
 warmup 待機、settle grace など、`_MS` 系の定数）を変更するコミットは、本文に
 **実測値** を含めること。
 
@@ -37,7 +37,7 @@ warmup 待機、settle grace など、`_MS` 系の定数）を変更するコミ
 ## 避けるべきパターン: 同じ定数ファミリーの盲目的エスカレーション
 
 Chrome probe の最小待機は、別々のバグ修正のたびに **同じ役割の定数が段階的に釣り上がって
-きた**（`git log --follow -- crates/awase-windows/src/tuning.rs` で確認）:
+きた**（`git log --follow -- crates/awase-windows-base/src/tuning.rs` で確認）:
 
 ```
 CHROME_PROBE_MIN_MS = 20        （c74a7ba, timing.rs 統合時）
@@ -51,8 +51,9 @@ CHROME_PROBE_F2_GJI_IDLE_MIN_MS = 350  （79134f5, という→toいう）
 4 段釣り上がった事実は注意信号である。値を上げる前に必ず問うこと:
 
 - 今回の不足は本当に「待ち時間が足りない」のか、それとも **probe の起点や発火条件が
-  ずれている** のか（`79134f5` は probe 起点が F2 送信より早い＝計測の基準点ズレが真因で、
-  値を上げるのは対症だった。`3c275a7` は context 失効を検出して F2 を再送する＝別軸の修正）。
+  ずれている** のか（`b101153` は probe 起点が F2 送信より ~7ms 早い＝計測の基準点ズレが一因で、
+  値を上げるのは対症だった。`79134f5` は keyboard idle が短く long_idle=false となり
+  probe_min=20ms が選ばれた＝発火条件のずれだった〈2026-10-13、コミット本文で訂正〉。`3c275a7` は context 失効を検出して F2 を再送する＝別軸の修正）。
 - マージンを足すだけで別の環境（別アプリ・別 idle）に副作用が出ないか。
 - 実測せずに「とりあえず倍にする」形の変更（実測なしのエスカレーション）は禁止。
   レビューで本文に ms の実測値が無ければ差し戻す。

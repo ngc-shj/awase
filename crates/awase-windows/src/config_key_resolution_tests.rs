@@ -42,7 +42,7 @@ const DOC_KNOWN_FAILURES: &[&str] = &[
     "usage-ja-2|default_mismatch|keys.engine_off_solo_repeat",
     "usage-ja-12|default_mismatch|keys.engine_off_solo_repeat",
     "usage-en-2|default_mismatch|keys.engine_off_solo_repeat",
-    "usage-en-10|default_mismatch|keys.engine_off_solo_repeat",
+    "usage-en-12|default_mismatch|keys.engine_off_solo_repeat",
 ];
 
 /// 合成 config の「既知の失敗」。書式は `"<ファイル名>|<種別>|<詳細>"`(種別は上と同じ)。
@@ -63,6 +63,7 @@ const DOC_BASELINE: &[(&str, usize)] = &[
     ("config-app-overrides", 0),
     ("config-post-bypass", 0),
     ("config-diagnostics", 0),
+    ("config-indicator-evidence", 0),
     ("readme-minimal", 0),
     ("readme-app-overrides", 0),
     ("usage-ja-1", 0),
@@ -73,7 +74,7 @@ const DOC_BASELINE: &[(&str, usize)] = &[
     ("usage-ja-6", 0),
     ("usage-ja-7", 0),
     ("usage-ja-8", 0),
-    ("usage-ja-9", 0),
+    // usage-ja-9・usage-en-9(force_tsf の例)は、Tsf 注入経路の撤去(2026-10-22)で例ごと消した。
     ("usage-ja-10", 0),
     ("usage-ja-11", 0),
     ("usage-ja-12", 0),
@@ -86,8 +87,10 @@ const DOC_BASELINE: &[(&str, usize)] = &[
     ("usage-en-6", 0),
     ("usage-en-7", 0),
     ("usage-en-8", 0),
-    ("usage-en-9", 0),
     ("usage-en-10", 0),
+    ("usage-en-11", 0),
+    ("usage-en-12", 0),
+    ("usage-en-13", 0),
 ];
 
 /// 合成 config のファイル名と、`validate()` の警告数の基準(増えてはいけない)。
@@ -116,7 +119,7 @@ fn load_config_text(text: &str) -> Result<AppConfig, String> {
 fn hotkey_readable(s: &str) -> bool {
     #[cfg(windows)]
     {
-        crate::vk::parse_hotkey(s).is_some()
+        crate::vk_windows::parse_hotkey(s).is_some()
     }
     #[cfg(not(windows))]
     {

@@ -1,7 +1,7 @@
 //! 現在フォーカス中のウィンドウ情報を集約する構造体。
 
 use crate::focus::class_names::AppImeProfile;
-use crate::focus::{AppKind, FocusKind};
+use crate::focus::{AppKind, FocusChangedAxes, FocusKind};
 
 /// 現在フォーカス中のウィンドウに関する情報。
 ///
@@ -44,10 +44,6 @@ impl CurrentFocus {
 
     /// フォーカス情報をアトミックに更新する。
     /// `app_profile` は `class_name` と `process_name` から導出してキャッシュする。
-    pub fn update(&mut self, pid: u32, class_name: String, hwnd: usize, relay_apps: &[String]) {
-        self.update_with_process_name(pid, class_name, hwnd, relay_apps, None);
-    }
-
     /// 既に同一フォーカスプローブ内で取得済みの process_name があれば再利用して更新する。
     // `process_name` は `self.process_name` へそのまま move するため所有権が要る
     // （`unwrap_or_else` 経由で move、下記本体参照）。`&str` で受けて呼び出し元で
@@ -115,14 +111,6 @@ impl Default for FocusIdentity {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
-pub struct FocusChangedAxes {
-    pub process: bool,
-    pub window: bool,
-    pub app_kind: bool,
-    pub focus_kind: bool,
-}
-
 impl FocusIdentity {
     #[must_use]
     pub fn changed_axes(&self, next: &Self) -> FocusChangedAxes {
@@ -132,13 +120,6 @@ impl FocusIdentity {
             app_kind: self.app_kind != next.app_kind,
             focus_kind: self.focus_kind != next.focus_kind,
         }
-    }
-}
-
-impl FocusChangedAxes {
-    #[must_use]
-    pub const fn any(self) -> bool {
-        self.process || self.window || self.app_kind || self.focus_kind
     }
 }
 

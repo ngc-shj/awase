@@ -10,9 +10,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// SendInput 出力中にキー入力を保留するゲート。
 ///
-/// # OutputGate vs TsfGate
+/// # OutputGate と旧 TsfGate
 /// - `OutputGate`: `send_keys` 実行中に外部キー入力を defer するゲート（再入防止）。
-/// - `TsfGate` (in `probe.rs`): TSF warm-up 完了まで出力キューを保留するゲート。
+/// - 旧 `TsfGate`: フォーカス直後のキーを保留したゲート（Tsf 注入経路とともに 2026-10-22 に撤去）。
 ///   両者は独立した目的を持ち、混同しないこと。
 ///
 /// ## 内部フィールド（クロススレッド共有）
@@ -54,12 +54,6 @@ impl OutputGate {
     pub(crate) fn mark_vk_output(&self, ms: u64) {
         self.last_vk_output_ms.store(ms, Ordering::Relaxed);
     }
-
-    /// `last_vk_output_ms` の現在値を取得する。
-    #[inline]
-    pub fn last_vk_output_ms_val(&self) -> u64 {
-        self.last_vk_output_ms.load(Ordering::Relaxed)
-    }
 }
 
 pub static OUTPUT_GATE: OutputGate = OutputGate::new();
@@ -94,7 +88,7 @@ pub(crate) static OUTPUT_GATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex
 /// 二度と一致しなくなり、`OUTPUT_GATE.active` が恒久的に `true` にならない
 /// （`tsf::warmup::ms_ime_ready_coro::tests::phase1_does_not_hold_output_gate_only_phase2_does`
 /// が実機で毎回決定論的に失敗していた真因。`output/probe_io.rs`・
-/// `tsf/warmup/chrome_probe.rs`・`tsf/warmup/probe_fsm.rs` の `noop_for_test()`
+/// `tsf/warmup/probe_fsm.rs` の `noop_for_test()`
 /// 呼び出しが同じプロセス内の他の全テストの `OUTPUT_GATE` を汚染し続けていた）。
 /// `real` で生成経路を保持し、`Drop`側でノーオペレーションを実際に無害化する。
 #[derive(Debug)]
@@ -145,5 +139,7 @@ pub const WM_DRAIN_OUTPUT_QUEUE: u32 = 0x8000 + 18;
 
 /// OUTPUT_GATE.active 解除後に呼ぶ。キューに溜まったキーを再配送するメッセージを投げる。
 pub(crate) fn post_drain_output_queue() {
+    // 非 Windows にはメッセージループが無い(ADR-272 段階 A-2b)。Linux のテストでは投げ先が無いので何もしない。
+    #[cfg(windows)]
     crate::win32::post_to_main_thread(WM_DRAIN_OUTPUT_QUEUE);
 }

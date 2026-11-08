@@ -413,7 +413,7 @@ fn scenario_9_hwnd_cache_restored_can_be_overridden_by_observation() {
         "HwndCacheRestored は last_intent を設定しない"
     );
     assert!(
-        model.effective_open(),
+        model.effective_open_at(Instant::now()),
         "High 観測が effective_open を上書きする（has_user_explicit_intent=false のため）"
     );
 }
@@ -434,7 +434,7 @@ fn scenario_10_user_intent_blocks_observation_but_hwnd_cache_does_not() {
         stale_observation.clone(),
     ]);
     assert!(
-        !model_intent.effective_open(),
+        !model_intent.effective_open_at(Instant::now()),
         "UserImeSetIntent(false) 後は explicit intent があるため、Medium 観測は effective_open を変えない"
     );
 
@@ -444,7 +444,7 @@ fn scenario_10_user_intent_blocks_observation_but_hwnd_cache_does_not() {
         stale_observation,
     ]);
     assert!(
-        model_cache.effective_open(),
+        model_cache.effective_open_at(Instant::now()),
         "HwndCacheRestored(false) 後は explicit intent がないため、Medium 観測が effective_open を上書きする"
     );
 }
@@ -461,7 +461,6 @@ fn scenario_10_user_intent_blocks_observation_but_hwnd_cache_does_not() {
 fn scenario_11_edge_stale_eisu_recovers_via_physical_ime_key() {
     use awase::engine::{AssumedReason, InputModeState};
     use awase_windows::state::ime_event::{InputModeApplyResult, InputModeApplyStrategy};
-    use awase_windows::state::TickMs;
 
     // 1. Edge へフォーカス + キャッシュ復元で stale な ObservedEisu を引き継ぐ
     let deadlocked = run_reducer(vec![
@@ -470,14 +469,16 @@ fn scenario_11_edge_stale_eisu_recovers_via_physical_ime_key() {
             mode: InputModeState::ObservedEisu,
             strategy: InputModeApplyStrategy::CacheRestore,
             result: InputModeApplyResult::Applied,
-            at: TickMs(0),
         },
         // 2. ユーザーが物理かなキーで IME ON
         user_intent(true, UserIntentSource::PhysicalImeKey),
     ]);
     // ここまでが「詰み」状態の再現: IME ON でも input_mode が Eisu のままだと
     // engine は NotRomajiInput で活性化できない
-    assert!(deadlocked.effective_open(), "物理キーで IME ON にはなる");
+    assert!(
+        deadlocked.effective_open_at(Instant::now()),
+        "物理キーで IME ON にはなる"
+    );
     assert!(
         !deadlocked.input_mode().is_romaji_capable(),
         "救済なしでは ObservedEisu が残り engine が活性化できない (バグの再現)"
@@ -491,7 +492,6 @@ fn scenario_11_edge_stale_eisu_recovers_via_physical_ime_key() {
             mode: InputModeState::ObservedEisu,
             strategy: InputModeApplyStrategy::CacheRestore,
             result: InputModeApplyResult::Applied,
-            at: TickMs(0),
         },
         user_intent(true, UserIntentSource::PhysicalImeKey),
     ];
@@ -501,10 +501,12 @@ fn scenario_11_edge_stale_eisu_recovers_via_physical_ime_key() {
         },
         strategy: InputModeApplyStrategy::UserImeOnEisuReset,
         result: InputModeApplyResult::Applied,
-        at: TickMs(0),
     });
     let recovered = run_reducer(events);
-    assert!(recovered.effective_open(), "IME ON が維持される");
+    assert!(
+        recovered.effective_open_at(Instant::now()),
+        "IME ON が維持される"
+    );
     assert!(
         recovered.input_mode().is_romaji_capable(),
         "UserImeOnEisuReset で romaji-capable に回復し engine が活性化できる"
@@ -522,7 +524,6 @@ fn scenario_11_edge_stale_eisu_recovers_via_physical_ime_key() {
 fn scenario_12_gji_io_inference_corrects_stale_eisu() {
     use awase::engine::{AssumedReason, InputModeState};
     use awase_windows::state::ime_event::{InputModeApplyResult, InputModeApplyStrategy};
-    use awase_windows::state::TickMs;
 
     let model = run_reducer(vec![
         focus_changed(ImePolicyProfile::Imm32Unavailable),
@@ -530,7 +531,6 @@ fn scenario_12_gji_io_inference_corrects_stale_eisu() {
             mode: InputModeState::ObservedEisu,
             strategy: InputModeApplyStrategy::CacheRestore,
             result: InputModeApplyResult::Applied,
-            at: TickMs(0),
         },
         ImeEvent::InputModeObserved {
             mode: InputModeState::AssumedRomaji {
@@ -538,7 +538,6 @@ fn scenario_12_gji_io_inference_corrects_stale_eisu() {
             },
             source: ObservationSource::GjiIoInference,
             confidence: ObservationConfidence::Medium,
-            at: TickMs(0),
         },
     ]);
     assert!(
@@ -559,7 +558,6 @@ fn scenario_13_hwnd_cache_restore_does_not_reinject_stale_eisu() {
     use awase::engine::InputModeState;
     use awase_windows::state::eisu_recovery::cache_restore_eisu_guard;
     use awase_windows::state::ime_event::{InputModeApplyResult, InputModeApplyStrategy};
-    use awase_windows::state::TickMs;
 
     // 修正前の生キャッシュ値をそのまま適用した場合の再現（バグの固定）
     let unguarded = run_reducer(vec![
@@ -568,7 +566,6 @@ fn scenario_13_hwnd_cache_restore_does_not_reinject_stale_eisu() {
             mode: InputModeState::ObservedEisu,
             strategy: InputModeApplyStrategy::CacheRestore,
             result: InputModeApplyResult::Applied,
-            at: TickMs(0),
         },
     ]);
     assert!(
@@ -584,7 +581,6 @@ fn scenario_13_hwnd_cache_restore_does_not_reinject_stale_eisu() {
             mode: guarded_mode,
             strategy: InputModeApplyStrategy::CacheRestore,
             result: InputModeApplyResult::Applied,
-            at: TickMs(0),
         },
     ]);
     assert!(
@@ -604,7 +600,6 @@ fn scenario_14_turn_on_while_open_recovers_stale_eisu() {
     use awase::engine::{AssumedReason, InputModeState};
     use awase_windows::state::eisu_recovery::eisu_reset_on_turn_on_while_open;
     use awase_windows::state::ime_event::{InputModeApplyResult, InputModeApplyStrategy};
-    use awase_windows::state::TickMs;
 
     // IME は open のまま (物理キーで既に ON 済み)、conv だけが Eisu に固着
     let deadlocked = run_reducer(vec![
@@ -614,10 +609,12 @@ fn scenario_14_turn_on_while_open_recovers_stale_eisu() {
             mode: InputModeState::ObservedEisu,
             source: ObservationSource::ObserverPoll,
             confidence: ObservationConfidence::Medium,
-            at: TickMs(0),
         },
     ]);
-    assert!(deadlocked.effective_open(), "IME は open のまま");
+    assert!(
+        deadlocked.effective_open_at(Instant::now()),
+        "IME は open のまま"
+    );
     assert!(
         !deadlocked.input_mode().is_romaji_capable(),
         "OFF→ON 遷移を伴わないため UserImeOnEisuReset は発火せず ObservedEisu が残る \
@@ -641,17 +638,18 @@ fn scenario_14_turn_on_while_open_recovers_stale_eisu() {
             mode: InputModeState::ObservedEisu,
             source: ObservationSource::ObserverPoll,
             confidence: ObservationConfidence::Medium,
-            at: TickMs(0),
         },
     ];
     events.push(ImeEvent::InputModeApplied {
         mode: new_mode,
         strategy: InputModeApplyStrategy::UserTurnOnEisuReset,
         result: InputModeApplyResult::Applied,
-        at: TickMs(0),
     });
     let recovered = run_reducer(events);
-    assert!(recovered.effective_open(), "IME ON が維持される");
+    assert!(
+        recovered.effective_open_at(Instant::now()),
+        "IME ON が維持される"
+    );
     assert!(
         recovered.input_mode().is_romaji_capable(),
         "UserTurnOnEisuReset で romaji-capable に回復し engine が活性化できる"
@@ -673,7 +671,6 @@ fn scenario_14_turn_on_while_open_recovers_stale_eisu() {
 fn scenario_15_half_width_alnum_toggle_keeps_ime_open_while_engine_goes_inactive() {
     use awase::engine::{AssumedReason, InputModeState};
     use awase_windows::state::ime_event::{InputModeApplyResult, InputModeApplyStrategy};
-    use awase_windows::state::TickMs;
 
     // 前提: IME は既に ON でローマ字入力可能（通常のかな入力中）。
     let toggled_on = run_reducer(vec![
@@ -683,11 +680,10 @@ fn scenario_15_half_width_alnum_toggle_keeps_ime_open_while_engine_goes_inactive
             mode: InputModeState::ObservedEisu,
             strategy: InputModeApplyStrategy::UserHalfWidthAlnumToggle,
             result: InputModeApplyResult::Applied,
-            at: TickMs(0),
         },
     ]);
     assert!(
-        toggled_on.effective_open(),
+        toggled_on.effective_open_at(Instant::now()),
         "半角英数トグルON は SetOpen を経由しないため IME は open のまま維持される"
     );
     assert!(
@@ -703,7 +699,6 @@ fn scenario_15_half_width_alnum_toggle_keeps_ime_open_while_engine_goes_inactive
             mode: InputModeState::ObservedEisu,
             strategy: InputModeApplyStrategy::UserHalfWidthAlnumToggle,
             result: InputModeApplyResult::Applied,
-            at: TickMs(0),
         },
         ImeEvent::InputModeApplied {
             mode: InputModeState::AssumedRomaji {
@@ -711,10 +706,12 @@ fn scenario_15_half_width_alnum_toggle_keeps_ime_open_while_engine_goes_inactive
             },
             strategy: InputModeApplyStrategy::UserHalfWidthAlnumToggle,
             result: InputModeApplyResult::Applied,
-            at: TickMs(10),
         },
     ]);
-    assert!(toggled_off.effective_open(), "IME ON は一貫して維持される");
+    assert!(
+        toggled_off.effective_open_at(Instant::now()),
+        "IME ON は一貫して維持される"
+    );
     assert!(
         toggled_off.input_mode().is_romaji_capable(),
         "トグルOFF で romaji-capable に復帰し engine が再度活性化できる"
@@ -725,7 +722,6 @@ fn scenario_15_half_width_alnum_toggle_keeps_ime_open_while_engine_goes_inactive
 fn scenario_15_gji_half_width_alnum_toggle_keeps_ime_open() {
     use awase::engine::{AssumedReason, InputModeState};
     use awase_windows::state::ime_event::{InputModeApplyResult, InputModeApplyStrategy};
-    use awase_windows::state::TickMs;
 
     let model = run_reducer(vec![
         focus_changed(ImePolicyProfile::TsfNative),
@@ -734,7 +730,6 @@ fn scenario_15_gji_half_width_alnum_toggle_keeps_ime_open() {
             mode: InputModeState::ObservedEisu,
             strategy: InputModeApplyStrategy::UserHalfWidthAlnumToggle,
             result: InputModeApplyResult::Applied,
-            at: TickMs(0),
         },
         ImeEvent::InputModeApplied {
             mode: InputModeState::AssumedRomaji {
@@ -742,12 +737,11 @@ fn scenario_15_gji_half_width_alnum_toggle_keeps_ime_open() {
             },
             strategy: InputModeApplyStrategy::UserHalfWidthAlnumToggle,
             result: InputModeApplyResult::Applied,
-            at: TickMs(10),
         },
     ]);
 
     assert!(
-        model.effective_open(),
+        model.effective_open_at(Instant::now()),
         "GJI entry/exit でも IME open は維持する"
     );
     assert!(
@@ -760,7 +754,6 @@ fn scenario_15_gji_half_width_alnum_toggle_keeps_ime_open() {
 fn scenario_15_duplicate_restore_does_not_toggle_belief_back_to_eisu() {
     use awase::engine::{AssumedReason, InputModeState};
     use awase_windows::state::ime_event::{InputModeApplyResult, InputModeApplyStrategy};
-    use awase_windows::state::TickMs;
 
     let model = run_reducer(vec![
         focus_changed(ImePolicyProfile::TsfNative),
@@ -769,7 +762,6 @@ fn scenario_15_duplicate_restore_does_not_toggle_belief_back_to_eisu() {
             mode: InputModeState::ObservedEisu,
             strategy: InputModeApplyStrategy::UserHalfWidthAlnumToggle,
             result: InputModeApplyResult::Applied,
-            at: TickMs(0),
         },
         ImeEvent::InputModeApplied {
             mode: InputModeState::AssumedRomaji {
@@ -777,7 +769,6 @@ fn scenario_15_duplicate_restore_does_not_toggle_belief_back_to_eisu() {
             },
             strategy: InputModeApplyStrategy::UserHalfWidthAlnumToggle,
             result: InputModeApplyResult::Applied,
-            at: TickMs(10),
         },
         ImeEvent::InputModeApplied {
             mode: InputModeState::AssumedRomaji {
@@ -785,13 +776,94 @@ fn scenario_15_duplicate_restore_does_not_toggle_belief_back_to_eisu() {
             },
             strategy: InputModeApplyStrategy::UserHalfWidthAlnumToggle,
             result: InputModeApplyResult::Applied,
-            at: TickMs(20),
         },
     ]);
 
-    assert!(model.effective_open(), "二重復元でも IME open は維持する");
+    assert!(
+        model.effective_open_at(Instant::now()),
+        "二重復元でも IME open は維持する"
+    );
     assert!(
         model.input_mode().is_romaji_capable(),
         "復元イベントが二度来ても belief は英数へ戻らない"
+    );
+}
+
+// ── シナリオ 15 追補: ADR-245(BUG-193)の belief 側 ───────────────────────────
+//
+// reducer だけを回す。戻り待ちの判断(`state/half_width_alnum.rs`)は Linux 単体、殻の配線は CI 実機で検証する。
+
+/// 戻り待ちの `RebuildToggle`(ADR-245 決定8): 戻った窓でキャッシュ復元が AssumedRomaji に洗った後に、
+/// 半角英数トグルの belief(ObservedEisu)を書き直すと、最終の belief は ObservedEisu になる。
+/// 順序は ADR-245 決定8: 洗い(CacheRestore)が先、書き直しが後。
+#[test]
+fn scenario_15_rebuild_toggle_after_cache_restore_ends_as_observed_eisu() {
+    use awase::engine::{AssumedReason, InputModeState};
+    use awase_windows::state::ime_event::{InputModeApplyResult, InputModeApplyStrategy};
+
+    let model = run_reducer(vec![
+        focus_changed(ImePolicyProfile::Imm32Unavailable),
+        user_intent(true, UserIntentSource::PhysicalImeKey),
+        ImeEvent::InputModeApplied {
+            mode: InputModeState::AssumedRomaji {
+                reason: AssumedReason::AppKindExcluded,
+            },
+            strategy: InputModeApplyStrategy::CacheRestore,
+            result: InputModeApplyResult::Applied,
+        },
+        ImeEvent::InputModeApplied {
+            mode: InputModeState::ObservedEisu,
+            strategy: InputModeApplyStrategy::UserHalfWidthAlnumToggle,
+            result: InputModeApplyResult::Applied,
+        },
+    ]);
+
+    assert!(
+        model.effective_open_at(Instant::now()),
+        "IME ON は維持される"
+    );
+    assert_eq!(
+        model.input_mode(),
+        InputModeState::ObservedEisu,
+        "キャッシュ復元の後に書き直した半角英数トグルの belief が最終値になる"
+    );
+}
+
+/// 離脱時の belief 補正(ADR-245 決定1、B-3): A で半角英数トグル中に別プロセスの窓 B へ移るとき、
+/// IME へ何も送らなくても belief だけは AssumedRomaji へ戻す。B の ctx が romaji-capable になり、
+/// B で NICOLA が止まらない(ObservedEisu の持ち越しが無い)。
+#[test]
+fn scenario_15_leave_assumed_romaji_keeps_destination_window_romaji_capable() {
+    use awase::engine::{AssumedReason, InputModeState};
+    use awase_windows::state::ime_event::{InputModeApplyResult, InputModeApplyStrategy};
+
+    let model = run_reducer(vec![
+        focus_changed(ImePolicyProfile::TsfNative),
+        user_intent(true, UserIntentSource::PhysicalImeKey),
+        ImeEvent::InputModeApplied {
+            mode: InputModeState::ObservedEisu,
+            strategy: InputModeApplyStrategy::UserHalfWidthAlnumToggle,
+            result: InputModeApplyResult::Applied,
+        },
+        // 窓 B へ移動(実際の順序: FocusChanged が先、補正が後)。
+        ImeEvent::FocusChanged {
+            from: Some(HwndId(0x1234)),
+            to: HwndId(0x5678),
+            profile: ImePolicyProfile::TsfNative,
+            focus_epoch: 2,
+        },
+        // 離脱: 送信は無いが belief は戻す。
+        ImeEvent::InputModeApplied {
+            mode: InputModeState::AssumedRomaji {
+                reason: AssumedReason::UserHalfWidthAlnumToggleOff,
+            },
+            strategy: InputModeApplyStrategy::UserHalfWidthAlnumToggle,
+            result: InputModeApplyResult::Applied,
+        },
+    ]);
+
+    assert!(
+        model.input_mode().is_romaji_capable(),
+        "B の ctx が romaji-capable(ObservedEisu を B へ持ち越さない)"
     );
 }

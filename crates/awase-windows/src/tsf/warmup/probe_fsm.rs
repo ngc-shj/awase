@@ -34,7 +34,7 @@ use crate::tsf::literal_facts::{
 };
 
 /// `DeferredVk` の由来。ADR-123 変更B: focus 変更時等に `pending_deferred`
-/// を丸ごと破棄する経路（`discard_raw_recovery_if_focus_stale` 等）が、
+/// を丸ごと破棄する経路（`discard_raw_recovery_if_moved` 等）が、
 /// 「awase 自身が再送しようとしていたromaji」（`RecoveryResend`）と
 /// 「ユーザーが実際に打鍵したがまだ送信されていない入力」（`UserInput`）を
 /// 区別できるようにする。現時点ではログの内訳表示にのみ使う（挙動は変えない、
@@ -67,8 +67,13 @@ use timed_fsm::coro::{yield_step, Channel, StepCoro};
 /// テストでは任意値を注入できる。
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct TsfEnvSnapshot {
-    pub is_tsf_mode: bool,
     pub gji_active: bool,
+    /// 前景窓が、per-VK の確認の「2 番目以降の疑い」を信用できないクラス(Zoom のチャット)か(BUG-215)。
+    /// 真なら 2 番目以降の `SuspectedLiteral` を確認済みとみなして、残りのキーを送り続ける。
+    pub later_vk_literal_check_unreliable: bool,
+    /// この tick の時点の宛先の識別（focus 世代 + 前景窓）。段の途中で宛先の窓が変わったかを、
+    /// `state::raw_recovery_plan::plan_raw_recovery` で判断するのに使う（ADR-270 の確認の FSM）。`None` = 採っていない。
+    pub stage_origin_now: Option<crate::state::raw_recovery_plan::StageOrigin>,
     /// 現在の IME 入力モード belief（Off / Hiragana / Katakana / Unknown）。
     pub ime_mode: crate::tsf::ime_mode_fsm::ImeModeState,
     /// `ime_mode` が `IMC_GETCONVERSIONMODE` で OS から確認済みなら true。
@@ -76,9 +81,6 @@ pub(crate) struct TsfEnvSnapshot {
     /// `Output::confirm_gate_deadline_override_ms` の生値。`0` = 上書きなし。
     /// `MsImeReadyCoro` の期限判定に使う（ADR-084、BUG-49 追補2）。
     pub confirm_gate_deadline_override_ms: u64,
-    /// `TsfWarmupCoordinator` の deferred キューに現在何か積まれているか（覗き見、消費しない）。
-    /// `GjiWarmupCoro` の `decide_transmit_plan` eager path 判定に使う。
-    pub deferred_pending: bool,
     /// `crate::tsf::observer::gji_candidate_visible_now()` の生値。GJI candidate window が
     /// 現時点で可視かどうか（決定分岐から素の `AtomicBool` 読み取りを排除するため、
     /// `env` 経由の明示パラメータとして持つ。`.claude/rules/ime-belief-architecture.md`
@@ -91,121 +93,31 @@ pub(crate) struct TsfEnvSnapshot {
     pub literal_session_confirmed_gen: Option<Generation>,
 }
 
-/// probe 中に観測した事実。`decide_transmit_plan` の入力に使う。
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct ProbeObservations {
-    /// TSF の NameChange イベントが実際に発火したか（生の観測値、呼び出し元での上書き禁止）。
-    pub nc_fired: bool,
-    /// GJI probe が実際に新規 I/O を確認できたか（`GjiProbeOutcome.settled`）。
-    /// `confirm_key_tsf_hint` の救済を効かせてよいかどうかの実測ゲートに使う（BUG-40）。
-    pub gji_settled: bool,
-    /// `cold_reason` が confirm-key 系（ReinjectConfirmKey/PassthroughConfirmKey）かつ
-    /// TSF mode か。WezTerm 等で Enter/Space 後に NameChange が発火しないが GJI は
-    /// 正常に合成中というケースの救済ヒント（`3ffbe66` 参照）。`gji_settled` が
-    /// true（GJI が実際に I/O を返している）の場合に限り `nc_fired=false` を
-    /// 救済してよい。`gji_settled=false`（例: 88s idle 後に probe がわずか16msで
-    /// 完了した genuinely cold なセッション）まで無条件に救済すると、reactive
-    /// LiteralDetect が丸ごとスキップされ、漏れた romaji が無補正で出力される
-    /// （BUG-40、`docs/known-bugs.md` 参照）。
-    pub confirm_key_tsf_hint: bool,
-}
-
-/// `decide_transmit_plan` が確定した実行方針。dispatcher がそのまま実行する。
+/// コルーチンが確定した送信方針。dispatcher がそのまま実行する。
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TransmitPlan {
-    /// VK ローマ字パス（true）か Unicode TSF パス（false）か。
-    pub used_eager_path: bool,
     /// raw TSF literal の LiteralDetect フェーズを有効にするか。
     pub needs_literal: bool,
     /// LiteralDetect のタイムアウト期間（ms）。
     pub literal_detect_ms: u64,
 }
 
-/// probe 観測値・環境スナップショット・コンテキストから送信方針を決定する純粋計算関数。
-///
-/// `GjiWarmupCoro` 内から呼ばれるが、単独でテストも可能。副作用なし。
-pub(crate) fn decide_transmit_plan(
-    initial_used_eager: bool,
-    obs: ProbeObservations,
-    env: TsfEnvSnapshot,
-    deferred_empty: bool,
-    forces_prepend_f2: bool,
-    is_long_cold: bool,
-) -> TransmitPlan {
-    // romaji バッチへの F2 直接同梱（第3の防御層）は DIAG_DISABLE_PROACTIVE_TSF_WARMUP を
-    // 2026-07-19 に恒久化したことで撤去した。reactive な LiteralDetect のみに委ねる
-    // （`docs/known-bugs.md` BUG-24 参照）。
-
-    // nc_fired=false でも、confirm_key_tsf_hint（WezTerm 等で NameChange が発火しない
-    // 既知ケース）かつ gji_settled（GJI が実際に I/O を返しており genuinely warm）の
-    // 場合に限り、NameChange 発火とみなして救済する（`3ffbe66`）。gji_settled=false の
-    // ままこの救済を効かせると、genuinely cold なセッションまで誤救済されて reactive
-    // LiteralDetect が丸ごとスキップされる（BUG-40）。nc_fired 自体は書き換えない
-    // （呼び出し元・`is_partial_literal` が生値として参照するため）。
-    let nc_confirmed = obs.nc_fired || (obs.confirm_key_tsf_hint && obs.gji_settled);
-
-    // nc_confirmed=true: IME モード確認済み（Medium/Long cold かつ deferred なし → VK path）。
-    // nc_confirmed=false + TSF mode: VK path 固定（unicode は GJI composition をバイパスし "nお" race が起きる）。
-    let used_eager_path = if nc_confirmed {
-        (initial_used_eager || forces_prepend_f2) && deferred_empty
-    } else if env.is_tsf_mode {
-        false
-    } else {
-        initial_used_eager || forces_prepend_f2
-    };
-
-    // NameChangeWait タイムアウトで IME 準備が未確認のまま transmit したケースを
-    // LiteralDetect で回収する。F2 をバッチに含めない場合も IME が cold の可能性がある。
-    // （既知バグ: gji_idle ~1.4s で 300ms NameChangeWait が間に合わなかったケース）
-    let needs_literal = !nc_confirmed && env.is_tsf_mode && env.gji_active;
-
-    let literal_detect_ms = if is_long_cold && env.is_tsf_mode {
-        crate::tuning::RAW_TSF_LITERAL_DETECT_MS_LONG_IDLE
-    } else {
-        crate::tuning::RAW_TSF_LITERAL_DETECT_MS
-    };
-
-    TransmitPlan {
-        used_eager_path,
-        needs_literal,
-        literal_detect_ms,
-    }
-}
-
-/// [`ProbeAction::Transmit`] の送信先。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TransmitTarget {
-    Tsf,
-    Chrome,
-}
-
-impl From<TransmitTarget> for DetectTarget {
-    fn from(value: TransmitTarget) -> Self {
-        match value {
-            TransmitTarget::Tsf => Self::Tsf,
-            TransmitTarget::Chrome => Self::Chrome,
-        }
-    }
-}
-
 /// ステートマシン → dispatcher 方向の宣言的アクション。
 #[derive(Debug)]
 pub(crate) enum ProbeAction {
-    /// TSF または Chrome バッチパイプラインで `romaji` を送信する。
+    /// Chrome バッチパイプライン（Batched VK）で `romaji` を送信する。
     ///
     /// dispatcher は romaji 送信直後に `TsfWarmupCoordinator` の deferred キューを
-    /// フラッシュしてから warm マークし、`target == Tsf` なら
-    /// [`TsfProbeCoro::apply_transmit_done`] を呼ぶ。
+    /// フラッシュしてから warm マークする。
     Transmit {
         cold_seq: Generation,
         /// FSM が確定した実行方針。dispatcher はそのまま実行する（再導出不要）。
         plan: TransmitPlan,
         romaji: String,
-        target: TransmitTarget,
     },
     /// IME セッション最初の1文字専用（BUG-24 追補）: romaji の VK を1つだけ送信する。
     ///
-    /// `is_partial_literal()` が送信前の無関係な代理指標（`nc_fired`）に
+    /// 旧 `is_partial_literal()`（ECRS MB-02 で撤去）が送信前の無関係な代理指標（`nc_fired`）に
     /// 頼っているため、cold 直後の最初の1文字は VK を1個ずつ送って「送ったVK自身」への
     /// `CompositionConfirmed`/`SuspectedLiteral` を確認してから次の VK を送る。
     /// dispatcher は送信直前に `LiteralDetector::new_with_pre_send_baseline()` でベースラインを取り、1 VK だけ
@@ -220,11 +132,12 @@ pub(crate) enum ProbeAction {
         is_last: bool,
         idx: u16,
         last_idx: u16,
-        /// 送信先（`Tsf`: WezTerm 等 TSF-native、`Chrome`: Chrome/Edge）。
-        /// dispatcher が VK 送信関数（`send_single_tsf_vk`/`send_single_chrome_vk`）と
-        /// detector 構築方式（SHOW ベース/write-bytes ベース）を切り替えるために使う。
-        target: TransmitTarget,
     },
+    /// ADR-285: Mozc の cold の最初の 1 キーの確認ができたあとの、残りのローマ字の送信。
+    ///
+    /// `Transmit` と違い、Mozc の確認を張り直さない（最初の 1 キーで入力中の文字ができたので、残りは確認の対象外）。
+    /// 確認が結論を出せずに終わった場合（判断しない）にも、残りは必ず送る。
+    TransmitRest { romaji: String },
     /// `RAW_TSF_LITERAL` を設定し、composition を `RawTsfLiteralRecovery` で cold マークする。
     RawTsfLiteralRecovery {
         cold_seq: Generation,
@@ -235,12 +148,6 @@ pub(crate) enum ProbeAction {
         escape_composition: bool,
         facts: LiteralDetectFacts,
     },
-    /// Unicode モードで GJI write が観測されなかった。
-    ///
-    /// [`crate::tsf::warmup::unicode_literal_observer::UnicodeLiteralObserverFsm`] が emit する。
-    /// dispatcher は `DispatchResult::LearnedTsf` を返し、呼び出し元 (`advance_tsf_probe`) が
-    /// フォーカス中クラスを `InjectionModeStore` に学習し injection_mode を Tsf に昇格させる。
-    UpgradeToTsf,
     /// `DetectionResult::CompositionConfirmed`（非 partial）を確認した。
     ///
     /// dispatcher は必ず `consecutive_count`（`RawTsfLiteralRecovery` 連続発火数）を
@@ -254,14 +161,15 @@ pub(crate) enum ProbeAction {
     /// スキップ対象としてマークする（`tsf::observer::mark_literal_session_confirmed`、
     /// BUG-39 で世代付きに変更）。per-VK confirm では各 VK の confirm で
     /// `mark_literal_session=false`、全 VK 確認済みの最終確認でのみ `true` を使う。
+    ///
+    /// `resets_consecutive=true` の場合、`mark_literal_session` とは別に連続失敗の数を 0 に戻す(BUG-227)。
+    /// Mozc は最初の 1 キーだけを確かめるので `mark_literal_session` を使わない(語の確認済み印を付けると次の語の
+    /// 確認が飛ぶ)が、確認できたなら以前のリテラルとは連続しない。戻さないと、13 分前のリテラルの数え残りで
+    /// 次のリテラルが「連続 2 回目」になり、`s` を消さずに `a` だけ送って `sあ` になった。
     CompositionConfirmed {
         cold_seq: Generation,
         mark_literal_session: bool,
-        facts: LiteralDetectFacts,
-    },
-    /// literal-detect の判定は確定したが、dispatcher 側の副作用が不要な診断専用 action。
-    LiteralDetectNote {
-        cold_seq: Generation,
+        resets_consecutive: bool,
         facts: LiteralDetectFacts,
     },
     /// プローブ完了。dispatcher は `TIMER_TSF_PROBE` を kill する。
@@ -270,29 +178,17 @@ pub(crate) enum ProbeAction {
 
 // ── TickInput ─────────────────────────────────────────────────────────────────
 
-/// probe コルーチン (`TsfProbeCoro`/`GjiWarmupCoro`) 共有の tick 入力。
+/// probe コルーチン (`TsfProbeCoro`) の tick 入力。
 ///
 /// 統合前（2026-07-17 以前）は `TsfProbeTickInput`（Chrome）/ `TickInput`（TSF）として
 /// 別々に定義されていたが、フィールド構成が完全に同一だったため共有した。
 pub(crate) struct ProbeTickInput {
     pub(crate) env: TsfEnvSnapshot,
-    pub(crate) transmit_done: Option<TransmitDonePayload>,
     pub(crate) vk_sent: Option<VkSentPayload>,
 }
 
-/// `apply_transmit_done(Some(detector))` のペイロード。次 tick で inline LiteralDetect に入る。
-/// Chrome (`TsfProbeCoro`) / TSF (`GjiWarmupCoro`) で共有。
-pub(crate) struct TransmitDonePayload {
-    pub(crate) romaji: String,
-    pub(crate) ze_bs_count: usize,
-    pub(crate) detector: LiteralDetector,
-    /// `apply_transmit_done` 呼び出し時点の `current_tick_ms() + literal_detect_ms`。
-    pub(crate) deadline_ms: u64,
-}
-
 /// `apply_vk_sent` のペイロード。次 tick の [`ProbeTickInput`] に載り、コルーチン本体が
-/// そのVK専用の detector をポーリングする。Chrome per-VK confirm (`TsfProbeCoro`) と
-/// TSF per-VK confirm (`GjiWarmupCoro`) で共有する（統合前は別々に定義されていた）。
+/// そのVK専用の detector をポーリングする（`TsfProbeCoro` の per-VK confirm）。
 pub(crate) struct VkSentPayload {
     pub(crate) detector: LiteralDetector,
     pub(crate) deadline_ms: u64,
@@ -305,33 +201,19 @@ pub(crate) struct VkSentPayload {
 /// 次の VK へ進む。バッチ送信特有の「どの文字が化けたか区別できない」曖昧さ（BUG-03 が
 /// Chrome で解決できなかった原因）を、そもそもバッチにしないことで回避する。
 ///
-/// 統合前は `probe_fsm.rs::tsf_probe_coro_body`（Chrome Phase 2c）と
-/// `gji_warmup_coro.rs::gji_coro_body`（TSF Phase 5b）にほぼ同一のループが重複していた。
-/// 差分はログ/診断タグの接頭辞のみで、`target` から導出できるためここに統合できた
-/// （BUG-29 の候補ウィンドウ可視時 polling スキップは元々 Chrome 限定だったが、
-/// BUG-30 で検出ロジック自体が統一されたため両ターゲット共通になった）。
+/// かつては Tsf 注入モード用の `GjiWarmupCoro`（TSF Phase 5b）と共有していたが、Tsf 注入経路の
+/// 撤去（2026-10-22）で使い手は `tsf_probe_coro_body`（Chrome Phase 2c）だけになった。
 ///
 /// 全 VK 確認できたらセッション確認 (`mark_literal_session=true`) + `Done` を、
 /// `SuspectedLiteral` を検出したら `RawTsfLiteralRecovery` を、dispatcher が
 /// `apply_vk_sent` を呼ばなかった場合（BUG-27）は無リカバリで中断する。いずれの場合も
 /// 必要なアクションは内部で yield 済み（または `CoroStep::Complete` の `Done` フォール
 /// バックに委ねる）で、呼び出し元は `.await` 後にそのまま `return` すればよい。
-/// [`run_per_vk_confirm`] のログ・診断タグ（Chrome/TSF で従来通り書き分ける。
-/// docs/known-bugs.md のデバッグキーワード表・実機ログ grep パターンとの互換性を保つため）。
-fn per_vk_confirm_tags(target: TransmitTarget) -> (&'static str, &'static str, &'static str) {
-    match target {
-        TransmitTarget::Chrome => (
-            "tsf-probe",
-            "chrome-per-vk-literal",
-            "chrome-per-vk-confirmed",
-        ),
-        TransmitTarget::Tsf => (
-            "gji-coro",
-            "setopen-per-vk-literal",
-            "setopen-per-vk-confirmed",
-        ),
-    }
-}
+/// [`run_per_vk_confirm`] のログ・診断タグ（docs/known-bugs.md のデバッグキーワード表・
+/// 実機ログ grep パターンとの互換性を保つため、従来の Chrome のタグのまま）。
+const PER_VK_LOG_TAG: &str = "tsf-probe";
+const PER_VK_LITERAL_TAG: &str = "chrome-per-vk-literal";
+const PER_VK_CONFIRMED_TAG: &str = "chrome-per-vk-confirmed";
 
 fn idx_u16(idx: usize) -> u16 {
     u16::try_from(idx).unwrap_or(u16::MAX)
@@ -341,7 +223,6 @@ fn literal_facts(
     detection: &crate::tsf::probe::DetectionResult,
     route: DetectRoute,
     path: DetectPath,
-    target: TransmitTarget,
     vk: Option<VkCode>,
     idx: usize,
     last_idx: usize,
@@ -351,7 +232,7 @@ fn literal_facts(
         verdict: LiteralVerdict::from(detection),
         route,
         path,
-        target: target.into(),
+        target: DetectTarget::Chrome,
         vk: vk.map(|vk| vk.0),
         idx: idx_u16(idx),
         last_idx: idx_u16(last_idx),
@@ -444,22 +325,43 @@ async fn await_vk_detection(
     }
 }
 
+/// 2 番目以降の疑いを信用しない窓(Zoom のチャット)で、疑いを無視して「確認済み」として進めるための
+/// アクションを返す(BUG-215)。`run_per_vk_confirm` の複雑度を抑えるために切り出した。
+fn ignored_later_suspicion(
+    log_tag: &str,
+    cold_seq: Generation,
+    idx: usize,
+    last_idx: usize,
+    vk: VkCode,
+    facts: LiteralDetectFacts,
+) -> ProbeAction {
+    tracing::debug!(
+        "[{log_tag}] cold={cold_seq} per-VK[{idx}/{last_idx}] 2 番目以降の疑いは信用しない窓 \
+         → 確認済みとして続行 (vk=0x{:02X})",
+        vk.0,
+        cold_seq = cold_seq.value(),
+    );
+    ProbeAction::CompositionConfirmed {
+        cold_seq,
+        mark_literal_session: false,
+        resets_consecutive: false,
+        facts,
+    }
+}
+
 #[expect(clippy::future_not_send)]
 pub(crate) async fn run_per_vk_confirm(
     ch: Rc<Channel<ProbeTickInput, Vec<ProbeAction>>>,
     cold_seq: Generation,
     romaji: &str,
     plan: TransmitPlan,
-    target: TransmitTarget,
 ) {
     use crate::tsf::probe::DetectionResult;
 
-    let (log_tag, literal_tag, confirmed_tag) = per_vk_confirm_tags(target);
+    let (log_tag, literal_tag, confirmed_tag) =
+        (PER_VK_LOG_TAG, PER_VK_LITERAL_TAG, PER_VK_CONFIRMED_TAG);
 
-    let vk_chars: Vec<(VkCode, bool)> = romaji
-        .chars()
-        .filter_map(crate::output::resolve_ascii_to_vk)
-        .collect();
+    let vk_chars: Vec<(VkCode, bool)> = romaji.chars().filter_map(crate::vk::ascii_to_vk).collect();
     if vk_chars.is_empty() {
         yield_step(ch.clone(), vec![ProbeAction::Done]).await;
         return;
@@ -484,7 +386,6 @@ pub(crate) async fn run_per_vk_confirm(
             is_last,
             idx: idx_u16(idx),
             last_idx: idx_u16(last_idx),
-            target,
         });
         let vk_input = yield_step(ch.clone(), actions).await;
         let Some(sent) = vk_input.vk_sent else {
@@ -510,6 +411,7 @@ pub(crate) async fn run_per_vk_confirm(
         // スナップショット）を全 VK で使い回すと、後続 VK の可視性変化を無視してしまい
         // 挙動が変わる。`ProbeTickInput.env` は tick ごとに更新されるため、これが
         // 旧実装のライブ読みに最も近い等価物。
+        let later_unreliable = vk_input.env.later_vk_literal_check_unreliable;
         let (detection, route, evidence) = await_vk_detection(
             &ch,
             &sent,
@@ -525,7 +427,6 @@ pub(crate) async fn run_per_vk_confirm(
             &detection,
             route,
             DetectPath::PerVk,
-            target,
             Some(vk),
             idx,
             last_idx,
@@ -544,8 +445,16 @@ pub(crate) async fn run_per_vk_confirm(
                 pending_confirm = Some(ProbeAction::CompositionConfirmed {
                     cold_seq,
                     mark_literal_session: false,
+                    resets_consecutive: false,
                     facts,
                 });
+            }
+            // BUG-215: Zoom のチャットでは 2 番目以降の疑いを信用しない(直前のキーは確認済み)。ESC + 全体の再送の連鎖を
+            // 起こすだけなので、確認済みとして次のキーへ進む。1 番目のキーの疑いは下の回収に任せる。
+            DetectionResult::SuspectedLiteral if idx > 0 && later_unreliable => {
+                pending_confirm = Some(ignored_later_suspicion(
+                    log_tag, cold_seq, idx, last_idx, vk, facts,
+                ));
             }
             DetectionResult::SuspectedLiteral => {
                 let (backs, escape_composition) =
@@ -556,7 +465,7 @@ pub(crate) async fn run_per_vk_confirm(
                     vk.0,
                     cold_seq = cold_seq.value(),
                 );
-                crate::ime_diagnostic::log_composition_probe(cold_seq, literal_tag);
+                crate::tsf::log_composition_probe(cold_seq, literal_tag);
                 // emit_recovery_actions は常に RawTsfLiteralRecovery（backspace のみ、
                 // 捨て駒キーには倒れない）を返す。consecutive==0 なら dispatcher が
                 // romaji の再送を自然に次の cold パス（per-VK confirm）へ委ねる。
@@ -599,7 +508,7 @@ pub(crate) async fn run_per_vk_confirm(
                     vk.0,
                     cold_seq = cold_seq.value(),
                 );
-                crate::ime_diagnostic::log_composition_probe(cold_seq, "epoch-fence-stale");
+                crate::tsf::log_composition_probe(cold_seq, "epoch-fence-stale");
                 let actions = crate::tsf::warmup::literal_detect_fsm::emit_recovery_actions(
                     cold_seq,
                     romaji.to_string(),
@@ -618,7 +527,7 @@ pub(crate) async fn run_per_vk_confirm(
         vk_chars.len(),
         cold_seq = cold_seq.value(),
     );
-    crate::ime_diagnostic::log_composition_probe(cold_seq, confirmed_tag);
+    crate::tsf::log_composition_probe(cold_seq, confirmed_tag);
     // BUG-27 追補4: 最後の VK の pending_confirm は不要（mark_literal_session=true
     // 版のリセットで包含されるため）、破棄してよい。
     let _ = pending_confirm.take();
@@ -628,11 +537,12 @@ pub(crate) async fn run_per_vk_confirm(
             ProbeAction::CompositionConfirmed {
                 cold_seq,
                 mark_literal_session: true,
+                resets_consecutive: false,
                 facts: LiteralDetectFacts {
                     verdict: LiteralVerdict::CompositionConfirmed,
                     route: DetectRoute::CheckNow,
                     path: DetectPath::PerVk,
-                    target: target.into(),
+                    target: DetectTarget::Chrome,
                     vk: None,
                     idx: idx_u16(last_idx),
                     last_idx: idx_u16(last_idx),
@@ -654,15 +564,12 @@ async fn tsf_probe_coro_body(
     ch: Rc<Channel<ProbeTickInput, Vec<ProbeAction>>>,
     romaji: String,
     probe: TsfReadinessProbe,
-    total_max_ms: u64,
     cold_seq: Generation,
 ) {
     // ── Phase 1: ChromeProbe ポーリング ──────────────────────────────────────
-    let env = loop {
+    let env = {
         let input = yield_step(ch.clone(), vec![]).await;
-        let Some(outcome) = probe.check_outcome(total_max_ms) else {
-            continue;
-        };
+        let outcome = probe.outcome();
         tracing::debug!(
             "[tsf-probe] cold={cold_seq} ChromeProbe 完了 ({}ms)",
             outcome.elapsed_ms,
@@ -671,142 +578,43 @@ async fn tsf_probe_coro_body(
         // VK_IME_OFF→VK_IME_ON を Chrome path で使わない（タイムアウト後のリセット専用）。
         // VK_IME_OFF が Chrome TSF context を壊し、VK_IME_ON が間に合わず na がリテラル化する。
         // ChromeProbe の F2 (VK_DBE_HIRAGANA) warmup のみで GJI を活性化する。
-        break input.env;
+        input.env
     };
 
     // ── Phase 2b: 直接 Chrome 送信 ──
-    // gji_active なら inline LiteralDetect（Phase 3）/ per-VK confirm（Phase 2c）を
+    // gji_active なら per-VK confirm（Phase 2c）を
     // 安全網として有効化する。VK_A probe + Chrome reinit のフルコース
     // （StartSacrificialWarmup、2026-07-18 撤去）は踏まない。
     let needs_literal = env.gji_active;
 
     // ── Phase 2c（per-VK confirm）──
-    // TSF 側 gji_coro_body の Phase 5b と共通実装（`run_per_vk_confirm`、2026-07-17 統合）。
+    // `run_per_vk_confirm`（2026-07-17 統合。Tsf 側の利用者は 2026-10-22 に撤去）。
     if needs_literal && env.literal_session_confirmed_gen != Some(cold_seq) {
         let plan = TransmitPlan {
-            used_eager_path: false,
             needs_literal: true,
             literal_detect_ms: crate::tuning::RAW_TSF_LITERAL_DETECT_MS,
         };
-        run_per_vk_confirm(ch.clone(), cold_seq, &romaji, plan, TransmitTarget::Chrome).await;
+        run_per_vk_confirm(ch.clone(), cold_seq, &romaji, plan).await;
         return;
     }
 
-    let transmit_input = yield_step(
+    // ここへ来るのは `needs_literal=false`(= `gji_active` でない)のときだけ。dispatcher が `apply_transmit_done(None)` → true で
+    // machine を drop するので、コルーチンは再開されない。`needs_literal=true` は上の per-VK confirm が必ず先に取る
+    // (ECRS MB-01、2026-10-21。`cold_seq` は cold start のたびに新規採番され、`literal_session_confirmed_gen` に
+    // 生成直後のコルーチンの `cold_seq` が入ることは無い)。
+    // 旧 Phase 3(inline LiteralDetect。StaleConfirm→romaji 再送を含む)は撤去した。
+    yield_step(
         ch.clone(),
         vec![ProbeAction::Transmit {
             cold_seq,
             plan: TransmitPlan {
-                used_eager_path: false,
                 needs_literal,
                 literal_detect_ms: crate::tuning::RAW_TSF_LITERAL_DETECT_MS,
             },
             romaji,
-            target: TransmitTarget::Chrome,
         }],
     )
     .await;
-
-    // ── Phase 3: Inline LiteralDetect（dispatcher が detector を渡した場合のみ）─
-    let Some(TransmitDonePayload {
-        romaji: recovery_romaji,
-        ze_bs_count,
-        detector,
-        deadline_ms,
-    }) = transmit_input.transmit_done
-    else {
-        return;
-    };
-
-    loop {
-        use crate::tsf::probe::DetectionResult;
-        let poll_input = yield_step(ch.clone(), vec![]).await;
-
-        let Some(detection) = detector.check_now(deadline_ms) else {
-            continue;
-        };
-        let facts = literal_facts(
-            &detection,
-            DetectRoute::CheckNow,
-            DetectPath::Word,
-            TransmitTarget::Chrome,
-            None,
-            0,
-            0,
-            detector.evidence_now(
-                poll_input.env.gji_candidate_visible_now,
-                deadline_ms,
-                cold_seq,
-            ),
-        );
-
-        let final_actions = match detection {
-            DetectionResult::SuspectedLiteral => {
-                crate::ime_diagnostic::log_composition_probe(cold_seq, "suspected");
-                let (backs, escape_composition) =
-                    crate::tsf::warmup::literal_detect_fsm::word_level_recovery_params(
-                        false,
-                        ze_bs_count,
-                    );
-                vec![
-                    ProbeAction::RawTsfLiteralRecovery {
-                        cold_seq,
-                        backs,
-                        romaji: recovery_romaji,
-                        escape_composition,
-                        facts,
-                    },
-                    ProbeAction::Done,
-                ]
-            }
-            DetectionResult::CompositionConfirmed => {
-                tracing::debug!(
-                    "[raw-tsf-literal] cold={cold_seq} composition confirmed",
-                    cold_seq = cold_seq.value(),
-                );
-                crate::ime_diagnostic::log_composition_probe(cold_seq, "confirmed");
-                vec![
-                    ProbeAction::LiteralDetectNote { cold_seq, facts },
-                    ProbeAction::Done,
-                ]
-            }
-            DetectionResult::StaleConfirm => {
-                // ADR-079 Stage 1 追補: 「検出のみ・recovery なし」は実機で
-                // 未送信 VK が欠落する回帰を引き起こした（run_per_vk_confirm 側の
-                // 同種修正のコメント参照）。romaji 再送自体は必要なので Done では
-                // 終わらせない。
-                //
-                // BUG-33 追補4: 一方 backspace は「literal である」証拠がない
-                // 限り送らない（`per_vk_recovery_params` のドキュメント参照）。
-                // StaleConfirm は confirm 根拠が古いことの検出であって literal の
-                // 証拠ではないため backs=0 とする。
-                tracing::warn!(
-                    "[raw-tsf-literal] cold={cold_seq} stale confirm 検出 → \
-                     backspace は送らず romaji 再送のみ行う",
-                    cold_seq = cold_seq.value(),
-                );
-                crate::ime_diagnostic::log_composition_probe(cold_seq, "epoch-fence-stale");
-                let (backs, escape_composition) =
-                    crate::tsf::warmup::literal_detect_fsm::word_level_recovery_params(
-                        true,
-                        ze_bs_count,
-                    );
-                vec![
-                    ProbeAction::RawTsfLiteralRecovery {
-                        cold_seq,
-                        backs,
-                        romaji: recovery_romaji,
-                        escape_composition,
-                        facts,
-                    },
-                    ProbeAction::Done,
-                ]
-            }
-        };
-
-        yield_step(ch, final_actions).await;
-        return;
-    }
 }
 
 // ── TsfProbeCoro ──────────────────────────────────────────────────────────────
@@ -816,12 +624,10 @@ async fn tsf_probe_coro_body(
 /// `pending_tsf` (`RefCell<Option<Box<dyn TickableFsm>>>`) に格納し、
 /// `TIMER_TSF_PROBE` ハンドラが `tick()` で 1 ステップ進める。
 pub(crate) struct TsfProbeCoro {
-    /// `tick`/`apply_transmit_done`/`apply_vk_sent`/prime のラッパー配線
-    /// （`GjiWarmupCoro` と共有、`probe_coro_state.rs` 参照）。
+    /// `tick`/`apply_vk_sent`/prime のラッパー配線（`probe_coro_state.rs` 参照）。
     state: ProbeCoroState,
     /// RAII guard。drop で `OUTPUT_GATE.active=false`。コルーチン生存中ずっと
-    /// active を保持する（`GjiWarmupCoro::literal_detect_guard` と異なり、
-    /// LiteralDetect フェーズ突入を待たず construction 時点から確保する）。
+    /// active を保持する（construction 時点から確保する）。
     _guard: OutputActiveGuard,
 }
 
@@ -831,12 +637,11 @@ impl TsfProbeCoro {
         romaji: &str,
         cold_seq: Generation,
         probe: TsfReadinessProbe,
-        total_max_ms: u64,
         guard: OutputActiveGuard,
     ) -> Self {
         let romaji = romaji.to_string();
         let coro = StepCoro::new(async move |ch| {
-            tsf_probe_coro_body(ch, romaji, probe, total_max_ms, cold_seq).await;
+            tsf_probe_coro_body(ch, romaji, probe, cold_seq).await;
         });
         Self {
             state: ProbeCoroState::new(coro, cold_seq, "TsfProbeCoro"),
@@ -854,23 +659,7 @@ impl TickableFsm for TsfProbeCoro {
         self.state.cold_seq()
     }
 
-    /// dispatcher が `Transmit(Chrome)` を実行した後に呼ぶ。
-    ///
-    /// `detector` が `Some` なら `LiteralDetect` フェーズへ進む（`false` を返す）。
-    /// `None` なら Done（`true` を返す）。
-    fn apply_transmit_done(
-        &mut self,
-        romaji: String,
-        ze_bs_count: usize,
-        detector: Option<LiteralDetector>,
-        literal_detect_ms: u64,
-    ) -> bool {
-        self.state
-            .apply_transmit_done(romaji, ze_bs_count, detector, literal_detect_ms)
-    }
-
-    /// Chrome per-VK confirm が1 VK 送信するたびに呼ぶ。
-    /// `GjiWarmupCoro::apply_vk_sent` の Chrome 版。`_guard` がコルーチン生存中ずっと
+    /// Chrome per-VK confirm が1 VK 送信するたびに呼ぶ。`_guard` がコルーチン生存中ずっと
     /// active を保持しているため、追加のガード確保は不要。
     fn apply_vk_sent(&mut self, detector: LiteralDetector, deadline_ms: u64) {
         self.state
@@ -881,196 +670,6 @@ impl TickableFsm for TsfProbeCoro {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── decide_transmit_plan 回帰テスト ──────────────────────────────────────
-
-    #[test]
-    fn decide_plan_nc_not_fired_tsf_not_long_idle_keeps_literal() {
-        // nc_fired=false + TSF mode + Short cold (forces_prepend_f2=false):
-        // IME 準備完了が未確認のため LiteralDetect は有効にして回収する。
-        let obs = ProbeObservations {
-            nc_fired: false,
-            ..Default::default()
-        };
-        let env = TsfEnvSnapshot {
-            is_tsf_mode: true,
-            gji_active: true,
-            ..Default::default()
-        };
-
-        let plan = decide_transmit_plan(false, obs, env, true, false, false);
-
-        assert!(
-            plan.needs_literal,
-            "nc_fired=false + tsf: IME 準備未確認 → LiteralDetect で保護"
-        );
-    }
-
-    #[test]
-    fn decide_plan_nc_not_fired_tsf_long_idle_keeps_literal() {
-        // Long cold (forces_prepend_f2=true): LiteralDetect が有効（GJI 応答未確認）。
-        let obs = ProbeObservations {
-            nc_fired: false,
-            ..Default::default()
-        };
-        let env = TsfEnvSnapshot {
-            is_tsf_mode: true,
-            gji_active: true,
-            ..Default::default()
-        };
-
-        let plan = decide_transmit_plan(false, obs, env, true, true, true);
-
-        assert!(plan.needs_literal, "tsf mode: LiteralDetect 有効");
-    }
-
-    #[test]
-    fn decide_plan_nc_fired_suppresses_literal_even_when_gji_active() {
-        // BUG-40（docs/known-bugs.md）で `nc_confirmed = nc_fired || (confirm_key_tsf_hint
-        // && gji_settled)` に整理されて以降、nc_fired=true（NameChange が実発火 = 合成が
-        // 実際に確認された）は常に needs_literal=false になる。この関数は
-        // `426a7f2`（2026-07-19）で追加された旧テスト（旧実装では
-        // `should_prepend_f2` 由来の第1節があり、nc_fired=true でも
-        // gji_active+!is_long_cold なら literal 有効、という別の分岐が生きていた）の
-        // 期待値が、その後の削除・BUG-40整理で古くなったまま残っていたもの。
-        // BUG-40の副次的発見として記録済み（本テスト自体は未修正のまま放置されて
-        // いた）で、2026-07-25にWindows実機CIで実際にassertion failureとして
-        // 顕在化したのを機に、現在の意図された挙動に合わせて更新した。
-        let obs = ProbeObservations {
-            nc_fired: true,
-            ..Default::default()
-        };
-        let env = TsfEnvSnapshot {
-            is_tsf_mode: true,
-            gji_active: true,
-            ..Default::default()
-        };
-
-        let plan = decide_transmit_plan(false, obs, env, true, false, false);
-
-        assert!(
-            !plan.needs_literal,
-            "nc_fired=true(NameChange確認済み)ならgji_active/is_long_cold問わずLiteralDetect不要のはず(BUG-40)"
-        );
-    }
-
-    #[test]
-    fn decide_plan_nc_fired_with_deferred_vks_disables_eager_path() {
-        // nc_fired=true でも deferred_vks が存在する場合は unicode に戻さない（nお race 防止）。
-        let obs = ProbeObservations {
-            nc_fired: true,
-            ..Default::default()
-        };
-        let env = TsfEnvSnapshot {
-            is_tsf_mode: false,
-            gji_active: false,
-            ..Default::default()
-        };
-
-        let plan = decide_transmit_plan(true, obs, env, false, false, false); // deferred_empty=false
-
-        assert!(
-            !plan.used_eager_path,
-            "deferred_vks あり: unicode TSF パスを使わない"
-        );
-    }
-
-    #[test]
-    fn decide_plan_medium_cold_keeps_literal_on_ncwait_timeout() {
-        // Medium cold (forces_prepend_f2=true) + nc_fired=false → GJI 応答未確認のため
-        // LiteralDetect は有効なまま。
-        let obs = ProbeObservations {
-            nc_fired: false,
-            ..Default::default()
-        };
-        let env = TsfEnvSnapshot {
-            is_tsf_mode: true,
-            gji_active: true,
-            ..Default::default()
-        };
-
-        let plan = decide_transmit_plan(false, obs, env, true, true, false); // Medium cold
-
-        assert!(plan.needs_literal, "GJI 応答未確認: LiteralDetect 有効");
-    }
-
-    // ── BUG-40 回帰テスト: confirm_key_tsf_hint は gji_settled 必須 ────────────
-    //
-    // `nc_for_plan = nc_fired || (cold_reason.is_confirm_key() && env.is_tsf_mode)`
-    // という旧実装（gji_settled を一切見ない）は、WezTerm の Enter/Space 後に
-    // NameChange が発火しないが GJI は実際に合成中というケース（`3ffbe66`）を
-    // 救済するために書かれた。しかし gji_settled を見ないため、88s idle 後に
-    // probe がわずか16msで完了した genuinely cold なセッション（GJI は未確定、
-    // gji_settled=false）まで同じ条件で誤救済し、reactive LiteralDetect が
-    // 丸ごとスキップされて漏れた romaji ("ke" 等) が無補正で出力された。
-
-    #[test]
-    fn decide_plan_confirm_key_hint_without_settled_keeps_literal() {
-        // confirm_key_tsf_hint=true だが gji_settled=false（genuinely cold, BUG-40
-        // の実トレース相当）: 救済せず LiteralDetect を有効なままにする。
-        let obs = ProbeObservations {
-            nc_fired: false,
-            gji_settled: false,
-            confirm_key_tsf_hint: true,
-        };
-        let env = TsfEnvSnapshot {
-            is_tsf_mode: true,
-            gji_active: true,
-            ..Default::default()
-        };
-
-        let plan = decide_transmit_plan(false, obs, env, true, false, false);
-
-        assert!(
-            plan.needs_literal,
-            "BUG-40: gji_settled=false のまま confirm_key_tsf_hint だけで救済してはならない"
-        );
-    }
-
-    #[test]
-    fn decide_plan_confirm_key_hint_with_settled_suppresses_literal() {
-        // confirm_key_tsf_hint=true かつ gji_settled=true（WezTerm が実際に I/O を
-        // 返している、3ffbe66 の対象シナリオ）: NameChange 欠落を救済し、誤検出の
-        // backspace で確定済み文字を消さないよう LiteralDetect を抑制する。
-        let obs = ProbeObservations {
-            nc_fired: false,
-            gji_settled: true,
-            confirm_key_tsf_hint: true,
-        };
-        let env = TsfEnvSnapshot {
-            is_tsf_mode: true,
-            gji_active: true,
-            ..Default::default()
-        };
-
-        let plan = decide_transmit_plan(false, obs, env, true, false, false);
-
-        assert!(
-            !plan.needs_literal,
-            "3ffbe66: gji_settled=true なら NameChange 欠落を救済し LiteralDetect を抑制する"
-        );
-    }
-
-    #[test]
-    fn decide_plan_confirm_key_hint_without_tsf_mode_has_no_effect() {
-        // confirm_key_tsf_hint は is_tsf_mode 前提の救済ヒントであり、それ単体
-        // （gji_settled=true でも）non-TSF では needs_literal に影響しない
-        // （non-TSF は元々 needs_literal の第3項 `env.is_tsf_mode` で false 固定）。
-        let obs = ProbeObservations {
-            nc_fired: false,
-            gji_settled: true,
-            confirm_key_tsf_hint: true,
-        };
-        let env = TsfEnvSnapshot {
-            is_tsf_mode: false,
-            gji_active: true,
-            ..Default::default()
-        };
-
-        let plan = decide_transmit_plan(false, obs, env, true, false, false);
-
-        assert!(!plan.needs_literal, "non-TSF: needs_literal は常に false");
-    }
 
     // ── TsfProbeCoro (Chrome) — 犠牲キー撤去後の直接送信回帰テスト ────────────
     //
@@ -1083,13 +682,46 @@ mod tests {
     /// ロックを取らない — 呼び出し元ごとに他の TSF_OBS フィールドの初期化と
     /// まとめてロックを取りたいケースがあるため）。
     fn ready_chrome_probe() -> TsfProbeCoro {
-        // total_max_ms=0 → check_now が最初の tick で即 ready になる。
+        // 最初の tick で probe.outcome() を読んで進む。
         crate::tsf::observer::TSF_OBS
             .gji_monitor_ok
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let guard = OutputActiveGuard::noop_for_test();
-        let probe = TsfReadinessProbe::new(0, Generation::INITIAL, 0);
-        TsfProbeCoro::new_chrome("ka", Generation::INITIAL, probe, 0, guard)
+        let probe = TsfReadinessProbe::new(0, Generation::INITIAL);
+        TsfProbeCoro::new_chrome("ka", Generation::INITIAL, probe, guard)
+    }
+
+    // ── TickableFsm 経由の capability 到達(旧 ChromeProbe ラッパーの BUG-27 回帰を引き継ぐ) ──
+    //
+    // 本番の `pending_tsf: Box<dyn TickableFsm>` と同じ経路で `apply_vk_sent` を
+    // 呼んでも、デフォルト no-op に落ちず実装に届くこと。
+
+    #[test]
+    fn chrome_apply_vk_sent_via_trait_reaches_coro() {
+        use crate::tsf::warmup::tickable_fsm::TickableFsm;
+        let _g = crate::tsf::observer::TSF_OBS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::tsf::observer::reset_literal_session_confirmed();
+        let mut machine = ready_chrome_probe();
+        let env = || TsfEnvSnapshot {
+            gji_active: true,
+            ..Default::default()
+        };
+        let first = TickableFsm::tick(&mut machine, env());
+        assert!(
+            matches!(first.as_slice(), [ProbeAction::TransmitSingleVk { .. }]),
+            "{first:?}"
+        );
+        let deadline_ms = crate::clock::current_tick_ms() + 1000;
+        TickableFsm::apply_vk_sent(
+            &mut machine,
+            LiteralDetector::new_with_pre_send_baseline(crate::tsf::observer::gji_write_bytes()),
+            deadline_ms,
+        );
+        // 届いていれば detection 待ちの polling(空の Vec)。no-op に落ちると即 Done。
+        let after = TickableFsm::tick(&mut machine, env());
+        assert!(after.is_empty(), "{after:?}");
     }
 
     #[test]
@@ -1107,13 +739,7 @@ mod tests {
         });
 
         assert!(
-            matches!(
-                actions.as_slice(),
-                [ProbeAction::TransmitSingleVk {
-                    target: TransmitTarget::Chrome,
-                    ..
-                }]
-            ),
+            matches!(actions.as_slice(), [ProbeAction::TransmitSingleVk { .. }]),
             "gji_active: per-VK confirm（TransmitSingleVk）を安全網として使う: {actions:?}"
         );
     }
@@ -1133,11 +759,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                ProbeAction::Transmit {
-                    plan,
-                    target: TransmitTarget::Chrome,
-                    ..
-                } if !plan.needs_literal
+                ProbeAction::Transmit { plan, .. } if !plan.needs_literal
             )),
             "!gji_active: LiteralDetect 不要のまま直接送信する: {actions:?}"
         );
@@ -1227,6 +849,7 @@ mod tests {
         let _g = TSF_OBS_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _clock = crate::clock::freeze();
 
         crate::tsf::observer::reset_literal_session_confirmed();
         TSF_OBS.gji_candidate_visible.store(false, SeqCst);
@@ -1245,11 +868,9 @@ mod tests {
             "per-VK confirm ループの最初の VK 送信要求のはず: {first_actions:?}"
         );
 
-        let detector = LiteralDetector::new_with_pre_send_baseline(
-            crate::tsf::observer::gji_write_bytes(),
-            false,
-        );
-        let deadline_ms = crate::hook::current_tick_ms() + 10_000;
+        let detector =
+            LiteralDetector::new_with_pre_send_baseline(crate::tsf::observer::gji_write_bytes());
+        let deadline_ms = crate::clock::current_tick_ms() + 10_000;
 
         // 前世代の残存 GJI I/O（今回の VK 送信より前）だけがある状態を模擬する。
         // detector構築時刻(epoch_send_ms)より確実に前のwrite根拠を作るため、実時間
@@ -1259,7 +880,7 @@ mod tests {
         // trueになり、猶予に入らず即座にactionが出て「猶予期間中は空のはず」の
         // アサートがflakyに失敗する(2026-07-25、Windows実機で初めてこのテストを
         // 実行した際に顕在化)。
-        let stale_write_ms = crate::hook::current_tick_ms().saturating_sub(50);
+        let stale_write_ms = crate::clock::current_tick_ms().saturating_sub(50);
         TSF_OBS.gji_last_write_ms.store(stale_write_ms, SeqCst);
 
         // 候補ウィンドウが「既に可視」= 前世代の合成が残っている状態を模擬する。
@@ -1283,10 +904,8 @@ mod tests {
 
         // 猶予期間（EPOCH_FENCE_GRACE_MS）が過ぎても gji_last_write_ms は追いつかない
         // （前世代の残存 GJI I/O のまま）ため、次 tick で StaleConfirm に確定する。
-        std::thread::sleep(std::time::Duration::from_millis(
-            // BUG-130 と同型: GetTickCount64 の量子化(~15.6ms)を吸収するため +50ms(+10ms では windows-build CI で稀に flake した)。
-            LiteralDetector::EPOCH_FENCE_GRACE_MS + 50,
-        ));
+        // 実時間の sleep は BUG-130 と同型で GetTickCount64 の量子化(~15.6ms)と CI の負荷でフレークした。仮想時計を進める(ADR-272 段階 B0)。
+        crate::clock::advance(LiteralDetector::EPOCH_FENCE_GRACE_MS + 50);
         let actions_after_stale = machine.tick(TsfEnvSnapshot {
             gji_active: true,
             gji_candidate_visible_now: true,
@@ -1337,16 +956,14 @@ mod tests {
 
         // 送信直前時点では GJI I/O がまだ観測されていない（同一世代内の
         // ポーリングラグを模擬）。
-        let epoch_ms = crate::hook::current_tick_ms();
+        let epoch_ms = crate::clock::current_tick_ms();
         TSF_OBS
             .gji_last_write_ms
             .store(epoch_ms.saturating_sub(50), SeqCst); // stale（epoch より前）
 
-        let detector = LiteralDetector::new_with_pre_send_baseline(
-            crate::tsf::observer::gji_write_bytes(),
-            false,
-        );
-        let deadline_ms = crate::hook::current_tick_ms() + 10_000;
+        let detector =
+            LiteralDetector::new_with_pre_send_baseline(crate::tsf::observer::gji_write_bytes());
+        let deadline_ms = crate::clock::current_tick_ms() + 10_000;
         TSF_OBS.gji_candidate_visible.store(true, SeqCst);
 
         machine.apply_vk_sent(detector, deadline_ms);
@@ -1366,7 +983,7 @@ mod tests {
         // 猶予期間内に、このVK自身の送信によるGJI I/Oが観測されたことにする。
         TSF_OBS
             .gji_last_write_ms
-            .store(crate::hook::current_tick_ms(), SeqCst);
+            .store(crate::clock::current_tick_ms(), SeqCst);
         let actions_after_catchup = machine.tick(TsfEnvSnapshot {
             gji_active: true,
             gji_candidate_visible_now: true,
@@ -1416,8 +1033,8 @@ mod tests {
 
         // VK0 ('k') を write-bytes 閾値超過（genuinely fresh）で confirm する。
         let baseline = crate::tsf::observer::gji_write_bytes();
-        let detector0 = LiteralDetector::new_with_pre_send_baseline(baseline, false);
-        let deadline0 = crate::hook::current_tick_ms() + 10_000;
+        let detector0 = LiteralDetector::new_with_pre_send_baseline(baseline);
+        let deadline0 = crate::clock::current_tick_ms() + 10_000;
         machine.apply_vk_sent(detector0, deadline0);
         let after_send0 = machine.tick(TsfEnvSnapshot {
             gji_active: true,
@@ -1431,7 +1048,7 @@ mod tests {
         TSF_OBS.gji_write_bytes.store(baseline + 400, SeqCst); // 閾値超過、fresh write
         TSF_OBS
             .gji_last_write_ms
-            .store(crate::hook::current_tick_ms(), SeqCst);
+            .store(crate::clock::current_tick_ms(), SeqCst);
         let actions_vk0_confirmed = machine.tick(TsfEnvSnapshot {
             gji_active: true,
             ..Default::default()
@@ -1445,11 +1062,9 @@ mod tests {
 
         // VK1 ('a') は候補ウィンドウ非可視のまま、deadline を既に過ぎた状態にして
         // 本物の SuspectedLiteral（「既に可視」ショートカットではない）を起こす。
-        let detector1 = LiteralDetector::new_with_pre_send_baseline(
-            crate::tsf::observer::gji_write_bytes(),
-            false,
-        );
-        let deadline1 = crate::hook::current_tick_ms(); // 既に期限切れ
+        let detector1 =
+            LiteralDetector::new_with_pre_send_baseline(crate::tsf::observer::gji_write_bytes());
+        let deadline1 = crate::clock::current_tick_ms(); // 既に期限切れ
         machine.apply_vk_sent(detector1, deadline1);
         let after_send1 = machine.tick(TsfEnvSnapshot {
             gji_active: true,
@@ -1476,6 +1091,101 @@ mod tests {
             "直前の VK が confirmed 済みの SuspectedLiteral は ESC のみ・backspace \
              なしのはず（実機で確定済みの直前文字を誤って消す実害が確認された）: \
              {actions_vk1:?}"
+        );
+
+        TSF_OBS.gji_candidate_visible.store(false, SeqCst);
+        TSF_OBS.gji_last_write_ms.store(0, SeqCst);
+    }
+
+    /// BUG-215 の回帰テスト: Zoom のチャット（`later_vk_literal_check_unreliable`）では、2 番目以降の VK が
+    /// `SuspectedLiteral` になっても回収（ESC + 全体の再送）に入らず、確認済みとして最後まで進む。
+    /// 実機では 1 打鍵で `ki` が 6 回再送された。
+    #[test]
+    fn chrome_per_vk_later_vk_suspicion_is_ignored_in_unreliable_window() {
+        use crate::tsf::observer::{TSF_OBS, TSF_OBS_TEST_LOCK};
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let _g = TSF_OBS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::tsf::observer::reset_literal_session_confirmed();
+        TSF_OBS.gji_candidate_visible.store(false, SeqCst);
+        TSF_OBS.gji_last_write_ms.store(0, SeqCst);
+
+        let mut machine = ready_chrome_probe(); // romaji "ka" (2 VK)
+        let first_actions = machine.tick(TsfEnvSnapshot {
+            gji_active: true,
+            ..Default::default()
+        });
+        assert!(
+            matches!(
+                first_actions.as_slice(),
+                [ProbeAction::TransmitSingleVk { .. }]
+            ),
+            "per-VK confirm ループの最初の VK 送信要求のはず: {first_actions:?}"
+        );
+
+        // VK0 ('k') を write-bytes 閾値超過（genuinely fresh）で confirm する。
+        let baseline = crate::tsf::observer::gji_write_bytes();
+        let detector0 = LiteralDetector::new_with_pre_send_baseline(baseline);
+        let deadline0 = crate::clock::current_tick_ms() + 10_000;
+        machine.apply_vk_sent(detector0, deadline0);
+        let after_send0 = machine.tick(TsfEnvSnapshot {
+            gji_active: true,
+            ..Default::default()
+        });
+        assert!(
+            after_send0.is_empty(),
+            "confirm 待ちの1 tick 目は空のはず: {after_send0:?}"
+        );
+
+        TSF_OBS.gji_write_bytes.store(baseline + 400, SeqCst); // 閾値超過、fresh write
+        TSF_OBS
+            .gji_last_write_ms
+            .store(crate::clock::current_tick_ms(), SeqCst);
+        let actions_vk0_confirmed = machine.tick(TsfEnvSnapshot {
+            gji_active: true,
+            ..Default::default()
+        });
+        assert!(
+            actions_vk0_confirmed
+                .iter()
+                .any(|a| matches!(a, ProbeAction::TransmitSingleVk { .. })),
+            "VK0 confirm 後は VK1 の送信要求が来るはず: {actions_vk0_confirmed:?}"
+        );
+
+        // VK1 ('a') は候補ウィンドウ非可視のまま、deadline を既に過ぎた状態にして
+        // 本物の SuspectedLiteral（「既に可視」ショートカットではない）を起こす。
+        let detector1 =
+            LiteralDetector::new_with_pre_send_baseline(crate::tsf::observer::gji_write_bytes());
+        let deadline1 = crate::clock::current_tick_ms(); // 既に期限切れ
+        machine.apply_vk_sent(detector1, deadline1);
+        let after_send1 = machine.tick(TsfEnvSnapshot {
+            gji_active: true,
+            later_vk_literal_check_unreliable: true,
+            ..Default::default()
+        });
+        assert!(
+            after_send1.is_empty(),
+            "confirm 待ちの1 tick 目は空のはず: {after_send1:?}"
+        );
+
+        let actions_vk1 = machine.tick(TsfEnvSnapshot {
+            gji_active: true,
+            later_vk_literal_check_unreliable: true,
+            ..Default::default()
+        });
+        assert!(
+            !actions_vk1
+                .iter()
+                .any(|a| matches!(a, ProbeAction::RawTsfLiteralRecovery { .. })),
+            "信用できない窓の 2 番目の VK の疑いは回収しない: {actions_vk1:?}"
+        );
+        assert!(
+            actions_vk1
+                .iter()
+                .any(|a| matches!(a, ProbeAction::CompositionConfirmed { .. })),
+            "確認済みとして最後まで進み、セッション確認で終わる: {actions_vk1:?}"
         );
 
         TSF_OBS.gji_candidate_visible.store(false, SeqCst);

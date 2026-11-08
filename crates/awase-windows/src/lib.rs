@@ -21,27 +21,44 @@
 //! `vk`（`parse_hotkey` のみ windows-gated）などの純粋モジュールのみコンパイルされる。
 
 // ── 純粋モジュール（全プラットフォーム）──────────────────────────────────────────
-pub mod bug_report;
+pub use awase_ime_core::{indicator_evidence, journal, journal_policy, keymap, tuning, vk};
+// 不具合報告のペイロードの組み立てなどは OS 非依存の `awase-bug-report` に移した（ADR-274 段階 1）。
+// `awase_windows::bug_report` の経路を変えないよう再公開する。
+pub use awase_bug_report::bug_report;
+#[cfg_attr(not(windows), allow(dead_code))]
+pub mod clock;
 pub mod config_diagnostics;
 #[cfg(test)]
 mod config_key_resolution_tests;
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) mod conv_flags;
 pub mod focus;
 pub mod focus_resync;
 pub mod gji_charset_autodetect;
 pub mod hook_channel;
-pub mod journal_policy;
+pub mod key_effect_io;
+#[cfg(test)]
+mod key_input_replay_tests;
 pub(crate) mod lifetime_counter;
 pub mod msime_key_assignment;
 // 本番の呼び出し元（`read_legacy_toggle_assignment`/`read_legacy_compat_mode_enabled`）は
 // `#[cfg(windows)]` のため、純粋なパース部分は非 Windows では未使用になる（テストは Linux で回す）。
 #[cfg_attr(not(windows), allow(dead_code))]
 pub mod msime_legacy_keymap;
-pub mod scancode_map;
+pub mod probe_rejection_stats;
+// Scancode Map（キー入れ替え）の判断・編集モデル・適用は OS 非依存の `awase-scancode` に移した（ADR-274 段階 1）。
+// `awase_windows::scancode_*` の経路を変えないよう再公開する。
+pub use awase_scancode::{
+    scancode_apply, scancode_diagram, scancode_editor, scancode_map, scancode_pairs,
+};
+// Windows Scancode Map のレジストリ I/O（`scancode_map` の純粋部から分けた殻のファイル。ADR-274）。
+#[cfg(windows)]
+pub mod scancode_registry;
 pub mod scanmap;
 pub mod single_thread_cell;
 pub mod state;
-pub mod tuning;
-pub mod vk;
+#[cfg(windows)]
+pub mod vk_windows;
 
 // ── Windows 専用モジュール ───────────────────────────────────────────────────────
 #[cfg(windows)]
@@ -58,17 +75,18 @@ pub mod ime_controller;
 pub mod ime_diagnostic;
 #[cfg(windows)]
 pub(crate) mod imm;
-#[cfg(windows)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub mod input_defer;
 #[cfg(windows)]
-pub mod journal;
+pub mod journal_dump;
+#[cfg(windows)]
+pub(crate) mod key_pacer;
 // `KeymapTable`/`find_match`/`filter_active` は純粋な値比較のみで Windows API に
 // 依存しないため ungated（ADR-114、Linux で `cargo test -p awase-windows --lib`
 // から全数テストできるようにする。唯一の呼び出し元 `runtime/message_handlers.rs`
 // は `#[cfg(windows)]` のため非 Windows では未使用になる、他の純粋関数モジュール
 // と同じ局所抑制パターン）。
 #[cfg_attr(not(windows), allow(dead_code))]
-pub mod keymap;
 #[cfg(windows)]
 pub mod observer;
 #[cfg(windows)]
@@ -83,8 +101,6 @@ pub(crate) mod probe_actuation_fence;
 pub mod runtime;
 #[cfg(windows)]
 pub(crate) mod send_health;
-#[cfg(windows)]
-pub(crate) mod shadow_send_trace;
 #[cfg(windows)]
 pub mod timer;
 #[cfg(windows)]
@@ -114,10 +130,8 @@ pub use crate::state::PlatformState;
 pub use crate::state::{HookConfig, ImeBelief};
 pub use crate::tuning::IME_DETECT_MISS_THRESHOLD;
 
-#[cfg(windows)]
 pub use crate::tsf::probe_bridge::{OUTPUT_GATE, WM_DRAIN_OUTPUT_QUEUE};
 
-#[cfg(windows)]
 pub use crate::input_defer::{InputDeferQueue, INPUT_DEFER};
 
 // ── クロススレッド共有グローバル状態（ADR-164 フェーズ6）──
@@ -198,27 +212,6 @@ impl RawTsfLiteralPending {
             escape_composition: AtomicBool::new(false),
         }
     }
-
-    /// バックスペース数とローマ字を一括セットする。
-    ///
-    /// # Panics
-    /// Mutex が poison された場合（通常発生しない）。
-    pub fn set_pending(&self, backs: usize, romaji: String) {
-        use std::sync::atomic::Ordering::Relaxed;
-        self.backs.store(backs, Relaxed);
-        *self.romaji.lock().unwrap() = romaji;
-    }
-
-    /// バックスペース数とローマ字を一括取り出しする（backs は 0 にリセット、romaji は空にリセット）。
-    ///
-    /// # Panics
-    /// Mutex が poison された場合（通常発生しない）。
-    pub fn take_pending(&self) -> (usize, String) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let backs = self.backs.swap(0, Relaxed);
-        let romaji = std::mem::take(&mut *self.romaji.lock().unwrap());
-        (backs, romaji)
-    }
 }
 
 #[cfg(windows)]
@@ -286,8 +279,7 @@ pub const TIMER_POWER_RESUME: usize = 103;
 pub const TIMER_OUTPUT_GUARD: usize = 104;
 /// TSF ウォームアッププローブのポーリングタイマー ID
 pub const TIMER_TSF_PROBE: usize = 105;
-/// TsfGate の PendingWarmup フォールバックタイマー ID
-pub const TIMER_TSF_GATE: usize = 106;
+// 106 は旧 `TIMER_TSF_GATE`（TsfGate の PendingWarmup フォールバック。2026-10-22 撤去）。
 /// Ctrl+無変換 IME OFF ミスタイプ救済の先読みタイマー ID
 pub const TIMER_IME_OFF_RESCUE: usize = 107;
 /// GjiFsm の LongIdle タイムアウトタイマー ID
@@ -295,24 +287,48 @@ pub const TIMER_GJI_LONG_IDLE: usize = 108;
 /// フォーカス復帰後 resync のハード期限タイマー ID（report `01M0VGJ2M5KQHD1D9V7HAMBHNT`）
 pub const TIMER_FOCUS_RESYNC: usize = 109;
 /// hook watchdog カナリア確認タイマー ID（issue #165 自己修復 round2 B1(i)）。
-/// 一発タイマーで、ハンドラ冒頭で自ら `kill` する（`TIMER_TSF_GATE`/
-/// `TIMER_POWER_RESUME`と同じ流儀）。
+/// 一発タイマーで、ハンドラ冒頭で自ら `kill` する（`TIMER_POWER_RESUME`と同じ流儀）。
 pub const TIMER_HOOK_WATCHDOG_CANARY_CHECK: usize = 110;
+/// ADR-263 PR 2b: エピソード先頭の打鍵の保持の期限タイマー ID。一発タイマーで、ハンドラ冒頭で自ら `kill` する。
+pub const TIMER_LANG_HOLD: usize = 111;
+/// ADR-245 追補 2 R2: 戻った窓の最初の打鍵の保持の期限タイマー ID。一発タイマーで、ハンドラ冒頭で自ら `kill` する。
+/// 保持の解放(完了の札・上限・フォーカス変化・panic・設定再読み込み)でも必ず kill される(`runtime/resume_hold.rs`)。
+pub const TIMER_RESUME_HOLD: usize = 112;
+/// ADR-268 D5: 共有メモリの専用の読みのタイマー ID。
+///
+/// refresh の tick(`TIMER_IME_REFRESH`)は、明示意図があるとき・効果的に TSF ネイティブなときに止まる(他の stage を
+/// 走らせないため)ので、共有メモリの読み・追随だけを切り離して回す。一発タイマーで、ハンドラ冒頭で自ら `kill` し、
+/// 共有メモリのブロックがある間だけ読んだ後に張り直す(`runtime/mozc_shm_shadow.rs`)。
+pub const TIMER_MOZC_SHM: usize = 113;
+/// ADR-279 案 P の段階 P0(観測だけ): 明示 OFF の意図の間の IMM の読みの専用タイマー ID。
+///
+/// refresh の tick(`TIMER_IME_REFRESH`)は明示意図があると止まる。refresh を再開すると GJI の I/O 推論が drift correction の
+/// 根拠になって IME を書き直すので、読みだけを切り離して回す。一発タイマーで、ハンドラ冒頭で自ら `kill` し、対象の窓の間だけ
+/// 読む前に張り直す(`runtime/drift_follow_would.rs`)。
+pub const TIMER_DRIFT_FOLLOW_WOULD: usize = 114;
+/// PR #809 の M1: 窓切替直後の打鍵の保持の期限タイマー ID(`tuning::FOCUS_SWITCH_HOLD_MAX_MS`)。一発タイマーで、ハンドラ冒頭で
+/// 自ら `kill` する。保持の解放(refresh の完了・上限・panic・設定再読み込み)でも必ず kill される(`runtime/focus_switch_hold.rs`)。
+pub const TIMER_FOCUS_SWITCH_HOLD: usize = 115;
 
 // ── Windows メッセージ定数 ──────────────────────────────────────────────────────
-
-/// `WM_FOCUS_KIND_UPDATE` の wParam 上位 8bit が「AppKind 不明」を示すセンチネル値。
-pub const FOCUS_KIND_UPDATE_NO_APP_KIND: u8 = 0xFF;
 
 /// 設定リロード用カスタムメッセージ
 #[cfg(windows)]
 pub const WM_RELOAD_CONFIG: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 10;
-// WM_APP+11 (旧 WM_PROCESS_DEFERRED) / +13 / +14 (旧 WM_IME_KEY_DETECTED) は欠番。
+// WM_APP+11 (旧 WM_PROCESS_DEFERRED) / +12 (旧 WM_FOCUS_KIND_UPDATE、UIA 非同期判定の通知。ECRS F1 で撤去) / +13 / +14 (旧 WM_IME_KEY_DETECTED) は欠番。
 // +11/+14 は post 側がモジュール分割リファクタで消えた孤児ハンドラを 2026-07-06 の
 // 到達不能パス監査で撤去したもの。再利用より欠番のままが安全。
-/// UIA 非同期判定完了通知用カスタムメッセージ
+// WM_APP+28 (旧 WM_INDICATOR_MENU_READ、ADR-264 のメニュー読み取り。2026-10-22 撤去) は欠番。
+/// 入力インジケーターの字形の取り込みワーカーの結果（ADR-261 段階 1）。
+/// `wParam`/`lParam` は `state::indicator_glyph::ProbeOutcome::pack` の符号化。
 #[cfg(windows)]
-pub const WM_FOCUS_KIND_UPDATE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 12;
+pub const WM_INDICATOR_GLYPH_READ: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 30;
+/// 入力インジケーター要素自身の `Name` プロパティの変化を UIA push で検知した通知（ADR-261 決定5追補3・ADR-283 §10）。
+/// 字形を今すぐ再読みしてよい、という契機のトリガーのみ（`wParam`/`lParam` は使わない）。T2〜T4(欄の移動・モード系の
+/// 打鍵・途切れ)の個別のプロキシ事象配線の代わりに、この push 通知 1 本を共通トリガーとして使う。
+#[cfg(windows)]
+pub const WM_INDICATOR_GLYPH_PUSH_NOTIFY: u32 =
+    windows::Win32::UI::WindowsAndMessaging::WM_APP + 31;
 /// フックコールバックからキューされた Effects の実行要求
 #[cfg(windows)]
 pub const WM_EXECUTE_EFFECTS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 15;
@@ -355,6 +371,10 @@ pub const WM_KANA_LOCK_WARNING_CHANGED: u32 = windows::Win32::UI::WindowsAndMess
 /// hook の IME-mode 診断ログを journal へ吸い上げる契機。
 #[cfg(windows)]
 pub const WM_HOOK_IME_MODE_DIAGNOSTIC: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 27;
+/// ADR-245 追補 2 R2: 復元タスクの完了の札(`ResumeDoneToken`)が保持の解放を通知する。wparam = hold_id、lparam = 理由の符号
+/// (`ReleaseReason::code`)。`hold_id` が今の保持と一致するときだけ解放する。
+#[cfg(windows)]
+pub const WM_RESUME_HOLD_DONE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 29;
 // ── RawKeyEventExt ───────────────────────────────────────────────────────────────
 
 /// `RawKeyEvent` の SendInput 再注入ヘルパー。
@@ -368,6 +388,15 @@ pub trait RawKeyEventExt {
     unsafe fn reinject(&self);
 }
 
+// `vk::reinject_key_spec` が返す dwFlags のビット値（core は `windows` 非依存なので定数を複製している）が
+// Win32 の定義とずれていないことをコンパイル時に固定する（ADR-253）。
+#[cfg(windows)]
+const _: () = {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{KEYEVENTF_KEYUP, KEYEVENTF_UNICODE};
+    assert!(vk::REINJECT_FLAG_KEYUP == KEYEVENTF_KEYUP.0);
+    assert!(vk::REINJECT_FLAG_UNICODE == KEYEVENTF_UNICODE.0);
+};
+
 #[cfg(windows)]
 impl RawKeyEventExt for RawKeyEvent {
     #[allow(unsafe_code)]
@@ -375,23 +404,20 @@ impl RawKeyEventExt for RawKeyEvent {
         use crate::output::INJECTED_MARKER;
         use awase::types::KeyEventType;
         use windows::Win32::UI::Input::KeyboardAndMouse::{
-            INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
-            VIRTUAL_KEY,
+            INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, VIRTUAL_KEY,
         };
 
         let is_keyup = matches!(self.event_type, KeyEventType::KeyUp);
+        // VK_PACKET は文字が wScan に載るので UNICODE で送り直す（ADR-253、BUG-198）。
+        let (w_vk, w_scan, flags) = vk::reinject_key_spec(self.vk_code, self.scan_code.0, is_keyup);
 
         let input = INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
                 ki: KEYBDINPUT {
-                    wVk: VIRTUAL_KEY(self.vk_code.0),
-                    wScan: vk::reinject_scan_code(self.vk_code, self.scan_code.0),
-                    dwFlags: if is_keyup {
-                        KEYEVENTF_KEYUP
-                    } else {
-                        KEYBD_EVENT_FLAGS(0)
-                    },
+                    wVk: VIRTUAL_KEY(w_vk),
+                    wScan: w_scan,
+                    dwFlags: KEYBD_EVENT_FLAGS(flags),
                     time: 0,
                     dwExtraInfo: INJECTED_MARKER,
                 },
