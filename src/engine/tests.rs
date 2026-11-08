@@ -6224,7 +6224,7 @@ mod engine_integration_tests {
         }
     }
 
-    /// BUG-233 追補: 非活性中に素通しした押下は、活性化後の auto-repeat でも
+    /// MAC-006 追補: 非活性中に素通しした押下は、活性化後の auto-repeat でも
     /// FSM に入らない。
     ///
     /// auto-repeat は新しい物理押下ではないので、途中で Consume に変えると
@@ -6258,7 +6258,7 @@ mod engine_integration_tests {
         );
     }
 
-    /// BUG-233 追補2: 素通し中の押下の repeat でも活性化遷移は検知する。
+    /// MAC-006 追補2: 素通し中の押下の repeat でも活性化遷移は検知する。
     ///
     /// Phase 0.5 が素の `PassThrough` で帰ると、押しっぱなしのキーの repeat しか
     /// 届かない間 `prev_activation`・UI 通知・ActivationSync が更新されず、
@@ -6283,7 +6283,7 @@ mod engine_integration_tests {
         );
     }
 
-    /// BUG-230: 親指キーが IME 切替キーを兼ねる構成（macOS の 英数/かな）で、
+    /// MAC-003: 親指キーが IME 切替キーを兼ねる構成（macOS の 英数/かな）で、
     /// 親指を押したまま engine が非活性化しても切替キーが消えないこと。
     ///
     /// これが落ちると「ON を押したのに IME が ON にならず、次の打鍵が生キーで

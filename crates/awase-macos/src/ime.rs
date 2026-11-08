@@ -147,7 +147,7 @@ mod imp {
     /// 打鍵は観測ベースだと旧状態で判定されて素通り/誤変換する
     /// （英字モード→かな→即 k で「き」でなく k が出る問題）。
     ///
-    /// 実測（2026-09-02、ATOK atok36、英数⇄かな 往復 102 回、BUG-228）:
+    /// 実測（2026-09-02、ATOK atok36、英数⇄かな 往復 102 回、MAC-001）:
     /// 「かな」キー送出から TIS が新入力ソースを報告するまで p50 ~60ms /
     /// p90 ~160ms / **max 208ms**（2 回の計測で max 191ms → 208ms と伸びた）。
     /// OFF 側は max 122ms。実測最大 208ms + マージン 92ms = 300ms とする。
@@ -187,7 +187,7 @@ mod imp {
     /// リテラルが消えたことだけを根拠にしないこと。
     ///
     /// `AWASE_MACOS_SETTLE_MS` で上書きできる（この値を実機で詰めるための
-    /// 診断用。BUG-228）。
+    /// 診断用。MAC-001）。
     ///
     /// フィールド検証（2026-09-05〜09-10、通常使用 6 日、切替 2,600 回超）:
     /// settle 完了から 50〜59ms で送出したケースを多数含みつつ、リテラル化・
@@ -279,7 +279,7 @@ mod imp {
         /// 直近に観測した入力ソース ID（種別を問わない）。遷移をログへ残す
         /// ためだけに持つ — `last_japanese_id` はかなモードの ID しか記録
         /// しないため、ATOK Roman → ABC keylayout のような日本語 IM の外へ
-        /// 出る遷移が誰の直後に起きたのか追えなかった（BUG-228 の追跡課題）。
+        /// 出る遷移が誰の直後に起きたのか追えなかった（MAC-001 の追跡課題）。
         last_observed_id: std::cell::RefCell<Option<String>>,
         /// 最後に観測した「IME OFF を意味する入力ソース」の ID。ABC keylayout も
         /// ATOK の英字モードも、ユーザーが使っている方をそのまま記憶する。
@@ -287,16 +287,16 @@ mod imp {
         /// ON 側（`last_japanese_id`）と対称にするためのもの。`select_for(false)` が
         /// 「同ファミリの Roman/Eiji を優先し、無ければ keylayout」という優先順位で
         /// 選ぶと、ABC を使っている環境が ATOK の英字モードへ勝手に移り、macOS が
-        /// それを記憶して以後ずっと変わってしまう（BUG-231。実際に BUG-229 の
+        /// それを記憶して以後ずっと変わってしまう（MAC-004。実際に MAC-002 の
         /// 張り直し経路がこれを起こした）。優先順位を押し付けず、観測した実物を
         /// 復元する。
         last_off_id: std::cell::RefCell<Option<String>>,
         /// 観測されないまま猶予切れした切替の目標状態。呼び出し側が
-        /// `take_failed_switch` で一度だけ受け取り、張り直しに使う（BUG-229）。
+        /// `take_failed_switch` で一度だけ受け取り、張り直しに使う（MAC-002）。
         failed_switch: std::cell::Cell<Option<bool>>,
         /// 直近の切替が観測で確認された時刻。`pending` は settle 完了で消えるので
         /// 別に持つ — 「切替の何 ms 後に注入したか」をログに残し、
-        /// `OBSERVATION_SETTLE` を実測で詰めるために使う（BUG-228）。
+        /// `OBSERVATION_SETTLE` を実測で詰めるために使う（MAC-001）。
         last_confirmed_at: std::cell::Cell<Option<Instant>>,
     }
 
@@ -344,7 +344,7 @@ mod imp {
             self.pending.borrow().as_ref().map(|exp| exp.expected)
         }
 
-        /// 観測されないまま猶予切れした切替を一度だけ受け取る（BUG-229）。
+        /// 観測されないまま猶予切れした切替を一度だけ受け取る（MAC-002）。
         ///
         /// 切替キーが IME に届かなかったということなので、呼び出し側は
         /// `set_ime_on` で張り直す。判定を進めるため、先に `is_ime_on` を
@@ -353,7 +353,7 @@ mod imp {
             self.failed_switch.take()
         }
 
-        /// 直近の切替が観測で確認されてからの経過時間（BUG-228 の実測用）。
+        /// 直近の切替が観測で確認されてからの経過時間（MAC-001 の実測用）。
         ///
         /// 「切替の N ms 後に注入した打鍵が消えた／化けた」を突き合わせて
         /// `OBSERVATION_SETTLE` を詰めるために使う。
@@ -380,7 +380,7 @@ mod imp {
             if !was_confirmed {
                 if let Some(confirmed) = exp.confirmed {
                     self.last_confirmed_at.set(Some(confirmed));
-                    // settle 定数の実測用（BUG-228）。切替キー送出から TIS が
+                    // settle 定数の実測用（MAC-001）。切替キー送出から TIS が
                     // 新入力ソースを報告するまでの実時間を残す
                     tracing::debug!(
                         "IME switch observed: open={expected} after {}ms, \
@@ -440,7 +440,7 @@ mod imp {
             }
             let observed = classify_input_source(&id);
             // OFF 側も ON 側と対称に、ユーザーが実際に使っている入力ソースを
-            // 記憶する（BUG-231）。`select_for(false)` が優先順位で選ぶと、
+            // 記憶する（MAC-004）。`select_for(false)` が優先順位で選ぶと、
             // ABC を使っている環境が ATOK の英字モードへ勝手に移る
             if observed == Some(false) {
                 let mut last = self.last_off_id.borrow_mut();
@@ -609,7 +609,7 @@ mod imp {
             assert_eq!(at(&mut exp, None, 30 * MS), Expectation::Hold(true));
         }
 
-        /// BUG-228 の回帰: TIS が切替済みを報告した瞬間に保留を解いてはならない。
+        /// MAC-001 の回帰: TIS が切替済みを報告した瞬間に保留を解いてはならない。
         /// ここが `Clear` に戻ると、アプリの入力コンテキストが新入力ソースへ
         /// 繋がる前にローマ字が流れ、「きょう」が `kilyou` になる。
         #[test]
@@ -657,7 +657,7 @@ mod imp {
             assert!(exp.confirmed.is_none());
         }
 
-        /// BUG-231 の一部: ATOK の英字モードも ABC keylayout も等しく
+        /// MAC-004 の一部: ATOK の英字モードも ABC keylayout も等しく
         /// 「OFF を意味する入力ソース」として分類される。ここが片方だけだと
         /// `last_off_id` に記録されず、`select_for(false)` が優先順位で
         /// 選び直してユーザーの入力ソースを勝手に移してしまう。

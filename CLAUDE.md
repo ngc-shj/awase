@@ -86,7 +86,7 @@ Dead-dependency check: `cargo machete`. Security advisories: `cargo audit` (tria
 ```
 awase (root crate, src/)      Platform-independent core: engine/, config.rs, ngram.rs, kana_table.rs, yab/
 crates/awase-windows/         Windows platform implementation (the shell; the bulk of the complexity)
-crates/awase-macos/           macOS platform implementation (fork-only, macos-port branch; removed upstream)
+crates/awase-macos/           macOS platform implementation (fork-only, removed upstream; see docs/macos/README.md, bugs are MAC-NNN)
 crates/awase-ime-core/        The IME core (ADR-229 D4, renamed from awase-windows-core in ADR-274): IME-state (belief) /
                               observation / actuation decisions and the journal; state/ (the modules not moved to the sibling
                               core crates below, except platform_state.rs + sync_actuation.rs + ime_decision_view.rs),
