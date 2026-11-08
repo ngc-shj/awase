@@ -66,6 +66,8 @@ pub struct KeyLifecycle {
     /// Consume は OS に何も渡していないので途中で素通しへ切り替えても OS 側の
     /// キー状態が壊れないのに対し、Pass は既に KeyDown を渡してしまっており
     /// 対応する KeyUp を渡さないとキーが押しっぱなしになるため。
+    /// 例外として、非活性化の解放で Engine が同じ VK の Up を既に送った押下だけは
+    /// Consume を保つ（OS に Up が二重に届くのを防ぐ、`Engine::release_pending_and_reinject`・MAC-008）。
     passed_while_inactive: Vec<VkCode>,
 }
 

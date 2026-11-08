@@ -381,7 +381,11 @@ impl Engine {
         let pending_key_ups = self.lifecycle.flush_pending_key_ups();
         self.phase1_held = None;
         for evt in pending_key_ups {
-            if !released_vks.contains(&evt.vk_code) {
+            if released_vks.contains(&evt.vk_code) {
+                // OS は解放でこの VK の Up を受け取り済み。物理の KeyUp まで素通しすると
+                // Down の無い KeyUp が二重に届くので、消費の義務を残す（MAC-008）
+                self.lifecycle.on_key_down_consumed(&evt);
+            } else {
                 effects.push(Effect::Input(InputEffect::ReinjectKey(evt)));
             }
         }

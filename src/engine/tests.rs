@@ -6316,6 +6316,40 @@ mod engine_integration_tests {
         );
     }
 
+    /// MAC-008: 非活性化で切替キーを 1 打鍵（Down+Up）として送ったあと、
+    /// 押したままだった物理キーの KeyUp は消費する。
+    ///
+    /// 素通しすると OS には Down・Up・Up と届き、対になる Down の無い KeyUp が残る
+    /// （実機ログ: 英数を押すたびに `phys 0x66 KeyDown -> consume` →
+    /// `inj-tap 0x66 KeyDown/KeyUp` → `phys 0x66 KeyUp -> pass`）。
+    #[test]
+    fn the_physical_key_up_of_a_switch_key_sent_on_deactivation_is_consumed() {
+        let mut engine = make_test_engine();
+        engine.set_thumb_keys_are_ime_switch(true);
+
+        let _ = engine.on_input(Ev::down(VK_NONCONVERT).at(0).build(), &ime_on_ctx());
+        let ctx_off = InputContext {
+            left_thumb_down: Some(0),
+            ..ime_off_ctx()
+        };
+        let _ = engine.on_command(EngineCommand::RefreshState, &ctx_off);
+
+        let up = engine.on_input(Ev::up(VK_NONCONVERT).at(100).build(), &ime_off_ctx());
+        assert!(
+            up.is_consumed(),
+            "the OS already got Down+Up for this key, got {:?}",
+            effects_of(&up)
+        );
+        assert!(
+            !has_effect(&up, |e| matches!(
+                e,
+                Effect::Input(InputEffect::ReinjectKey(_))
+            )),
+            "and must not get another KeyUp, got {:?}",
+            effects_of(&up)
+        );
+    }
+
     /// 既定（親指キーが IME 切替キーではない = Windows/Linux）では従来どおり
     /// 抑制する。ここが緩むと、フォーカス変更に伴う非活性化で保留中の親指キーが
     /// 別ウィンドウへ生送出される（`ThumbRawVkEmission::Denied` が防いでいる事故）。
